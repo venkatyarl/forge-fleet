@@ -40,6 +40,10 @@ WorkingDirectory=%h
 Environment=RUST_LOG=info
 Environment=FORGEFLEET_NODE_NAME=__COMPUTER_NAME__
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/cuda/bin:/opt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
+# Desktop keyring agents are session-scoped; a lingering user manager can keep
+# their dead socket path indefinitely. Daemon-owned SSH is BatchMode and uses
+# the enrolled file-backed fleet key, so never inherit an ambient agent socket.
+Environment=SSH_AUTH_SOCK=
 
 Restart=on-failure
 RestartSec=10

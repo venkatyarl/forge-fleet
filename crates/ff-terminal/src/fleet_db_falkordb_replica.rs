@@ -490,10 +490,8 @@ async fn run_on_node(node: &Computer, script: &str, timeout: Duration) -> Result
         command.args(["-lc", script]);
         command
     } else {
-        let mut command = tokio::process::Command::new("ssh");
+        let mut command = strict_ssh_command();
         command.args([
-            "-o",
-            "BatchMode=yes",
             "-o",
             "StrictHostKeyChecking=yes",
             "-o",
@@ -513,6 +511,23 @@ async fn run_on_node(node: &Computer, script: &str, timeout: Duration) -> Result
         .await
         .with_context(|| format!("command on {} timed out", node.name))?
         .with_context(|| format!("run bounded command on {}", node.name))
+}
+
+fn strict_ssh_command() -> tokio::process::Command {
+    let mut command = tokio::process::Command::new("ssh");
+    // User-systemd managers can retain a stale desktop keyring socket long
+    // after the graphical agent exits. OpenSSH waits on that Unix socket
+    // instead of reaching the enrolled file-backed fleet key. Every command
+    // here is BatchMode and must be deterministic, so never inherit an ambient
+    // agent from the daemon and explicitly disable agents in OpenSSH too.
+    command.env_remove("SSH_AUTH_SOCK");
+    command.args(ff_agent::ssh_opts::ssh_bypass_args()).args([
+        "-o",
+        "IdentitiesOnly=yes",
+        "-i",
+        "~/.ssh/id_ed25519",
+    ]);
+    command
 }
 
 fn primary_proof_transport(local_name: &str, target: &Computer) -> PrimaryProofTransport {
@@ -659,8 +674,6 @@ fn strict_ssh_loopback_args(node: &Computer, forward: &str) -> Vec<String> {
     vec![
         "-N".into(),
         "-o".into(),
-        "BatchMode=yes".into(),
-        "-o".into(),
         "StrictHostKeyChecking=yes".into(),
         "-o".into(),
         "ConnectTimeout=5".into(),
@@ -689,7 +702,8 @@ async fn strict_ssh_loopback_probe(
     let port = listener.local_addr()?.port();
     drop(listener);
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{remote_port}");
-    let mut child = tokio::process::Command::new("ssh")
+    let mut command = strict_ssh_command();
+    let mut child = command
         .args(strict_ssh_loopback_args(node, &forward))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -3389,7 +3403,16 @@ mod tests {
     fn strict_primary_tunnel_is_fail_closed_and_exact() {
         let primary = computer(2, "priya", "192.168.5.104");
         let args = strict_ssh_loopback_args(&primary, "127.0.0.1:45678:127.0.0.1:63379");
+        let mut command = { strict_ssh_command() };
+        command.args(args);
+        let args: Vec<String> = command
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
         for exact in [
+            "IdentityAgent=none",
+            "IdentitiesOnly=yes",
             "BatchMode=yes",
             "StrictHostKeyChecking=yes",
             "ConnectTimeout=5",
@@ -3403,7 +3426,45 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| { pair == ["-L", "127.0.0.1:45678:127.0.0.1:63379"] }));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "IdentityAgent=none"]));
+        assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "IdentitiesOnly=yes"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-i", "~/.ssh/id_ed25519"]));
         assert_eq!(args.last().map(String::as_str), Some("priya@192.168.5.104"));
+
+        assert!(command.as_std().get_envs().any(|(key, value)| {
+            key == std::ffi::OsStr::new("SSH_AUTH_SOCK") && value.is_none()
+        }));
+
+        let source = include_str!("fleet_db_falkordb_replica.rs");
+        let raw_constructor = ["Command::new(", "\"ssh\"", ")"].concat();
+        assert_eq!(source.matches(&raw_constructor).count(), 1);
+        let factory_name = ["strict_ssh_", "command()"].concat();
+        assert_eq!(source.matches(&factory_name).count(), 4);
+
+        for unit in [
+            include_str!("../../../deploy/systemd/forgefleetd.service"),
+            include_str!("../../../deploy/systemd/forgefleet-mcp.service"),
+        ] {
+            let mut section = "";
+            let mut environment_lines = 0;
+            for line in unit.lines() {
+                if line.starts_with('[') && line.ends_with(']') {
+                    section = line;
+                }
+                if line == "Environment=SSH_AUTH_SOCK=" {
+                    assert_eq!(section, "[Service]");
+                    environment_lines += 1;
+                }
+            }
+            assert_eq!(environment_lines, 1);
+        }
     }
 
     #[test]
