@@ -33,6 +33,36 @@ const MODEL_LIBRARY_HASH_SELECT_FOR_UPDATE_SQL: &str =
       WHERE id = $1
       FOR UPDATE";
 
+const RELEASE_ARTIFACT_INSERT_SQL: &str = "INSERT INTO release_artifacts
+        (artifact_name, artifact_version, source_commit, target_triple, sha256, size_bytes)
+    VALUES ($1, $2, $3, $4, $5, $6)
+    ON CONFLICT (artifact_name, artifact_version, source_commit, target_triple) DO NOTHING
+    RETURNING id, artifact_name, artifact_version, source_commit, target_triple,
+              sha256, size_bytes, created_at";
+
+const RELEASE_ARTIFACT_SELECT_FOR_UPDATE_SQL: &str = "SELECT id, artifact_name,
+           artifact_version, source_commit, target_triple, sha256, size_bytes, created_at
+      FROM release_artifacts
+     WHERE artifact_name = $1 AND artifact_version = $2
+       AND source_commit = $3 AND target_triple = $4
+     FOR UPDATE";
+
+const RELEASE_CUSTODY_INSERT_SQL: &str = "INSERT INTO release_artifact_custody
+        (artifact_id, computer_id, holder_name_at_registration, relative_path)
+    VALUES ($1, $2, $3, $4)
+    ON CONFLICT (artifact_id, computer_id) DO NOTHING
+    RETURNING artifact_id, computer_id, holder_name_at_registration, relative_path,
+              first_verified_at, last_verified_at";
+
+const RELEASE_CUSTODY_SELECT_FOR_UPDATE_SQL: &str = "SELECT artifact_id, computer_id,
+           holder_name_at_registration, relative_path, first_verified_at, last_verified_at
+      FROM release_artifact_custody
+     WHERE artifact_id = $1 AND computer_id = $2
+     FOR UPDATE";
+
+const RELEASE_HOLDER_SELECT_FOR_UPDATE_SQL: &str =
+    "SELECT name FROM computers WHERE id = $1 FOR UPDATE";
+
 #[derive(Debug, Clone)]
 pub struct ModelLibraryHashAssertion {
     pub row_id: Uuid,
@@ -59,6 +89,59 @@ pub enum ModelLibraryHashCasOutcome {
     Mismatch,
     StaleIdentity,
     LostRace,
+}
+
+/// Fresh, verified evidence submitted to the immutable release registry.
+///
+/// The caller must construct this immediately after a descriptor-relative
+/// filesystem verification. The transaction independently fences the current
+/// computer name so a concurrent rename cannot misattribute custody.
+#[derive(Debug, Clone)]
+pub struct ReleaseArtifactAssertion {
+    pub artifact_name: String,
+    pub artifact_version: String,
+    pub source_commit: String,
+    pub target_triple: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub computer_id: Uuid,
+    pub holder_name: String,
+    pub relative_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseArtifactRow {
+    pub id: Uuid,
+    pub artifact_name: String,
+    pub artifact_version: String,
+    pub source_commit: String,
+    pub target_triple: String,
+    pub sha256: String,
+    pub size_bytes: i64,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseArtifactCustodyRow {
+    pub artifact_id: Uuid,
+    pub computer_id: Uuid,
+    pub holder_name_at_registration: String,
+    pub relative_path: String,
+    pub first_verified_at: DateTime<Utc>,
+    pub last_verified_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseArtifactRegistrationOutcome {
+    Registered,
+    Verified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseArtifactRegistration {
+    pub artifact: ReleaseArtifactRow,
+    pub custody: ReleaseArtifactCustodyRow,
+    pub outcome: ReleaseArtifactRegistrationOutcome,
 }
 
 /// Pure comparison policy: a known digest is never rewritten.
@@ -129,6 +212,336 @@ pub async fn pg_compare_or_cas_model_library_sha256(
     Ok(outcome)
 }
 
+/// Register immutable artifact content and local custody in one transaction.
+///
+/// A repeated, byte-for-byte identical assertion refreshes only
+/// `last_verified_at`. Any content, holder-name, or path disagreement aborts
+/// the transaction. There is intentionally no force, rewrite, or delete twin.
+pub async fn pg_register_release_artifact(
+    pool: &PgPool,
+    assertion: &ReleaseArtifactAssertion,
+) -> Result<ReleaseArtifactRegistration> {
+    validate_release_artifact_assertion(assertion)?;
+
+    let mut transaction = pool.begin().await?;
+    let canonical_holder: Option<String> = sqlx::query_scalar(RELEASE_HOLDER_SELECT_FOR_UPDATE_SQL)
+        .bind(assertion.computer_id)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let canonical_holder = canonical_holder.ok_or_else(|| {
+        DbError::ArtifactIntegrity(format!(
+            "custody computer {} is not canonical",
+            assertion.computer_id
+        ))
+    })?;
+    if canonical_holder != assertion.holder_name {
+        return Err(DbError::ArtifactIntegrity(format!(
+            "custody holder changed during verification: expected {}, found {}",
+            assertion.holder_name, canonical_holder
+        )));
+    }
+    if !model_integrity_worker_allowed(&canonical_holder) {
+        return Err(DbError::ArtifactIntegrity(
+            "release artifact operations are forbidden on Vinny".to_string(),
+        ));
+    }
+
+    let inserted_artifact = sqlx::query(RELEASE_ARTIFACT_INSERT_SQL)
+        .bind(&assertion.artifact_name)
+        .bind(&assertion.artifact_version)
+        .bind(&assertion.source_commit)
+        .bind(&assertion.target_triple)
+        .bind(&assertion.sha256)
+        .bind(assertion.size_bytes)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let artifact_was_inserted = inserted_artifact.is_some();
+    let artifact = match inserted_artifact {
+        Some(row) => release_artifact_from_row(&row),
+        None => {
+            let row = sqlx::query(RELEASE_ARTIFACT_SELECT_FOR_UPDATE_SQL)
+                .bind(&assertion.artifact_name)
+                .bind(&assertion.artifact_version)
+                .bind(&assertion.source_commit)
+                .bind(&assertion.target_triple)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    DbError::ArtifactIntegrity(
+                        "release identity disappeared during compare-and-set".to_string(),
+                    )
+                })?;
+            let artifact = release_artifact_from_row(&row);
+            if !release_content_matches(&artifact, assertion) {
+                return Err(DbError::ArtifactIntegrity(format!(
+                    "release identity already exists with different content (stored sha256={}, size_bytes={})",
+                    artifact.sha256, artifact.size_bytes
+                )));
+            }
+            artifact
+        }
+    };
+
+    let inserted_custody = sqlx::query(RELEASE_CUSTODY_INSERT_SQL)
+        .bind(artifact.id)
+        .bind(assertion.computer_id)
+        .bind(&assertion.holder_name)
+        .bind(&assertion.relative_path)
+        .fetch_optional(&mut *transaction)
+        .await?;
+    let custody_was_inserted = inserted_custody.is_some();
+    let custody = match inserted_custody {
+        Some(row) => release_custody_from_row(&row),
+        None => {
+            let row = sqlx::query(RELEASE_CUSTODY_SELECT_FOR_UPDATE_SQL)
+                .bind(artifact.id)
+                .bind(assertion.computer_id)
+                .fetch_optional(&mut *transaction)
+                .await?
+                .ok_or_else(|| {
+                    DbError::ArtifactIntegrity(
+                        "custody identity disappeared during compare-and-set".to_string(),
+                    )
+                })?;
+            let existing = release_custody_from_row(&row);
+            if !release_custody_matches(&existing, assertion) {
+                return Err(DbError::ArtifactIntegrity(format!(
+                    "custody identity already exists with different holder/path (stored holder={}, path={})",
+                    existing.holder_name_at_registration, existing.relative_path
+                )));
+            }
+            let row = sqlx::query(
+                "UPDATE release_artifact_custody
+                    SET last_verified_at = clock_timestamp()
+                  WHERE artifact_id = $1 AND computer_id = $2
+                RETURNING artifact_id, computer_id, holder_name_at_registration, relative_path,
+                          first_verified_at, last_verified_at",
+            )
+            .bind(artifact.id)
+            .bind(assertion.computer_id)
+            .fetch_one(&mut *transaction)
+            .await?;
+            release_custody_from_row(&row)
+        }
+    };
+
+    transaction.commit().await?;
+    Ok(ReleaseArtifactRegistration {
+        artifact,
+        custody,
+        outcome: if artifact_was_inserted || custody_was_inserted {
+            ReleaseArtifactRegistrationOutcome::Registered
+        } else {
+            ReleaseArtifactRegistrationOutcome::Verified
+        },
+    })
+}
+
+pub async fn pg_get_release_artifact(
+    pool: &PgPool,
+    artifact_name: &str,
+    artifact_version: &str,
+    source_commit: &str,
+    target_triple: &str,
+) -> Result<Option<ReleaseArtifactRow>> {
+    let row = sqlx::query(
+        "SELECT id, artifact_name, artifact_version, source_commit, target_triple,
+                sha256, size_bytes, created_at
+           FROM release_artifacts
+          WHERE artifact_name = $1 AND artifact_version = $2
+            AND source_commit = $3 AND target_triple = $4",
+    )
+    .bind(artifact_name)
+    .bind(artifact_version)
+    .bind(source_commit)
+    .bind(target_triple)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(release_artifact_from_row))
+}
+
+pub async fn pg_list_release_artifacts(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<ReleaseArtifactRow>> {
+    let rows = sqlx::query(
+        "SELECT id, artifact_name, artifact_version, source_commit, target_triple,
+                sha256, size_bytes, created_at
+           FROM release_artifacts
+          ORDER BY created_at DESC, artifact_name, target_triple
+          LIMIT $1",
+    )
+    .bind(limit.clamp(1, 1000))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(release_artifact_from_row).collect())
+}
+
+pub async fn pg_list_release_artifact_custody(
+    pool: &PgPool,
+    artifact_id: Uuid,
+) -> Result<Vec<ReleaseArtifactCustodyRow>> {
+    let rows = sqlx::query(
+        "SELECT artifact_id, computer_id, holder_name_at_registration, relative_path,
+                first_verified_at, last_verified_at
+           FROM release_artifact_custody
+          WHERE artifact_id = $1
+          ORDER BY holder_name_at_registration, computer_id",
+    )
+    .bind(artifact_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.iter().map(release_custody_from_row).collect())
+}
+
+fn release_artifact_from_row(row: &sqlx::postgres::PgRow) -> ReleaseArtifactRow {
+    ReleaseArtifactRow {
+        id: row.get("id"),
+        artifact_name: row.get("artifact_name"),
+        artifact_version: row.get("artifact_version"),
+        source_commit: row.get("source_commit"),
+        target_triple: row.get("target_triple"),
+        sha256: row.get("sha256"),
+        size_bytes: row.get("size_bytes"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn release_custody_from_row(row: &sqlx::postgres::PgRow) -> ReleaseArtifactCustodyRow {
+    ReleaseArtifactCustodyRow {
+        artifact_id: row.get("artifact_id"),
+        computer_id: row.get("computer_id"),
+        holder_name_at_registration: row.get("holder_name_at_registration"),
+        relative_path: row.get("relative_path"),
+        first_verified_at: row.get("first_verified_at"),
+        last_verified_at: row.get("last_verified_at"),
+    }
+}
+
+fn release_content_matches(
+    existing: &ReleaseArtifactRow,
+    assertion: &ReleaseArtifactAssertion,
+) -> bool {
+    existing.artifact_name == assertion.artifact_name
+        && existing.artifact_version == assertion.artifact_version
+        && existing.source_commit == assertion.source_commit
+        && existing.target_triple == assertion.target_triple
+        && constant_time_sha256_eq(&existing.sha256, &assertion.sha256)
+        && existing.size_bytes == assertion.size_bytes
+}
+
+fn release_custody_matches(
+    existing: &ReleaseArtifactCustodyRow,
+    assertion: &ReleaseArtifactAssertion,
+) -> bool {
+    existing.computer_id == assertion.computer_id
+        && existing.holder_name_at_registration == assertion.holder_name
+        && existing.relative_path == assertion.relative_path
+}
+
+fn validate_release_artifact_assertion(assertion: &ReleaseArtifactAssertion) -> Result<()> {
+    let canonical_token = |value: &str| {
+        !value.is_empty()
+            && value.len() <= 128
+            && (value.as_bytes()[0].is_ascii_lowercase() || value.as_bytes()[0].is_ascii_digit())
+    };
+    let token_tail = |value: &str| {
+        value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"._+-".contains(&byte)
+        })
+    };
+    if !canonical_token(&assertion.artifact_name) || !token_tail(&assertion.artifact_name) {
+        return Err(DbError::ArtifactIntegrity(
+            "artifact name must be a canonical lowercase token".to_string(),
+        ));
+    }
+    if !canonical_token(&assertion.artifact_version) || !token_tail(&assertion.artifact_version) {
+        return Err(DbError::ArtifactIntegrity(
+            "artifact version must be a canonical lowercase token".to_string(),
+        ));
+    }
+    if !is_lower_hex(&assertion.source_commit, 40) {
+        return Err(DbError::ArtifactIntegrity(
+            "source commit must be exactly 40 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    if !is_canonical_target_triple(&assertion.target_triple) {
+        return Err(DbError::ArtifactIntegrity(
+            "target triple must contain 3-5 canonical lowercase components".to_string(),
+        ));
+    }
+    if !is_lower_hex(&assertion.sha256, 64) {
+        return Err(DbError::ArtifactIntegrity(
+            "sha256 must be exactly 64 lowercase hexadecimal characters".to_string(),
+        ));
+    }
+    if assertion.size_bytes <= 0 {
+        return Err(DbError::ArtifactIntegrity(
+            "artifact size must be positive".to_string(),
+        ));
+    }
+    if !is_canonical_holder_name(&assertion.holder_name)
+        || !model_integrity_worker_allowed(&assertion.holder_name)
+    {
+        return Err(DbError::ArtifactIntegrity(
+            "custody holder is non-canonical or excluded".to_string(),
+        ));
+    }
+    if !is_normal_relative_path(&assertion.relative_path) {
+        return Err(DbError::ArtifactIntegrity(
+            "custody path must be a normal UTF-8 path relative to the release root".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_lower_hex(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_canonical_target_triple(value: &str) -> bool {
+    if value.is_empty() || value.len() > 128 {
+        return false;
+    }
+    let components: Vec<_> = value.split('-').collect();
+    (3..=5).contains(&components.len())
+        && components.iter().all(|component| {
+            !component.is_empty()
+                && component.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || byte == b'_'
+                        || byte == b'.'
+                })
+        })
+}
+
+fn is_canonical_holder_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value.as_bytes()[0] != b'-'
+        && value.as_bytes()[value.len() - 1] != b'-'
+}
+
+fn is_normal_relative_path(value: &str) -> bool {
+    use std::path::{Component, Path};
+
+    !value.is_empty()
+        && !value.contains('\\')
+        && !value.contains("//")
+        && !value.ends_with('/')
+        && !Path::new(value).is_absolute()
+        && Path::new(value)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
 fn validate_assertion(assertion: &ModelLibraryHashAssertion) -> Result<()> {
     if !model_integrity_worker_allowed(&assertion.worker_name) {
         return Err(DbError::NotFound(
@@ -171,7 +584,10 @@ fn classify_cas_rows(affected: u64) -> Result<ModelLibraryHashCasOutcome> {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
+
     use super::*;
+    use sqlx::postgres::PgPoolOptions;
 
     const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
@@ -186,6 +602,82 @@ mod tests {
             digest_algorithm: algorithm.to_string(),
             computed_sha256: HASH.to_string(),
         }
+    }
+
+    fn release_assertion(computer_id: Uuid, holder: &str) -> ReleaseArtifactAssertion {
+        ReleaseArtifactAssertion {
+            artifact_name: "ff".to_string(),
+            artifact_version: "2026.8.5_1".to_string(),
+            source_commit: "6dc4086b7217cb8c2ccc1945b1e1f3213b9b1941".to_string(),
+            target_triple: "aarch64-unknown-linux-gnu".to_string(),
+            sha256: HASH.to_string(),
+            size_bytes: 3,
+            computer_id,
+            holder_name: holder.to_string(),
+            relative_path: "ff-6dc4086b-aarch64/artifact/ff".to_string(),
+        }
+    }
+
+    fn artifact_test_db_url() -> Option<String> {
+        env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()
+    }
+
+    async fn create_fresh_artifact_temp_db() -> Option<(PgPool, PgPool, String)> {
+        let base_url = artifact_test_db_url()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_artifact_v291_{}", Uuid::new_v4().simple());
+        let admin_url = format!("{prefix}/postgres");
+        let database_url = format!("{prefix}/{db_name}");
+
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .ok()?;
+        if sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .is_err()
+        {
+            admin.close().await;
+            return None;
+        }
+        let pool = match PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(_) => {
+                let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+                    .execute(&admin)
+                    .await;
+                admin.close().await;
+                return None;
+            }
+        };
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_artifact_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1
+                AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate artifact temp database sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop artifact temp database");
+        admin.close().await;
     }
 
     #[test]
@@ -253,5 +745,224 @@ mod tests {
             ModelLibraryHashCasOutcome::Initialized
         );
         assert!(classify_cas_rows(2).is_err());
+    }
+
+    #[test]
+    fn release_assertion_validation_fails_closed() {
+        let valid = release_assertion(Uuid::new_v4(), "thalia");
+        validate_release_artifact_assertion(&valid).unwrap();
+
+        let mut invalid = valid.clone();
+        invalid.sha256 = "A".repeat(64);
+        assert!(validate_release_artifact_assertion(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.source_commit = "6dc4086b".to_string();
+        assert!(validate_release_artifact_assertion(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.target_triple = "linux".to_string();
+        assert!(validate_release_artifact_assertion(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.size_bytes = 0;
+        assert!(validate_release_artifact_assertion(&invalid).is_err());
+        let mut invalid = valid.clone();
+        invalid.holder_name = "VINNY".to_string();
+        assert!(validate_release_artifact_assertion(&invalid).is_err());
+        for path in [
+            "/absolute/ff",
+            "../ff",
+            "build/../ff",
+            "build\\ff",
+            "build//ff",
+        ] {
+            let mut invalid = valid.clone();
+            invalid.relative_path = path.to_string();
+            assert!(
+                validate_release_artifact_assertion(&invalid).is_err(),
+                "accepted spoofable path {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn release_content_and_custody_are_compare_only() {
+        let assertion = release_assertion(Uuid::new_v4(), "thalia");
+        let artifact = ReleaseArtifactRow {
+            id: Uuid::new_v4(),
+            artifact_name: assertion.artifact_name.clone(),
+            artifact_version: assertion.artifact_version.clone(),
+            source_commit: assertion.source_commit.clone(),
+            target_triple: assertion.target_triple.clone(),
+            sha256: assertion.sha256.clone(),
+            size_bytes: assertion.size_bytes,
+            created_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        assert!(release_content_matches(&artifact, &assertion));
+        let mut changed = assertion.clone();
+        changed.sha256 = "0".repeat(64);
+        assert!(!release_content_matches(&artifact, &changed));
+        let mut changed = assertion.clone();
+        changed.size_bytes += 1;
+        assert!(!release_content_matches(&artifact, &changed));
+
+        let custody = ReleaseArtifactCustodyRow {
+            artifact_id: artifact.id,
+            computer_id: assertion.computer_id,
+            holder_name_at_registration: assertion.holder_name.clone(),
+            relative_path: assertion.relative_path.clone(),
+            first_verified_at: DateTime::<Utc>::UNIX_EPOCH,
+            last_verified_at: DateTime::<Utc>::UNIX_EPOCH,
+        };
+        assert!(release_custody_matches(&custody, &assertion));
+        let mut changed = assertion;
+        changed.relative_path = "different/artifact/ff".to_string();
+        assert!(!release_custody_matches(&custody, &changed));
+    }
+
+    #[test]
+    fn release_sql_has_no_content_rewrite_or_delete_surface() {
+        assert!(RELEASE_ARTIFACT_INSERT_SQL.contains("ON CONFLICT"));
+        assert!(RELEASE_ARTIFACT_INSERT_SQL.contains("DO NOTHING"));
+        assert!(!RELEASE_ARTIFACT_INSERT_SQL.contains("DO UPDATE"));
+        assert!(!RELEASE_ARTIFACT_INSERT_SQL.contains("DELETE"));
+        assert!(RELEASE_ARTIFACT_SELECT_FOR_UPDATE_SQL.contains("FOR UPDATE"));
+        assert!(RELEASE_CUSTODY_INSERT_SQL.contains("DO NOTHING"));
+        assert!(!RELEASE_CUSTODY_INSERT_SQL.contains("DO UPDATE"));
+        assert!(RELEASE_CUSTODY_SELECT_FOR_UPDATE_SQL.contains("FOR UPDATE"));
+        assert!(RELEASE_HOLDER_SELECT_FOR_UPDATE_SQL.contains("WHERE id = $1"));
+        assert!(RELEASE_HOLDER_SELECT_FOR_UPDATE_SQL.contains("FOR UPDATE"));
+        assert!(!RELEASE_HOLDER_SELECT_FOR_UPDATE_SQL.contains("KEY SHARE"));
+    }
+
+    /// Integration test against a freshly-created disposable database. The
+    /// configured fleet URL is used only to reach the server's `postgres`
+    /// administration database; authority tables and rows are never created in
+    /// the configured database itself.
+    #[tokio::test]
+    async fn release_registration_converges_and_rejects_mismatch() {
+        let Some((admin, pool, db_name)) = create_fresh_artifact_temp_db().await else {
+            eprintln!(
+                "skipping release artifact integration test: no usable \
+                 FORGEFLEET_POSTGRES_URL/FORGEFLEET_DATABASE_URL temp-db authority"
+            );
+            return;
+        };
+        eprintln!("created disposable artifact test database {db_name}");
+        sqlx::raw_sql(
+            "CREATE TABLE computers (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                primary_ip TEXT NOT NULL,
+                all_ips JSONB NOT NULL DEFAULT '[]',
+                os_family TEXT NOT NULL,
+                ssh_user TEXT NOT NULL
+             );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(crate::schema::SCHEMA_V291_RELEASE_ARTIFACT_CUSTODY)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let suffix = Uuid::new_v4().simple().to_string();
+        let holder_a = format!("a{}", &suffix[..10]);
+        let holder_b = format!("b{}", &suffix[..10]);
+        let computer_a = Uuid::new_v4();
+        let computer_b = Uuid::new_v4();
+        for (id, name, ip) in [
+            (computer_a, holder_a.as_str(), "192.0.2.10"),
+            (computer_b, holder_b.as_str(), "192.0.2.11"),
+        ] {
+            sqlx::query(
+                "INSERT INTO computers (id, name, primary_ip, all_ips, os_family, ssh_user)
+                 VALUES ($1, $2, $3, '[]'::jsonb, 'linux-ubuntu', 'test')",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(ip)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let mut assertion_a = release_assertion(computer_a, &holder_a);
+        assertion_a.artifact_version = suffix.clone();
+        let mut assertion_b = release_assertion(computer_b, &holder_b);
+        assertion_b.artifact_version = suffix.clone();
+        let (registered_a, registered_b) = tokio::join!(
+            pg_register_release_artifact(&pool, &assertion_a),
+            pg_register_release_artifact(&pool, &assertion_b),
+        );
+        let registered_a = registered_a.unwrap();
+        let registered_b = registered_b.unwrap();
+        assert_eq!(registered_a.artifact.id, registered_b.artifact.id);
+        assert_eq!(
+            pg_list_release_artifact_custody(&pool, registered_a.artifact.id)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let verified = pg_register_release_artifact(&pool, &assertion_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            verified.outcome,
+            ReleaseArtifactRegistrationOutcome::Verified
+        );
+        assert!(verified.custody.last_verified_at >= verified.custody.first_verified_at);
+
+        let mut wrong_digest = assertion_a.clone();
+        wrong_digest.sha256 = "0".repeat(64);
+        assert!(
+            pg_register_release_artifact(&pool, &wrong_digest)
+                .await
+                .is_err()
+        );
+        let mut wrong_path = assertion_a.clone();
+        wrong_path.relative_path = "different/artifact/ff".to_string();
+        assert!(
+            pg_register_release_artifact(&pool, &wrong_path)
+                .await
+                .is_err()
+        );
+        let stored = pg_get_release_artifact(
+            &pool,
+            &assertion_a.artifact_name,
+            &assertion_a.artifact_version,
+            &assertion_a.source_commit,
+            &assertion_a.target_triple,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored.sha256, HASH);
+        assert_eq!(stored.size_bytes, 3);
+        let listed = pg_list_release_artifacts(&pool, 10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], stored);
+
+        assert!(
+            sqlx::query("UPDATE release_artifacts SET sha256 = $2 WHERE id = $1")
+                .bind(stored.id)
+                .bind("0".repeat(64))
+                .execute(&pool)
+                .await
+                .is_err(),
+            "database trigger must reject direct content mutation"
+        );
+        assert!(
+            sqlx::query("DELETE FROM release_artifact_custody WHERE artifact_id = $1")
+                .bind(stored.id)
+                .execute(&pool)
+                .await
+                .is_err(),
+            "database trigger must reject custody deletion"
+        );
+
+        drop_artifact_temp_db(admin, pool, &db_name).await;
+        eprintln!("dropped disposable artifact test database {db_name}");
     }
 }

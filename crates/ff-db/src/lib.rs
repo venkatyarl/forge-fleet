@@ -32,7 +32,10 @@ pub use migrations::{
 };
 pub use model_integrity::{
     HashWriteDecision, ModelLibraryHashAssertion, ModelLibraryHashCasOutcome,
-    pg_compare_or_cas_model_library_sha256,
+    ReleaseArtifactAssertion, ReleaseArtifactCustodyRow, ReleaseArtifactRegistration,
+    ReleaseArtifactRegistrationOutcome, ReleaseArtifactRow, pg_compare_or_cas_model_library_sha256,
+    pg_get_release_artifact, pg_list_release_artifact_custody, pg_list_release_artifacts,
+    pg_register_release_artifact,
 };
 pub use models::WorkItem;
 pub use operational_store::OperationalStore;
@@ -359,6 +362,9 @@ pub mod error {
 
         #[error("not found: {0}")]
         NotFound(String),
+
+        #[error("artifact integrity error: {0}")]
+        ArtifactIntegrity(String),
     }
 
     pub type Result<T> = std::result::Result<T, DbError>;

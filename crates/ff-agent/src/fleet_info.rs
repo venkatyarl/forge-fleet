@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
 use tokio::sync::OnceCell;
 use tracing::debug;
+use uuid::Uuid;
 
 /// Cached process-wide fleet description used by the default system prompt.
 /// Populated on first successful call to [`hydrate_fleet_description`].
@@ -286,27 +287,132 @@ pub async fn resolve_this_worker_name() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Enumerate local IPv4 addresses (non-loopback) via `ifconfig -l`.
-/// Returns an empty vec on any error; callers then fall through to hostname.
+/// Stable local computer identity used by custody and other authority writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalComputerIdentity {
+    pub id: Uuid,
+    pub name: String,
+}
+
+const STRICT_LOCAL_COMPUTER_SQL: &str = "SELECT DISTINCT c.id, c.name
+       FROM computers c
+       LEFT JOIN fleet_workers fw ON lower(fw.name) = lower(c.name)
+      WHERE c.primary_ip = ANY($1::text[])
+         OR EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements(COALESCE(c.all_ips, '[]'::jsonb)) AS c_ip(value)
+                 WHERE CASE jsonb_typeof(c_ip.value)
+                           WHEN 'string' THEN c_ip.value #>> '{}'
+                           WHEN 'object' THEN c_ip.value ->> 'ip'
+                           ELSE NULL
+                       END = ANY($1::text[])
+            )
+         OR fw.ip = ANY($1::text[])
+         OR EXISTS (
+                SELECT 1
+                  FROM jsonb_array_elements(COALESCE(fw.alt_ips, '[]'::jsonb)) AS fw_ip(value)
+                 WHERE CASE jsonb_typeof(fw_ip.value)
+                           WHEN 'string' THEN fw_ip.value #>> '{}'
+                           WHEN 'object' THEN fw_ip.value ->> 'ip'
+                           ELSE NULL
+                       END = ANY($1::text[])
+            )
+      ORDER BY c.name, c.id";
+
+/// Resolve this host to exactly one canonical `computers` row.
+///
+/// Unlike [`resolve_this_worker_name`], this authority-grade resolver never
+/// trusts `FORGEFLEET_NODE_NAME` and never falls back to hostname. It compares
+/// kernel-reported, active non-loopback IPv4 addresses with both canonical
+/// roster projections, deduplicates by stable computer UUID, and fails closed
+/// on zero or multiple matches. Vinny remains excluded at this boundary.
+pub async fn resolve_this_computer_identity_strict(
+    pool: &PgPool,
+) -> Result<LocalComputerIdentity, String> {
+    let local_ips = local_ipv4_addrs();
+    if local_ips.is_empty() {
+        return Err("no active non-loopback local IPv4 address is available".to_string());
+    }
+
+    let rows = sqlx::query_as::<_, (Uuid, String)>(STRICT_LOCAL_COMPUTER_SQL)
+        .bind(&local_ips)
+        .fetch_all(pool)
+        .await
+        .map_err(|error| format!("resolve canonical local computer: {error}"))?
+        .into_iter()
+        .map(|(id, name)| LocalComputerIdentity { id, name })
+        .collect();
+
+    select_strict_local_identity(rows, &local_ips)
+}
+
+fn select_strict_local_identity(
+    rows: Vec<LocalComputerIdentity>,
+    local_ips: &[String],
+) -> Result<LocalComputerIdentity, String> {
+    match rows.as_slice() {
+        [] => Err(format!(
+            "local addresses [{}] do not match a canonical fleet computer",
+            local_ips.join(", ")
+        )),
+        [identity] if identity.name.eq_ignore_ascii_case("vinny") => {
+            Err("release artifact operations are forbidden on Vinny".to_string())
+        }
+        [identity] => Ok(identity.clone()),
+        many => Err(format!(
+            "local addresses [{}] ambiguously match computers [{}]",
+            local_ips.join(", "),
+            many.iter()
+                .map(|identity| format!("{}:{}", identity.name, identity.id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// Enumerate active non-loopback IPv4 addresses directly from the kernel.
+/// Returns an empty vec on unsupported platforms or kernel API failure.
+#[cfg(unix)]
 fn local_ipv4_addrs() -> Vec<String> {
-    // Use `ifconfig` with `-a` (BSD/mac: lists all interfaces with addresses).
-    let out = std::process::Command::new("ifconfig").arg("-a").output();
-    let Ok(out) = out else { return Vec::new() };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut ips = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("inet ") {
-            // rest looks like "192.168.5.100 netmask ..."
-            if let Some(addr) = rest.split_whitespace().next()
-                && !addr.starts_with("127.")
-                && !addr.starts_with("169.254")
-            {
-                ips.push(addr.to_string());
+    use std::collections::BTreeSet;
+    use std::net::Ipv4Addr;
+    use std::ptr;
+
+    let mut head: *mut libc::ifaddrs = ptr::null_mut();
+    // SAFETY: `head` is a valid out-pointer and is freed exactly once below.
+    if unsafe { libc::getifaddrs(&mut head) } != 0 || head.is_null() {
+        return Vec::new();
+    }
+
+    let mut ips = BTreeSet::new();
+    let mut cursor = head;
+    while !cursor.is_null() {
+        // SAFETY: every cursor comes from the linked list returned by
+        // getifaddrs and remains valid until freeifaddrs after this loop.
+        let entry = unsafe { &*cursor };
+        let address = entry.ifa_addr;
+        let is_up = entry.ifa_flags & libc::IFF_UP as u32 != 0;
+        if is_up && !address.is_null() {
+            // SAFETY: the family check precedes the sockaddr_in cast.
+            let family = unsafe { (*address).sa_family as i32 };
+            if family == libc::AF_INET {
+                let socket = unsafe { &*(address as *const libc::sockaddr_in) };
+                let ip = Ipv4Addr::from(socket.sin_addr.s_addr.to_ne_bytes());
+                if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+                    ips.insert(ip.to_string());
+                }
             }
         }
+        cursor = entry.ifa_next;
     }
-    ips
+    // SAFETY: `head` is the original successful getifaddrs allocation.
+    unsafe { libc::freeifaddrs(head) };
+    ips.into_iter().collect()
+}
+
+#[cfg(not(unix))]
+fn local_ipv4_addrs() -> Vec<String> {
+    Vec::new()
 }
 
 /// Map a secret key to its fallback environment variable name.
@@ -592,6 +698,56 @@ mod tests {
             env_key_for_secret("telegram_bot_token"),
             "FORGEFLEET_TELEGRAM_BOT_TOKEN"
         );
+    }
+
+    #[test]
+    fn strict_local_identity_rejects_missing_ambiguous_and_vinny_matches() {
+        let ips = vec!["192.0.2.10".to_string()];
+        assert!(select_strict_local_identity(Vec::new(), &ips).is_err());
+
+        let adele = LocalComputerIdentity {
+            id: Uuid::new_v4(),
+            name: "adele".to_string(),
+        };
+        assert_eq!(
+            select_strict_local_identity(vec![adele.clone()], &ips).unwrap(),
+            adele
+        );
+        assert!(
+            select_strict_local_identity(
+                vec![
+                    LocalComputerIdentity {
+                        id: Uuid::new_v4(),
+                        name: "adele".to_string(),
+                    },
+                    LocalComputerIdentity {
+                        id: Uuid::new_v4(),
+                        name: "sia".to_string(),
+                    },
+                ],
+                &ips,
+            )
+            .is_err()
+        );
+        assert!(
+            select_strict_local_identity(
+                vec![LocalComputerIdentity {
+                    id: Uuid::new_v4(),
+                    name: "VINNY".to_string(),
+                }],
+                &ips,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn strict_local_identity_sql_handles_canonical_object_and_legacy_string_ips() {
+        assert!(STRICT_LOCAL_COMPUTER_SQL.contains("WHEN 'object' THEN c_ip.value ->> 'ip'"));
+        assert!(STRICT_LOCAL_COMPUTER_SQL.contains("WHEN 'string' THEN c_ip.value #>> '{}'"));
+        assert!(STRICT_LOCAL_COMPUTER_SQL.contains("WHEN 'object' THEN fw_ip.value ->> 'ip'"));
+        assert!(STRICT_LOCAL_COMPUTER_SQL.contains("WHEN 'string' THEN fw_ip.value #>> '{}'"));
+        assert!(!STRICT_LOCAL_COMPUTER_SQL.contains("FORGEFLEET_NODE_NAME"));
     }
 
     // `FORGEFLEET_HOME` is process-global, so tests that override it must not

@@ -1304,6 +1304,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "secure_enrollment_hardening",
         sql: schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING,
     },
+    PgMigration {
+        version: 291,
+        name: "release_artifact_custody",
+        sql: schema::SCHEMA_V291_RELEASE_ARTIFACT_CUSTODY,
+    },
 ];
 
 /// Fail closed unless the enrollment authority table is exactly the reviewed
@@ -1777,6 +1782,42 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn v291_is_immutable_release_artifact_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 291)
+            .expect("v291 must be appended to PG_MIGRATIONS");
+        assert_eq!(migration.name, "release_artifact_custody");
+        for required in [
+            "CREATE TABLE release_artifacts",
+            "CREATE TABLE release_artifact_custody",
+            "UNIQUE (artifact_name, artifact_version, source_commit, target_triple)",
+            "CHECK (source_commit ~ '^[0-9a-f]{40}$')",
+            "CHECK (sha256 ~ '^[0-9a-f]{64}$')",
+            "CHECK (size_bytes > 0)",
+            "REFERENCES computers(id) ON DELETE RESTRICT",
+            "PRIMARY KEY (artifact_id, computer_id)",
+            "UNIQUE (computer_id, relative_path)",
+            "CREATE TRIGGER release_artifacts_immutable",
+            "CREATE TRIGGER release_artifact_custody_refresh_only",
+            "NEW.last_verified_at < OLD.last_verified_at",
+            "position(E'\\\\' in relative_path) = 0",
+        ] {
+            assert!(migration.sql.contains(required), "v291 missing {required}");
+        }
+        for forbidden in ["ON DELETE CASCADE", "ON DELETE SET NULL"] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v291 custody evidence must not be erasable through {forbidden}"
+            );
+        }
+        assert!(
+            !migration.sql.contains("IF NOT EXISTS"),
+            "a preexisting authority table must fail the migration, not be reused"
+        );
     }
 
     #[test]

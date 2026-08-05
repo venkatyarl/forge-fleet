@@ -5,6 +5,7 @@ pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod arbiter;
+pub mod artifact_registry;
 pub mod auto_backlog_feeder;
 pub mod auto_upgrade;
 pub mod autoscaler;

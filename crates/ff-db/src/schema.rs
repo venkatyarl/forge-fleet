@@ -13259,6 +13259,116 @@ END
 $secure_enrollment_indexes$;
 "#;
 
+/// v291: immutable release-artifact authority plus per-computer custody.
+///
+/// `release_artifacts` is the canonical content identity.  A release identity
+/// can acquire more custodians, but its digest and size are never rewritten.
+/// `release_artifact_custody` records the exact relative path verified on each
+/// holder.  The application exposes insert-or-verify APIs only; the RESTRICT
+/// foreign keys also prevent ordinary computer cleanup from erasing custody
+/// evidence accidentally.
+pub const SCHEMA_V291_RELEASE_ARTIFACT_CUSTODY: &str = r#"
+CREATE TABLE release_artifacts (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    artifact_name    TEXT NOT NULL,
+    artifact_version TEXT NOT NULL,
+    source_commit    TEXT NOT NULL,
+    target_triple    TEXT NOT NULL,
+    sha256           TEXT NOT NULL,
+    size_bytes       BIGINT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT release_artifacts_canonical_name
+        CHECK (artifact_name ~ '^[a-z0-9][a-z0-9._+-]{0,127}$'),
+    CONSTRAINT release_artifacts_canonical_version
+        CHECK (artifact_version ~ '^[a-z0-9][a-z0-9._+-]{0,127}$'),
+    CONSTRAINT release_artifacts_source_commit
+        CHECK (source_commit ~ '^[0-9a-f]{40}$'),
+    CONSTRAINT release_artifacts_target_triple
+        CHECK (target_triple ~ '^[a-z0-9_]+(-[a-z0-9_.]+){2,4}$'),
+    CONSTRAINT release_artifacts_sha256
+        CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT release_artifacts_positive_size
+        CHECK (size_bytes > 0),
+    CONSTRAINT release_artifacts_identity
+        UNIQUE (artifact_name, artifact_version, source_commit, target_triple)
+);
+
+CREATE INDEX idx_release_artifacts_sha256
+    ON release_artifacts (sha256);
+
+CREATE TABLE release_artifact_custody (
+    artifact_id                 UUID NOT NULL
+        REFERENCES release_artifacts(id) ON DELETE RESTRICT,
+    computer_id                 UUID NOT NULL
+        REFERENCES computers(id) ON DELETE RESTRICT,
+    holder_name_at_registration TEXT NOT NULL,
+    relative_path               TEXT NOT NULL,
+    first_verified_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    last_verified_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (artifact_id, computer_id),
+    CONSTRAINT release_artifact_custody_canonical_holder
+        CHECK (holder_name_at_registration ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    CONSTRAINT release_artifact_custody_normal_relative_path
+        CHECK (relative_path <> ''
+            AND left(relative_path, 1) <> '/'
+            AND right(relative_path, 1) <> '/'
+            AND relative_path !~ '(^|/)\.\.?(/|$)'
+            AND relative_path !~ '//'
+            AND position(E'\\' in relative_path) = 0),
+    CONSTRAINT release_artifact_custody_time_order
+        CHECK (last_verified_at >= first_verified_at),
+    CONSTRAINT release_artifact_custody_path_identity
+        UNIQUE (computer_id, relative_path)
+);
+
+CREATE INDEX idx_release_artifact_custody_computer
+    ON release_artifact_custody (computer_id, last_verified_at DESC);
+
+COMMENT ON TABLE release_artifacts IS
+    'Immutable canonical release-binary identity; content fields are compare-only after insert.';
+COMMENT ON TABLE release_artifact_custody IS
+    'Verified local custody under the holder release-build root; re-registration refreshes only last_verified_at.';
+
+CREATE FUNCTION forbid_release_artifact_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_artifact_immutable$
+BEGIN
+    RAISE EXCEPTION 'release artifact content is immutable';
+    RETURN NULL;
+END
+$release_artifact_immutable$;
+
+CREATE TRIGGER release_artifacts_immutable
+    BEFORE UPDATE OR DELETE ON release_artifacts
+    FOR EACH ROW EXECUTE FUNCTION forbid_release_artifact_mutation();
+
+CREATE FUNCTION enforce_release_custody_refresh_only()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_custody_immutable$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'release artifact custody is immutable';
+    END IF;
+    IF NEW.artifact_id IS DISTINCT FROM OLD.artifact_id
+       OR NEW.computer_id IS DISTINCT FROM OLD.computer_id
+       OR NEW.holder_name_at_registration IS DISTINCT FROM OLD.holder_name_at_registration
+       OR NEW.relative_path IS DISTINCT FROM OLD.relative_path
+       OR NEW.first_verified_at IS DISTINCT FROM OLD.first_verified_at
+       OR NEW.last_verified_at < OLD.last_verified_at
+    THEN
+        RAISE EXCEPTION 'release artifact custody permits only monotonic verification refresh';
+    END IF;
+    RETURN NEW;
+END
+$release_custody_immutable$;
+
+CREATE TRIGGER release_artifact_custody_refresh_only
+    BEFORE UPDATE OR DELETE ON release_artifact_custody
+    FOR EACH ROW EXECUTE FUNCTION enforce_release_custody_refresh_only();
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

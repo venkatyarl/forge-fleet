@@ -40,6 +40,7 @@ mod agent_cmd;
 mod agents_cmd;
 mod alert_cmd;
 mod arbiter_cmd;
+mod artifact_cmd;
 mod backends_cmd;
 mod brain_cmd;
 mod build_cmd;
@@ -728,6 +729,11 @@ enum Command {
     Software {
         #[command(subcommand)]
         command: SoftwareCommand,
+    },
+    /// Verify and register immutable local release artifacts and custody.
+    Artifact {
+        #[command(subcommand)]
+        command: artifact_cmd::ArtifactCommand,
     },
     /// Conformance — desired-state profiles + a VERIFY GATE that actually runs
     /// (V120). Catches "green pip but GPU never binds" that a version parse
@@ -4860,6 +4866,9 @@ async fn main() -> Result<()> {
         Some(Command::Software { command }) => {
             return software_cmd::handle_software(command.clone()).await;
         }
+        Some(Command::Artifact { command }) => {
+            return artifact_cmd::handle_artifact(command.clone()).await;
+        }
         Some(Command::Ext { command }) => return ext_cmd::handle_ext(command.clone()).await,
         Some(Command::Github { command }) => {
             return github_cmd::handle_github(command.clone()).await;
@@ -5277,6 +5286,7 @@ async fn main() -> Result<()> {
         }) => ssh_cmd::handle_ssh(worker, command, sudo, timeout, json).await,
         Some(Command::Llm { command }) => llm_cmd::handle_llm(command).await,
         Some(Command::Software { command }) => software_cmd::handle_software(command).await,
+        Some(Command::Artifact { command }) => artifact_cmd::handle_artifact(command).await,
         Some(Command::Conformance { command }) => conformance_cmd::run(command).await,
         Some(Command::Ext { command }) => ext_cmd::handle_ext(command).await,
         Some(Command::Github { command }) => github_cmd::handle_github(command).await,
@@ -6741,6 +6751,97 @@ mod oauth_cli_guard_tests {
             "cleanup-mesh-repair-backlog",
             "--apply",
         ]));
+    }
+}
+
+#[cfg(test)]
+mod artifact_cli_tests {
+    use super::{Cli, Command, artifact_cmd::ArtifactCommand};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn artifact parser thread")
+            .join()
+            .expect("artifact parser thread panicked")
+    }
+
+    fn complete_args() -> Vec<&'static str> {
+        vec![
+            "ff",
+            "artifact",
+            "register",
+            "--name",
+            "ff",
+            "--version",
+            "2026.8.5_1",
+            "--source-commit",
+            "6dc4086b7217cb8c2ccc1945b1e1f3213b9b1941",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--sha256",
+            "b810351bb47e90c3d52f7db50ae3df00faddd1e147671a0cb32a5f8ac8cf8e30",
+            "--size-bytes",
+            "58188224",
+            "--path",
+            "ff-6dc4086b-aarch64/artifact/ff",
+            "--json",
+        ]
+    }
+
+    #[test]
+    fn artifact_register_requires_and_parses_exact_evidence() {
+        let cli = parse(&complete_args()).expect("complete artifact register must parse");
+        match cli.command {
+            Some(Command::Artifact {
+                command:
+                    ArtifactCommand::Register {
+                        name,
+                        version,
+                        source_commit,
+                        target,
+                        sha256,
+                        size_bytes,
+                        path,
+                        json,
+                    },
+            }) => {
+                assert_eq!(name, "ff");
+                assert_eq!(version, "2026.8.5_1");
+                assert_eq!(source_commit.len(), 40);
+                assert_eq!(target, "aarch64-unknown-linux-gnu");
+                assert_eq!(sha256.len(), 64);
+                assert_eq!(size_bytes, 58_188_224);
+                assert_eq!(path.to_string_lossy(), "ff-6dc4086b-aarch64/artifact/ff");
+                assert!(json);
+            }
+            _ => panic!("expected artifact register"),
+        }
+
+        let mut missing_digest = complete_args();
+        let index = missing_digest
+            .iter()
+            .position(|arg| *arg == "--sha256")
+            .unwrap();
+        missing_digest.drain(index..=index + 1);
+        assert!(parse(&missing_digest).is_err());
+    }
+
+    #[test]
+    fn artifact_register_exposes_no_holder_force_or_delete_surface() {
+        let mut holder = complete_args();
+        holder.extend(["--holder", "sia"]);
+        assert!(parse(&holder).is_err());
+
+        let mut force = complete_args();
+        force.push("--force");
+        assert!(parse(&force).is_err());
+
+        assert!(parse(&["ff", "artifact", "delete"]).is_err());
+        assert!(parse(&["ff", "artifact", "unregister"]).is_err());
     }
 }
 
