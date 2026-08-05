@@ -45,6 +45,11 @@ pub struct LocalReleaseActivationRequest {
 }
 
 #[derive(Debug, Clone)]
+pub struct LocalReleaseRollbackRequest {
+    pub transaction_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
 struct CanonicalReleaseIdentity {
     artifact_version: String,
     source_commit: String,
@@ -57,6 +62,7 @@ struct ServicePorts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ActivatedArtifactReceipt {
     pub artifact_name: String,
     pub sha256: String,
@@ -64,11 +70,20 @@ pub struct ActivatedArtifactReceipt {
     pub destinations: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PriorReleaseIdentity {
+    FullSha { sha: String },
+    LegacyReported { short_sha: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ReleaseActivationReceipt {
     pub transaction_id: Uuid,
     pub artifact_version: String,
     pub source_commit: String,
+    pub prior_release_identity: PriorReleaseIdentity,
     pub target_triple: String,
     pub computer_id: Uuid,
     pub computer_name: String,
@@ -76,6 +91,30 @@ pub struct ReleaseActivationReceipt {
     pub mcp_service: String,
     pub daemon_service: String,
     pub artifacts: Vec<ActivatedArtifactReceipt>,
+    pub receipt_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RestoredArtifactReceipt {
+    pub artifact_name: String,
+    pub restored_sha256: String,
+    pub restored_size_bytes: i64,
+    pub replaced_sha256: String,
+    pub replaced_size_bytes: i64,
+    pub destinations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReleaseRollbackReceipt {
+    pub transaction_id: Uuid,
+    pub replaced_source_commit: String,
+    pub restored_release_identity: PriorReleaseIdentity,
+    pub computer_id: Uuid,
+    pub computer_name: String,
+    pub rolled_back_at: DateTime<Utc>,
+    pub artifacts: Vec<RestoredArtifactReceipt>,
     pub receipt_path: String,
 }
 
@@ -129,6 +168,8 @@ struct InstallEntry {
     artifact_name: String,
     expected_sha256: String,
     expected_size: u64,
+    previous_sha256: String,
+    previous_size: u64,
     dir: OwnedFd,
     dir_path: PathBuf,
     destination: CString,
@@ -137,18 +178,22 @@ struct InstallEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RollbackManifest {
     transaction_id: Uuid,
     artifact_version: String,
     source_commit: String,
+    prior_release_identity: PriorReleaseIdentity,
     target_triple: String,
     computer_id: Uuid,
     computer_name: String,
+    platform: ServicePlatform,
     created_at: DateTime<Utc>,
     entries: Vec<ManifestEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ManifestEntry {
     artifact_name: String,
     destination: String,
@@ -156,9 +201,12 @@ struct ManifestEntry {
     backup: String,
     sha256: String,
     size_bytes: u64,
+    previous_sha256: String,
+    previous_size_bytes: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct JournalEvent {
     at: DateTime<Utc>,
     state: String,
@@ -170,6 +218,7 @@ struct ActiveTransaction {
     id: Uuid,
     version: String,
     source_commit: String,
+    prior_release_identity: PriorReleaseIdentity,
     target_triple: String,
     identity: LocalComputerIdentity,
     platform: ServicePlatform,
@@ -178,6 +227,16 @@ struct ActiveTransaction {
     activation_dir: PathBuf,
     journal_path: PathBuf,
     entries: Vec<InstallEntry>,
+    _operation_lock: File,
+}
+
+#[derive(Debug)]
+struct PreparedExplicitRollback {
+    receipt: ReleaseRollbackReceipt,
+    journal_path: PathBuf,
+    receipt_path: PathBuf,
+    receipt_already_committed: bool,
+    _operation_lock: File,
 }
 
 /// Activate the exact `ff` + `forgefleetd` V291 pair for this host.
@@ -209,6 +268,16 @@ pub async fn activate_local_release_pair(
         ReleaseActivationError::Refused("effective-user home is unavailable".into())
     })?;
     let ports = resolve_service_ports(pool, &home).await?;
+    let prior_release_identity = probe_running_release_identity(ports).await?;
+    if prior_release_identity
+        == (PriorReleaseIdentity::FullSha {
+            sha: request.source_commit.clone(),
+        })
+    {
+        return Err(ReleaseActivationError::Refused(
+            "the requested exact release is already running".into(),
+        ));
+    }
 
     let mut pair = Vec::with_capacity(2);
     for artifact_name in ARTIFACT_NAMES {
@@ -240,6 +309,7 @@ pub async fn activate_local_release_pair(
     let request_owned = canonical;
     let identity_for_worker = identity.clone();
     let target_for_worker = target_triple.clone();
+    let previous_for_worker = prior_release_identity.clone();
     let transaction = tokio::task::spawn_blocking(move || {
         prepare_swap_and_restart(
             pair,
@@ -249,6 +319,7 @@ pub async fn activate_local_release_pair(
             platform,
             ports,
             home,
+            previous_for_worker,
             &SystemCommandRunner,
             None,
         )
@@ -272,6 +343,58 @@ pub async fn activate_local_release_pair(
     }
 
     tokio::task::spawn_blocking(move || commit_transaction(transaction, &SystemCommandRunner))
+        .await?
+}
+
+/// Restore the exact predecessor pair retained by a committed activation.
+///
+/// The transaction UUID is the only caller-selected identity. Every pathname,
+/// digest, service, platform, prior release identity, and local computer identity
+/// is re-derived from private durable activation authority. There is no force
+/// mode and Vinny is permanently out of scope.
+pub async fn rollback_local_release_transaction(
+    pool: &PgPool,
+    request: &LocalReleaseRollbackRequest,
+) -> Result<ReleaseRollbackReceipt> {
+    let identity = resolve_this_computer_identity_strict(pool)
+        .await
+        .map_err(ReleaseActivationError::Refused)?;
+    if identity.name.eq_ignore_ascii_case("vinny") {
+        return Err(ReleaseActivationError::Refused(
+            "release rollback is forbidden on Vinny".into(),
+        ));
+    }
+    let home = authority_home_dir().ok_or_else(|| {
+        ReleaseActivationError::Refused("effective-user home is unavailable".into())
+    })?;
+    let ports = resolve_service_ports(pool, &home).await?;
+    let platform = current_service_platform()?;
+    let transaction_id = request.transaction_id;
+    let prepared = tokio::task::spawn_blocking(move || {
+        prepare_explicit_rollback(
+            transaction_id,
+            identity,
+            platform,
+            ports,
+            home,
+            &SystemCommandRunner,
+            None,
+        )
+    })
+    .await??;
+
+    if let Err(error) =
+        verify_running_release_identity(&prepared.receipt.restored_release_identity, ports).await
+    {
+        let _ = append_journal(
+            &prepared.journal_path,
+            "rollback_verification_failed",
+            &error.to_string(),
+        );
+        return Err(error);
+    }
+
+    tokio::task::spawn_blocking(move || commit_explicit_rollback(prepared, &SystemCommandRunner))
         .await?
 }
 
@@ -493,6 +616,10 @@ fn current_platform_identity(source_commit: &str) -> Result<LocalPlatformIdentit
         },
         &os_release,
     )
+}
+
+fn current_service_platform() -> Result<ServicePlatform> {
+    Ok(current_platform_identity(&"0".repeat(40))?.service_platform)
 }
 
 fn derive_platform_identity(
@@ -1039,15 +1166,23 @@ fn prepare_swap_and_restart(
     platform: ServicePlatform,
     ports: ServicePorts,
     home: PathBuf,
+    prior_release_identity: PriorReleaseIdentity,
     runner: &dyn CommandRunner,
     fail_after_installs: Option<usize>,
 ) -> Result<ActiveTransaction> {
     let transaction_id = Uuid::new_v4();
     let activation_dir = home.join(".forgefleet").join("release-activations");
     ensure_activation_directory(&activation_dir)?;
+    let operation_lock = acquire_operation_lock(&activation_dir)?;
     recover_unfinished_transactions(&activation_dir, platform, ports, &home, runner)?;
     ensure_no_unfinished_transaction(&activation_dir)?;
     preflight_service_topology(platform, ports, &home, runner)?;
+    let installed_prior = probe_installed_pair_identity(&home, runner)?;
+    if installed_prior != prior_release_identity {
+        return Err(ReleaseActivationError::Refused(
+            "installed ff/forgefleetd provenance disagrees with live daemon health".into(),
+        ));
+    }
 
     let release_root = local_release_build_root().map_err(|error| {
         ReleaseActivationError::Refused(format!("release-build root unavailable: {error}"))
@@ -1071,10 +1206,10 @@ fn prepare_swap_and_restart(
     let cargo_bin = home.join(".cargo").join("bin");
     let local_dir = open_owned_dir(&local_bin)?;
     let local_ff_old = hash_existing_destination(local_dir.as_raw_fd(), OsStr::new("ff"))?;
-    let _daemon_old = hash_existing_destination(local_dir.as_raw_fd(), OsStr::new("forgefleetd"))?;
+    let daemon_old = hash_existing_destination(local_dir.as_raw_fd(), OsStr::new("forgefleetd"))?;
 
     let cargo_mirror_exists = file_exists_at_path(&cargo_bin.join("ff"))?;
-    let cargo_dir = if cargo_mirror_exists {
+    let cargo_destination = if cargo_mirror_exists {
         let dir = open_owned_dir(&cargo_bin)?;
         let cargo_old = hash_existing_destination(dir.as_raw_fd(), OsStr::new("ff"))?;
         if local_ff_old != cargo_old {
@@ -1082,12 +1217,12 @@ fn prepare_swap_and_restart(
                 "pre-existing ~/.cargo/bin/ff diverges from ~/.local/bin/ff".into(),
             ));
         }
-        Some(dir)
+        Some((dir, cargo_old))
     } else {
         None
     };
 
-    let mut entries = Vec::with_capacity(if cargo_dir.is_some() { 3 } else { 2 });
+    let mut entries = Vec::with_capacity(if cargo_destination.is_some() { 3 } else { 2 });
     entries.push(stage_install_entry(
         transaction_id,
         "ff",
@@ -1096,6 +1231,7 @@ fn prepare_swap_and_restart(
         local_dir,
         local_bin.clone(),
         "ff",
+        &local_ff_old,
     )?);
     entries.push(stage_install_entry(
         transaction_id,
@@ -1105,8 +1241,9 @@ fn prepare_swap_and_restart(
         open_owned_dir(&local_bin)?,
         local_bin.clone(),
         "forgefleetd",
+        &daemon_old,
     )?);
-    if let Some(cargo_dir) = cargo_dir {
+    if let Some((cargo_dir, cargo_old)) = cargo_destination {
         entries.push(stage_install_entry(
             transaction_id,
             "ff",
@@ -1115,6 +1252,7 @@ fn prepare_swap_and_restart(
             cargo_dir,
             cargo_bin,
             "ff",
+            &cargo_old,
         )?);
     }
 
@@ -1130,9 +1268,11 @@ fn prepare_swap_and_restart(
         transaction_id,
         artifact_version: request.artifact_version.clone(),
         source_commit: request.source_commit.clone(),
+        prior_release_identity: prior_release_identity.clone(),
         target_triple: target_triple.clone(),
         computer_id: identity.id,
         computer_name: identity.name.clone(),
+        platform,
         created_at: Utc::now(),
         entries: entries
             .iter()
@@ -1155,6 +1295,8 @@ fn prepare_swap_and_restart(
                     .to_string(),
                 sha256: entry.expected_sha256.clone(),
                 size_bytes: entry.expected_size,
+                previous_sha256: entry.previous_sha256.clone(),
+                previous_size_bytes: entry.previous_size,
             })
             .collect(),
     };
@@ -1169,6 +1311,7 @@ fn prepare_swap_and_restart(
         id: transaction_id,
         version: request.artifact_version,
         source_commit: request.source_commit,
+        prior_release_identity,
         target_triple,
         identity,
         platform,
@@ -1177,6 +1320,7 @@ fn prepare_swap_and_restart(
         activation_dir,
         journal_path,
         entries,
+        _operation_lock: operation_lock,
     };
 
     if let Err(primary) = stop_services(transaction.platform, &transaction.home, runner) {
@@ -1353,6 +1497,7 @@ fn commit_transaction(
         transaction_id: transaction.id,
         artifact_version: transaction.version.clone(),
         source_commit: transaction.source_commit.clone(),
+        prior_release_identity: transaction.prior_release_identity.clone(),
         target_triple: transaction.target_triple.clone(),
         computer_id: transaction.identity.id,
         computer_name: transaction.identity.name.clone(),
@@ -1394,6 +1539,611 @@ fn commit_transaction(
         };
     }
     Ok(receipt)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RollbackPathState {
+    CandidateInstalled,
+    CandidateParked,
+    PreviousRestored,
+}
+
+fn prepare_explicit_rollback(
+    transaction_id: Uuid,
+    identity: LocalComputerIdentity,
+    platform: ServicePlatform,
+    ports: ServicePorts,
+    home: PathBuf,
+    runner: &dyn CommandRunner,
+    fail_after_transitions: Option<usize>,
+) -> Result<PreparedExplicitRollback> {
+    if identity.name.eq_ignore_ascii_case("vinny") {
+        return Err(ReleaseActivationError::Refused(
+            "release rollback is forbidden on Vinny".into(),
+        ));
+    }
+    let activation_dir = home.join(".forgefleet").join("release-activations");
+    ensure_activation_directory(&activation_dir)?;
+    let operation_lock = acquire_operation_lock(&activation_dir)?;
+    let manifest_path = activation_dir.join(format!("{transaction_id}.manifest.json"));
+    let journal_path = activation_dir.join(format!("{transaction_id}.journal.jsonl"));
+    let activation_receipt_path = activation_dir.join(format!("{transaction_id}.receipt.json"));
+    let rollback_receipt_path = activation_dir.join(format!("{transaction_id}.rollback.json"));
+    let pending_receipt_path = activation_dir.join(format!(".{transaction_id}.rollback.pending"));
+
+    let manifest: RollbackManifest = read_private_json(&manifest_path, "rollback manifest")?;
+    let activation_receipt: ReleaseActivationReceipt =
+        read_private_json(&activation_receipt_path, "activation receipt")?;
+    validate_explicit_rollback_authority(
+        transaction_id,
+        &identity,
+        platform,
+        &home,
+        &manifest,
+        &activation_receipt,
+        &activation_receipt_path,
+    )?;
+    validate_latest_activation_receipt(
+        &activation_dir,
+        transaction_id,
+        activation_receipt.activated_at,
+    )?;
+    let entries = entries_from_manifest(&manifest, &home)?;
+    validate_activation_receipt_entries(&activation_receipt, &entries)?;
+
+    let state = last_journal_state(&journal_path)?
+        .ok_or_else(|| ReleaseActivationError::Refused("activation journal is empty".into()))?;
+    let allowed = matches!(
+        state.as_str(),
+        "committed"
+            | "rollback_started"
+            | "rollback_stop_failed"
+            | "rollback_candidate_parked"
+            | "rollback_previous_restored"
+            | "rollback_start_failed"
+            | "rollback_services_started"
+            | "rollback_verification_failed"
+            | "rollback_verified"
+            | "rollback_committed"
+    );
+    if !allowed {
+        return Err(ReleaseActivationError::Refused(format!(
+            "transaction is not a committed activation or resumable explicit rollback: {state}"
+        )));
+    }
+    ensure_no_other_unfinished_transaction(&activation_dir, transaction_id)?;
+
+    let mut path_states = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        path_states.push(classify_rollback_paths(entry)?);
+    }
+    if state == "committed"
+        && path_states
+            .iter()
+            .any(|state| *state != RollbackPathState::CandidateInstalled)
+    {
+        return Err(ReleaseActivationError::Refused(
+            "committed activation pathnames do not all contain the exact candidate and predecessor"
+                .into(),
+        ));
+    }
+
+    if state == "rollback_committed" {
+        require_all_previous_restored(&path_states)?;
+        verify_restored_entries(&entries, platform, runner)?;
+        if probe_installed_pair_identity(&home, runner)? != manifest.prior_release_identity {
+            return Err(ReleaseActivationError::Refused(
+                "committed rollback no longer reproduces the retained prior release report".into(),
+            ));
+        }
+        let receipt: ReleaseRollbackReceipt =
+            read_private_json(&rollback_receipt_path, "rollback receipt")?;
+        validate_rollback_receipt(
+            &receipt,
+            &manifest,
+            &identity,
+            &entries,
+            &rollback_receipt_path,
+        )?;
+        return Ok(PreparedExplicitRollback {
+            receipt,
+            journal_path,
+            receipt_path: rollback_receipt_path,
+            receipt_already_committed: true,
+            _operation_lock: operation_lock,
+        });
+    }
+
+    if state == "committed" {
+        preflight_service_topology(platform, ports, &home, runner)?;
+    }
+    if platform == ServicePlatform::Macos {
+        for entry in &entries {
+            if classify_rollback_paths(entry)? != RollbackPathState::PreviousRestored {
+                verify_codesign_path(
+                    &entry.dir_path.join(os_from_cstr(&entry.backup)),
+                    &entry.artifact_name,
+                    runner,
+                )?;
+            }
+        }
+    }
+    if state == "committed" {
+        append_journal(
+            &journal_path,
+            "rollback_started",
+            "explicit exact-predecessor rollback accepted",
+        )?;
+    }
+    if let Err(error) = stop_services_best_effort(platform, &home, runner) {
+        let detail = format!("explicit rollback could not quiesce exact services: {error}");
+        let _ = append_journal(&journal_path, "rollback_stop_failed", &detail);
+        return Err(ReleaseActivationError::Refused(detail));
+    }
+
+    let mut transitions = 0_usize;
+    for (index, entry) in entries.iter().enumerate() {
+        let dir = entry.dir.as_raw_fd();
+        let mut entry_state = classify_rollback_paths(entry)?;
+        if entry_state == RollbackPathState::CandidateInstalled {
+            rename_noreplace(
+                dir,
+                os_from_cstr(&entry.destination),
+                dir,
+                os_from_cstr(&entry.stage),
+            )?;
+            fsync_fd(dir)?;
+            append_journal(
+                &journal_path,
+                "rollback_candidate_parked",
+                &format!("index={index} artifact={}", entry.artifact_name),
+            )?;
+            transitions += 1;
+            if fail_after_transitions == Some(transitions) {
+                return Err(ReleaseActivationError::Refused(format!(
+                    "injected explicit rollback crash after transition {transitions}"
+                )));
+            }
+            entry_state = classify_rollback_paths(entry)?;
+        }
+        if entry_state == RollbackPathState::CandidateParked {
+            rename_noreplace(
+                dir,
+                os_from_cstr(&entry.backup),
+                dir,
+                os_from_cstr(&entry.destination),
+            )?;
+            fsync_fd(dir)?;
+            append_journal(
+                &journal_path,
+                "rollback_previous_restored",
+                &format!("index={index} artifact={}", entry.artifact_name),
+            )?;
+            transitions += 1;
+            if fail_after_transitions == Some(transitions) {
+                return Err(ReleaseActivationError::Refused(format!(
+                    "injected explicit rollback crash after transition {transitions}"
+                )));
+            }
+        }
+    }
+
+    let final_states: Vec<_> = entries
+        .iter()
+        .map(classify_rollback_paths)
+        .collect::<Result<_>>()?;
+    require_all_previous_restored(&final_states)?;
+    verify_restored_entries(&entries, platform, runner)?;
+    let restored_identity = probe_installed_pair_identity(&home, runner)?;
+    if restored_identity != manifest.prior_release_identity {
+        return Err(ReleaseActivationError::Refused(
+            "restored exact bytes do not reproduce the retained prior release report".into(),
+        ));
+    }
+    if let Err(error) = start_services(platform, &home, runner) {
+        let detail = format!("predecessor restored but exact services failed to start: {error}");
+        let _ = append_journal(&journal_path, "rollback_start_failed", &detail);
+        return Err(ReleaseActivationError::Refused(detail));
+    }
+    append_journal(
+        &journal_path,
+        "rollback_services_started",
+        "restored predecessor pair installed and exact services restarted",
+    )?;
+
+    let receipt = load_or_build_rollback_receipt(
+        &manifest,
+        &identity,
+        &entries,
+        &rollback_receipt_path,
+        &pending_receipt_path,
+    )?;
+    Ok(PreparedExplicitRollback {
+        receipt,
+        journal_path,
+        receipt_path: rollback_receipt_path,
+        receipt_already_committed: false,
+        _operation_lock: operation_lock,
+    })
+}
+
+fn commit_explicit_rollback(
+    prepared: PreparedExplicitRollback,
+    _runner: &dyn CommandRunner,
+) -> Result<ReleaseRollbackReceipt> {
+    if prepared.receipt_already_committed {
+        return Ok(prepared.receipt);
+    }
+    append_journal(
+        &prepared.journal_path,
+        "rollback_verified",
+        "restored exact release identity, MCP semantics, and daemon health verified",
+    )?;
+    let pending_path = prepared
+        .receipt_path
+        .parent()
+        .expect("receipt parent")
+        .join(format!(
+            ".{}.rollback.pending",
+            prepared.receipt.transaction_id
+        ));
+    if !prepared.receipt_path.exists() {
+        if !pending_path.exists() {
+            write_new_json(&pending_path, &prepared.receipt, 0o600)?;
+        } else {
+            let pending: ReleaseRollbackReceipt =
+                read_private_json(&pending_path, "pending rollback receipt")?;
+            if pending != prepared.receipt {
+                return Err(ReleaseActivationError::Refused(
+                    "pending rollback receipt differs from durable rollback authority".into(),
+                ));
+            }
+        }
+        rename_path_noreplace(&pending_path, &prepared.receipt_path)?;
+        fs::set_permissions(&prepared.receipt_path, fs::Permissions::from_mode(0o444))?;
+        sync_parent(&prepared.receipt_path)?;
+    } else {
+        let durable: ReleaseRollbackReceipt =
+            read_private_json(&prepared.receipt_path, "rollback receipt")?;
+        if durable != prepared.receipt {
+            return Err(ReleaseActivationError::Refused(
+                "durable rollback receipt differs from prepared rollback authority".into(),
+            ));
+        }
+    }
+    append_journal(
+        &prepared.journal_path,
+        "rollback_committed",
+        "stable explicit rollback receipt durable",
+    )?;
+    Ok(prepared.receipt)
+}
+
+fn read_private_json<T: for<'de> Deserialize<'de>>(path: &Path, label: &str) -> Result<T> {
+    serde_json::from_str(&read_private_authority_text(path, 4 * 1024 * 1024, label)?)
+        .map_err(Into::into)
+}
+
+fn validate_explicit_rollback_authority(
+    transaction_id: Uuid,
+    identity: &LocalComputerIdentity,
+    platform: ServicePlatform,
+    home: &Path,
+    manifest: &RollbackManifest,
+    receipt: &ReleaseActivationReceipt,
+    receipt_path: &Path,
+) -> Result<()> {
+    validate_full_source_commit(&manifest.source_commit)?;
+    validate_prior_release_identity(&manifest.prior_release_identity)?;
+    if manifest.prior_release_identity
+        == (PriorReleaseIdentity::FullSha {
+            sha: manifest.source_commit.clone(),
+        })
+    {
+        return Err(ReleaseActivationError::Refused(
+            "rollback manifest candidate and predecessor source commits are identical".into(),
+        ));
+    }
+    let derived = current_platform_identity(&manifest.source_commit)?;
+    let now = Utc::now();
+    if manifest.transaction_id != transaction_id
+        || receipt.transaction_id != transaction_id
+        || manifest.computer_id != identity.id
+        || receipt.computer_id != identity.id
+        || manifest.computer_name != identity.name
+        || receipt.computer_name != identity.name
+        || manifest.platform != platform
+        || derived.service_platform != platform
+        || manifest.artifact_version != derived.artifact_version
+        || manifest.target_triple != derived.target_triple
+        || receipt.artifact_version != manifest.artifact_version
+        || receipt.source_commit != manifest.source_commit
+        || receipt.prior_release_identity != manifest.prior_release_identity
+        || receipt.target_triple != manifest.target_triple
+        || receipt.receipt_path != receipt_path.display().to_string()
+        || receipt.activated_at < manifest.created_at
+        || receipt.activated_at > now + chrono::TimeDelta::minutes(5)
+    {
+        return Err(ReleaseActivationError::Refused(
+            "manifest/receipt/local identity authority mismatch".into(),
+        ));
+    }
+    let expected_services = match platform {
+        ServicePlatform::Linux => (MCP_UNIT, DAEMON_UNIT),
+        ServicePlatform::Macos => (MCP_LABEL, DAEMON_LABEL),
+    };
+    if receipt.mcp_service != expected_services.0 || receipt.daemon_service != expected_services.1 {
+        return Err(ReleaseActivationError::Refused(
+            "activation receipt service authority mismatch".into(),
+        ));
+    }
+    let expected_prefix = home.join(".forgefleet/release-activations");
+    if receipt_path.parent() != Some(expected_prefix.as_path()) {
+        return Err(ReleaseActivationError::Refused(
+            "activation receipt is outside the fixed private authority directory".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_no_other_unfinished_transaction(activation_dir: &Path, selected_id: Uuid) -> Result<()> {
+    for entry in fs::read_dir(activation_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(ReleaseActivationError::Refused(
+                "activation authority directory contains a non-UTF8 entry".into(),
+            ));
+        };
+        let Some(id_text) = name.strip_suffix(".journal.jsonl") else {
+            continue;
+        };
+        let id = Uuid::parse_str(id_text).map_err(|_| {
+            ReleaseActivationError::Refused("malformed activation journal filename".into())
+        })?;
+        if id == selected_id {
+            continue;
+        }
+        if !matches!(
+            last_journal_state(&entry.path())?.as_deref(),
+            Some("committed" | "rolled_back" | "rollback_committed")
+        ) {
+            return Err(ReleaseActivationError::Refused(format!(
+                "another unfinished release transaction must be recovered first: {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_latest_activation_receipt(
+    activation_dir: &Path,
+    requested_id: Uuid,
+    requested_at: DateTime<Utc>,
+) -> Result<()> {
+    for entry in fs::read_dir(activation_dir)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(ReleaseActivationError::Refused(
+                "activation authority directory contains a non-UTF8 entry".into(),
+            ));
+        };
+        let Some(id_text) = name.strip_suffix(".receipt.json") else {
+            continue;
+        };
+        let id = Uuid::parse_str(id_text).map_err(|_| {
+            ReleaseActivationError::Refused("malformed activation receipt filename".into())
+        })?;
+        let receipt: ReleaseActivationReceipt =
+            read_private_json(&entry.path(), "activation receipt")?;
+        if receipt.transaction_id != id
+            || receipt.receipt_path != entry.path().display().to_string()
+        {
+            return Err(ReleaseActivationError::Refused(
+                "activation receipt filename/path identity mismatch".into(),
+            ));
+        }
+        if receipt.activated_at > requested_at
+            || (receipt.activated_at == requested_at && id != requested_id)
+        {
+            return Err(ReleaseActivationError::Refused(format!(
+                "transaction {requested_id} is stale; a newer or ambiguous activation receipt exists"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_activation_receipt_entries(
+    receipt: &ReleaseActivationReceipt,
+    entries: &[InstallEntry],
+) -> Result<()> {
+    if receipt.artifacts != build_artifact_receipts(entries) {
+        return Err(ReleaseActivationError::Refused(
+            "activation receipt artifact authority differs from rollback manifest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn optional_path_identity(dir: RawFd, name: &OsStr) -> Result<Option<(u64, String)>> {
+    if !exists_at(dir, name)? {
+        return Ok(None);
+    }
+    hash_existing_destination(dir, name).map(Some)
+}
+
+fn identity_matches(actual: &Option<(u64, String)>, size: u64, sha256: &str) -> bool {
+    actual.as_ref().is_some_and(|(actual_size, actual_sha)| {
+        *actual_size == size && constant_time_sha256_eq(actual_sha, sha256)
+    })
+}
+
+fn classify_rollback_paths(entry: &InstallEntry) -> Result<RollbackPathState> {
+    let dir = entry.dir.as_raw_fd();
+    let destination = optional_path_identity(dir, os_from_cstr(&entry.destination))?;
+    let stage = optional_path_identity(dir, os_from_cstr(&entry.stage))?;
+    let backup = optional_path_identity(dir, os_from_cstr(&entry.backup))?;
+    let destination_candidate =
+        identity_matches(&destination, entry.expected_size, &entry.expected_sha256);
+    let destination_previous =
+        identity_matches(&destination, entry.previous_size, &entry.previous_sha256);
+    let stage_candidate = identity_matches(&stage, entry.expected_size, &entry.expected_sha256);
+    let backup_previous = identity_matches(&backup, entry.previous_size, &entry.previous_sha256);
+    match (
+        destination_candidate,
+        destination_previous,
+        stage.is_none(),
+        stage_candidate,
+        backup.is_none(),
+        backup_previous,
+    ) {
+        (true, false, true, false, false, true) => Ok(RollbackPathState::CandidateInstalled),
+        (false, false, false, true, false, true) if destination.is_none() => {
+            Ok(RollbackPathState::CandidateParked)
+        }
+        (false, true, false, true, true, false) => Ok(RollbackPathState::PreviousRestored),
+        _ => Err(ReleaseActivationError::Refused(format!(
+            "rollback pathname identity is missing, partial, stale, or tampered for {}",
+            entry
+                .dir_path
+                .join(os_from_cstr(&entry.destination))
+                .display()
+        ))),
+    }
+}
+
+fn require_all_previous_restored(states: &[RollbackPathState]) -> Result<()> {
+    if states
+        .iter()
+        .all(|state| *state == RollbackPathState::PreviousRestored)
+    {
+        Ok(())
+    } else {
+        Err(ReleaseActivationError::Refused(
+            "explicit rollback did not restore the complete exact predecessor pair".into(),
+        ))
+    }
+}
+
+fn verify_restored_entries(
+    entries: &[InstallEntry],
+    platform: ServicePlatform,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
+    for entry in entries {
+        let actual =
+            hash_existing_destination(entry.dir.as_raw_fd(), os_from_cstr(&entry.destination))?;
+        if actual.0 != entry.previous_size
+            || !constant_time_sha256_eq(&actual.1, &entry.previous_sha256)
+        {
+            return Err(ReleaseActivationError::Refused(format!(
+                "restored {} differs from retained predecessor size/SHA",
+                entry.artifact_name
+            )));
+        }
+        if platform == ServicePlatform::Macos {
+            verify_codesign_path(
+                &entry.dir_path.join(os_from_cstr(&entry.destination)),
+                &entry.artifact_name,
+                runner,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn build_rollback_receipt(
+    manifest: &RollbackManifest,
+    identity: &LocalComputerIdentity,
+    entries: &[InstallEntry],
+    receipt_path: &Path,
+) -> ReleaseRollbackReceipt {
+    let artifacts = ARTIFACT_NAMES
+        .iter()
+        .filter_map(|name| {
+            let matching: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.artifact_name == *name)
+                .collect();
+            matching.first().map(|first| RestoredArtifactReceipt {
+                artifact_name: (*name).to_string(),
+                restored_sha256: first.previous_sha256.clone(),
+                restored_size_bytes: first.previous_size as i64,
+                replaced_sha256: first.expected_sha256.clone(),
+                replaced_size_bytes: first.expected_size as i64,
+                destinations: matching
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .dir_path
+                            .join(os_from_cstr(&entry.destination))
+                            .display()
+                            .to_string()
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+    ReleaseRollbackReceipt {
+        transaction_id: manifest.transaction_id,
+        replaced_source_commit: manifest.source_commit.clone(),
+        restored_release_identity: manifest.prior_release_identity.clone(),
+        computer_id: identity.id,
+        computer_name: identity.name.clone(),
+        rolled_back_at: Utc::now(),
+        artifacts,
+        receipt_path: receipt_path.display().to_string(),
+    }
+}
+
+fn load_or_build_rollback_receipt(
+    manifest: &RollbackManifest,
+    identity: &LocalComputerIdentity,
+    entries: &[InstallEntry],
+    receipt_path: &Path,
+    pending_path: &Path,
+) -> Result<ReleaseRollbackReceipt> {
+    for (path, label) in [
+        (receipt_path, "rollback receipt"),
+        (pending_path, "pending rollback receipt"),
+    ] {
+        if path.exists() {
+            let receipt: ReleaseRollbackReceipt = read_private_json(path, label)?;
+            validate_rollback_receipt(&receipt, manifest, identity, entries, receipt_path)?;
+            return Ok(receipt);
+        }
+    }
+    Ok(build_rollback_receipt(
+        manifest,
+        identity,
+        entries,
+        receipt_path,
+    ))
+}
+
+fn validate_rollback_receipt(
+    receipt: &ReleaseRollbackReceipt,
+    manifest: &RollbackManifest,
+    identity: &LocalComputerIdentity,
+    entries: &[InstallEntry],
+    receipt_path: &Path,
+) -> Result<()> {
+    let expected = build_rollback_receipt(manifest, identity, entries, receipt_path);
+    if receipt.transaction_id != expected.transaction_id
+        || receipt.replaced_source_commit != expected.replaced_source_commit
+        || receipt.restored_release_identity != expected.restored_release_identity
+        || receipt.computer_id != expected.computer_id
+        || receipt.computer_name != expected.computer_name
+        || receipt.artifacts != expected.artifacts
+        || receipt.receipt_path != expected.receipt_path
+        || receipt.rolled_back_at < manifest.created_at
+        || receipt.rolled_back_at > Utc::now() + chrono::TimeDelta::minutes(5)
+    {
+        return Err(ReleaseActivationError::Refused(
+            "rollback receipt differs from exact retained authority".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn build_artifact_receipts(entries: &[InstallEntry]) -> Vec<ActivatedArtifactReceipt> {
@@ -1577,6 +2327,7 @@ fn stage_install_entry(
     dir: OwnedFd,
     dir_path: PathBuf,
     destination: &str,
+    previous: &(u64, String),
 ) -> Result<InstallEntry> {
     let stage = format!(".{destination}.release-{transaction_id}.stage");
     let backup = format!(".{destination}.release-{transaction_id}.rollback");
@@ -1589,6 +2340,13 @@ fn stage_install_entry(
     let mut total = 0_u64;
     let expected_size = u64::try_from(row.size_bytes)
         .map_err(|_| ReleaseActivationError::Refused("registry artifact size is invalid".into()))?;
+    if previous.0 == expected_size && constant_time_sha256_eq(&previous.1, &row.sha256) {
+        unlink_at(dir.as_raw_fd(), OsStr::new(&stage));
+        return Err(ReleaseActivationError::Refused(format!(
+            "{} candidate bytes are identical to the retained predecessor",
+            row.artifact_name
+        )));
+    }
     let mut buffer = [0_u8; 128 * 1024];
     loop {
         let read = source.file.read(&mut buffer)?;
@@ -1630,6 +2388,8 @@ fn stage_install_entry(
         artifact_name: artifact_name.into(),
         expected_sha256: row.sha256.clone(),
         expected_size,
+        previous_sha256: previous.1.clone(),
+        previous_size: previous.0,
         dir,
         dir_path,
         destination: CString::new(destination).expect("fixed destination"),
@@ -1687,6 +2447,12 @@ fn hash_existing_destination(dir: RawFd, name: &OsStr) -> Result<(u64, String)> 
     let mut file = File::from(fd);
     let before = fstat_fd(file.as_raw_fd())?;
     validate_regular_stat(&before, unsafe { libc::geteuid() }, true)?;
+    if before.st_mode & 0o022 != 0 {
+        return Err(ReleaseActivationError::Refused(format!(
+            "installed binary is writable by another identity: {}",
+            name.to_string_lossy()
+        )));
+    }
     let mut hasher = Sha256::new();
     let mut total = 0_u64;
     let mut buffer = [0_u8; 128 * 1024];
@@ -2047,14 +2813,22 @@ fn verify_codesign(entry: &InstallEntry, staged: bool, runner: &dyn CommandRunne
     } else {
         os_from_cstr(&entry.destination)
     };
-    let path = entry.dir_path.join(name).display().to_string();
+    verify_codesign_path(&entry.dir_path.join(name), &entry.artifact_name, runner)
+}
+
+fn verify_codesign_path(
+    path: &Path,
+    artifact_name: &str,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
+    let path = path.display().to_string();
     // Activation must never sign: signing mutates the bytes whose digest V291
     // registered.  Builders sign before hashing; consumers only verify.
     require_command(
         runner,
         "/usr/bin/codesign",
         &["--verify", "--strict", "--verbose=2", &path],
-        &format!("codesign verification failed for {}", entry.artifact_name),
+        &format!("codesign verification failed for {artifact_name}"),
     )?;
     Ok(())
 }
@@ -2115,6 +2889,91 @@ fn smoke_path(path: &Path, source_commit: &str, runner: &dyn CommandRunner) -> R
         )));
     }
     Ok(())
+}
+
+fn validate_prior_release_identity(identity: &PriorReleaseIdentity) -> Result<()> {
+    match identity {
+        PriorReleaseIdentity::FullSha { sha } => validate_full_source_commit(sha),
+        PriorReleaseIdentity::LegacyReported { short_sha }
+            if (8..=10).contains(&short_sha.len())
+                && short_sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Ok(())
+        }
+        PriorReleaseIdentity::LegacyReported { .. } => Err(ReleaseActivationError::Refused(
+            "legacy release identity must be exactly 8-10 lowercase hexadecimal characters".into(),
+        )),
+    }
+}
+
+fn parse_reported_release_identity(value: &str) -> Result<PriorReleaseIdentity> {
+    let mut identities = value
+        .split(|character: char| !character.is_ascii_hexdigit())
+        .filter_map(|token| {
+            let identity = if token.len() == 40 {
+                PriorReleaseIdentity::FullSha {
+                    sha: token.to_string(),
+                }
+            } else if (8..=10).contains(&token.len()) {
+                PriorReleaseIdentity::LegacyReported {
+                    short_sha: token.to_string(),
+                }
+            } else {
+                return None;
+            };
+            validate_prior_release_identity(&identity).ok()?;
+            Some(identity)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if identities.len() != 1 {
+        return Err(ReleaseActivationError::Refused(
+            "release probe did not report one unambiguous full or legacy build identity".into(),
+        ));
+    }
+    Ok(identities.pop_first().expect("one identity"))
+}
+
+fn parse_canonical_reported_identity(value: &str) -> Result<PriorReleaseIdentity> {
+    let identity = if value.len() == 40 {
+        PriorReleaseIdentity::FullSha {
+            sha: value.to_string(),
+        }
+    } else {
+        PriorReleaseIdentity::LegacyReported {
+            short_sha: value.to_string(),
+        }
+    };
+    validate_prior_release_identity(&identity)?;
+    Ok(identity)
+}
+
+fn probe_installed_pair_identity(
+    home: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<PriorReleaseIdentity> {
+    let mut reported = Vec::with_capacity(2);
+    for name in ARTIFACT_NAMES {
+        let path = home.join(".local/bin").join(name);
+        let output = runner.run(&path.display().to_string(), &["--version".into()])?;
+        if !output.success {
+            return Err(ReleaseActivationError::Refused(format!(
+                "installed {name} provenance probe failed: {}",
+                output.stderr.trim()
+            )));
+        }
+        reported.push(parse_reported_release_identity(&format!(
+            "{}\n{}",
+            output.stdout, output.stderr
+        ))?);
+    }
+    if reported[0] != reported[1] {
+        return Err(ReleaseActivationError::Refused(
+            "installed ff and forgefleetd report different prior release identities".into(),
+        ));
+    }
+    Ok(reported.remove(0))
 }
 
 fn swap_entries(
@@ -2180,6 +3039,32 @@ fn ensure_activation_directory(path: &Path) -> Result<()> {
     validate_owned_directory(path)
 }
 
+fn acquire_operation_lock(activation_dir: &Path) -> Result<File> {
+    let path = activation_dir.join(".operation.lock");
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let file = options.open(&path)?;
+    let stat = fstat_fd(file.as_raw_fd())?;
+    validate_regular_stat(&stat, unsafe { libc::geteuid() }, true)?;
+    if stat.st_mode & 0o077 != 0 {
+        return Err(ReleaseActivationError::Refused(
+            "release operation lock is not private".into(),
+        ));
+    }
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(ReleaseActivationError::Refused(format!(
+            "another release activation or rollback owns the local operation lock: {error}"
+        )));
+    }
+    Ok(file)
+}
+
 fn write_manifest(directory: &Path, manifest: &RollbackManifest) -> Result<()> {
     let path = directory.join(format!("{}.manifest.json", manifest.transaction_id));
     write_new_json(&path, manifest, 0o400)
@@ -2211,6 +3096,16 @@ fn append_journal(path: &Path, state: &str, detail: &str) -> Result<()> {
         .append(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    let opened = fstat_fd(file.as_raw_fd())?;
+    validate_regular_stat(&opened, unsafe { libc::geteuid() }, true)?;
+    if opened.st_mode & 0o022 != 0
+        || opened.st_dev != metadata.dev() as libc::dev_t
+        || opened.st_ino != metadata.ino() as libc::ino_t
+    {
+        return Err(ReleaseActivationError::Refused(
+            "transaction journal changed identity while opening".into(),
+        ));
+    }
     write_journal_event(&mut file, state, detail)
 }
 
@@ -2256,7 +3151,10 @@ fn ensure_no_unfinished_transaction(path: &Path) -> Result<()> {
             continue;
         }
         let state = last_journal_state(&entry.path())?;
-        if !matches!(state.as_deref(), Some("committed" | "rolled_back")) {
+        if !matches!(
+            state.as_deref(),
+            Some("committed" | "rolled_back" | "rollback_committed")
+        ) {
             return Err(ReleaseActivationError::Refused(format!(
                 "unfinished activation journal requires recovery: {}",
                 entry.path().display()
@@ -2302,9 +3200,17 @@ fn recover_unfinished_transactions(
         if journal.exists() {
             if matches!(
                 last_journal_state(&journal)?.as_deref(),
-                Some("committed" | "rolled_back")
+                Some("committed" | "rolled_back" | "rollback_committed")
             ) {
                 continue;
+            }
+            if last_journal_state(&journal)?
+                .as_deref()
+                .is_some_and(|state| state.starts_with("rollback_"))
+            {
+                return Err(ReleaseActivationError::Refused(format!(
+                    "explicit rollback transaction requires rollback resume: {id}"
+                )));
             }
         } else {
             create_journal(
@@ -2423,6 +3329,12 @@ fn read_private_authority_text(path: &Path, max_bytes: i64, label: &str) -> Resu
     let mut file = File::from(fd);
     let mut value = String::new();
     file.read_to_string(&mut value)?;
+    let after = fstat_fd(file.as_raw_fd())?;
+    if !same_file_snapshot(&stat, &after) || value.len() as i64 != stat.st_size {
+        return Err(ReleaseActivationError::Refused(format!(
+            "{label} changed while being read"
+        )));
+    }
     Ok(value)
 }
 
@@ -2460,6 +3372,23 @@ fn entries_from_manifest(manifest: &RollbackManifest, home: &Path) -> Result<Vec
     let mut seen = std::collections::BTreeSet::new();
     let mut entries = Vec::new();
     for manifest_entry in &manifest.entries {
+        validate_sha256(&manifest_entry.sha256, "candidate manifest SHA-256")?;
+        validate_sha256(
+            &manifest_entry.previous_sha256,
+            "predecessor manifest SHA-256",
+        )?;
+        if manifest_entry.size_bytes == 0
+            || manifest_entry.previous_size_bytes == 0
+            || manifest_entry.size_bytes > i64::MAX as u64
+            || manifest_entry.previous_size_bytes > i64::MAX as u64
+            || (manifest_entry.size_bytes == manifest_entry.previous_size_bytes
+                && constant_time_sha256_eq(&manifest_entry.sha256, &manifest_entry.previous_sha256))
+        {
+            return Err(ReleaseActivationError::Refused(
+                "rollback manifest contains invalid or indistinguishable candidate/predecessor authority"
+                    .into(),
+            ));
+        }
         let destination = PathBuf::from(&manifest_entry.destination);
         if destination != local_ff && destination != local_daemon && destination != cargo_ff {
             return Err(ReleaseActivationError::Refused(
@@ -2476,6 +3405,16 @@ fn entries_from_manifest(manifest: &RollbackManifest, home: &Path) -> Result<Vec
             .expect("fixed destination parent")
             .to_path_buf();
         let destination_name = destination.file_name().expect("fixed destination name");
+        let expected_artifact_name = if destination == local_daemon {
+            "forgefleetd"
+        } else {
+            "ff"
+        };
+        if manifest_entry.artifact_name != expected_artifact_name {
+            return Err(ReleaseActivationError::Refused(
+                "rollback manifest artifact name does not match its fixed destination".into(),
+            ));
+        }
         let stage = PathBuf::from(&manifest_entry.stage);
         let backup = PathBuf::from(&manifest_entry.backup);
         if stage.parent() != Some(parent.as_path())
@@ -2509,6 +3448,8 @@ fn entries_from_manifest(manifest: &RollbackManifest, home: &Path) -> Result<Vec
             artifact_name: manifest_entry.artifact_name.clone(),
             expected_sha256: manifest_entry.sha256.clone(),
             expected_size: manifest_entry.size_bytes,
+            previous_sha256: manifest_entry.previous_sha256.clone(),
+            previous_size: manifest_entry.previous_size_bytes,
             dir: open_owned_dir(&parent)?,
             dir_path: parent,
             destination: cstring(destination_name)?,
@@ -2527,10 +3468,72 @@ fn entries_from_manifest(manifest: &RollbackManifest, home: &Path) -> Result<Vec
             "unfinished manifest lacks the exact local ff+forgefleetd pair".into(),
         ));
     }
+    if entries.len() != 2 && entries.len() != 3 {
+        return Err(ReleaseActivationError::Refused(
+            "rollback manifest must contain exactly the local pair and optional cargo ff mirror"
+                .into(),
+        ));
+    }
+    let local_ff = entries
+        .iter()
+        .find(|entry| {
+            entry.dir_path == home.join(".local/bin")
+                && os_from_cstr(&entry.destination) == OsStr::new("ff")
+        })
+        .expect("validated local ff");
+    if let Some(cargo_ff) = entries
+        .iter()
+        .find(|entry| entry.dir_path == home.join(".cargo/bin"))
+        && (cargo_ff.expected_size != local_ff.expected_size
+            || !constant_time_sha256_eq(&cargo_ff.expected_sha256, &local_ff.expected_sha256)
+            || cargo_ff.previous_size != local_ff.previous_size
+            || !constant_time_sha256_eq(&cargo_ff.previous_sha256, &local_ff.previous_sha256))
+    {
+        return Err(ReleaseActivationError::Refused(
+            "cargo ff mirror authority diverges from the fixed local ff authority".into(),
+        ));
+    }
     Ok(entries)
 }
 
+fn validate_sha256(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ReleaseActivationError::Refused(format!(
+            "{label} must be exactly 64 lowercase hexadecimal characters"
+        )));
+    }
+    Ok(())
+}
+
 async fn verify_running_release(source_commit: &str, ports: ServicePorts) -> Result<()> {
+    verify_running_release_identity(
+        &PriorReleaseIdentity::FullSha {
+            sha: source_commit.to_string(),
+        },
+        ports,
+    )
+    .await
+}
+
+async fn verify_running_release_identity(
+    expected: &PriorReleaseIdentity,
+    ports: ServicePorts,
+) -> Result<()> {
+    validate_prior_release_identity(expected)?;
+    let reported = probe_running_release_identity(ports).await?;
+    if &reported != expected {
+        return Err(ReleaseActivationError::Refused(format!(
+            "post-restart daemon provenance mismatch: expected {expected:?}, reported {reported:?}"
+        )));
+    }
+    Ok(())
+}
+
+async fn probe_running_release_identity(ports: ServicePorts) -> Result<PriorReleaseIdentity> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .connect_timeout(Duration::from_secs(3))
@@ -2544,8 +3547,8 @@ async fn verify_running_release(source_commit: &str, ports: ServicePorts) -> Res
     let mut last_error = String::new();
     for _ in 0..10 {
         match verify_mcp_initialize(&client, &mcp_url).await {
-            Ok(()) => match verify_daemon_health(&client, &gateway_url, source_commit).await {
-                Ok(()) => return Ok(()),
+            Ok(()) => match daemon_health_source(&client, &gateway_url).await {
+                Ok(source_commit) => return Ok(source_commit),
                 Err(error) => last_error = error.to_string(),
             },
             Err(error) => last_error = error.to_string(),
@@ -2621,11 +3624,7 @@ fn verify_mcp_initialize_body(body: &str) -> Result<()> {
     Ok(())
 }
 
-async fn verify_daemon_health(
-    client: &reqwest::Client,
-    url: &str,
-    source_commit: &str,
-) -> Result<()> {
+async fn daemon_health_source(client: &reqwest::Client, url: &str) -> Result<PriorReleaseIdentity> {
     let response = client.get(url).send().await.map_err(|error| {
         ReleaseActivationError::Refused(format!("daemon health transport: {error}"))
     })?;
@@ -2639,21 +3638,34 @@ async fn verify_daemon_health(
         .json()
         .await
         .map_err(|error| ReleaseActivationError::Refused(format!("daemon health JSON: {error}")))?;
-    verify_daemon_health_value(&value, source_commit)
+    daemon_health_source_value(&value)
 }
 
+#[cfg(test)]
 fn verify_daemon_health_value(value: &Value, source_commit: &str) -> Result<()> {
-    let reported = value.get("build_sha").and_then(Value::as_str).unwrap_or("");
-    if value.get("status").and_then(Value::as_str) != Some("ok")
-        || value.get("service").and_then(Value::as_str) != Some("ff-gateway")
-        || reported != source_commit
-        || validate_full_source_commit(reported).is_err()
+    let reported = daemon_health_source_value(value)?;
+    if reported
+        != (PriorReleaseIdentity::FullSha {
+            sha: source_commit.to_string(),
+        })
     {
         return Err(ReleaseActivationError::Refused(
             "daemon health did not prove exact full source provenance".into(),
         ));
     }
     Ok(())
+}
+
+fn daemon_health_source_value(value: &Value) -> Result<PriorReleaseIdentity> {
+    let reported = value.get("build_sha").and_then(Value::as_str).unwrap_or("");
+    if value.get("status").and_then(Value::as_str) != Some("ok")
+        || value.get("service").and_then(Value::as_str) != Some("ff-gateway")
+    {
+        return Err(ReleaseActivationError::Refused(
+            "daemon health did not prove canonical release provenance".into(),
+        ));
+    }
+    parse_canonical_reported_identity(reported)
 }
 
 fn validate_owned_regular_path(path: &Path) -> Result<()> {
@@ -2835,6 +3847,7 @@ mod tests {
     use std::sync::Mutex;
 
     const SOURCE: &str = "6dc4086b7217cb8c2ccc1945b1e1f3213b9b1941";
+    const PRIOR_SOURCE: &str = "5c1b63fb7217cb8c2ccc1945b1e1f3213b9b1941";
     const ABC_SHA: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     fn private_dir(path: &Path) {
@@ -2881,6 +3894,8 @@ mod tests {
     struct FakeRunner {
         home: PathBuf,
         source: String,
+        prior_source: String,
+        daemon_prior_source: String,
         mcp_port: u16,
         fail_contains: Vec<String>,
         absent_labels: Vec<String>,
@@ -2893,6 +3908,8 @@ mod tests {
             Self {
                 home,
                 source: SOURCE.into(),
+                prior_source: SOURCE.into(),
+                daemon_prior_source: SOURCE.into(),
                 mcp_port: 51111,
                 fail_contains: Vec::new(),
                 absent_labels: Vec::new(),
@@ -2928,6 +3945,18 @@ mod tests {
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn with_prior_source(mut self, source: &str) -> Self {
+            self.prior_source = source.into();
+            self.daemon_prior_source = source.into();
+            self
+        }
+
+        fn with_mismatched_prior_sources(mut self, ff: &str, daemon: &str) -> Self {
+            self.prior_source = ff.into();
+            self.daemon_prior_source = daemon.into();
+            self
         }
     }
 
@@ -2984,7 +4013,21 @@ mod tests {
             } else if call.contains("launchctl print") && call.contains(DAEMON_LABEL) {
                 format!("program = {}\narguments = start", binary.display())
             } else if args == ["--version"] {
-                format!("release pushed {}", self.source)
+                let prior = fs::read(program)
+                    .map(|bytes| bytes.starts_with(b"old-"))
+                    .unwrap_or(false);
+                format!(
+                    "release pushed {}",
+                    if prior {
+                        if program.ends_with("forgefleetd") {
+                            &self.daemon_prior_source
+                        } else {
+                            &self.prior_source
+                        }
+                    } else {
+                        &self.source
+                    }
+                )
             } else {
                 String::new()
             };
@@ -3261,6 +4304,7 @@ mod tests {
         fs::rename(root.join("ff"), root.join("moved")).unwrap();
         fs::write(root.join("ff"), b"evil").unwrap();
         let valid = row("ff", "v", "x", b"abc");
+        let previous = (3, format!("{:x}", Sha256::digest(b"old")));
         let staged = stage_install_entry(
             Uuid::new_v4(),
             "ff",
@@ -3269,6 +4313,7 @@ mod tests {
             open_owned_dir(&destination).unwrap(),
             destination.clone(),
             "ff",
+            &previous,
         )
         .unwrap();
         assert_eq!(
@@ -3288,7 +4333,8 @@ mod tests {
                 &mut clean,
                 open_owned_dir(&destination).unwrap(),
                 destination.clone(),
-                "ff2"
+                "ff2",
+                &previous,
             )
             .is_err()
         );
@@ -3303,7 +4349,8 @@ mod tests {
                 &mut clean,
                 open_owned_dir(&destination).unwrap(),
                 destination,
-                "ff3"
+                "ff3",
+                &previous,
             )
             .is_err()
         );
@@ -3341,6 +4388,8 @@ mod tests {
             artifact_name: "ff".into(),
             expected_sha256: ABC_SHA.into(),
             expected_size: 3,
+            previous_sha256: ABC_SHA.into(),
+            previous_size: 3,
             dir,
             dir_path: home.join(".local/bin"),
             destination: CString::new("ff").unwrap(),
@@ -3421,10 +4470,12 @@ mod tests {
         let entries = transaction_entries(&home, id);
         let journal = activation_dir.join(format!("{id}.journal.jsonl"));
         create_journal(&journal, "prepared", "test").unwrap();
+        let operation_lock = acquire_operation_lock(&activation_dir).unwrap();
         let transaction = ActiveTransaction {
             id,
             version: "v".into(),
             source_commit: SOURCE.into(),
+            prior_release_identity: PriorReleaseIdentity::FullSha { sha: SOURCE.into() },
             target_triple: "x".into(),
             identity: LocalComputerIdentity {
                 id: Uuid::new_v4(),
@@ -3439,6 +4490,7 @@ mod tests {
             activation_dir,
             journal_path: journal.clone(),
             entries,
+            _operation_lock: operation_lock,
         };
         let runner = FakeRunner::failing(home.clone(), "start forgefleetd.service");
         let error = handle_stop_failure(
@@ -3491,17 +4543,466 @@ mod tests {
         }
         [(&bin, "ff"), (&bin, "forgefleetd"), (&cargo_bin, "ff")]
             .into_iter()
-            .map(|(dir_path, name)| InstallEntry {
-                artifact_name: name.into(),
-                expected_sha256: "0".repeat(64),
-                expected_size: 1,
-                dir: open_owned_dir(dir_path).unwrap(),
-                dir_path: dir_path.clone(),
-                destination: CString::new(name).unwrap(),
-                stage: CString::new(format!(".{name}.release-{id}.stage")).unwrap(),
-                backup: CString::new(format!(".{name}.release-{id}.rollback")).unwrap(),
+            .map(|(dir_path, name)| {
+                let destination = hash_existing_destination(
+                    open_owned_dir(dir_path).unwrap().as_raw_fd(),
+                    OsStr::new(name),
+                )
+                .unwrap();
+                let stage_name = format!(".{name}.release-{id}.stage");
+                let candidate = hash_existing_destination(
+                    open_owned_dir(dir_path).unwrap().as_raw_fd(),
+                    OsStr::new(&stage_name),
+                )
+                .unwrap();
+                InstallEntry {
+                    artifact_name: name.into(),
+                    expected_sha256: candidate.1,
+                    expected_size: candidate.0,
+                    previous_sha256: destination.1,
+                    previous_size: destination.0,
+                    dir: open_owned_dir(dir_path).unwrap(),
+                    dir_path: dir_path.clone(),
+                    destination: CString::new(name).unwrap(),
+                    stage: CString::new(stage_name).unwrap(),
+                    backup: CString::new(format!(".{name}.release-{id}.rollback")).unwrap(),
+                }
             })
             .collect()
+    }
+
+    fn committed_activation_fixture(
+        home: &Path,
+        prior_release_identity: PriorReleaseIdentity,
+    ) -> (Uuid, LocalComputerIdentity, ServicePlatform, ServicePorts) {
+        let activation_dir = home.join(".forgefleet/release-activations");
+        ensure_activation_directory(&activation_dir).unwrap();
+        let id = Uuid::new_v4();
+        let identity = LocalComputerIdentity {
+            id: Uuid::new_v4(),
+            name: "lily".into(),
+        };
+        let platform_identity = current_platform_identity(SOURCE).unwrap();
+        let platform = platform_identity.service_platform;
+        let ports = ServicePorts {
+            mcp: 51111,
+            gateway: 52002,
+        };
+        let entries = transaction_entries(home, id);
+        let created_at = Utc::now();
+        let manifest = RollbackManifest {
+            transaction_id: id,
+            artifact_version: platform_identity.artifact_version.clone(),
+            source_commit: SOURCE.into(),
+            prior_release_identity: prior_release_identity.clone(),
+            target_triple: platform_identity.target_triple.clone(),
+            computer_id: identity.id,
+            computer_name: identity.name.clone(),
+            platform,
+            created_at,
+            entries: entries
+                .iter()
+                .map(|entry| ManifestEntry {
+                    artifact_name: entry.artifact_name.clone(),
+                    destination: entry
+                        .dir_path
+                        .join(os_from_cstr(&entry.destination))
+                        .display()
+                        .to_string(),
+                    stage: entry
+                        .dir_path
+                        .join(os_from_cstr(&entry.stage))
+                        .display()
+                        .to_string(),
+                    backup: entry
+                        .dir_path
+                        .join(os_from_cstr(&entry.backup))
+                        .display()
+                        .to_string(),
+                    sha256: entry.expected_sha256.clone(),
+                    size_bytes: entry.expected_size,
+                    previous_sha256: entry.previous_sha256.clone(),
+                    previous_size_bytes: entry.previous_size,
+                })
+                .collect(),
+        };
+        write_manifest(&activation_dir, &manifest).unwrap();
+        let journal_path = activation_dir.join(format!("{id}.journal.jsonl"));
+        create_journal(&journal_path, "prepared", "fixture").unwrap();
+        swap_entries(&entries, &journal_path, None).unwrap();
+        append_journal(&journal_path, "services_started", "fixture").unwrap();
+        let receipt_path = activation_dir.join(format!("{id}.receipt.json"));
+        let services = match platform {
+            ServicePlatform::Linux => (MCP_UNIT, DAEMON_UNIT),
+            ServicePlatform::Macos => (MCP_LABEL, DAEMON_LABEL),
+        };
+        let receipt = ReleaseActivationReceipt {
+            transaction_id: id,
+            artifact_version: manifest.artifact_version.clone(),
+            source_commit: manifest.source_commit.clone(),
+            prior_release_identity,
+            target_triple: manifest.target_triple.clone(),
+            computer_id: identity.id,
+            computer_name: identity.name.clone(),
+            activated_at: created_at + TimeDelta::milliseconds(1),
+            mcp_service: services.0.into(),
+            daemon_service: services.1.into(),
+            artifacts: build_artifact_receipts(&entries),
+            receipt_path: receipt_path.display().to_string(),
+        };
+        write_new_json(&receipt_path, &receipt, 0o444).unwrap();
+        append_journal(&journal_path, "committed", "fixture").unwrap();
+        (id, identity, platform, ports)
+    }
+
+    #[test]
+    fn legacy_reported_identity_is_strict_unambiguous_and_pair_consistent() {
+        assert_eq!(
+            parse_reported_release_identity("ff 5c1b63fb").unwrap(),
+            PriorReleaseIdentity::LegacyReported {
+                short_sha: "5c1b63fb".into()
+            }
+        );
+        assert_eq!(
+            parse_reported_release_identity(&format!("ff {SOURCE}")).unwrap(),
+            PriorReleaseIdentity::FullSha { sha: SOURCE.into() }
+        );
+        assert_eq!(
+            daemon_health_source_value(
+                &json!({"status":"ok","service":"ff-gateway","build_sha":"5c1b63fb"})
+            )
+            .unwrap(),
+            PriorReleaseIdentity::LegacyReported {
+                short_sha: "5c1b63fb".into()
+            }
+        );
+        assert!(
+            daemon_health_source_value(
+                &json!({"status":"ok","service":"ff-gateway","build_sha":"build-5c1b63fb"})
+            )
+            .is_err()
+        );
+        for invalid in [
+            "ff 5C1B63FB",
+            "ff 5c1b63f",
+            "ff 5c1b63fb 6dc4086b",
+            "ff 5c1b63fb00f",
+        ] {
+            assert!(
+                parse_reported_release_identity(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path();
+        let id = Uuid::new_v4();
+        let entries = transaction_entries(home, id);
+        drop(entries);
+        let matching = FakeRunner::new(home.to_path_buf()).with_prior_source("5c1b63fb");
+        assert_eq!(
+            probe_installed_pair_identity(home, &matching).unwrap(),
+            PriorReleaseIdentity::LegacyReported {
+                short_sha: "5c1b63fb".into()
+            }
+        );
+        let mismatch = FakeRunner::new(home.to_path_buf())
+            .with_mismatched_prior_sources("5c1b63fb", "6dc4086b");
+        assert!(probe_installed_pair_identity(home, &mismatch).is_err());
+    }
+
+    #[test]
+    fn explicit_rollback_restores_legacy_pair_and_is_idempotent() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let prior = PriorReleaseIdentity::LegacyReported {
+            short_sha: "5c1b63fb".into(),
+        };
+        let (id, identity, platform, ports) = committed_activation_fixture(&home, prior.clone());
+        let runner = FakeRunner::new(home.clone()).with_prior_source("5c1b63fb");
+        let prepared = prepare_explicit_rollback(
+            id,
+            identity.clone(),
+            platform,
+            ports,
+            home.clone(),
+            &runner,
+            None,
+        )
+        .unwrap();
+        assert_eq!(prepared.receipt.restored_release_identity, prior);
+        assert_eq!(fs::read(home.join(".local/bin/ff")).unwrap(), b"old-ff");
+        assert_eq!(
+            fs::read(home.join(".local/bin/forgefleetd")).unwrap(),
+            b"old-daemon"
+        );
+        let committed = commit_explicit_rollback(prepared, &runner).unwrap();
+        assert_eq!(
+            last_journal_state(
+                &home
+                    .join(".forgefleet/release-activations")
+                    .join(format!("{id}.journal.jsonl"))
+            )
+            .unwrap()
+            .as_deref(),
+            Some("rollback_committed")
+        );
+
+        let retried =
+            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).unwrap();
+        assert!(retried.receipt_already_committed);
+        assert_eq!(retried.receipt, committed);
+    }
+
+    #[test]
+    fn explicit_rollback_restores_full_sha_predecessor() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, identity, platform, ports) = committed_activation_fixture(
+            &home,
+            PriorReleaseIdentity::FullSha {
+                sha: PRIOR_SOURCE.into(),
+            },
+        );
+        let runner = FakeRunner::new(home.clone()).with_prior_source(PRIOR_SOURCE);
+        let prepared =
+            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).unwrap();
+        assert_eq!(
+            prepared.receipt.restored_release_identity,
+            PriorReleaseIdentity::FullSha {
+                sha: PRIOR_SOURCE.into()
+            }
+        );
+        commit_explicit_rollback(prepared, &runner).unwrap();
+    }
+
+    #[test]
+    fn explicit_rollback_resumes_after_each_durable_pair_transition() {
+        for transition in 1..=6 {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().to_path_buf();
+            let (id, identity, platform, ports) = committed_activation_fixture(
+                &home,
+                PriorReleaseIdentity::LegacyReported {
+                    short_sha: "5c1b63fb".into(),
+                },
+            );
+            let runner = FakeRunner::new(home.clone()).with_prior_source("5c1b63fb");
+            assert!(
+                prepare_explicit_rollback(
+                    id,
+                    identity.clone(),
+                    platform,
+                    ports,
+                    home.clone(),
+                    &runner,
+                    Some(transition),
+                )
+                .is_err()
+            );
+            let prepared = prepare_explicit_rollback(
+                id,
+                identity,
+                platform,
+                ports,
+                home.clone(),
+                &runner,
+                None,
+            )
+            .unwrap();
+            commit_explicit_rollback(prepared, &runner).unwrap();
+            assert_eq!(fs::read(home.join(".local/bin/ff")).unwrap(), b"old-ff");
+            assert_eq!(fs::read(home.join(".cargo/bin/ff")).unwrap(), b"old-ff");
+        }
+    }
+
+    #[test]
+    fn explicit_rollback_rejects_tamper_missing_partial_and_stale_authority() {
+        use std::os::unix::fs::symlink;
+
+        for mutation in [
+            "digest",
+            "missing",
+            "partial",
+            "symlink",
+            "hardlink",
+            "receipt_symlink",
+            "journal_hardlink",
+            "manifest_hardlink",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let home = temp.path().to_path_buf();
+            let (id, identity, platform, ports) = committed_activation_fixture(
+                &home,
+                PriorReleaseIdentity::FullSha {
+                    sha: PRIOR_SOURCE.into(),
+                },
+            );
+            let bin = home.join(".local/bin");
+            let destination = bin.join("ff");
+            let backup = bin.join(format!(".ff.release-{id}.rollback"));
+            let stage = bin.join(format!(".ff.release-{id}.stage"));
+            let activation_dir = home.join(".forgefleet/release-activations");
+            match mutation {
+                "digest" => fs::write(&backup, b"tampered").unwrap(),
+                "missing" => fs::remove_file(&destination).unwrap(),
+                "partial" => fs::write(&stage, b"unexpected").unwrap(),
+                "symlink" => {
+                    fs::remove_file(&backup).unwrap();
+                    symlink("ff", &backup).unwrap();
+                }
+                "hardlink" => {
+                    fs::remove_file(&backup).unwrap();
+                    let other = bin.join("other-old-ff");
+                    fs::write(&other, b"old-ff").unwrap();
+                    fs::hard_link(&other, &backup).unwrap();
+                }
+                "receipt_symlink" => {
+                    let receipt = activation_dir.join(format!("{id}.receipt.json"));
+                    let original = activation_dir.join("saved-receipt");
+                    fs::rename(&receipt, &original).unwrap();
+                    symlink("saved-receipt", &receipt).unwrap();
+                }
+                "journal_hardlink" => {
+                    let journal = activation_dir.join(format!("{id}.journal.jsonl"));
+                    fs::hard_link(&journal, activation_dir.join("journal-hardlink")).unwrap();
+                }
+                "manifest_hardlink" => {
+                    let manifest = activation_dir.join(format!("{id}.manifest.json"));
+                    fs::hard_link(&manifest, activation_dir.join("manifest-hardlink")).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let runner = FakeRunner::new(home.clone());
+            assert!(
+                prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None)
+                    .is_err(),
+                "mutation {mutation} must fail closed"
+            );
+            assert!(
+                runner.calls().is_empty(),
+                "mutation must fail before quiesce"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, identity, platform, ports) = committed_activation_fixture(
+            &home,
+            PriorReleaseIdentity::FullSha {
+                sha: PRIOR_SOURCE.into(),
+            },
+        );
+        let activation_dir = home.join(".forgefleet/release-activations");
+        let receipt_path = activation_dir.join(format!("{id}.receipt.json"));
+        let mut newer: ReleaseActivationReceipt =
+            read_private_json(&receipt_path, "activation receipt").unwrap();
+        newer.transaction_id = Uuid::new_v4();
+        newer.activated_at += TimeDelta::seconds(1);
+        let newer_path = activation_dir.join(format!("{}.receipt.json", newer.transaction_id));
+        newer.receipt_path = newer_path.display().to_string();
+        write_new_json(&newer_path, &newer, 0o444).unwrap();
+        let runner = FakeRunner::new(home.clone());
+        assert!(
+            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).is_err()
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn explicit_rollback_rejects_manifest_metadata_drift_and_other_unfinished_work() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, identity, platform, ports) = committed_activation_fixture(
+            &home,
+            PriorReleaseIdentity::FullSha {
+                sha: PRIOR_SOURCE.into(),
+            },
+        );
+        let activation_dir = home.join(".forgefleet/release-activations");
+        let manifest_path = activation_dir.join(format!("{id}.manifest.json"));
+        let manifest: RollbackManifest =
+            read_private_json(&manifest_path, "rollback manifest").unwrap();
+        let mut wrong_name = serde_json::to_value(&manifest).unwrap();
+        wrong_name["entries"][0]["artifact_name"] = json!("forgefleetd");
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&wrong_name).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let runner = FakeRunner::new(home.clone());
+        assert!(
+            prepare_explicit_rollback(
+                id,
+                identity.clone(),
+                platform,
+                ports,
+                home.clone(),
+                &runner,
+                None,
+            )
+            .is_err()
+        );
+        assert!(runner.calls().is_empty());
+
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&manifest_path, fs::Permissions::from_mode(0o400)).unwrap();
+        let other = Uuid::new_v4();
+        create_journal(
+            &activation_dir.join(format!("{other}.journal.jsonl")),
+            "prepared",
+            "other unfinished fixture",
+        )
+        .unwrap();
+        assert!(
+            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).is_err()
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn explicit_rollback_forbids_vinny_without_touching_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, mut identity, platform, ports) = committed_activation_fixture(
+            &home,
+            PriorReleaseIdentity::FullSha {
+                sha: PRIOR_SOURCE.into(),
+            },
+        );
+        identity.name = "Vinny".into();
+        let runner = FakeRunner::new(home.clone());
+        assert!(
+            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).is_err()
+        );
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn release_operation_lock_serializes_activation_and_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, identity, platform, ports) = committed_activation_fixture(
+            &home,
+            PriorReleaseIdentity::FullSha {
+                sha: PRIOR_SOURCE.into(),
+            },
+        );
+        let activation_dir = home.join(".forgefleet/release-activations");
+        let lock = acquire_operation_lock(&activation_dir).unwrap();
+        let runner = FakeRunner::new(home.clone());
+        assert!(
+            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).is_err()
+        );
+        assert!(runner.calls().is_empty());
+        drop(lock);
     }
 
     #[test]
@@ -3515,10 +5016,12 @@ mod tests {
         let journal = activation_dir.join(format!("{id}.journal.jsonl"));
         create_journal(&journal, "services_stopped", "test").unwrap();
         assert!(swap_entries(&entries, &journal, Some(1)).is_err());
+        let operation_lock = acquire_operation_lock(&activation_dir).unwrap();
         let mut transaction = ActiveTransaction {
             id,
             version: "v".into(),
             source_commit: SOURCE.into(),
+            prior_release_identity: PriorReleaseIdentity::FullSha { sha: SOURCE.into() },
             target_triple: "x".into(),
             identity: LocalComputerIdentity {
                 id: Uuid::new_v4(),
@@ -3533,6 +5036,7 @@ mod tests {
             activation_dir,
             journal_path: journal,
             entries,
+            _operation_lock: operation_lock,
         };
         rollback_transaction_inner(&mut transaction, &FakeRunner::new(home.clone()), "injected")
             .unwrap();
@@ -3572,10 +5076,12 @@ mod tests {
             b"old-daemon"
         );
 
+        let operation_lock = acquire_operation_lock(&activation_dir).unwrap();
         let mut transaction = ActiveTransaction {
             id,
             version: "v".into(),
             source_commit: SOURCE.into(),
+            prior_release_identity: PriorReleaseIdentity::FullSha { sha: SOURCE.into() },
             target_triple: "x".into(),
             identity: LocalComputerIdentity {
                 id: Uuid::new_v4(),
@@ -3590,6 +5096,7 @@ mod tests {
             activation_dir,
             journal_path: journal.clone(),
             entries,
+            _operation_lock: operation_lock,
         };
         let runner = FakeRunner::failing(home.clone(), "stop forgefleetd.service");
         assert!(rollback_transaction_inner(&mut transaction, &runner, "test").is_err());
@@ -3619,9 +5126,11 @@ mod tests {
             transaction_id: id,
             artifact_version: "v".into(),
             source_commit: SOURCE.into(),
+            prior_release_identity: PriorReleaseIdentity::FullSha { sha: SOURCE.into() },
             target_triple: "x".into(),
             computer_id: Uuid::new_v4(),
             computer_name: "lily".into(),
+            platform: ServicePlatform::Linux,
             created_at: Utc::now(),
             entries: entries
                 .iter()
@@ -3644,6 +5153,8 @@ mod tests {
                         .to_string(),
                     sha256: entry.expected_sha256.clone(),
                     size_bytes: entry.expected_size,
+                    previous_sha256: entry.previous_sha256.clone(),
+                    previous_size_bytes: entry.previous_size,
                 })
                 .collect(),
         };
@@ -3691,9 +5202,11 @@ mod tests {
             transaction_id: id,
             artifact_version: "v".into(),
             source_commit: SOURCE.into(),
+            prior_release_identity: PriorReleaseIdentity::FullSha { sha: SOURCE.into() },
             target_triple: "x".into(),
             computer_id: Uuid::new_v4(),
             computer_name: "ace".into(),
+            platform: ServicePlatform::Macos,
             created_at: Utc::now(),
             entries: entries
                 .iter()
@@ -3716,6 +5229,8 @@ mod tests {
                         .to_string(),
                     sha256: entry.expected_sha256.clone(),
                     size_bytes: entry.expected_size,
+                    previous_sha256: entry.previous_sha256.clone(),
+                    previous_size_bytes: entry.previous_size,
                 })
                 .collect(),
         };
@@ -3768,9 +5283,11 @@ mod tests {
                 transaction_id: id,
                 artifact_version: "v".into(),
                 source_commit: SOURCE.into(),
+                prior_release_identity: PriorReleaseIdentity::FullSha { sha: SOURCE.into() },
                 target_triple: "x".into(),
                 computer_id: Uuid::new_v4(),
                 computer_name: "lily".into(),
+                platform: ServicePlatform::Linux,
                 created_at: Utc::now(),
                 entries: entries
                     .iter()
@@ -3793,6 +5310,8 @@ mod tests {
                             .to_string(),
                         sha256: entry.expected_sha256.clone(),
                         size_bytes: entry.expected_size,
+                        previous_sha256: entry.previous_sha256.clone(),
+                        previous_size_bytes: entry.previous_size,
                     })
                     .collect(),
             };
