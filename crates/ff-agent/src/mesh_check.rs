@@ -6,10 +6,11 @@ use std::future::Future;
 use std::process::{Output, Stdio};
 use std::time::Duration;
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::{Instant, timeout};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -24,10 +25,19 @@ const SKIPPED_COMPUTER_STATUSES: [&str; 3] = ["offline", "reserved", "decommissi
 /// a full N×(N-1) scan from flooding a small node's sshd.
 const PAIRWISE_MESH_MAX_IN_FLIGHT: usize = 8;
 const PAIRWISE_MESH_TRANSIENT_COOLDOWN: Duration = Duration::from_secs(30);
-const PAIRWISE_MESH_SCAN_DEADLINE: Duration = Duration::from_secs(15 * 60);
+// The legacy daemon runs this tick inline and declares itself wedged after five
+// minutes. Leave enough room for child cancellation and bounded persistence.
+const PAIRWISE_MESH_SCAN_DEADLINE: Duration = Duration::from_secs(3 * 60);
 const PAIRWISE_MESH_MAX_TRANSIENT_RETRIES: u8 = 1;
-const MESH_SSH_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MESH_SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(12);
+const MESH_PERSIST_MAX_IN_FLIGHT: usize = 8;
+const MESH_PERSIST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const MESH_PERSIST_GLOBAL_TIMEOUT: Duration = Duration::from_secs(45);
 const MESH_SCAN_DEADLINE_ERROR: &str = "mesh scan deadline exceeded before probe completed";
+const MESH_SCAN_BUSY_ERROR: &str = "an SSH mesh scan is already in progress";
+const MESH_SCAN_FENCE_SQL: &str = "SELECT pg_try_advisory_xact_lock($1)";
+// Stable, repository-owned namespace for the single fleet-wide scan fence.
+const MESH_SCAN_FENCE_KEY: i64 = 0x4646_4d45_5348_0001;
 
 /// Emergency kill switch for the autonomous leader SSH mesh-repair producer.
 ///
@@ -260,6 +270,15 @@ struct ScheduledMeshProbe {
     transient_retries: u8,
 }
 
+#[derive(Debug)]
+struct MeshScheduleResult {
+    cells: Vec<MeshCell>,
+    /// Only final, actually-observed logical results belong in the database.
+    /// Physical retry failures and deadline-generated cells are diagnostics,
+    /// not authoritative observations.
+    persistable_edges: BTreeSet<(String, String)>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MeshSchedulePolicy {
     max_in_flight: usize,
@@ -405,6 +424,45 @@ pub async fn resolve_mesh_check_scope(
     )
 }
 
+/// Hold a transaction-scoped advisory lock for the whole scan. A transaction
+/// lock is important here: dropping a cancelled task returns the pooled
+/// connection only after SQLx rolls the transaction back, so no session-level
+/// lock can leak into an unrelated borrower.
+async fn acquire_mesh_scan_fence(pool: &PgPool) -> Result<Transaction<'_, Postgres>, String> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin SSH mesh scan fence: {error}"))?;
+    let acquired: bool = sqlx::query_scalar(MESH_SCAN_FENCE_SQL)
+        .bind(MESH_SCAN_FENCE_KEY)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|error| format!("acquire SSH mesh scan fence: {error}"))?;
+    if !acquired {
+        tx.rollback()
+            .await
+            .map_err(|error| format!("release busy SSH mesh scan fence: {error}"))?;
+        return Err(MESH_SCAN_BUSY_ERROR.into());
+    }
+    Ok(tx)
+}
+
+async fn finish_mesh_scan<T>(
+    fence: Transaction<'_, Postgres>,
+    result: Result<T, String>,
+) -> Result<T, String> {
+    let release = fence
+        .rollback()
+        .await
+        .map_err(|error| format!("release SSH mesh scan fence: {error}"));
+    match (result, release) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Err(operation), Err(release)) => Err(format!("{operation}; {release}")),
+    }
+}
+
 pub async fn pairwise_ssh_check(pool: &PgPool) -> Result<MeshMatrix, String> {
     pairwise_ssh_check_scoped(pool, &MeshCheckScope::default()).await
 }
@@ -418,13 +476,18 @@ pub async fn pairwise_ssh_check_scoped(
     pool: &PgPool,
     scope: &MeshCheckScope,
 ) -> Result<MeshMatrix, String> {
-    let nodes = ff_db::pg_list_nodes(pool)
-        .await
-        .map_err(|e| format!("pg_list_nodes: {e}"))?;
-    mark_ineligible_pairs_skipped(pool, &nodes, scope.exclusions()).await?;
-    let matrix = pairwise_ssh_check_inner(pool, &nodes, scope).await?;
-    let _ = fire_mesh_alert_scoped(pool, scope.exclusions()).await;
-    Ok(matrix)
+    let fence = acquire_mesh_scan_fence(pool).await?;
+    let result = async {
+        let nodes = ff_db::pg_list_nodes(pool)
+            .await
+            .map_err(|e| format!("pg_list_nodes: {e}"))?;
+        mark_ineligible_pairs_skipped(pool, &nodes, scope.exclusions()).await?;
+        let matrix = pairwise_ssh_check_inner(pool, &nodes, scope).await?;
+        fire_mesh_alert_scoped(pool, scope.exclusions()).await?;
+        Ok(matrix)
+    }
+    .await;
+    finish_mesh_scan(fence, result).await
 }
 
 fn mesh_probe_plan(nodes: &[ff_db::FleetNodeRow], scope: &MeshCheckScope) -> Vec<MeshProbe> {
@@ -467,9 +530,9 @@ async fn run_bounded_mesh_probes<F, Fut>(
     probes: Vec<MeshProbe>,
     policy: MeshSchedulePolicy,
     run_probe: F,
-) -> Vec<MeshCell>
+) -> MeshScheduleResult
 where
-    F: Fn(MeshProbe) -> Fut,
+    F: Fn(MeshProbe, CancellationToken) -> Fut,
     Fut: Future<Output = MeshCell>,
 {
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -486,8 +549,10 @@ where
     let mut endpoint_cooldowns = BTreeMap::<String, Instant>::new();
     let mut in_flight = FuturesUnordered::new();
     let mut cells = Vec::with_capacity(pending.len());
+    let mut persistable_edges = BTreeSet::new();
     let max_in_flight = policy.max_in_flight.max(1);
     let deadline = Instant::now() + policy.scan_deadline;
+    let scan_cancel = CancellationToken::new();
     let mut deadline_expired = false;
 
     while !pending.is_empty() || !in_flight.is_empty() {
@@ -516,7 +581,7 @@ where
             active_nodes.insert(src.clone());
             active_nodes.insert(dst.clone());
             active_probes.insert((src.clone(), dst.clone()), probe.clone());
-            let future = run_probe(probe.clone());
+            let future = run_probe(probe.clone(), scan_cancel.child_token());
             in_flight.push(async move { (src, dst, scheduled, future.await) });
         }
 
@@ -571,14 +636,29 @@ where
                 continue;
             }
         }
+        persistable_edges.insert((cell.src.clone(), cell.dst.clone()));
         cells.push(cell);
     }
 
     if deadline_expired {
-        // Dropping these futures drops the owned probe Command. Its
-        // kill_on_drop guard closes the outer SSH connection; the command
-        // timeout path also explicitly kills and reaps before returning.
-        drop(in_flight);
+        // Cancellation is cooperative and owned: every active probe kills and
+        // reaps its child and joins/aborts pipe readers before its future
+        // resolves. Drain all futures so no detached SSH work survives return.
+        scan_cancel.cancel();
+        while let Some((src, dst, scheduled, cell)) = in_flight.next().await {
+            active_nodes.remove(&src);
+            active_nodes.remove(&dst);
+            active_probes.remove(&(src, dst));
+            let exhausted_transient_retry = transient_mesh_failure_scope(&cell).is_some()
+                && scheduled.transient_retries >= policy.max_transient_retries;
+            if cell.last_error.as_deref() != Some(MESH_SCAN_DEADLINE_ERROR)
+                && (transient_mesh_failure_scope(&cell).is_none() || exhausted_transient_retry)
+            {
+                persistable_edges.insert((cell.src.clone(), cell.dst.clone()));
+            }
+            cells.push(cell);
+        }
+
         let mut unfinished = BTreeMap::<(String, String), MeshProbe>::new();
         for scheduled in pending {
             unfinished.insert(
@@ -586,12 +666,15 @@ where
                 scheduled.probe,
             );
         }
-        unfinished.extend(active_probes);
+        debug_assert!(active_probes.is_empty());
         cells.extend(unfinished.into_values().map(mesh_deadline_cell));
     }
 
     cells.sort_by(|a, b| (&a.src, &a.dst).cmp(&(&b.src, &b.dst)));
-    cells
+    MeshScheduleResult {
+        cells,
+        persistable_edges,
+    }
 }
 
 fn endpoint_ready(cooldowns: &BTreeMap<String, Instant>, endpoint: &str, now: Instant) -> bool {
@@ -677,24 +760,16 @@ fn mesh_deadline_cell(probe: MeshProbe) -> MeshCell {
     }
 }
 
-async fn pairwise_ssh_check_inner(
-    pool: &PgPool,
-    nodes: &[ff_db::FleetNodeRow],
-    scope: &MeshCheckScope,
-) -> Result<MeshMatrix, String> {
-    let probes = mesh_probe_plan(nodes, scope);
-    let cells =
-        run_bounded_mesh_probes(probes, PAIRWISE_MESH_SCHEDULE_POLICY, |probe| async move {
-            let cell = probe_pair(
-                probe.src,
-                probe.src_user,
-                probe.src_ip,
-                probe.dst,
-                probe.dst_user,
-                probe.dst_ip,
-            )
-            .await;
-            let _ = ff_db::pg_upsert_mesh_probe(
+async fn persist_mesh_cells(pool: &PgPool, cells: Vec<MeshCell>) -> Result<(), String> {
+    use futures::stream::{self, StreamExt};
+
+    if cells.is_empty() {
+        return Ok(());
+    }
+    let writes = stream::iter(cells).map(|cell| async move {
+        timeout(
+            MESH_PERSIST_WRITE_TIMEOUT,
+            ff_db::pg_upsert_mesh_probe(
                 pool,
                 &cell.src,
                 &cell.dst,
@@ -702,32 +777,65 @@ async fn pairwise_ssh_check_inner(
                 cell.last_error.as_deref(),
                 cell.ping_ok,
                 Some(cell.ssh_ok),
-            )
-            .await;
-            cell
-        })
-        .await;
-
-    // Deadline cells never ran through the probe closure, so persist their
-    // bounded-scan failure explicitly instead of leaving stale success rows.
-    for cell in cells
-        .iter()
-        .filter(|cell| cell.last_error.as_deref() == Some(MESH_SCAN_DEADLINE_ERROR))
-    {
-        let _ = ff_db::pg_upsert_mesh_probe(
-            pool,
-            &cell.src,
-            &cell.dst,
-            &cell.status,
-            cell.last_error.as_deref(),
-            cell.ping_ok,
-            Some(cell.ssh_ok),
+            ),
         )
-        .await;
+        .await
+        .map_err(|_| format!("persist mesh edge {} -> {} timed out", cell.src, cell.dst))?
+        .map_err(|error| format!("persist mesh edge {} -> {}: {error}", cell.src, cell.dst))
+    });
+    let results = timeout(
+        MESH_PERSIST_GLOBAL_TIMEOUT,
+        writes
+            .buffer_unordered(MESH_PERSIST_MAX_IN_FLIGHT)
+            .collect::<Vec<_>>(),
+    )
+    .await
+    .map_err(|_| "mesh persistence exceeded its global deadline".to_string())?;
+    let errors: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
     }
+}
+
+async fn pairwise_ssh_check_inner(
+    pool: &PgPool,
+    nodes: &[ff_db::FleetNodeRow],
+    scope: &MeshCheckScope,
+) -> Result<MeshMatrix, String> {
+    let probes = mesh_probe_plan(nodes, scope);
+    let schedule = run_bounded_mesh_probes(
+        probes,
+        PAIRWISE_MESH_SCHEDULE_POLICY,
+        |probe, cancellation| async move {
+            probe_pair(
+                probe.src,
+                probe.src_user,
+                probe.src_ip,
+                probe.dst,
+                probe.dst_user,
+                probe.dst_ip,
+                cancellation,
+            )
+            .await
+        },
+    )
+    .await;
+    let persistable: Vec<MeshCell> = schedule
+        .cells
+        .iter()
+        .filter(|cell| {
+            schedule
+                .persistable_edges
+                .contains(&(cell.src.clone(), cell.dst.clone()))
+        })
+        .cloned()
+        .collect();
+    persist_mesh_cells(pool, persistable).await?;
 
     Ok(MeshMatrix {
-        cells,
+        cells: schedule.cells,
         checked_at: chrono::Utc::now(),
     })
 }
@@ -748,6 +856,39 @@ async fn join_child_pipe(
         .map_err(|error| std::io::Error::other(format!("SSH pipe reader task failed: {error}")))?
 }
 
+async fn abort_child_pipe(task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>) {
+    task.abort();
+    let _ = task.await;
+}
+
+#[derive(Debug)]
+enum CommandOutcome {
+    Completed(Output),
+    TimedOut,
+    Cancelled,
+}
+
+async fn terminate_and_reap_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+    stdout_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) {
+    if let Some(pid) = pid {
+        crate::task_runner::kill_process_group(pid);
+    }
+    if let Err(error) = child.start_kill()
+        && error.kind() != std::io::ErrorKind::InvalidInput
+    {
+        warn!(%error, "mesh command child could not be killed");
+    }
+    if let Err(error) = child.wait().await {
+        warn!(%error, "mesh command child could not be reaped");
+    }
+    abort_child_pipe(stdout_task).await;
+    abort_child_pipe(stderr_task).await;
+}
+
 /// Run one SSH process with cancellation that owns the process lifecycle.
 ///
 /// Tokio's timeout only cancels the Rust future. Without `kill_on_drop`, the
@@ -757,7 +898,10 @@ async fn join_child_pipe(
 async fn output_with_hard_timeout(
     mut command: Command,
     limit: Duration,
-) -> std::io::Result<Option<Output>> {
+    cancellation: CancellationToken,
+) -> std::io::Result<CommandOutcome> {
+    #[cfg(unix)]
+    command.process_group(0);
     command
         .kill_on_drop(true)
         .stdout(Stdio::piped())
@@ -773,40 +917,39 @@ async fn output_with_hard_timeout(
         .ok_or_else(|| std::io::Error::other("SSH stderr pipe unavailable"))?;
     let stdout_task = tokio::spawn(read_child_pipe(stdout));
     let stderr_task = tokio::spawn(read_child_pipe(stderr));
+    let pid = child.id();
 
-    let status = match timeout(limit, child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let _ = child.start_kill();
-            let _ = timeout(MESH_SSH_REAP_TIMEOUT, child.wait()).await;
-            stdout_task.abort();
-            stderr_task.abort();
+    enum WaitOutcome {
+        Exited(std::io::Result<std::process::ExitStatus>),
+        TimedOut,
+        Cancelled,
+    }
+    let wait_outcome = tokio::select! {
+        biased;
+        status = child.wait() => WaitOutcome::Exited(status),
+        _ = cancellation.cancelled() => WaitOutcome::Cancelled,
+        _ = tokio::time::sleep(limit) => WaitOutcome::TimedOut,
+    };
+
+    let status = match wait_outcome {
+        WaitOutcome::Exited(Ok(status)) => status,
+        WaitOutcome::Exited(Err(error)) => {
+            terminate_and_reap_child(&mut child, pid, stdout_task, stderr_task).await;
             return Err(error);
         }
-        Err(_) => {
-            if let Err(error) = child.start_kill() {
-                warn!(%error, "timed-out mesh SSH child could not be killed");
-            }
-            match timeout(MESH_SSH_REAP_TIMEOUT, child.wait()).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(error)) => {
-                    warn!(%error, "timed-out mesh SSH child could not be reaped");
-                }
-                Err(_) => {
-                    warn!("timed-out mesh SSH child exceeded bounded reap timeout");
-                }
-            }
-            stdout_task.abort();
-            stderr_task.abort();
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
-            return Ok(None);
+        WaitOutcome::TimedOut => {
+            terminate_and_reap_child(&mut child, pid, stdout_task, stderr_task).await;
+            return Ok(CommandOutcome::TimedOut);
+        }
+        WaitOutcome::Cancelled => {
+            terminate_and_reap_child(&mut child, pid, stdout_task, stderr_task).await;
+            return Ok(CommandOutcome::Cancelled);
         }
     };
 
     let stdout = join_child_pipe(stdout_task).await?;
     let stderr = join_child_pipe(stderr_task).await?;
-    Ok(Some(Output {
+    Ok(CommandOutcome::Completed(Output {
         status,
         stdout,
         stderr,
@@ -820,6 +963,7 @@ async fn probe_pair(
     dst: String,
     dst_user: String,
     dst_ip: String,
+    cancellation: CancellationToken,
 ) -> MeshCell {
     // Bypass the (possibly wedged) inherited ssh-agent on both hops — the outer
     // hop is daemon-spawned, the inner runs in the src host's shell. See
@@ -839,10 +983,10 @@ async fn probe_pair(
         &format!("{src_user}@{src_ip}"),
         &inner,
     ]);
-    let result = output_with_hard_timeout(command, Duration::from_secs(12)).await;
+    let result = output_with_hard_timeout(command, MESH_SSH_PROBE_TIMEOUT, cancellation).await;
 
     match result {
-        Ok(Some(out)) if out.status.success() => MeshCell {
+        Ok(CommandOutcome::Completed(out)) if out.status.success() => MeshCell {
             ping_ok: parse_remote_probe_marker(&out.stdout).map(|(ping, _)| ping),
             ssh_ok: true,
             src,
@@ -850,7 +994,7 @@ async fn probe_pair(
             status: "ok".into(),
             last_error: None,
         },
-        Ok(Some(out)) => MeshCell {
+        Ok(CommandOutcome::Completed(out)) => MeshCell {
             ping_ok: parse_remote_probe_marker(&out.stdout).map(|(ping, _)| ping),
             ssh_ok: false,
             src,
@@ -874,13 +1018,21 @@ async fn probe_pair(
             status: "failed".into(),
             last_error: Some(format!("spawn: {e}")),
         },
-        Ok(None) => MeshCell {
+        Ok(CommandOutcome::TimedOut) => MeshCell {
             ping_ok: None,
             ssh_ok: false,
             src,
             dst,
             status: "failed".into(),
             last_error: Some("timeout".into()),
+        },
+        Ok(CommandOutcome::Cancelled) => MeshCell {
+            ping_ok: None,
+            ssh_ok: false,
+            src,
+            dst,
+            status: "failed".into(),
+            last_error: Some(MESH_SCAN_DEADLINE_ERROR.into()),
         },
     }
 }
@@ -927,6 +1079,15 @@ pub async fn local_reach_check_scoped(
     pool: &PgPool,
     scope: &MeshCheckScope,
 ) -> Result<Vec<LocalProbe>, String> {
+    let fence = acquire_mesh_scan_fence(pool).await?;
+    let result = local_reach_check_scoped_inner(pool, scope).await;
+    finish_mesh_scan(fence, result).await
+}
+
+async fn local_reach_check_scoped_inner(
+    pool: &PgPool,
+    scope: &MeshCheckScope,
+) -> Result<Vec<LocalProbe>, String> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
     let me = crate::fleet_info::resolve_this_worker_name().await;
@@ -950,33 +1111,25 @@ pub async fn local_reach_check_scoped(
         if futs.len() >= 8
             && let Some(p) = futs.next().await
         {
-            let _ = ff_db::pg_upsert_mesh_probe(
-                pool,
-                &p.src,
-                &p.dst,
-                &p.status,
-                p.detail.as_deref(),
-                Some(p.ping_ok),
-                Some(p.ssh_ok),
-            )
-            .await;
             probes.push(p);
         }
     }
     while let Some(p) = futs.next().await {
-        let _ = ff_db::pg_upsert_mesh_probe(
-            pool,
-            &p.src,
-            &p.dst,
-            &p.status,
-            p.detail.as_deref(),
-            Some(p.ping_ok),
-            Some(p.ssh_ok),
-        )
-        .await;
         probes.push(p);
     }
-    let _ = fire_mesh_alert_scoped(pool, scope.exclusions()).await;
+    let cells = probes
+        .iter()
+        .map(|probe| MeshCell {
+            src: probe.src.clone(),
+            dst: probe.dst.clone(),
+            status: probe.status.clone(),
+            last_error: probe.detail.clone(),
+            ping_ok: Some(probe.ping_ok),
+            ssh_ok: probe.ssh_ok,
+        })
+        .collect();
+    persist_mesh_cells(pool, cells).await?;
+    fire_mesh_alert_scoped(pool, scope.exclusions()).await?;
     probes.sort_by(|a, b| a.dst.cmp(&b.dst));
     Ok(probes)
 }
@@ -988,35 +1141,27 @@ async fn probe_direct(src: String, dst: String, dst_user: String, dst_ip: String
     } else {
         "2"
     };
+    let mut ping = Command::new("ping");
+    ping.args(["-c", "1", "-W", ping_wait, &dst_ip]);
     let ping_ok = matches!(
-        timeout(
-            Duration::from_secs(4),
-            Command::new("ping")
-                .args(["-c", "1", "-W", ping_wait, &dst_ip])
-                .output(),
-        )
-        .await,
-        Ok(Ok(o)) if o.status.success()
+        output_with_hard_timeout(ping, Duration::from_secs(4), CancellationToken::new()).await,
+        Ok(CommandOutcome::Completed(out)) if out.status.success()
     );
 
-    let ssh_res = timeout(
-        Duration::from_secs(8),
-        Command::new("ssh")
-            .args(crate::ssh_opts::ssh_bypass_args())
-            .args([
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &format!("{dst_user}@{dst_ip}"),
-                "true",
-            ])
-            .output(),
-    )
-    .await;
+    let mut ssh = Command::new("ssh");
+    ssh.args(crate::ssh_opts::ssh_bypass_args()).args([
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        &format!("{dst_user}@{dst_ip}"),
+        "true",
+    ]);
+    let ssh_res =
+        output_with_hard_timeout(ssh, Duration::from_secs(8), CancellationToken::new()).await;
     let ssh_err = match ssh_res {
-        Ok(Ok(out)) if out.status.success() => None,
-        Ok(Ok(out)) => Some(format!(
+        Ok(CommandOutcome::Completed(out)) if out.status.success() => None,
+        Ok(CommandOutcome::Completed(out)) => Some(format!(
             "exit {}: {}",
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stderr)
@@ -1025,8 +1170,9 @@ async fn probe_direct(src: String, dst: String, dst_user: String, dst_ip: String
                 .take(120)
                 .collect::<String>()
         )),
-        Ok(Err(e)) => Some(format!("spawn: {e}")),
-        Err(_) => Some("timeout".into()),
+        Err(e) => Some(format!("spawn: {e}")),
+        Ok(CommandOutcome::TimedOut) => Some("timeout".into()),
+        Ok(CommandOutcome::Cancelled) => Some("cancelled".into()),
     };
     let ssh_ok = ssh_err.is_none();
     let (status, detail) = classify_direct_probe(ping_ok, ssh_err);
@@ -1359,23 +1505,24 @@ async fn propagate_to_peer(
 }
 
 async fn ssh_exec(dest: &str, cmd: &str) -> Result<(), String> {
-    let out = timeout(
-        Duration::from_secs(15),
-        Command::new("ssh")
-            .args(crate::ssh_opts::ssh_bypass_args())
-            .args([
-                "-o",
-                "ConnectTimeout=8",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                dest,
-                cmd,
-            ])
-            .output(),
-    )
-    .await
-    .map_err(|_| format!("ssh to {dest} timed out"))?
-    .map_err(|e| format!("ssh spawn: {e}"))?;
+    let mut command = Command::new("ssh");
+    command.args(crate::ssh_opts::ssh_bypass_args()).args([
+        "-o",
+        "ConnectTimeout=8",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        dest,
+        cmd,
+    ]);
+    let out =
+        match output_with_hard_timeout(command, Duration::from_secs(15), CancellationToken::new())
+            .await
+            .map_err(|e| format!("ssh spawn: {e}"))?
+        {
+            CommandOutcome::Completed(out) => out,
+            CommandOutcome::TimedOut => return Err(format!("ssh to {dest} timed out")),
+            CommandOutcome::Cancelled => return Err(format!("ssh to {dest} cancelled")),
+        };
     if !out.status.success() {
         return Err(format!(
             "exit {}: {}",
@@ -1436,18 +1583,10 @@ pub async fn probe_single_pair(pool: &PgPool, src: &str, dst: &str) -> Result<Me
         d.name.clone(),
         d.ssh_user.clone(),
         d.ip.clone(),
+        CancellationToken::new(),
     )
     .await;
-    let _ = ff_db::pg_upsert_mesh_probe(
-        pool,
-        &cell.src,
-        &cell.dst,
-        &cell.status,
-        cell.last_error.as_deref(),
-        cell.ping_ok,
-        Some(cell.ssh_ok),
-    )
-    .await;
+    persist_mesh_cells(pool, vec![cell.clone()]).await?;
     Ok(cell)
 }
 
@@ -1714,7 +1853,7 @@ mod tests {
             scan_deadline: Duration::from_secs(1),
             max_transient_retries: 0,
         };
-        let run = run_bounded_mesh_probes(probes, policy, |probe| {
+        let run = run_bounded_mesh_probes(probes, policy, |probe, _cancellation| {
             let active_by_node = Arc::clone(&active_by_node);
             let active_total = Arc::clone(&active_total);
             let max_total = Arc::clone(&max_total);
@@ -1755,9 +1894,14 @@ mod tests {
                 }
             }
         });
-        let cells = timeout(Duration::from_secs(2), run)
+        let schedule = timeout(Duration::from_secs(2), run)
             .await
             .expect("bounded scheduler deadlocked");
+        assert_eq!(
+            schedule.persistable_edges.len(),
+            names.len() * (names.len() - 1)
+        );
+        let cells = schedule.cells;
 
         assert_eq!(cells.len(), names.len() * (names.len() - 1));
         assert_eq!(
@@ -1870,9 +2014,9 @@ mod tests {
             max_transient_retries: 1,
         };
 
-        let cells = run_bounded_mesh_probes(probes, policy, {
+        let schedule = run_bounded_mesh_probes(probes, policy, {
             let starts = Arc::clone(&starts);
-            move |probe| {
+            move |probe, _cancellation| {
                 let starts = Arc::clone(&starts);
                 async move {
                     let is_first_ab_attempt = {
@@ -1892,6 +2036,12 @@ mod tests {
             }
         })
         .await;
+        assert_eq!(
+            schedule.persistable_edges.len(),
+            3,
+            "only one final logical observation per edge is persistable"
+        );
+        let cells = schedule.cells;
 
         assert_eq!(cells.len(), 3);
         let starts = starts.lock().expect("start record lock");
@@ -1934,9 +2084,9 @@ mod tests {
             scan_deadline: Duration::from_secs(60),
             max_transient_retries: 1,
         };
-        let cells = run_bounded_mesh_probes(probes, policy, {
+        let schedule = run_bounded_mesh_probes(probes, policy, {
             let starts = Arc::clone(&starts);
-            move |probe| {
+            move |probe, _cancellation| {
                 let starts = Arc::clone(&starts);
                 async move {
                     starts
@@ -1957,6 +2107,8 @@ mod tests {
             }
         })
         .await;
+        assert_eq!(schedule.persistable_edges.len(), 2);
+        let cells = schedule.cells;
 
         assert_eq!(cells.len(), 2);
         assert_eq!(
@@ -1979,14 +2131,19 @@ mod tests {
             scan_deadline: Duration::from_secs(10),
             max_transient_retries: 1,
         };
-        let cells = run_bounded_mesh_probes(vec![scheduled_test_probe("a", "b")], policy, {
+        let schedule = run_bounded_mesh_probes(vec![scheduled_test_probe("a", "b")], policy, {
             let attempts = Arc::clone(&attempts);
-            move |probe| {
+            move |probe, _cancellation| {
                 attempts.fetch_add(1, Ordering::SeqCst);
                 async move { scheduled_test_cell(probe, "failed", Some("timeout"), None) }
             }
         })
         .await;
+        assert!(
+            schedule.persistable_edges.is_empty(),
+            "an unprobed deadline cell must never overwrite the last observation"
+        );
+        let cells = schedule.cells;
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert_eq!(cells.len(), 1);
@@ -2007,10 +2164,17 @@ mod tests {
         let mut command = Command::new("sh");
         command.args(["-c", &script]);
 
-        let result = output_with_hard_timeout(command, Duration::from_millis(250))
-            .await
-            .expect("local child should spawn");
-        assert!(result.is_none(), "sleeping child must hit the hard timeout");
+        let result = output_with_hard_timeout(
+            command,
+            Duration::from_millis(250),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("local child should spawn");
+        assert!(
+            matches!(result, CommandOutcome::TimedOut),
+            "sleeping child must hit the hard timeout"
+        );
 
         let pid = std::fs::read_to_string(&pid_file)
             .expect("child wrote pid")
@@ -2021,6 +2185,76 @@ mod tests {
             "timed-out child {pid} still exists after helper returned"
         );
         let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn scan_deadline_cancels_and_reaps_live_child_before_returning() {
+        let pid_file =
+            std::env::temp_dir().join(format!("ff-mesh-scan-cancel-{}.pid", Uuid::new_v4()));
+        let policy = MeshSchedulePolicy {
+            max_in_flight: 1,
+            transient_cooldown: Duration::ZERO,
+            scan_deadline: Duration::from_millis(250),
+            max_transient_retries: 0,
+        };
+        let schedule = run_bounded_mesh_probes(vec![scheduled_test_probe("a", "b")], policy, {
+            let pid_file = pid_file.clone();
+            move |probe, cancellation| {
+                let pid_file = pid_file.clone();
+                async move {
+                    let script = format!(
+                        "printf '%s' \"$$\" > {}; exec sleep 30",
+                        shell_escape_single(pid_file.to_string_lossy().as_ref())
+                    );
+                    let mut command = Command::new("sh");
+                    command.args(["-c", &script]);
+                    match output_with_hard_timeout(command, Duration::from_secs(30), cancellation)
+                        .await
+                        .expect("local child should spawn")
+                    {
+                        CommandOutcome::Cancelled => mesh_deadline_cell(probe),
+                        CommandOutcome::TimedOut => {
+                            scheduled_test_cell(probe, "failed", Some("timeout"), None)
+                        }
+                        CommandOutcome::Completed(_) => {
+                            scheduled_test_cell(probe, "ok", None, Some(true))
+                        }
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert!(schedule.persistable_edges.is_empty());
+        assert_eq!(
+            schedule.cells[0].last_error.as_deref(),
+            Some(MESH_SCAN_DEADLINE_ERROR)
+        );
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("child wrote pid before scan cancellation")
+            .trim()
+            .to_string();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "scan-cancelled child {pid} still exists after scheduler returned"
+        );
+        let _ = std::fs::remove_file(pid_file);
+    }
+
+    #[test]
+    fn production_mesh_deadlines_fit_below_daemon_watchdog() {
+        assert!(
+            PAIRWISE_MESH_SCAN_DEADLINE + MESH_SSH_PROBE_TIMEOUT + MESH_PERSIST_GLOBAL_TIMEOUT
+                < crate::daemon::WATCHDOG_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn full_mesh_entrypoints_share_a_nonblocking_transaction_fence() {
+        assert!(MESH_SCAN_FENCE_SQL.contains("pg_try_advisory_xact_lock"));
+        assert!(!MESH_SCAN_FENCE_SQL.contains("pg_advisory_lock("));
+        assert!(!MESH_SCAN_BUSY_ERROR.is_empty());
     }
 
     #[test]
