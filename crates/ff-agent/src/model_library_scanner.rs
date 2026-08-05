@@ -446,7 +446,7 @@ fn validate_mlx_hf_dir(
     safetensor_paths: &[PathBuf],
     has_index: bool,
 ) -> Result<(), String> {
-    let config = read_json_object(&path.join("config.json"), "config.json")?;
+    let config = read_contained_json_object(path, &path.join("config.json"), "config.json")?;
     let has_model_type = config
         .get("model_type")
         .and_then(serde_json::Value::as_str)
@@ -463,10 +463,23 @@ fn validate_mlx_hf_dir(
         return Err("config.json has no model_type or architecture identity".to_string());
     }
 
-    read_json_object(&path.join("tokenizer_config.json"), "tokenizer_config.json")?;
-    let has_tokenizer = ["tokenizer.json", "tokenizer.model", "spiece.model"]
-        .into_iter()
-        .any(|name| nonempty_file(&path.join(name)));
+    read_contained_json_object(
+        path,
+        &path.join("tokenizer_config.json"),
+        "tokenizer_config.json",
+    )?;
+    let mut has_tokenizer = false;
+    for name in ["tokenizer.json", "tokenizer.model", "spiece.model"] {
+        let tokenizer = path.join(name);
+        match std::fs::symlink_metadata(&tokenizer) {
+            Ok(_) => {
+                validate_contained_regular_file(path, &tokenizer, name)?;
+                has_tokenizer = true;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("inspect {name}: {error}")),
+        }
+    }
     if !has_tokenizer {
         return Err("no non-empty tokenizer artifact found".to_string());
     }
@@ -474,14 +487,8 @@ fn validate_mlx_hf_dir(
     if safetensor_paths.is_empty() {
         return Err("no safetensors weights found".to_string());
     }
-    if let Some(empty) = safetensor_paths
-        .iter()
-        .find(|weight| !nonempty_file(weight))
-    {
-        return Err(format!(
-            "weight file is missing or empty: {}",
-            empty.display()
-        ));
+    for weight in safetensor_paths {
+        validate_contained_regular_file(path, weight, "safetensors weight")?;
     }
 
     if has_index {
@@ -490,7 +497,12 @@ fn validate_mlx_hf_dir(
     Ok(())
 }
 
-fn read_json_object(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+fn read_contained_json_object(
+    model_root: &Path,
+    path: &Path,
+    label: &str,
+) -> Result<serde_json::Value, String> {
+    validate_contained_regular_file(model_root, path, label)?;
     let bytes = std::fs::read(path).map_err(|e| format!("read {label}: {e}"))?;
     let value: serde_json::Value =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {label}: {e}"))?;
@@ -500,14 +512,44 @@ fn read_json_object(path: &Path, label: &str) -> Result<serde_json::Value, Strin
     Ok(value)
 }
 
-fn nonempty_file(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+/// Require a model artifact to be a non-empty regular file whose final path is
+/// not a symlink and whose canonical target remains under the canonical model
+/// root. `metadata` and `Path::is_file` follow symlinks, so neither is a safe
+/// containment check by itself.
+fn validate_contained_regular_file(
+    model_root: &Path,
+    candidate: &Path,
+    label: &str,
+) -> Result<PathBuf, String> {
+    let canonical_root =
+        std::fs::canonicalize(model_root).map_err(|e| format!("canonicalize model root: {e}"))?;
+    let metadata = std::fs::symlink_metadata(candidate)
+        .map_err(|e| format!("inspect {label} {}: {e}", candidate.display()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(format!("{label} is a symlink: {}", candidate.display()));
+    }
+    if !metadata.file_type().is_file() || metadata.len() == 0 {
+        return Err(format!(
+            "{label} is missing, empty, or not a regular file: {}",
+            candidate.display()
+        ));
+    }
+    let canonical_candidate = std::fs::canonicalize(candidate)
+        .map_err(|e| format!("canonicalize {label} {}: {e}", candidate.display()))?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(format!(
+            "{label} escapes model directory: {}",
+            candidate.display()
+        ));
+    }
+    Ok(canonical_candidate)
 }
 
 fn validate_safetensors_index(model_root: &Path) -> Result<(), String> {
     use std::path::Component;
 
-    let index = read_json_object(
+    let index = read_contained_json_object(
+        model_root,
         &model_root.join("model.safetensors.index.json"),
         "model.safetensors.index.json",
     )?;
@@ -516,8 +558,6 @@ fn validate_safetensors_index(model_root: &Path) -> Result<(), String> {
         .and_then(serde_json::Value::as_object)
         .filter(|map| !map.is_empty())
         .ok_or_else(|| "safetensors index has no non-empty weight_map".to_string())?;
-    let canonical_root =
-        std::fs::canonicalize(model_root).map_err(|e| format!("canonicalize model root: {e}"))?;
     let mut shards = std::collections::BTreeSet::new();
     for value in weight_map.values() {
         let relative = value
@@ -548,20 +588,7 @@ fn validate_safetensors_index(model_root: &Path) -> Result<(), String> {
 
     for relative in shards {
         let shard = model_root.join(&relative);
-        if !nonempty_file(&shard) {
-            return Err(format!(
-                "indexed shard is missing or empty: {}",
-                shard.display()
-            ));
-        }
-        let canonical_shard = std::fs::canonicalize(&shard)
-            .map_err(|e| format!("canonicalize indexed shard {}: {e}", shard.display()))?;
-        if !canonical_shard.starts_with(&canonical_root) {
-            return Err(format!(
-                "indexed shard escapes model directory: {}",
-                shard.display()
-            ));
-        }
+        validate_contained_regular_file(model_root, &shard, "indexed shard")?;
     }
     Ok(())
 }
@@ -1102,5 +1129,51 @@ mod tests {
         symlink(&outside, model.join("model.safetensors")).unwrap();
 
         assert!(classify_dir_with_runtime_hint(&model, &[], Some("mlx")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mlx_indexless_repo_rejects_a_symlinked_weight_that_escapes_the_model_dir() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("model");
+        write_valid_mlx_model(&model, false);
+        let outside = temp.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(model.join("model.safetensors")).unwrap();
+        symlink(&outside, model.join("model.safetensors")).unwrap();
+
+        assert!(classify_dir_with_runtime_hint(&model, &[], Some("mlx")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mlx_rejects_symlinked_config_and_tokenizer_artifacts() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        for (artifact, outside_contents) in [
+            ("config.json", br#"{"model_type":"qwen3"}"#.as_slice()),
+            (
+                "tokenizer_config.json",
+                br#"{"tokenizer_class":"Qwen2Tokenizer"}"#.as_slice(),
+            ),
+            ("tokenizer.json", br#"{"version":"1.0"}"#.as_slice()),
+        ] {
+            let model = temp
+                .path()
+                .join(format!("model-{}", artifact.replace('.', "-")));
+            write_valid_mlx_model(&model, false);
+            let outside = temp.path().join(format!("outside-{artifact}"));
+            std::fs::write(&outside, outside_contents).unwrap();
+            std::fs::remove_file(model.join(artifact)).unwrap();
+            symlink(&outside, model.join(artifact)).unwrap();
+
+            assert!(
+                classify_dir_with_runtime_hint(&model, &[], Some("mlx")).is_none(),
+                "symlinked {artifact} must be rejected"
+            );
+        }
     }
 }

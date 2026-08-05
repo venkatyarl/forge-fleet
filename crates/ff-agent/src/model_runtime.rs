@@ -1170,16 +1170,38 @@ async fn load_model_with_authority(
         ),
     )
     .await
-    .and_then(|result| result.map_err(|_| "startup health check failed"));
+    .map_err(str::to_string)
+    .and_then(|result| result);
     if let Err(startup_error) = health {
         // Never signal from a stale observation. cleanup_launched_process
         // rechecks the exact PID incarnation and confirms its termination.
         launch_guard.cleanup_now().await;
         release_reservation = false;
-        return Err(format!(
+        let message = format!(
             "refusing to activate {worker_name}:{port} after {}ms: {startup_error}",
             startup_started.elapsed().as_millis()
-        ));
+        );
+        if runtime_label == "mlx" {
+            log_model_error(
+                pool,
+                &worker_name,
+                None,
+                Some(&lib.id),
+                Some(&lib.catalog_id),
+                runtime_label,
+                ModelErrorKind::Startup,
+                &message,
+                serde_json::json!({
+                    "port": port,
+                    "phase": "health_and_generation_readiness",
+                    "model_path": launched_model_path,
+                    "error": startup_error,
+                }),
+                tail_log_file(&log_path, 16_384).as_deref(),
+            )
+            .await;
+        }
+        return Err(message);
     }
 
     // Record the parallel slot count so the data plane can compute
@@ -1970,31 +1992,63 @@ fn llama_server_binary() -> String {
 /// Resolve the MLX HTTP launcher without assuming pip installed its console
 /// script into the current process's PATH.
 ///
-/// Prefer the historical `mlx_lm.server` entrypoint when present. A regular
-/// user-site install may expose the Python package without placing that script
-/// on PATH (the layout observed on Ace); in that case `python3 -m
-/// mlx_lm.server` is the same server and retains the command-line identity the
-/// process reconciler already recognises. Missing both launchers is reported
-/// before spawn with a stable error code.
+/// Prefer the ForgeFleet-owned production venv so a known-bad user/global MLX
+/// package cannot win through PATH. The historical standalone entrypoint is a
+/// compatibility fallback. An unversioned `python3 -m mlx_lm.server` fallback
+/// is disabled unless the operator explicitly opts in; Ace's global Python is
+/// known to resolve an older package that passes health but fails generation.
 fn mlx_server_launcher() -> Result<(String, Vec<String>), String> {
+    let production = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .map(|home| home.join(".forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server"))
+        .filter(|candidate| is_regular_executable(candidate))
+        .map(|candidate| candidate.to_string_lossy().to_string());
+    let allow_unversioned_python =
+        std::env::var("FF_MLX_ALLOW_UNVERSIONED_PYTHON").as_deref() == Ok("1");
     resolve_mlx_server_launcher(
+        production,
         crate::cli_executor::which_on_path("mlx_lm.server"),
         crate::cli_executor::which_on_path("python3"),
+        allow_unversioned_python,
     )
 }
 
+fn is_regular_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 fn resolve_mlx_server_launcher(
+    production: Option<String>,
     standalone: Option<String>,
     python3: Option<String>,
+    allow_unversioned_python: bool,
 ) -> Result<(String, Vec<String>), String> {
+    if let Some(program) = production {
+        return Ok((program, Vec::new()));
+    }
     if let Some(program) = standalone {
         return Ok((program, Vec::new()));
     }
-    if let Some(program) = python3 {
+    if allow_unversioned_python && let Some(program) = python3 {
         return Ok((program, vec!["-m".to_string(), "mlx_lm.server".to_string()]));
     }
     Err(
-        "MLX_LAUNCHER_NOT_FOUND: neither mlx_lm.server nor python3 is available in PATH or known binary directories"
+        "MLX_LAUNCHER_NOT_FOUND: install an executable at ~/.forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server or provide mlx_lm.server on PATH; unversioned python3 fallback requires FF_MLX_ALLOW_UNVERSIONED_PYTHON=1"
             .to_string(),
     )
 }
@@ -2061,6 +2115,19 @@ async fn wait_for_startup_health(
         // connection refusal are deliberately transient until the deadline.
         if probe_health(runtime, port, std::time::Duration::from_secs(2), client).await {
             inspect_listener_identity(port, pid, start, model_path).await?;
+            if runtime == "mlx" {
+                probe_mlx_generation_readiness(
+                    port,
+                    model_path,
+                    std::time::Duration::from_secs(20),
+                    client,
+                )
+                .await?;
+                // The generation path can expose a runtime failure that the
+                // metadata endpoint cannot. Recheck the exact process and
+                // listener after the completed response before activation.
+                inspect_listener_identity(port, pid, start, model_path).await?;
+            }
             return classify_startup_observation(
                 started.elapsed(),
                 timeout,
@@ -2077,6 +2144,76 @@ async fn wait_for_startup_health(
         }
         tokio::time::sleep(STARTUP_PROBE_INTERVAL.min(deadline.saturating_duration_since(now)))
             .await;
+    }
+}
+
+/// MLX readiness requires one bounded, non-streaming generation. MLX-LM can
+/// return 200 from `/v1/models` while its generation worker is broken, so
+/// metadata health alone is insufficient evidence for activation.
+async fn probe_mlx_generation_readiness(
+    port: u16,
+    model_path: &str,
+    timeout: std::time::Duration,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let request = client.post(&url).json(&serde_json::json!({
+        "model": model_path,
+        "messages": [{"role": "user", "content": "Reply with one short word."}],
+        "max_tokens": 16,
+        "temperature": 0,
+        "stream": false,
+    }));
+    let (status, body) = tokio::time::timeout(timeout, async {
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "MLX_GENERATION_READINESS_TIMEOUT: no complete response within {}s",
+            timeout.as_secs()
+        )
+    })?
+    .map_err(|error| format!("MLX_GENERATION_READINESS_HTTP: {error}"))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "MLX_GENERATION_READINESS_STATUS: HTTP {}",
+            status.as_u16()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("MLX_GENERATION_READINESS_BODY: {error}"))?;
+    classify_mlx_generation_response(&value).map_err(str::to_string)
+}
+
+fn classify_mlx_generation_response(value: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return Err("MLX_GENERATION_READINESS_BODY: missing choices array");
+    };
+    let complete = choices.iter().any(|choice| {
+        let Some(message) = choice.get("message").and_then(serde_json::Value::as_object) else {
+            return false;
+        };
+        let has_generated_text = ["content", "reasoning_content"].into_iter().any(|field| {
+            message
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        });
+        let has_finish_reason = choice
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| !reason.is_empty());
+        has_generated_text && has_finish_reason
+    });
+    if complete {
+        Ok(())
+    } else {
+        Err("MLX_GENERATION_READINESS_BODY: no complete generated choice")
     }
 }
 
@@ -3390,10 +3527,29 @@ mod tests {
     }
 
     #[test]
-    fn mlx_launcher_prefers_the_existing_console_entrypoint() {
+    fn mlx_launcher_prefers_the_production_venv_over_path() {
         let resolved = resolve_mlx_server_launcher(
+            Some("/Users/ace/.forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server".to_string()),
             Some("/opt/mlx/bin/mlx_lm.server".to_string()),
             Some("/usr/bin/python3".to_string()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.0,
+            "/Users/ace/.forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server"
+        );
+        assert!(resolved.1.is_empty());
+    }
+
+    #[test]
+    fn mlx_launcher_prefers_the_existing_console_entrypoint() {
+        let resolved = resolve_mlx_server_launcher(
+            None,
+            Some("/opt/mlx/bin/mlx_lm.server".to_string()),
+            Some("/usr/bin/python3".to_string()),
+            true,
         )
         .unwrap();
 
@@ -3402,10 +3558,12 @@ mod tests {
     }
 
     #[test]
-    fn mlx_launcher_falls_back_to_the_importable_python_module() {
-        let resolved =
-            resolve_mlx_server_launcher(None, Some("/opt/homebrew/bin/python3".to_string()))
-                .unwrap();
+    fn mlx_launcher_only_uses_unversioned_python_after_explicit_opt_in() {
+        let python = Some("/opt/homebrew/bin/python3".to_string());
+        let denied = resolve_mlx_server_launcher(None, None, python.clone(), false).unwrap_err();
+        assert!(denied.starts_with("MLX_LAUNCHER_NOT_FOUND:"));
+
+        let resolved = resolve_mlx_server_launcher(None, None, python, true).unwrap();
 
         assert_eq!(resolved.0, "/opt/homebrew/bin/python3");
         assert_eq!(resolved.1, ["-m", "mlx_lm.server"]);
@@ -3413,9 +3571,57 @@ mod tests {
 
     #[test]
     fn mlx_launcher_fails_before_spawn_when_no_launcher_exists() {
-        let error = resolve_mlx_server_launcher(None, None).unwrap_err();
+        let error = resolve_mlx_server_launcher(None, None, None, false).unwrap_err();
 
         assert!(error.starts_with("MLX_LAUNCHER_NOT_FOUND:"));
+    }
+
+    #[test]
+    fn mlx_generation_readiness_requires_a_complete_generated_choice() {
+        let content = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "Ready"},
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(classify_mlx_generation_response(&content), Ok(()));
+
+        let reasoning = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "", "reasoning_content": "Thinking"},
+                "finish_reason": "length"
+            }]
+        });
+        assert_eq!(classify_mlx_generation_response(&reasoning), Ok(()));
+
+        for invalid in [
+            serde_json::json!({"choices": []}),
+            serde_json::json!({"choices": [{"message": {"content": "Ready"}}]}),
+            serde_json::json!({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}),
+            serde_json::json!({"error": {"message": "generation failed"}}),
+        ] {
+            assert!(classify_mlx_generation_response(&invalid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mlx_production_launcher_must_be_a_regular_executable() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("mlx_lm.server");
+        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        assert!(!is_regular_executable(&launcher));
+
+        let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&launcher, permissions).unwrap();
+        assert!(is_regular_executable(&launcher));
+
+        let link = temp.path().join("linked-mlx_lm.server");
+        symlink(&launcher, &link).unwrap();
+        assert!(!is_regular_executable(&link));
     }
 
     #[test]
