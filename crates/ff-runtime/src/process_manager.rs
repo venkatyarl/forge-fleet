@@ -1078,13 +1078,11 @@ fn open_authoritative_file(
                 reason: "file is group- or world-writable".into(),
             });
         }
-        if metadata.permissions().mode() & 0o111 == 0 {
-            if executable {
-                return Err(LlamaRuntimePolicyError::Artifact {
-                    path: path.to_path_buf(),
-                    reason: "regular file is not executable".into(),
-                });
-            }
+        if metadata.permissions().mode() & 0o111 == 0 && executable {
+            return Err(LlamaRuntimePolicyError::Artifact {
+                path: path.to_path_buf(),
+                reason: "regular file is not executable".into(),
+            });
         }
     }
     #[cfg(not(unix))]

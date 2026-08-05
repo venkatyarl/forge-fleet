@@ -58,7 +58,6 @@ pub fn enrich_ip(ip: &mut Ip, _my_computer_name: &str) {
         ip.kind = kind;
         ip.paired_with = None;
         ip.link_speed_gbps = link_speed_gbps(&ip.iface);
-        return;
     }
     // Thunderbolt classification is retained, but peer identity is not guessed.
 }

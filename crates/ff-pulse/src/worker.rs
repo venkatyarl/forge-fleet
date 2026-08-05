@@ -17,7 +17,7 @@ pub struct Worker<T> {
 impl<T: Clone> Worker<T> {
     /// Create a worker that owns `slot_count` slots, all initialized to `value`.
     pub fn new(slot_count: usize, value: T) -> Self {
-        Self::from_values(std::iter::repeat(value).take(slot_count))
+        Self::from_values(std::iter::repeat_n(value, slot_count))
     }
 }
 
@@ -69,13 +69,13 @@ impl<T> Deref for SlotGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        &*self.guard
+        &self.guard
     }
 }
 
 impl<T> DerefMut for SlotGuard<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut *self.guard
+        &mut self.guard
     }
 }
 

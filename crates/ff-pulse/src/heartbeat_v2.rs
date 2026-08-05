@@ -913,9 +913,7 @@ fn classify_linux_gpu_probe_results(
 ) -> &'static str {
     if nvidia_smi_ok {
         "nvidia_cuda"
-    } else if rocm_smi_ok {
-        "amd_rocm"
-    } else if rocminfo_output.is_some_and(rocminfo_reports_gpu) {
+    } else if rocm_smi_ok || rocminfo_output.is_some_and(rocminfo_reports_gpu) {
         "amd_rocm"
     } else {
         "none"
