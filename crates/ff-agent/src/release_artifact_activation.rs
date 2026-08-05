@@ -2494,7 +2494,7 @@ fn open_new_file_at(parent: RawFd, name: &OsStr, mode: libc::mode_t) -> Result<O
             parent,
             name.as_ptr(),
             libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
+            mode as libc::c_uint,
         )
     };
     if raw < 0 {
