@@ -34,10 +34,13 @@ const MESH_PERSIST_MAX_IN_FLIGHT: usize = 8;
 const MESH_PERSIST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MESH_PERSIST_GLOBAL_TIMEOUT: Duration = Duration::from_secs(45);
 const MESH_DB_STEP_TIMEOUT: Duration = Duration::from_secs(10);
+const MESH_CHILD_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const MESH_PROCESS_GROUP_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 const FULL_MESH_OPERATION_DEADLINE: Duration = Duration::from_secs(260);
 const MESH_OPERATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const MESH_SCAN_DEADLINE_ERROR: &str = "mesh scan deadline exceeded before probe completed";
 const MESH_OPERATION_CANCELLED_ERROR: &str = "mesh operation cancelled";
+const MESH_PROCESS_CLEANUP_ERROR_PREFIX: &str = "mesh process cleanup failed: ";
 const MESH_SCAN_BUSY_ERROR: &str = "an SSH mesh scan is already in progress";
 const MESH_SCAN_FENCE_SQL: &str = "SELECT pg_try_advisory_xact_lock($1)";
 // Stable, repository-owned namespace for the single fleet-wide scan fence.
@@ -534,13 +537,14 @@ where
             match timeout(MESH_OPERATION_CLEANUP_TIMEOUT, &mut task).await {
                 Ok(joined) => joined,
                 Err(_) => {
-                    // Return to the daemon before its 300-second watchdog, but
-                    // detach (do not abort) the process-owning task. It keeps
-                    // the cancellation token and must finish its direct-child
-                    // wait/reap even if kernel cleanup takes unusually long.
-                    // Aborting here would turn a bounded error into a leaked
-                    // child/process group.
-                    drop(task);
+                    // Every command cleanup path is independently bounded
+                    // below this budget. If the owner still has not exited,
+                    // abort and join it so its advisory transaction and pooled
+                    // connection are dropped before the daemon tick returns.
+                    // The operation reports an error; it never declares a
+                    // partially-cleaned process tree successful.
+                    task.abort();
+                    let _ = task.await;
                     cancel_on_drop.disarm();
                     return Err(format!(
                         "{label} exceeded its full deadline and cleanup timeout"
@@ -966,6 +970,13 @@ async fn pairwise_ssh_check_inner(
         },
     )
     .await;
+    if let Some(error) = schedule.cells.iter().find_map(|cell| {
+        cell.last_error
+            .as_deref()
+            .filter(|error| is_mesh_process_cleanup_error(error))
+    }) {
+        return Err(error.to_string());
+    }
     let persistable: Vec<MeshCell> = schedule
         .cells
         .iter()
@@ -1000,6 +1011,14 @@ enum CommandOutcome {
     Cancelled,
 }
 
+fn mesh_process_cleanup_error(error: std::io::Error) -> std::io::Error {
+    std::io::Error::other(format!("{MESH_PROCESS_CLEANUP_ERROR_PREFIX}{error}"))
+}
+
+fn is_mesh_process_cleanup_error(error: &str) -> bool {
+    error.contains(MESH_PROCESS_CLEANUP_ERROR_PREFIX)
+}
+
 #[cfg(unix)]
 fn process_group_exists(pid: u32) -> bool {
     // SAFETY: signal 0 does not mutate the process group; it only performs the
@@ -1010,17 +1029,59 @@ fn process_group_exists(pid: u32) -> bool {
 }
 
 #[cfg(unix)]
-async fn wait_for_process_group_exit(pid: u32) {
-    while process_group_exists(pid) {
-        // Do not turn a slow init/subreaper into false cleanup success. The
-        // process-owning task keeps waiting after the outer 280-second
-        // operation budget returns an error to the daemon.
-        tokio::time::sleep(Duration::from_millis(10)).await;
+async fn wait_for_process_group_exit(pid: u32) -> std::io::Result<()> {
+    wait_for_process_group_exit_with(pid, MESH_PROCESS_GROUP_EXIT_TIMEOUT, process_group_exists)
+        .await
+}
+
+async fn wait_for_process_group_exit_with<F>(
+    pid: u32,
+    limit: Duration,
+    mut group_exists: F,
+) -> std::io::Result<()>
+where
+    F: FnMut(u32) -> bool,
+{
+    let deadline = Instant::now() + limit;
+    loop {
+        if !group_exists(pid) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "mesh process group {pid} remained visible after SIGKILL; system PID 1/subreaper did not clear all descendants within {limit:?}"
+                ),
+            ));
+        }
+        tokio::time::sleep_until((Instant::now() + Duration::from_millis(10)).min(deadline)).await;
     }
 }
 
 #[cfg(not(unix))]
-async fn wait_for_process_group_exit(_pid: u32) {}
+async fn wait_for_process_group_exit(_pid: u32) -> std::io::Result<()> {
+    Ok(())
+}
+
+async fn finish_child_and_process_group<C, G>(child_wait: C, group_wait: G) -> std::io::Result<()>
+where
+    C: Future<Output = std::io::Result<()>>,
+    G: Future<Output = std::io::Result<()>>,
+{
+    // Do not use `?` on the child wait: the group check must run even when
+    // wait(2) itself errors, otherwise descendants can escape cleanup.
+    let child_result = child_wait.await;
+    let group_result = group_wait.await;
+    match (child_result, group_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(child), Ok(())) => Err(child),
+        (Ok(()), Err(group)) => Err(group),
+        (Err(child), Err(group)) => Err(std::io::Error::other(format!(
+            "direct child cleanup failed: {child}; process group cleanup failed: {group}"
+        ))),
+    }
+}
 
 async fn terminate_and_reap_child(
     child: &mut tokio::process::Child,
@@ -1035,16 +1096,24 @@ async fn terminate_and_reap_child(
         warn!(%error, "mesh command child could not be killed");
     }
 
-    // Once SIGKILL has been sent, waiting for this direct child is not an
-    // optional/best-effort cleanup step. Returning before wait(2) observes it
-    // would leak a zombie. The enclosing operation retains its independent
-    // 300-second watchdog contract; under Unix a SIGKILLed child cannot keep
-    // executing or ignore termination.
-    child.wait().await?;
-    if let Some(pid) = pid {
-        wait_for_process_group_exit(pid).await;
-    }
-    Ok(())
+    let child_wait = async {
+        timeout(MESH_CHILD_WAIT_TIMEOUT, child.wait())
+            .await
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "mesh direct child did not reap after SIGKILL",
+                )
+            })??;
+        Ok(())
+    };
+    let group_wait = async {
+        match pid {
+            Some(pid) => wait_for_process_group_exit(pid).await,
+            None => Ok(()),
+        }
+    };
+    finish_child_and_process_group(child_wait, group_wait).await
 }
 
 /// Run one SSH process with cancellation that owns the process lifecycle.
@@ -1072,14 +1141,18 @@ async fn output_with_hard_timeout(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            terminate_and_reap_child(&mut child, pid).await?;
+            terminate_and_reap_child(&mut child, pid)
+                .await
+                .map_err(mesh_process_cleanup_error)?;
             return Err(std::io::Error::other("SSH stdout pipe unavailable"));
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            terminate_and_reap_child(&mut child, pid).await?;
+            terminate_and_reap_child(&mut child, pid)
+                .await
+                .map_err(mesh_process_cleanup_error)?;
             return Err(std::io::Error::other("SSH stderr pipe unavailable"));
         }
     };
@@ -1118,15 +1191,21 @@ async fn output_with_hard_timeout(
     match wait_outcome {
         WaitOutcome::Completed(Ok(output)) => Ok(CommandOutcome::Completed(output)),
         WaitOutcome::Completed(Err(error)) => {
-            terminate_and_reap_child(&mut child, pid).await?;
+            terminate_and_reap_child(&mut child, pid)
+                .await
+                .map_err(mesh_process_cleanup_error)?;
             Err(error)
         }
         WaitOutcome::TimedOut => {
-            terminate_and_reap_child(&mut child, pid).await?;
+            terminate_and_reap_child(&mut child, pid)
+                .await
+                .map_err(mesh_process_cleanup_error)?;
             Ok(CommandOutcome::TimedOut)
         }
         WaitOutcome::Cancelled => {
-            terminate_and_reap_child(&mut child, pid).await?;
+            terminate_and_reap_child(&mut child, pid)
+                .await
+                .map_err(mesh_process_cleanup_error)?;
             Ok(CommandOutcome::Cancelled)
         }
     }
@@ -1162,6 +1241,18 @@ async fn probe_pair(
     let probe_cancellation = cancellation.clone();
     let result = output_with_hard_timeout(command, MESH_SSH_PROBE_TIMEOUT, cancellation).await;
     if probe_cancellation.is_cancelled() {
+        if let Err(error) = &result
+            && is_mesh_process_cleanup_error(&error.to_string())
+        {
+            return MeshCell {
+                ping_ok: None,
+                ssh_ok: false,
+                src,
+                dst,
+                status: "failed".into(),
+                last_error: Some(error.to_string()),
+            };
+        }
         return MeshCell {
             ping_ok: None,
             ssh_ok: false,
@@ -1322,14 +1413,14 @@ async fn local_reach_check_scoped_inner(
             cancellation.child_token(),
         ));
         if futs.len() >= 8
-            && let Some(p) = futs.next().await
-            && let Some(p) = p
+            && let Some(result) = futs.next().await
+            && let Some(p) = result?
         {
             probes.push(p);
         }
     }
-    while let Some(p) = futs.next().await {
-        if let Some(p) = p {
+    while let Some(result) = futs.next().await {
+        if let Some(p) = result? {
             probes.push(p);
         }
     }
@@ -1361,7 +1452,7 @@ async fn probe_direct(
     dst_user: String,
     dst_ip: String,
     cancellation: CancellationToken,
-) -> Option<LocalProbe> {
+) -> Result<Option<LocalProbe>, String> {
     // macOS ping -W is milliseconds; Linux is seconds.
     let ping_wait: &str = if cfg!(target_os = "macos") {
         "2000"
@@ -1370,13 +1461,25 @@ async fn probe_direct(
     };
     let mut ping = Command::new("ping");
     ping.args(["-c", "1", "-W", ping_wait, &dst_ip]);
-    let ping_ok = matches!(
-        output_with_hard_timeout(ping, Duration::from_secs(4), cancellation.child_token()).await,
-        Ok(CommandOutcome::Completed(out)) if out.status.success()
-    );
+    let ping_result =
+        output_with_hard_timeout(ping, Duration::from_secs(4), cancellation.child_token()).await;
     if cancellation.is_cancelled() {
-        return None;
+        if let Err(error) = &ping_result
+            && is_mesh_process_cleanup_error(&error.to_string())
+        {
+            return Err(error.to_string());
+        }
+        return Ok(None);
     }
+    let ping_ok = match ping_result {
+        Ok(CommandOutcome::Completed(out)) => out.status.success(),
+        Ok(CommandOutcome::TimedOut) => false,
+        Ok(CommandOutcome::Cancelled) => return Ok(None),
+        Err(error) if is_mesh_process_cleanup_error(&error.to_string()) => {
+            return Err(error.to_string());
+        }
+        Err(_) => false,
+    };
 
     let mut ssh = Command::new("ssh");
     ssh.args(crate::ssh_opts::ssh_bypass_args()).args([
@@ -1390,7 +1493,12 @@ async fn probe_direct(
     let ssh_res =
         output_with_hard_timeout(ssh, Duration::from_secs(8), cancellation.child_token()).await;
     if cancellation.is_cancelled() {
-        return None;
+        if let Err(error) = &ssh_res
+            && is_mesh_process_cleanup_error(&error.to_string())
+        {
+            return Err(error.to_string());
+        }
+        return Ok(None);
     }
     let ssh_err = match ssh_res {
         Ok(CommandOutcome::Completed(out)) if out.status.success() => None,
@@ -1403,16 +1511,17 @@ async fn probe_direct(
                 .take(120)
                 .collect::<String>()
         )),
+        Err(e) if is_mesh_process_cleanup_error(&e.to_string()) => return Err(e.to_string()),
         Err(e) => Some(format!("spawn: {e}")),
         Ok(CommandOutcome::TimedOut) => Some("timeout".into()),
         // Cancellation is teardown, not a reachability observation. Returning
         // None prevents a synthetic failed cell from ever reaching the
         // persistence layer, even if cancellation races the caller's drain.
-        Ok(CommandOutcome::Cancelled) => return None,
+        Ok(CommandOutcome::Cancelled) => return Ok(None),
     };
     let ssh_ok = ssh_err.is_none();
     let (status, detail) = classify_direct_probe(ping_ok, ssh_err);
-    Some(LocalProbe {
+    Ok(Some(LocalProbe {
         src,
         dst,
         ip: dst_ip,
@@ -1420,7 +1529,7 @@ async fn probe_direct(
         ssh_ok,
         status,
         detail,
-    })
+    }))
 }
 
 /// Fold a ping result + optional SSH failure into the (status, last_error)
@@ -1736,8 +1845,12 @@ async fn mesh_propagate_inner(
                 cells.extend(observed_cells);
             }
             Err(e) => {
-                if cancellation.is_cancelled() {
-                    return Err(MESH_OPERATION_CANCELLED_ERROR.into());
+                if cancellation.is_cancelled() || is_mesh_process_cleanup_error(&e) {
+                    return Err(if is_mesh_process_cleanup_error(&e) {
+                        e
+                    } else {
+                        MESH_OPERATION_CANCELLED_ERROR.into()
+                    });
                 }
                 fail += 1;
                 warn!(peer = %peer.name, %e, "mesh propagation setup failed before directional probes");
@@ -1824,6 +1937,11 @@ async fn propagate_to_peer(
         crate::ssh_opts::SSH_AGENT_BYPASS,
     );
     let peer_to_new = ssh_exec(&peer_dest, &peer_to_new_probe, cancellation.child_token()).await;
+    if let Err(error) = &peer_to_new
+        && is_mesh_process_cleanup_error(error)
+    {
+        return Err(error.clone());
+    }
     if cancellation.is_cancelled() {
         return Err(MESH_OPERATION_CANCELLED_ERROR.into());
     }
@@ -1840,6 +1958,11 @@ async fn propagate_to_peer(
         peer.ip,
     );
     let new_to_peer = ssh_exec(&new_dest, &new_to_peer_probe, cancellation.child_token()).await;
+    if let Err(error) = &new_to_peer
+        && is_mesh_process_cleanup_error(error)
+    {
+        return Err(error.clone());
+    }
     if cancellation.is_cancelled() {
         return Err(MESH_OPERATION_CANCELLED_ERROR.into());
     }
@@ -1968,10 +2091,20 @@ async fn probe_single_pair_inner(
         cancellation.child_token(),
     )
     .await;
-    if cell.last_error.as_deref() == Some(MESH_SCAN_DEADLINE_ERROR) {
-        return Err(MESH_OPERATION_CANCELLED_ERROR.into());
-    }
+    let cell = validate_single_pair_cell_for_persistence(cell)?;
     persist_mesh_cells(pool, vec![cell.clone()], cancellation).await?;
+    Ok(cell)
+}
+
+fn validate_single_pair_cell_for_persistence(cell: MeshCell) -> Result<MeshCell, String> {
+    if let Some(error) = cell.last_error.as_deref() {
+        if is_mesh_process_cleanup_error(error) {
+            return Err(error.to_string());
+        }
+        if error == MESH_SCAN_DEADLINE_ERROR {
+            return Err(MESH_OPERATION_CANCELLED_ERROR.into());
+        }
+    }
     Ok(cell)
 }
 
@@ -2795,13 +2928,32 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn cleanup_timeout_returns_error_but_does_not_abort_cleanup_owner() {
-        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+    async fn cleanup_timeout_aborts_owner_releases_fence_and_prevents_late_writes() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct ReleaseOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let late_write = Arc::new(AtomicBool::new(false));
+        let operation_late_write = Arc::clone(&late_write);
         let started = Instant::now();
         let error = run_owned_mesh_operation("slow cleanup", move |cancellation| async move {
+            // Models the transaction/advisory-fence owner held by every real
+            // mesh entrypoint. Abort must drop it before the outer call ends.
+            let _fence_owner = ReleaseOnDrop(Some(released_tx));
             cancellation.cancelled().await;
             tokio::time::sleep(MESH_OPERATION_CLEANUP_TIMEOUT + Duration::from_secs(1)).await;
-            let _ = cleanup_tx.send(());
+            operation_late_write.store(true, Ordering::SeqCst);
             Ok::<(), String>(())
         })
         .await
@@ -2812,10 +2964,61 @@ mod tests {
             Instant::now().duration_since(started),
             FULL_MESH_OPERATION_DEADLINE + MESH_OPERATION_CLEANUP_TIMEOUT
         );
-        timeout(Duration::from_secs(2), cleanup_rx)
+        timeout(Duration::from_secs(1), released_rx)
             .await
-            .expect("detached cleanup owner continued after the bounded error")
-            .expect("cleanup owner retained its resources");
+            .expect("aborted owner released its fence/pool guard")
+            .expect("fence/pool guard sender survived until drop");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            !late_write.load(Ordering::SeqCst),
+            "aborted mesh owner performed a late persistence write"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanently_visible_process_group_returns_bounded_error() {
+        let started = Instant::now();
+        let error =
+            wait_for_process_group_exit_with(4242, MESH_PROCESS_GROUP_EXIT_TIMEOUT, |_pid| true)
+                .await
+                .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("PID 1/subreaper"));
+        assert_eq!(
+            Instant::now().duration_since(started),
+            MESH_PROCESS_GROUP_EXIT_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn process_group_check_runs_even_when_direct_child_wait_errors() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        let group_checked = Arc::new(AtomicBool::new(false));
+        let group_checked_in_future = Arc::clone(&group_checked);
+        let error = finish_child_and_process_group(
+            async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "synthetic wait(2) error",
+                ))
+            },
+            async move {
+                group_checked_in_future.store(true, Ordering::SeqCst);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "synthetic visible group",
+                ))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(group_checked.load(Ordering::SeqCst));
+        assert!(error.to_string().contains("direct child cleanup failed"));
+        assert!(error.to_string().contains("process group cleanup failed"));
     }
 
     #[test]
@@ -2823,6 +3026,10 @@ mod tests {
         assert!(
             FULL_MESH_OPERATION_DEADLINE + MESH_OPERATION_CLEANUP_TIMEOUT
                 < crate::daemon::WATCHDOG_TIMEOUT
+        );
+        assert!(
+            MESH_CHILD_WAIT_TIMEOUT + MESH_PROCESS_GROUP_EXIT_TIMEOUT
+                < MESH_OPERATION_CLEANUP_TIMEOUT
         );
         assert!(PAIRWISE_MESH_SCAN_DEADLINE < FULL_MESH_OPERATION_DEADLINE);
     }
@@ -2868,8 +3075,29 @@ mod tests {
             "192.0.2.1".into(),
             cancellation,
         )
-        .await;
+        .await
+        .expect("cancellation without a spawned child has no cleanup error");
         assert!(probe.is_none());
+    }
+
+    #[test]
+    fn single_pair_retry_rejects_process_cleanup_failure_before_persistence() {
+        let cell = scheduled_test_cell(
+            scheduled_test_probe("a", "b"),
+            "failed",
+            Some("spawn: mesh process cleanup failed: process group remained visible"),
+            Some(true),
+        );
+        let error = validate_single_pair_cell_for_persistence(cell).unwrap_err();
+        assert!(is_mesh_process_cleanup_error(&error));
+
+        let ordinary_failure = scheduled_test_cell(
+            scheduled_test_probe("a", "b"),
+            "failed",
+            Some("exit 255: connection refused"),
+            Some(true),
+        );
+        assert!(validate_single_pair_cell_for_persistence(ordinary_failure).is_ok());
     }
 
     #[test]
