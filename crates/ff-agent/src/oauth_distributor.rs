@@ -13,8 +13,8 @@
 //! 3. **Status**: reports per-provider whether the token is present,
 //!    decoded expiry, and last refresh time.
 //! 4. **RefreshWatch**: long-lived loop that polls the leader's cred files
-//!    every `REFRESH_POLL_SECS` and re-imports + redistributes whenever
-//!    the file's mtime changes (new token from a vendor refresh).
+//!    every `REFRESH_POLL_SECS` and re-imports whenever the file's mtime
+//!    changes. Distribution always requires an explicit target list.
 //!
 //! Layer 1 (`cloud_llm.rs::try_route_to_cloud`) reads
 //! `fleet_secrets[<provider>.oauth_token]` for the `oauth_subscription`
@@ -25,19 +25,23 @@
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, SecondsFormat, Utc};
+use futures::future::try_join_all;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Row, Transaction};
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 use std::path::{Component, PathBuf};
 use std::time::{Duration, SystemTime};
 #[cfg(unix)]
 use std::{
     ffi::CString,
     fs::File,
-    io::Write,
+    io::{Read, Write},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::ffi::OsStrExt,
+        unix::fs::MetadataExt,
     },
 };
 use tokio::sync::watch;
@@ -45,12 +49,37 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::task_runner::{
-    EnqueueOnceOutcome, pg_enqueue_oauth_credential_install_once, pg_enqueue_shell_task_once,
+    EnqueueOnceOutcome, pg_enqueue_oauth_credential_install_once_tx, pg_enqueue_shell_task_once,
 };
 
 const OAUTH_CREDENTIAL_INSTALL_OPERATION: &str = "install_oauth_credentials";
 const OAUTH_CREDENTIAL_INSTALL_VERSION: u8 = 1;
 const MAX_CREDENTIAL_DOCUMENT_BYTES: usize = 1024 * 1024;
+const OAUTH_LEADER_FRESHNESS_SECS: i64 = 45;
+const OAUTH_TARGET_FRESHNESS_SECS: i64 = 180;
+const OAUTH_TARGET_HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+const OAUTH_CREDENTIAL_SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+const OAUTH_AUTHORITY_XACT_LOCK_KEY: i64 = 0x4646_4f41_5554_4801;
+
+#[derive(Debug, Clone)]
+struct OauthLeaderAuthority {
+    computer_id: uuid::Uuid,
+    member_name: String,
+    epoch: i64,
+}
+
+#[derive(Debug, Clone)]
+struct OauthTarget {
+    computer_id: uuid::Uuid,
+    name: String,
+    primary_ip: IpAddr,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct GatewayPortAuthority {
+    port: u16,
+    updated_at: DateTime<Utc>,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -257,6 +286,223 @@ pub async fn oauth_distribution_enabled(pool: &PgPool) -> bool {
     )
 }
 
+fn require_locked_oauth_distribution_gate(
+    row: Option<(String, Option<DateTime<Utc>>, DateTime<Utc>)>,
+) -> Result<()> {
+    let (value, expires_at, database_now) = row.ok_or_else(|| {
+        anyhow!("OAuth distribution gate authority is missing; refusing batch commit")
+    })?;
+    let enabled = matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on" | "enabled"
+    );
+    let restored = !enabled
+        && expires_at.is_some_and(|expires_at| expires_at < database_now)
+        && OAUTH_DISTRIBUTION_RESTORE_ON_EXPIRY;
+    if !enabled && !restored {
+        anyhow::bail!("OAuth distribution was disabled during target preflight");
+    }
+    Ok(())
+}
+
+async fn lock_oauth_distribution_gate_for_commit(tx: &mut Transaction<'_, Postgres>) -> Result<()> {
+    let row: Option<(String, Option<DateTime<Utc>>, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT value, expires_at, clock_timestamp()
+           FROM fleet_secrets
+          WHERE key = 'oauth_distribution_enabled'
+          FOR SHARE",
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .context("lock OAuth distribution gate for commit")?;
+    require_locked_oauth_distribution_gate(row)
+}
+
+fn canonical_oauth_node_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name == name.trim()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn reject_recovery_identity(name: &str) -> Result<()> {
+    if name.eq_ignore_ascii_case("vinny") || name.eq_ignore_ascii_case("taylor") {
+        anyhow::bail!("OAuth credential operations are forbidden for recovery identity `{name}`");
+    }
+    Ok(())
+}
+
+async fn lock_local_oauth_authority(
+    tx: &mut Transaction<'_, Postgres>,
+    local_identity: &crate::fleet_info::LocalComputerIdentity,
+) -> Result<OauthLeaderAuthority> {
+    reject_recovery_identity(&local_identity.name)?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(OAUTH_AUTHORITY_XACT_LOCK_KEY)
+        .execute(&mut **tx)
+        .await
+        .context("lock OAuth authority")?;
+
+    let row = sqlx::query(
+        "SELECT l.computer_id, l.member_name, l.epoch
+           FROM fleet_leader_state l
+           JOIN computers c
+             ON c.id = l.computer_id AND c.name = l.member_name
+           JOIN fleet_workers w
+             ON w.name = c.name AND NULLIF(w.ip, '') = c.primary_ip
+          WHERE l.singleton_key = 'current'
+            AND l.heartbeat_at > clock_timestamp() - make_interval(secs => $1)
+            AND (l.relinquishing_until IS NULL
+                 OR l.relinquishing_until <= clock_timestamp())
+            AND l.computer_id = $2
+            AND l.member_name = $3
+            AND c.enrolled_at IS NOT NULL
+            AND c.status = 'online'
+            AND w.status = 'online'
+        ",
+    )
+    .bind(OAUTH_LEADER_FRESHNESS_SECS)
+    .bind(local_identity.id)
+    .bind(&local_identity.name)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("resolve locked OAuth leader authority")?
+    .ok_or_else(|| {
+        anyhow!("this host is not the fresh, non-relinquishing, canonical OAuth leader")
+    })?;
+
+    let member_name: String = row.try_get("member_name")?;
+    if !canonical_oauth_node_name(&member_name) {
+        anyhow::bail!("elected OAuth leader name is not canonical");
+    }
+    reject_recovery_identity(&member_name)?;
+    Ok(OauthLeaderAuthority {
+        computer_id: row.try_get("computer_id")?,
+        member_name,
+        epoch: row.try_get("epoch")?,
+    })
+}
+
+async fn revalidate_oauth_authority_snapshot(
+    tx: &mut Transaction<'_, Postgres>,
+    authority: &OauthLeaderAuthority,
+) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+               FROM fleet_leader_state l
+               JOIN computers c
+                 ON c.id = l.computer_id AND c.name = l.member_name
+               JOIN fleet_workers w
+                 ON w.name = c.name AND NULLIF(w.ip, '') = c.primary_ip
+              WHERE l.singleton_key = 'current'
+                AND l.computer_id = $1
+                AND l.member_name = $2
+                AND l.epoch = $3
+                AND l.heartbeat_at > clock_timestamp() - make_interval(secs => $4)
+                AND (l.relinquishing_until IS NULL
+                     OR l.relinquishing_until <= clock_timestamp())
+                AND c.enrolled_at IS NOT NULL
+                AND c.status = 'online'
+                AND w.status = 'online'
+         )",
+    )
+    .bind(authority.computer_id)
+    .bind(&authority.member_name)
+    .bind(authority.epoch)
+    .bind(OAUTH_LEADER_FRESHNESS_SECS)
+    .fetch_one(&mut **tx)
+    .await
+    .context("revalidate locked OAuth leader authority")?;
+    if !valid {
+        anyhow::bail!("OAuth leader authority changed before commit");
+    }
+    Ok(())
+}
+
+async fn lock_oauth_authority_for_commit(
+    tx: &mut Transaction<'_, Postgres>,
+    authority: &OauthLeaderAuthority,
+) -> Result<()> {
+    let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        "SELECT l.computer_id
+           FROM fleet_leader_state l
+           JOIN computers c
+             ON c.id = l.computer_id AND c.name = l.member_name
+           JOIN fleet_workers w
+             ON w.name = c.name AND NULLIF(w.ip, '') = c.primary_ip
+          WHERE l.singleton_key = 'current'
+            AND l.computer_id = $1
+            AND l.member_name = $2
+            AND l.epoch = $3
+            AND l.heartbeat_at > clock_timestamp() - make_interval(secs => $4)
+            AND (l.relinquishing_until IS NULL
+                 OR l.relinquishing_until <= clock_timestamp())
+            AND c.enrolled_at IS NOT NULL
+            AND c.status = 'online'
+            AND w.status = 'online'
+          FOR SHARE OF l, c, w",
+    )
+    .bind(authority.computer_id)
+    .bind(&authority.member_name)
+    .bind(authority.epoch)
+    .bind(OAUTH_LEADER_FRESHNESS_SECS)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("lock OAuth leader epoch for commit")?;
+    if row.is_none() {
+        anyhow::bail!("OAuth leader authority changed before commit");
+    }
+    Ok(())
+}
+
+async fn begin_local_oauth_authority(
+    pool: &PgPool,
+) -> Result<(Transaction<'_, Postgres>, OauthLeaderAuthority)> {
+    let local_identity = crate::fleet_info::resolve_this_computer_identity_strict(pool)
+        .await
+        .map_err(anyhow::Error::msg)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin OAuth authority transaction")?;
+    let authority = lock_local_oauth_authority(&mut tx, &local_identity).await?;
+    Ok((tx, authority))
+}
+
+fn normalize_requested_targets(requested: &[String], leader_name: &str) -> Result<Vec<String>> {
+    if requested.is_empty() {
+        anyhow::bail!("at least one explicit --target is required");
+    }
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(requested.len());
+    for target in requested {
+        if !canonical_oauth_node_name(target) {
+            anyhow::bail!("OAuth target `{target}` is not a canonical computer name");
+        }
+        if target.eq_ignore_ascii_case("all") {
+            anyhow::bail!(
+                "OAuth target `all` is forbidden; name every intended computer explicitly"
+            );
+        }
+        reject_recovery_identity(target)?;
+        if target.eq_ignore_ascii_case(leader_name) {
+            anyhow::bail!("OAuth target `{target}` is the current leader");
+        }
+        let folded = target.to_ascii_lowercase();
+        if !seen.insert(folded.clone()) {
+            anyhow::bail!("duplicate OAuth target `{target}`");
+        }
+        normalized.push(folded);
+    }
+    // Stable ordering prevents concurrent batches with the same targets in a
+    // different CLI order from acquiring per-target advisory locks inversely.
+    normalized.sort_unstable();
+    Ok(normalized)
+}
+
 fn oauth_distribute_enqueue_key(
     provider: &str,
     target_id: uuid::Uuid,
@@ -265,8 +511,13 @@ fn oauth_distribute_enqueue_key(
     format!("oauth-distribute:{provider}:{target_id}:{secret_version}")
 }
 
-fn oauth_repush_enqueue_key(provider: &str, leader_id: uuid::Uuid) -> String {
-    format!("oauth-repush:{provider}:{leader_id}")
+fn oauth_repush_enqueue_key(
+    provider: &str,
+    leader_id: uuid::Uuid,
+    leader_epoch: i64,
+    requester_id: uuid::Uuid,
+) -> String {
+    format!("oauth-repush:{provider}:{leader_id}:{leader_epoch}:{requester_id}")
 }
 
 /// Read the password value of a macOS Keychain generic-password entry
@@ -277,17 +528,18 @@ fn oauth_repush_enqueue_key(provider: &str, leader_id: uuid::Uuid) -> String {
 #[cfg(target_os = "macos")]
 async fn keychain_read(service_name: &str) -> Result<Vec<u8>> {
     let user = std::env::var("USER").context("USER env var not set")?;
-    let out = tokio::process::Command::new("security")
-        .args([
-            "find-generic-password",
-            "-s",
-            service_name,
-            "-a",
-            user.as_str(),
-            "-w",
-        ])
-        .output()
+    let mut command = tokio::process::Command::new("security");
+    command.kill_on_drop(true).args([
+        "find-generic-password",
+        "-s",
+        service_name,
+        "-a",
+        user.as_str(),
+        "-w",
+    ]);
+    let out = tokio::time::timeout(OAUTH_CREDENTIAL_SOURCE_TIMEOUT, command.output())
         .await
+        .context("macOS Keychain credential read timed out")?
         .context("spawn security")?;
     if !out.status.success() {
         anyhow::bail!(
@@ -349,6 +601,120 @@ pub struct ProviderStatus {
 /// `distribute_token` (push the cred to followers) so both honor the same
 /// source — otherwise `distribute` reads a file that doesn't exist on a
 /// macOS leader and claude silently fails to fan out.
+#[cfg(unix)]
+fn read_private_credential_file_under(
+    home: &std::path::Path,
+    relative: &std::path::Path,
+) -> Result<Vec<u8>> {
+    let canonical_home = home
+        .canonicalize()
+        .context("resolve local home for OAuth credential read")?;
+    let mut components: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => Err(anyhow!("OAuth credential path escaped the local home")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let file_name = components
+        .pop()
+        .ok_or_else(|| anyhow!("OAuth credential path has no file name"))?;
+
+    let mut directory =
+        File::open(&canonical_home).context("open local home for OAuth credential read")?;
+    verify_private_directory(&directory)?;
+    for component in components {
+        let component = cstring_component(&component)?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("open OAuth credential directory without following links");
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+        verify_private_directory(&directory)?;
+    }
+
+    let file_name = cstring_component(&file_name)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("open OAuth credential document without following links");
+    }
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .context("inspect OAuth credential document")?;
+    let expected_uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > MAX_CREDENTIAL_DOCUMENT_BYTES as u64
+    {
+        anyhow::bail!(
+            "OAuth credential document is not a private, owner-only, single-link regular file"
+        );
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take((MAX_CREDENTIAL_DOCUMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .context("read bounded OAuth credential document")?;
+    if bytes.is_empty() || bytes.len() > MAX_CREDENTIAL_DOCUMENT_BYTES {
+        anyhow::bail!("OAuth credential document has an invalid size");
+    }
+    let after = file
+        .metadata()
+        .context("reinspect OAuth credential document")?;
+    if metadata.dev() != after.dev()
+        || metadata.ino() != after.ino()
+        || metadata.len() != after.len()
+        || bytes.len() as u64 != after.len()
+        || metadata.mtime() != after.mtime()
+        || metadata.mtime_nsec() != after.mtime_nsec()
+        || metadata.ctime() != after.ctime()
+        || metadata.ctime_nsec() != after.ctime_nsec()
+    {
+        anyhow::bail!("OAuth credential document changed while it was being read");
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_private_credential_file(provider: &OauthProvider) -> Result<Vec<u8>> {
+    let home = dirs::home_dir().context("resolve local home for OAuth credential read")?;
+    let relative = credential_relative_path(provider)?;
+    read_private_credential_file_under(&home, &relative)
+}
+
+#[cfg(not(unix))]
+fn read_private_credential_file(provider: &OauthProvider) -> Result<Vec<u8>> {
+    let path = expand_home(provider.cred_path)
+        .ok_or_else(|| anyhow!("provider {} has no credential path", provider.name))?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .context("inspect OAuth credential document without following links")?;
+    if !metadata.is_file()
+        || metadata.len() == 0
+        || metadata.len() > MAX_CREDENTIAL_DOCUMENT_BYTES as u64
+    {
+        anyhow::bail!("OAuth credential document is not a bounded regular file");
+    }
+    std::fs::read(path).context("read OAuth credential document")
+}
+
 async fn read_leader_cred_bytes(provider: &OauthProvider) -> Result<Vec<u8>> {
     let path = expand_home(provider.cred_path).ok_or_else(|| {
         anyhow!(
@@ -366,7 +732,15 @@ async fn read_leader_cred_bytes(provider: &OauthProvider) -> Result<Vec<u8>> {
         return Ok(b);
     }
 
-    tokio::fs::read(&path).await.with_context(|| {
+    let provider_copy = *provider;
+    tokio::time::timeout(
+        OAUTH_CREDENTIAL_SOURCE_TIMEOUT,
+        tokio::task::spawn_blocking(move || read_private_credential_file(&provider_copy)),
+    )
+    .await
+    .context("private OAuth credential read timed out")?
+    .context("join private OAuth credential read")?
+    .with_context(|| {
         let kc = if cfg!(target_os = "macos") && provider.name == "claude" {
             " (also tried macOS Keychain `Claude Code-credentials`)"
         } else {
@@ -440,9 +814,10 @@ fn validate_credential_document(document: &str, provider: &OauthProvider) -> Res
 pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()> {
     let path = expand_home(provider.cred_path)
         .ok_or_else(|| anyhow!("provider {} has no cred_path configured — set the token manually with `ff secrets set {}`", provider.name, provider.secret_key))?;
-
+    let (mut tx, authority) = begin_local_oauth_authority(pool).await?;
+    // The credential source is intentionally not opened until the durable
+    // leader row, epoch, roster projection, and OAuth advisory fence are held.
     let bytes = read_leader_cred_bytes(provider).await?;
-
     let json: Value = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse cred for provider {} as JSON", provider.name))?;
 
@@ -458,20 +833,6 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
             )
         })?;
 
-    ff_db::pg_set_secret(
-        pool,
-        provider.secret_key,
-        token,
-        Some(&format!(
-            "OAuth subscription token for {} (imported from {})",
-            provider.name,
-            path.display()
-        )),
-        Some("ff oauth import"),
-    )
-    .await
-    .context("write token to fleet_secrets")?;
-
     // Enrollment needs the complete vendor-owned document (refresh token,
     // expiry, account metadata, etc.), not a guessed token-only JSON shape.
     // Keep it beside the extracted bearer token so bootstrap can pull it via
@@ -480,32 +841,216 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     let credentials = std::str::from_utf8(&bytes)
         .with_context(|| format!("credential document for {} is not UTF-8", provider.name))?;
     validate_credential_document(credentials, provider)?;
-    ff_db::pg_set_secret(
-        pool,
-        &credentials_key,
-        credentials,
-        Some(&format!(
-            "Complete OAuth credential document for {} onboarding",
-            provider.name
-        )),
-        Some("ff oauth import"),
-    )
-    .await
-    .context("write credential document to fleet_secrets")?;
+    lock_oauth_authority_for_commit(&mut tx, &authority).await?;
+
+    // One timestamp and one transaction make the bearer token and complete
+    // vendor document a single versioned authority state.
+    let updated_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
+        .fetch_one(&mut *tx)
+        .await
+        .context("timestamp OAuth authority update")?;
+    let token_description = format!(
+        "OAuth subscription token for {} (imported from {})",
+        provider.name,
+        path.display()
+    );
+    let credentials_description = format!(
+        "Complete OAuth credential document for {} onboarding",
+        provider.name
+    );
+    for (key, value, description) in [
+        (provider.secret_key, token, token_description.as_str()),
+        (
+            credentials_key.as_str(),
+            credentials,
+            credentials_description.as_str(),
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO fleet_secrets
+                 (key, value, description, expires_at, previous_value, updated_at, updated_by)
+             VALUES ($1, $2, $3, NULL, NULL, $4, 'ff oauth import')
+             ON CONFLICT (key) DO UPDATE SET
+                 value = EXCLUDED.value,
+                 description = EXCLUDED.description,
+                 expires_at = NULL,
+                 previous_value = NULL,
+                 updated_at = EXCLUDED.updated_at,
+                 updated_by = EXCLUDED.updated_by",
+        )
+        .bind(key)
+        .bind(value)
+        .bind(description)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await
+        .context("write atomic OAuth authority state")?;
+    }
+    tx.commit().await.context("commit OAuth authority state")?;
 
     info!(
         provider = provider.name,
+        leader = %authority.member_name,
+        epoch = authority.epoch,
         "imported OAuth token to fleet_secrets"
     );
     Ok(())
 }
 
-/// Enqueue a non-secret credential reference for every eligible fleet member.
+async fn resolve_locked_oauth_targets(
+    tx: &mut Transaction<'_, Postgres>,
+    normalized_names: &[String],
+) -> Result<Vec<OauthTarget>> {
+    let rows = sqlx::query(
+        "SELECT c.id, c.name, c.primary_ip
+           FROM computers c
+           JOIN fleet_workers w
+             ON w.name = c.name AND NULLIF(w.ip, '') = c.primary_ip
+          WHERE lower(c.name) = ANY($1::text[])
+            AND c.enrolled_at IS NOT NULL
+            AND c.status = 'online'
+            AND w.status = 'online'
+            AND c.last_seen_at > clock_timestamp() - make_interval(secs => $2)
+            AND w.updated_at > clock_timestamp() - make_interval(secs => $2)
+          ORDER BY lower(c.name), c.id
+          FOR SHARE OF c, w",
+    )
+    .bind(normalized_names)
+    .bind(OAUTH_TARGET_FRESHNESS_SECS)
+    .fetch_all(&mut **tx)
+    .await
+    .context("resolve locked OAuth target roster")?;
+
+    let requested: HashSet<&str> = normalized_names.iter().map(String::as_str).collect();
+    let mut by_name: HashMap<String, OauthTarget> = HashMap::new();
+    for row in rows {
+        let name: String = row.try_get("name")?;
+        let folded = name.to_ascii_lowercase();
+        if !canonical_oauth_node_name(&name) || !requested.contains(folded.as_str()) {
+            anyhow::bail!("OAuth target roster returned a non-canonical identity");
+        }
+        reject_recovery_identity(&name)?;
+        let primary_ip_raw: String = row
+            .try_get("primary_ip")
+            .context("OAuth target lacks an authoritative IP")?;
+        let primary_ip: IpAddr = primary_ip_raw
+            .parse()
+            .context("OAuth target has an invalid authoritative IP")?;
+        let target = OauthTarget {
+            computer_id: row.try_get("id")?,
+            name,
+            primary_ip,
+        };
+        if by_name.insert(folded, target).is_some() {
+            anyhow::bail!("OAuth target roster is ambiguous under case folding");
+        }
+    }
+    if by_name.len() != normalized_names.len() {
+        let missing = normalized_names
+            .iter()
+            .filter(|name| !by_name.contains_key(name.as_str()))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow::bail!(
+            "OAuth target(s) are missing, unenrolled, offline, stale, or inconsistent across computers/fleet_workers: {missing}"
+        );
+    }
+    Ok(normalized_names
+        .iter()
+        .filter_map(|name| by_name.remove(name))
+        .collect())
+}
+
+fn parse_gateway_port_authority(
+    row: Option<(String, DateTime<Utc>)>,
+) -> Result<GatewayPortAuthority> {
+    let (raw, updated_at) = row.ok_or_else(|| {
+        anyhow!("fleet_secrets is missing required gateway port authority `port.gateway`")
+    })?;
+    let port = raw
+        .parse::<u16>()
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| anyhow!("fleet_secrets `port.gateway` is not a valid non-zero TCP port"))?;
+    Ok(GatewayPortAuthority { port, updated_at })
+}
+
+async fn resolve_locked_gateway_port(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<GatewayPortAuthority> {
+    let row: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT value, updated_at
+           FROM fleet_secrets
+          WHERE key = 'port.gateway'
+            AND disabled_reason IS NULL
+            AND (expires_at IS NULL OR expires_at > NOW())
+          FOR SHARE",
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .context("resolve canonical gateway port authority")?;
+    parse_gateway_port_authority(row)
+}
+
+async fn probe_oauth_target_health(targets: &[OauthTarget], gateway_port: u16) -> Result<()> {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(OAUTH_TARGET_HEALTH_TIMEOUT)
+        .build()
+        .context("build OAuth target health client")?;
+    try_join_all(targets.iter().cloned().map(|target| {
+        let client = client.clone();
+        async move {
+            let host = match target.primary_ip {
+                IpAddr::V4(ip) => ip.to_string(),
+                IpAddr::V6(ip) => format!("[{ip}]"),
+            };
+            let url = format!("http://{host}:{gateway_port}/health");
+            let response = client
+                .get(url)
+                .send()
+                .await
+                .with_context(|| format!("OAuth target {} health probe failed", target.name))?;
+            if !response.status().is_success() {
+                anyhow::bail!(
+                    "OAuth target {} health probe returned HTTP {}",
+                    target.name,
+                    response.status()
+                );
+            }
+            let body: Value = response
+                .json()
+                .await
+                .with_context(|| format!("OAuth target {} health JSON is invalid", target.name))?;
+            if !valid_oauth_target_health_document(&body) {
+                anyhow::bail!(
+                    "OAuth target {} did not identify as a healthy ForgeFleet agent",
+                    target.name
+                );
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+    }))
+    .await?;
+    Ok(())
+}
+
+fn valid_oauth_target_health_document(body: &Value) -> bool {
+    body.get("status").and_then(Value::as_str) == Some("ok")
+        && body.get("service").and_then(Value::as_str) == Some("ff-gateway")
+}
+
+/// Enqueue a non-secret credential reference for explicit, healthy members.
 ///
 /// The queue never receives the token, credential document, an encoded form of
 /// either, or a shell command. The target resolves the exact referenced secret
 /// version just in time in [`run_oauth_credential_install`].
-pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
+pub async fn distribute_token(
+    pool: &PgPool,
+    provider: &OauthProvider,
+    requested_targets: &[String],
+) -> Result<usize> {
     if !oauth_distribution_enabled(pool).await {
         warn!(
             provider = provider.name,
@@ -515,19 +1060,23 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         return Ok(0);
     }
 
+    let (mut read_tx, read_authority) = begin_local_oauth_authority(pool).await?;
+    let normalized_targets =
+        normalize_requested_targets(requested_targets, &read_authority.member_name)?;
     let secret_ref = credentials_secret_ref(provider);
-    let authority: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+    let secret_authority: Option<(String, DateTime<Utc>)> = sqlx::query_as(
         "SELECT value, updated_at
            FROM fleet_secrets
           WHERE key = $1
             AND disabled_reason IS NULL
-            AND (expires_at IS NULL OR expires_at > NOW())",
+            AND (expires_at IS NULL OR expires_at > NOW())
+          FOR SHARE",
     )
     .bind(&secret_ref)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *read_tx)
     .await
     .context("resolve OAuth credential authority")?;
-    let Some((credential_document, updated_at)) = authority else {
+    let Some((credential_document, updated_at)) = secret_authority else {
         anyhow::bail!(
             "current credential authority for provider {} is missing, disabled, or expired; run `ff oauth import {}` first",
             provider.name,
@@ -537,37 +1086,61 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
     validate_credential_document(&credential_document, provider)?;
     drop(credential_document);
     let secret_version = updated_at.to_rfc3339_opts(SecondsFormat::Micros, true);
+    let gateway_authority = resolve_locked_gateway_port(&mut read_tx).await?;
+    let targets = resolve_locked_oauth_targets(&mut read_tx, &normalized_targets).await?;
+    revalidate_oauth_authority_snapshot(&mut read_tx, &read_authority).await?;
+    read_tx.commit().await.context("commit OAuth preflight")?;
+    probe_oauth_target_health(&targets, gateway_authority.port).await?;
 
-    // Target list = every fleet member EXCEPT the leader (the leader's local
-    // copy is already authoritative). The typed row is bound directly to the
-    // target UUID; no target-controlled string enters an executable surface.
-    let leader_id = ff_db::pg_get_current_leader(pool)
-        .await
-        .context("resolve current leader for OAuth distribution")?
-        .map(|leader| leader.computer_id);
-
-    let rows = sqlx::query(
-        // 'online' is the live status the heartbeat materializer writes;
-        // ('ok','pending','maintenance') are legacy/transitional vocab kept
-        // for compat. Omitting 'online' made distribute resolve ZERO targets
-        // on a fleet whose members are all 'online' (silent enqueued=0).
-        "SELECT id, name
-           FROM computers
-          WHERE status IN ('online', 'ok', 'pending', 'maintenance')",
+    // Re-acquire the global authority fence after the network probes. The
+    // leader epoch, exact credential version, and every target roster row are
+    // locked in the same transaction as the complete batch enqueue.
+    let (mut write_tx, write_authority) = begin_local_oauth_authority(pool).await?;
+    if write_authority.computer_id != read_authority.computer_id
+        || write_authority.epoch != read_authority.epoch
+    {
+        anyhow::bail!("OAuth leader changed during target health preflight");
+    }
+    let version_still_current: Option<DateTime<Utc>> = sqlx::query_scalar(
+        "SELECT updated_at FROM fleet_secrets
+          WHERE key = $1
+            AND updated_at = $2
+            AND disabled_reason IS NULL
+            AND (expires_at IS NULL OR expires_at > NOW())
+          FOR SHARE",
     )
-    .fetch_all(pool)
+    .bind(&secret_ref)
+    .bind(updated_at)
+    .fetch_one(&mut *write_tx)
     .await
-    .context("list computers")?;
+    .context("lock current OAuth credential version")?;
+    if version_still_current.is_none() {
+        anyhow::bail!("OAuth credential authority rotated during target health preflight");
+    }
+    let write_gateway_authority = resolve_locked_gateway_port(&mut write_tx).await?;
+    if write_gateway_authority != gateway_authority {
+        anyhow::bail!("canonical gateway port authority changed during target health preflight");
+    }
+    let locked_targets = resolve_locked_oauth_targets(&mut write_tx, &normalized_targets).await?;
+    if locked_targets
+        .iter()
+        .map(|target| (&target.name, target.computer_id, target.primary_ip))
+        .collect::<Vec<_>>()
+        != targets
+            .iter()
+            .map(|target| (&target.name, target.computer_id, target.primary_ip))
+            .collect::<Vec<_>>()
+    {
+        anyhow::bail!("OAuth target authority changed during health preflight");
+    }
+    lock_oauth_authority_for_commit(&mut write_tx, &write_authority).await?;
+    lock_oauth_distribution_gate_for_commit(&mut write_tx).await?;
 
     let mut enqueued = 0usize;
-    let leader_uuid = leader_id;
-    for row in rows {
-        use sqlx::Row;
-        let id: uuid::Uuid = row.get("id");
-        if Some(id) == leader_uuid {
-            continue;
-        }
-        let name: String = row.get("name");
+    let mut publish_after_commit = Vec::new();
+    for target in locked_targets {
+        let id = target.computer_id;
+        let name = target.name;
         let payload = serde_json::to_value(OauthCredentialInstallPayload {
             operation: OAUTH_CREDENTIAL_INSTALL_OPERATION.to_string(),
             version: OAUTH_CREDENTIAL_INSTALL_VERSION,
@@ -578,8 +1151,8 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         })
         .context("serialize typed OAuth credential install payload")?;
         let enqueue_once_key = oauth_distribute_enqueue_key(provider.name, id, &secret_version);
-        let outcome = pg_enqueue_oauth_credential_install_once(
-            pool,
+        let outcome = pg_enqueue_oauth_credential_install_once_tx(
+            &mut write_tx,
             &enqueue_once_key,
             &format!(
                 "oauth-distribute/{}: {} → {}",
@@ -593,6 +1166,7 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         .with_context(|| format!("enqueue distribute task for {name}"))?;
         if outcome.was_enqueued() {
             enqueued += 1;
+            publish_after_commit.push(outcome.task_id());
         } else {
             debug!(
                 provider = provider.name,
@@ -602,9 +1176,18 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             );
         }
     }
+    write_tx
+        .commit()
+        .await
+        .context("commit atomic OAuth distribution batch")?;
+    for task_id in publish_after_commit {
+        crate::nats_jetstream::publish_task_inserted(task_id).await;
+    }
 
     info!(
         provider = provider.name,
+        leader = %write_authority.member_name,
+        epoch = write_authority.epoch,
         enqueued, "OAuth distribute tasks enqueued"
     );
     Ok(enqueued)
@@ -1061,17 +1644,25 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
 /// Trigger the provider CLI's native refresh flow, then import and distribute
 /// the complete refreshed credential. Import still runs after a failed probe:
 /// some CLIs rotate credentials before returning a non-zero diagnostic.
-pub async fn refresh_and_distribute(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
+async fn refresh_and_import(pool: &PgPool, provider: &OauthProvider) -> Result<()> {
     if !oauth_distribution_enabled(pool).await {
-        return Ok(0);
+        return Ok(());
     }
     let probe = probe_one(pool, provider).await;
     if probe.status != "ok" {
         warn!(provider = provider.name, status = %probe.status, detail = ?probe.message,
             "OAuth native refresh probe did not return cleanly; importing freshest credential anyway");
     }
-    import_token(pool, provider).await?;
-    distribute_token(pool, provider).await
+    import_token(pool, provider).await
+}
+
+pub async fn refresh_and_distribute(
+    pool: &PgPool,
+    provider: &OauthProvider,
+    requested_targets: &[String],
+) -> Result<usize> {
+    refresh_and_import(pool, provider).await?;
+    distribute_token(pool, provider, requested_targets).await
 }
 
 /// Validate this node's distributed credentials once at daemon startup. A
@@ -1084,6 +1675,24 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
     if !oauth_distribution_enabled(pool).await {
         return;
     }
+    if !canonical_oauth_node_name(worker_name) || reject_recovery_identity(worker_name).is_err() {
+        warn!(worker = %worker_name, "refusing OAuth re-push request for non-canonical or recovery identity");
+        return;
+    }
+    let local_identity = match crate::fleet_info::resolve_this_computer_identity_strict(pool).await
+    {
+        Ok(identity) if identity.name == worker_name => identity,
+        Ok(identity) => {
+            warn!(worker = %worker_name, canonical_worker = %identity.name,
+                "refusing OAuth re-push for caller-supplied non-local identity");
+            return;
+        }
+        Err(error) => {
+            warn!(worker = %worker_name, %error,
+                "refusing OAuth re-push without strict local computer identity");
+            return;
+        }
+    };
     let leader = match ff_db::pg_get_current_leader(pool).await {
         Ok(Some(leader)) => leader,
         _ => return,
@@ -1101,6 +1710,9 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
     if leader_name == worker_name {
         return;
     }
+    if !canonical_oauth_node_name(&leader_name) || reject_recovery_identity(&leader_name).is_err() {
+        return;
+    }
 
     for name in AUTO_REFRESH_PROVIDERS {
         let Some(provider) = provider_by_name(name) else {
@@ -1111,8 +1723,16 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
             continue;
         }
         let title = format!("oauth-repush/{} requested-by {worker_name}", provider.name);
-        let command = format!("ff oauth refresh {}", provider.name);
-        let enqueue_once_key = oauth_repush_enqueue_key(provider.name, leader.computer_id);
+        let command = format!(
+            "ff oauth refresh {} --target {}",
+            provider.name, worker_name
+        );
+        let enqueue_once_key = oauth_repush_enqueue_key(
+            provider.name,
+            leader.computer_id,
+            leader.epoch,
+            local_identity.id,
+        );
         let outcome = pg_enqueue_shell_task_once(
             pool,
             &enqueue_once_key,
@@ -1165,11 +1785,11 @@ pub fn spawn_oauth_probe_tick(
 
                     for name in AUTO_REFRESH_PROVIDERS {
                         let Some(provider) = provider_by_name(name) else { continue };
-                        match refresh_and_distribute(&pg, provider).await {
-                            Ok(enqueued) => info!(provider = provider.name, enqueued,
-                                "periodic OAuth refresh and distribution complete"),
+                        match refresh_and_import(&pg, provider).await {
+                            Ok(()) => info!(provider = provider.name,
+                                "periodic OAuth refresh and leader import complete"),
                             Err(error) => warn!(provider = provider.name, %error,
-                                "periodic OAuth refresh and distribution failed"),
+                                "periodic OAuth refresh and leader import failed"),
                         }
                     }
                 }
@@ -1271,7 +1891,8 @@ pub async fn probe_one(pool: &PgPool, provider: &OauthProvider) -> ProbeResult {
 }
 
 /// Long-lived foreground loop. Polls every leader cred file every
-/// `REFRESH_POLL_SECS`; on mtime change, re-imports + redistributes.
+/// `REFRESH_POLL_SECS`; on mtime change, re-imports on the leader. Distribution
+/// always requires a separate command with explicit targets.
 /// Exits when `shutdown` flips to true.
 pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -1303,9 +1924,6 @@ pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) ->
                     if let Err(e) = import_token(&pool, p).await {
                         warn!(provider = p.name, error = %e, "auto-import failed");
                         continue;
-                    }
-                    if let Err(e) = distribute_token(&pool, p).await {
-                        warn!(provider = p.name, error = %e, "auto-distribute failed");
                     }
                 }
             }
@@ -1339,13 +1957,45 @@ mod tests {
     }
 
     #[test]
+    fn commit_gate_fails_closed_when_missing_or_disabled_during_preflight() {
+        let now = Utc::now();
+        assert!(require_locked_oauth_distribution_gate(None).is_err());
+        for value in ["false", "0", "no", "off", "disabled", "garbage"] {
+            assert!(
+                require_locked_oauth_distribution_gate(Some((
+                    value.into(),
+                    Some(now + chrono::Duration::minutes(5)),
+                    now,
+                )))
+                .is_err(),
+                "commit gate accepted disabled value {value}"
+            );
+        }
+        assert!(require_locked_oauth_distribution_gate(Some(("true".into(), None, now))).is_ok());
+        assert!(
+            require_locked_oauth_distribution_gate(Some((
+                "false".into(),
+                Some(now - chrono::Duration::seconds(1)),
+                now,
+            )))
+            .is_ok(),
+            "expired kill-switch must preserve the existing TTL restore semantics"
+        );
+    }
+
+    #[test]
     fn enqueue_once_keys_scope_repush_and_distribution_independently() {
         let leader = uuid::Uuid::nil();
         let target = uuid::Uuid::from_u128(1);
+        let requester = uuid::Uuid::from_u128(2);
         let version = "2026-08-05T10:00:00.000000Z";
         assert_eq!(
-            oauth_repush_enqueue_key("codex", leader),
-            format!("oauth-repush:codex:{leader}")
+            oauth_repush_enqueue_key("codex", leader, 7, requester),
+            format!("oauth-repush:codex:{leader}:7:{requester}")
+        );
+        assert_ne!(
+            oauth_repush_enqueue_key("codex", leader, 7, requester),
+            oauth_repush_enqueue_key("codex", leader, 7, uuid::Uuid::from_u128(3))
         );
         assert_eq!(
             oauth_distribute_enqueue_key("codex", target, version),
@@ -1359,6 +2009,67 @@ mod tests {
             oauth_distribute_enqueue_key("codex", target, version),
             oauth_distribute_enqueue_key("codex", target, "2026-08-05T10:00:01.000000Z")
         );
+    }
+
+    #[test]
+    fn explicit_targets_are_canonical_sorted_and_fail_closed() {
+        assert_eq!(
+            normalize_requested_targets(&["Sia".into(), "adele".into()], "Beyonce").unwrap(),
+            vec!["adele", "sia"]
+        );
+        for rejected in [
+            Vec::<String>::new(),
+            vec!["all".into()],
+            vec!["Vinny".into()],
+            vec!["taylor".into()],
+            vec!["Beyonce".into()],
+            vec!["sia".into(), "SIA".into()],
+            vec!["sia;reboot".into()],
+            vec![" sia".into()],
+        ] {
+            assert!(
+                normalize_requested_targets(&rejected, "Beyonce").is_err(),
+                "accepted unsafe targets: {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn target_health_requires_exact_forgefleet_agent_semantics() {
+        assert!(valid_oauth_target_health_document(&serde_json::json!({
+            "status": "ok",
+            "service": "ff-gateway",
+            "version": "2026.4.7",
+            "build_sha": "0123456789",
+            "uptime_epoch": 1785931200
+        })));
+        for body in [
+            serde_json::json!({"status": "ok"}),
+            serde_json::json!({"status": "ok", "service": "proxy"}),
+            serde_json::json!({"status": "failed", "service": "ff-gateway"}),
+            serde_json::json!("ok"),
+        ] {
+            assert!(!valid_oauth_target_health_document(&body));
+        }
+    }
+
+    #[test]
+    fn gateway_port_authority_rejects_missing_invalid_and_conflicting_versions() {
+        let stamp = Utc::now();
+        assert!(parse_gateway_port_authority(None).is_err());
+        for raw in ["", "0", "65536", "51002x", "-1"] {
+            assert!(parse_gateway_port_authority(Some((raw.into(), stamp))).is_err());
+        }
+        let first = parse_gateway_port_authority(Some(("51002".into(), stamp))).unwrap();
+        assert_eq!(first.port, 51_002);
+        let changed_value = parse_gateway_port_authority(Some(("51003".into(), stamp))).unwrap();
+        let changed_version = parse_gateway_port_authority(Some((
+            "51002".into(),
+            stamp + chrono::Duration::microseconds(1),
+        )))
+        .unwrap();
+        assert_ne!(first, changed_value);
+        assert_ne!(first, changed_version);
     }
 
     #[test]
@@ -1474,6 +2185,58 @@ mod tests {
             .to_string();
         assert!(!error.contains("opaque-test-value"));
         assert!(!outside.path().join("auth.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_reader_rejects_links_and_non_private_documents() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = home.path().join(".codex");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let document = directory.join("auth.json");
+        let marker = "opaque-private-reader-marker";
+        std::fs::write(&document, format!(r#"{{"access_token":"{marker}"}}"#)).unwrap();
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let bytes = read_private_credential_file_under(
+            home.path(),
+            std::path::Path::new(".codex/auth.json"),
+        )
+        .unwrap();
+        assert!(String::from_utf8(bytes).unwrap().contains(marker));
+
+        let linked = directory.join("linked.json");
+        symlink(&document, &linked).unwrap();
+        let link_error = read_private_credential_file_under(
+            home.path(),
+            std::path::Path::new(".codex/linked.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!link_error.contains(marker));
+
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mode_error = read_private_credential_file_under(
+            home.path(),
+            std::path::Path::new(".codex/auth.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!mode_error.contains(marker));
+        std::fs::set_permissions(&document, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let hard_link_path = directory.join("second-link.json");
+        std::fs::hard_link(&document, hard_link_path).unwrap();
+        let link_count_error = read_private_credential_file_under(
+            home.path(),
+            std::path::Path::new(".codex/auth.json"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!link_count_error.contains(marker));
     }
 
     #[test]
@@ -1780,7 +2543,7 @@ mod tests {
     }
 
     #[test]
-    fn both_autonomous_producers_check_the_gate_before_enqueuing() {
+    fn autonomous_producers_never_broadly_distribute() {
         let source = include_str!("oauth_distributor.rs");
         let startup = source
             .split("pub async fn validate_startup_and_request_repush")
@@ -1791,6 +2554,10 @@ mod tests {
             .expect("startup body");
         assert!(startup.contains("oauth_distribution_enabled(pool).await"));
         assert!(startup.contains("pg_enqueue_shell_task_once"));
+        assert!(startup.contains("--target {}"));
+        assert!(startup.contains("resolve_this_computer_identity_strict(pool).await"));
+        assert!(startup.contains("local_identity.id"));
+        assert!(startup.contains("leader.epoch"));
 
         let periodic = source
             .split("pub fn spawn_oauth_probe_tick")
@@ -1800,6 +2567,88 @@ mod tests {
             .next()
             .expect("periodic body");
         assert!(periodic.contains("oauth_distribution_enabled(&pg).await"));
-        assert!(periodic.contains("refresh_and_distribute(&pg, provider).await"));
+        assert!(periodic.contains("refresh_and_import(&pg, provider).await"));
+        assert!(!periodic.contains("distribute_token("));
+
+        let watcher = source
+            .split("pub fn spawn_refresh_watch")
+            .nth(1)
+            .expect("refresh watcher")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("refresh watcher body");
+        assert!(watcher.contains("import_token(&pool, p).await"));
+        assert!(!watcher.contains("distribute_token("));
+    }
+
+    #[test]
+    fn import_and_distribution_hold_authority_and_atomic_batch_boundaries() {
+        let source = include_str!("oauth_distributor.rs");
+        let import = source
+            .split("pub async fn import_token")
+            .nth(1)
+            .unwrap()
+            .split("async fn resolve_locked_oauth_targets")
+            .next()
+            .unwrap();
+        let leader = import
+            .find("begin_local_oauth_authority(pool).await")
+            .unwrap();
+        let read = import
+            .find("read_leader_cred_bytes(provider).await")
+            .unwrap();
+        let first_revalidate = import
+            .find("lock_oauth_authority_for_commit(&mut tx, &authority).await")
+            .unwrap();
+        let write = import.find("INSERT INTO fleet_secrets").unwrap();
+        assert!(leader < read && read < first_revalidate && first_revalidate < write);
+        assert!(import.contains("tx.commit().await"));
+
+        let distribute = source
+            .split("pub async fn distribute_token")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_install_payload")
+            .next()
+            .unwrap();
+        assert!(distribute.contains("normalize_requested_targets"));
+        assert!(distribute.contains("probe_oauth_target_health"));
+        assert!(source.contains(".no_proxy()"));
+        assert!(source.contains("ff-gateway"));
+        assert!(distribute.contains("resolve_locked_gateway_port"));
+        assert!(!distribute.contains("50002"));
+        assert!(!distribute.contains("51002"));
+        assert!(distribute.contains("pg_enqueue_oauth_credential_install_once_tx"));
+        let gate_lock = distribute
+            .find("lock_oauth_distribution_gate_for_commit")
+            .unwrap();
+        let enqueue = distribute
+            .find("pg_enqueue_oauth_credential_install_once_tx")
+            .unwrap();
+        assert!(gate_lock < enqueue);
+        assert!(distribute.contains("commit atomic OAuth distribution batch"));
+        assert!(distribute.contains("publish_task_inserted"));
+        assert!(!distribute.contains("status IN ('online', 'ok', 'pending', 'maintenance')"));
+
+        let initial_authority = source
+            .split("async fn lock_local_oauth_authority")
+            .nth(1)
+            .unwrap()
+            .split("async fn revalidate_oauth_authority_snapshot")
+            .next()
+            .unwrap();
+        assert!(initial_authority.contains("pg_advisory_xact_lock"));
+        assert!(!initial_authority.contains("FOR UPDATE"));
+        assert!(!initial_authority.contains("FOR SHARE"));
+        let commit_authority = source
+            .split("async fn lock_oauth_authority_for_commit")
+            .nth(1)
+            .unwrap()
+            .split("async fn begin_local_oauth_authority")
+            .next()
+            .unwrap();
+        assert!(commit_authority.contains("FOR SHARE OF l, c, w"));
+        assert!(source.contains("OAUTH_CREDENTIAL_SOURCE_TIMEOUT"));
+        assert!(source.contains("kill_on_drop(true)"));
     }
 }

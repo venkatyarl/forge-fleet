@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use sqlx::{PgPool, Row, postgres::PgRow};
+use sqlx::{PgPool, Postgres, Row, Transaction, postgres::PgRow};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -1071,6 +1071,7 @@ pub async fn pg_enqueue_shell_task_once(
 /// payload, the dedicated runner task type, and one FK-validated target UUID.
 /// The same advisory-lock + unique-signature protocol used by shell enqueue-once
 /// protects concurrent refresh/watch producers.
+#[allow(dead_code)]
 pub(crate) async fn pg_enqueue_oauth_credential_install_once(
     pg: &PgPool,
     enqueue_once_key: &str,
@@ -1080,9 +1081,37 @@ pub(crate) async fn pg_enqueue_oauth_credential_install_once(
     priority: i32,
 ) -> Result<EnqueueOnceOutcome, sqlx::Error> {
     let mut tx = pg.begin().await?;
+    let outcome = pg_enqueue_oauth_credential_install_once_tx(
+        &mut tx,
+        enqueue_once_key,
+        summary,
+        payload,
+        preferred_computer_id,
+        priority,
+    )
+    .await?;
+    tx.commit().await?;
+
+    if let EnqueueOnceOutcome::Enqueued(id) = outcome {
+        crate::nats_jetstream::publish_task_inserted(id).await;
+    }
+    Ok(outcome)
+}
+
+/// Transaction-aware form used when an authority check and an entire OAuth
+/// fan-out must commit as one unit. It deliberately neither commits nor
+/// publishes; callers publish only the newly inserted ids after commit.
+pub(crate) async fn pg_enqueue_oauth_credential_install_once_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    enqueue_once_key: &str,
+    summary: &str,
+    payload: &Value,
+    preferred_computer_id: uuid::Uuid,
+    priority: i32,
+) -> Result<EnqueueOnceOutcome, sqlx::Error> {
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))")
         .bind(enqueue_once_key)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
     let existing: Option<(uuid::Uuid, String)> = sqlx::query_as(
@@ -1092,12 +1121,11 @@ pub(crate) async fn pg_enqueue_oauth_credential_install_once(
           FOR UPDATE",
     )
     .bind(enqueue_once_key)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     if let Some((id, status)) = existing {
         if !is_terminal_enqueue_once_status(&status) {
-            tx.commit().await?;
             return Ok(EnqueueOnceOutcome::AlreadyActive(id));
         }
         sqlx::query(
@@ -1107,7 +1135,7 @@ pub(crate) async fn pg_enqueue_oauth_credential_install_once(
         )
         .bind(id)
         .bind(enqueue_once_key)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
     }
 
@@ -1125,11 +1153,8 @@ pub(crate) async fn pg_enqueue_oauth_credential_install_once(
     .bind(priority)
     .bind(preferred_computer_id)
     .bind(enqueue_once_key)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-    tx.commit().await?;
-
-    crate::nats_jetstream::publish_task_inserted(id).await;
     Ok(EnqueueOnceOutcome::Enqueued(id))
 }
 
@@ -2792,7 +2817,7 @@ mod oauth_typed_task_tests {
         assert!(source.contains("run_oauth_credential_install"));
 
         let enqueue = source
-            .split("pub(crate) async fn pg_enqueue_oauth_credential_install_once")
+            .split("pub(crate) async fn pg_enqueue_oauth_credential_install_once_tx")
             .nth(1)
             .unwrap()
             .split("fn is_terminal_enqueue_once_status")
@@ -2802,6 +2827,19 @@ mod oauth_typed_task_tests {
         assert!(enqueue.contains("preferred_computer_id"));
         assert!(!enqueue.contains("command:"));
         assert!(!enqueue.contains("pg_enqueue_shell_task"));
+        assert!(!enqueue.contains("tx.commit()"));
+        assert!(!enqueue.contains("publish_task_inserted"));
+
+        let wrapper = source
+            .split("pub(crate) async fn pg_enqueue_oauth_credential_install_once(")
+            .nth(1)
+            .unwrap()
+            .split("pub(crate) async fn pg_enqueue_oauth_credential_install_once_tx")
+            .next()
+            .unwrap();
+        let commit = wrapper.find("tx.commit().await").unwrap();
+        let publish = wrapper.find("publish_task_inserted").unwrap();
+        assert!(commit < publish);
     }
 }
 

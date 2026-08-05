@@ -1755,13 +1755,18 @@ enum OauthCommand {
         /// non-interactive callers (cron, CI, deferred tasks).
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Explicit target computer. Repeat once per intended recipient.
+        /// Broad `all`, duplicate names, the leader, Vinny, and Taylor are
+        /// rejected by the authority layer.
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
     },
     /// Show per-provider OAuth state: cred-file present on leader, mtime, and
     /// whether the canonical token is present. Token content is never shown.
     Status,
-    /// Long-running foreground watcher: re-imports + re-distributes
-    /// whenever any leader cred file changes (vendor CLI refreshed its
-    /// token). Run on the leader; ctrl-C to exit.
+    /// Long-running foreground watcher: re-imports on the leader whenever a
+    /// credential file changes. It never distributes without an explicit
+    /// operator target list. Run on the leader; ctrl-C to exit.
     RefreshWatch,
     /// Probe each oauth_subscription provider's API to verify the
     /// harvested token still authenticates. Reports OK / 401 / network
@@ -1786,6 +1791,9 @@ enum OauthCommand {
         /// or `all`.
         #[arg(default_value = "all")]
         provider: String,
+        /// Explicit target computer. Repeat once per intended recipient.
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
     },
     /// Preview or repair retained legacy OAuth payloads and the unstarted task
     /// flood. Apply atomically redacts every exact-fingerprint legacy payload
@@ -5893,17 +5901,21 @@ async fn main() -> Result<()> {
             match command {
                 OauthCommand::Import { provider } => {
                     for p in resolve(&provider)? {
-                        match import_token(&pool, p).await {
-                            Ok(()) => println!(
-                                "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
-                                p.name, p.secret_key
-                            ),
-                            Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
-                        }
+                        import_token(&pool, p)
+                            .await
+                            .with_context(|| format!("import {}", p.name))?;
+                        println!(
+                            "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
+                            p.name, p.secret_key
+                        );
                     }
                     Ok(())
                 }
-                OauthCommand::Distribute { provider, yes } => {
+                OauthCommand::Distribute {
+                    provider,
+                    yes,
+                    targets,
+                } => {
                     println!(
                         "{YELLOW}!{RESET} TOS reminder: distributing one subscription's OAuth token \
                          to multiple machines is grey-area on most vendor TOS — running one Pro/Plus \
@@ -5934,13 +5946,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     for p in resolve(&provider)? {
-                        match distribute_token(&pool, p).await {
-                            Ok(n) => println!(
-                                "{GREEN}✓{RESET} {}: enqueued {n} distribute task(s); follow with `ff tasks list`",
-                                p.name
-                            ),
-                            Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
-                        }
+                        let n = distribute_token(&pool, p, &targets)
+                            .await
+                            .with_context(|| format!("distribute {}", p.name))?;
+                        println!(
+                            "{GREEN}✓{RESET} {}: enqueued {n} distribute task(s); follow with `ff tasks list`",
+                            p.name
+                        );
                     }
                     Ok(())
                 }
@@ -6037,12 +6049,13 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                OauthCommand::Refresh { provider } => {
+                OauthCommand::Refresh { provider, targets } => {
                     let providers = resolve(&provider)?;
                     for p in providers {
-                        let n = ff_agent::oauth_distributor::refresh_and_distribute(&pool, p)
-                            .await
-                            .with_context(|| format!("refresh and distribute {}", p.name))?;
+                        let n =
+                            ff_agent::oauth_distributor::refresh_and_distribute(&pool, p, &targets)
+                                .await
+                                .with_context(|| format!("refresh and distribute {}", p.name))?;
                         println!(
                             "{:<10} {GREEN}✓{RESET} refreshed and enqueued {n} re-push task(s)",
                             p.name
@@ -6695,7 +6708,7 @@ mod oauth_cli_guard_tests {
     use super::{Cli, Command, FleetCommand, OauthCommand};
     use clap::Parser;
 
-    fn parse_cancel_backlog(args: &[&str]) -> bool {
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
         let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
         std::thread::Builder::new()
             .stack_size(16 * 1024 * 1024)
@@ -6703,6 +6716,10 @@ mod oauth_cli_guard_tests {
             .expect("spawn parser thread")
             .join()
             .expect("parser thread panicked")
+    }
+
+    fn parse_cancel_backlog(args: &[&str]) -> bool {
+        try_parse(args)
             .expect("valid oauth cancel-backlog command")
             .command
             .and_then(|command| match command {
@@ -6723,6 +6740,44 @@ mod oauth_cli_guard_tests {
             "cancel-backlog",
             "--apply",
         ]));
+    }
+
+    #[test]
+    fn oauth_distribution_and_refresh_require_repeatable_explicit_targets() {
+        for missing in [
+            vec!["ff", "oauth", "distribute", "codex", "--yes"],
+            vec!["ff", "oauth", "refresh", "codex"],
+        ] {
+            assert!(try_parse(&missing).is_err());
+        }
+
+        let cli = try_parse(&[
+            "ff",
+            "oauth",
+            "distribute",
+            "codex",
+            "--yes",
+            "--target",
+            "Sia",
+            "--target",
+            "Adele",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Oauth {
+                command:
+                    OauthCommand::Distribute {
+                        provider,
+                        yes,
+                        targets,
+                    },
+            }) => {
+                assert_eq!(provider, "codex");
+                assert!(yes);
+                assert_eq!(targets, ["Sia", "Adele"]);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
     }
 
     #[test]
