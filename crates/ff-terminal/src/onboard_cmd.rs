@@ -1,4 +1,9 @@
-use std::{net::IpAddr, process::Stdio, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr, UdpSocket},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use base64::Engine;
@@ -16,6 +21,44 @@ const OP_SERVICE_ACCOUNT_TOKEN_KEY: &str = "1Password:service_account_token";
 const TLS_CA_REF_KEY: &str = "enrollment.tls_ca_ref";
 const TLS_SPKI_PIN_REF_KEY: &str = "enrollment.tls_spki_pin_ref";
 const TLS_SERVER_NAME_KEY: &str = "enrollment.tls_server_name";
+const TRUSTED_OP_PATHS: &[&str] = &[
+    "/usr/bin/op",
+    "/usr/local/bin/op",
+    "/opt/homebrew/bin/op",
+    "/opt/1Password/op",
+];
+
+#[cfg(unix)]
+fn validate_trusted_op_path_component(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    executable: bool,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    anyhow::ensure!(
+        !metadata.file_type().is_symlink(),
+        "1Password path component {} is a symlink",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.mode() & 0o022 == 0,
+        "1Password path component {} is group/world writable",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.uid() == 0,
+        "1Password path component {} is not root-owned",
+        path.display()
+    );
+    if executable {
+        anyhow::ensure!(
+            metadata.mode() & 0o111 != 0,
+            "trusted 1Password binary is not executable"
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 struct EnrollmentAuthority {
@@ -106,11 +149,63 @@ async fn required_secret(pool: &sqlx::PgPool, key: &str) -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("required enrollment authority key {key} is not configured"))
 }
 
+fn validate_trusted_op_candidate(candidate: &str) -> Result<PathBuf> {
+    let path = Path::new(candidate);
+    anyhow::ensure!(path.is_absolute(), "1Password binary path is not absolute");
+    let link_metadata = path
+        .symlink_metadata()
+        .with_context(|| format!("inspect trusted 1Password binary {candidate}"))?;
+    anyhow::ensure!(
+        !link_metadata.file_type().is_symlink(),
+        "trusted 1Password binary must not be a symlink"
+    );
+    anyhow::ensure!(
+        link_metadata.is_file(),
+        "trusted 1Password path is not a file"
+    );
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("resolve trusted 1Password binary {candidate}"))?;
+    anyhow::ensure!(
+        canonical == path,
+        "trusted 1Password binary resolves outside its approved path"
+    );
+
+    #[cfg(unix)]
+    {
+        let mut component = Some(path);
+        while let Some(current) = component {
+            let metadata = current.symlink_metadata().with_context(|| {
+                format!("inspect 1Password path component {}", current.display())
+            })?;
+            validate_trusted_op_path_component(current, &metadata, current == path)?;
+            component = current.parent().filter(|parent| *parent != current);
+        }
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("trusted 1Password execution is unsupported on this platform");
+
+    Ok(canonical)
+}
+
+fn trusted_op_binary() -> Result<PathBuf> {
+    for candidate in TRUSTED_OP_PATHS {
+        if let Ok(path) = validate_trusted_op_candidate(candidate) {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!(
+        "1Password CLI is not a root-owned, non-symlink executable at an approved path ({})",
+        TRUSTED_OP_PATHS.join(", ")
+    )
+}
+
 async fn op_read(service_token: &Zeroizing<String>, reference: &str) -> Result<Zeroizing<Vec<u8>>> {
     anyhow::ensure!(valid_op_reference(reference), "invalid 1Password reference");
+    let op_binary = trusted_op_binary()?;
     let output = tokio::time::timeout(
         Duration::from_secs(15),
-        tokio::process::Command::new("op")
+        tokio::process::Command::new(op_binary)
             .arg("read")
             .arg(reference)
             .env("OP_SERVICE_ACCOUNT_TOKEN", service_token.as_str())
@@ -154,16 +249,28 @@ async fn load_client_trust(pool: &sqlx::PgPool) -> Result<ClientTrust> {
 
 async fn lock_enrollment_authority(
     tx: &mut Transaction<'_, Postgres>,
+    local_identity: &str,
 ) -> Result<EnrollmentAuthority> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ff_db::SECURE_ENROLLMENT_XACT_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+    // Acquire the roster table locks before any roster row lock so ordinary
+    // roster writers cannot deadlock with enrollment by holding the inverse
+    // table/row lock order.
+    sqlx::query("LOCK TABLE computers, fleet_workers IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut **tx)
+        .await?;
     let row = sqlx::query(
         "SELECT l.member_name, l.epoch, \
-                COALESCE(NULLIF(c.primary_ip, ''), NULLIF(w.ip, '')) AS leader_ip \
+                c.primary_ip AS leader_ip \
          FROM fleet_leader_state l \
-         LEFT JOIN computers c ON c.name = l.member_name \
-         LEFT JOIN fleet_workers w ON w.name = l.member_name \
-         WHERE l.heartbeat_at > clock_timestamp() - make_interval(secs => $1) \
+         JOIN computers c ON c.id = l.computer_id AND c.name = l.member_name \
+         JOIN fleet_workers w ON w.name = c.name AND NULLIF(w.ip, '') = c.primary_ip \
+         WHERE l.singleton_key = 'current' \
+           AND l.heartbeat_at > clock_timestamp() - make_interval(secs => $1) \
            AND (l.relinquishing_until IS NULL OR l.relinquishing_until <= clock_timestamp()) \
-         LIMIT 1 FOR SHARE OF l",
+         FOR UPDATE OF l, c, w",
     )
     .bind(LEADER_FRESHNESS_SECONDS)
     .fetch_optional(&mut **tx)
@@ -175,15 +282,59 @@ async fn lock_enrollment_authority(
         canonical_node_name(&leader_name),
         "elected leader name is not canonical"
     );
+    anyhow::ensure!(
+        leader_name == local_identity,
+        "enrollment credentials may only be issued by the locked current leader; local identity is {local_identity}, leader is {leader_name}"
+    );
     let leader_ip_raw: String = row
         .try_get("leader_ip")
         .context("elected leader has no authoritative IP")?;
     let leader_ip = bound_ip(&leader_ip_raw).context("elected leader has an invalid IP")?;
+    let routed_local_ip = route_selected_local_ip(leader_ip)?;
+    anyhow::ensure!(
+        routed_local_ip == leader_ip,
+        "local network identity {routed_local_ip} does not own elected leader address {leader_ip}"
+    );
     Ok(EnrollmentAuthority {
         leader_name,
         leader_epoch: row.try_get("epoch")?,
         leader_ip,
     })
+}
+
+fn route_selected_local_ip(destination: IpAddr) -> Result<IpAddr> {
+    let bind_addr = match destination {
+        IpAddr::V4(_) => "0.0.0.0:0",
+        IpAddr::V6(_) => "[::]:0",
+    };
+    let socket = UdpSocket::bind(bind_addr).context("bind local identity probe")?;
+    socket
+        .connect(SocketAddr::new(destination, 9))
+        .context("route local identity probe")?;
+    Ok(socket.local_addr()?.ip())
+}
+
+async fn canonical_local_issuer(pool: &sqlx::PgPool) -> Result<String> {
+    let local_identity = ff_agent::fleet_info::resolve_this_worker_name().await;
+    anyhow::ensure!(
+        canonical_node_name(&local_identity),
+        "local ForgeFleet identity is not canonical"
+    );
+    let exact_projection: bool = sqlx::query_scalar(
+        "SELECT EXISTS( \
+             SELECT 1 FROM computers c \
+             JOIN fleet_workers w ON w.name = c.name AND NULLIF(w.ip, '') = c.primary_ip \
+             WHERE c.name = $1 \
+         )",
+    )
+    .bind(&local_identity)
+    .fetch_one(pool)
+    .await?;
+    anyhow::ensure!(
+        exact_projection,
+        "local ForgeFleet identity is not an exact computers/fleet_workers projection"
+    );
+    Ok(local_identity)
 }
 
 async fn ensure_identity_available(
@@ -225,10 +376,8 @@ fn render_bootstrap_command(
         "set -euo pipefail\n\
 read -r -s -p 'Enrollment token: ' FORGEFLEET_ENROLLMENT_TOKEN; printf '\\n'\n\
 case \"$FORGEFLEET_ENROLLMENT_TOKEN\" in ffe1_???????????????????????????????????????????) ;; *) echo 'Invalid enrollment token' >&2; exit 2 ;; esac\n\
-read -r -s -p '1Password service-account token: ' OP_SERVICE_ACCOUNT_TOKEN; printf '\\n'\n\
-test -n \"$OP_SERVICE_ACCOUNT_TOKEN\" || {{ echo '1Password token is required' >&2; exit 2; }}\n\
-export FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN\n\
-trap 'unset FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN' EXIT\n\
+export FORGEFLEET_ENROLLMENT_TOKEN\n\
+trap 'unset FORGEFLEET_ENROLLMENT_TOKEN' EXIT\n\
 TLS_CA_PEM_B64='{ca}'\n\
 tls_curl() {{ curl --proto '=https' --tlsv1.3 --silent --show-error --fail \
   --resolve '{server}:{port}:{resolve_ip}' \
@@ -236,7 +385,7 @@ tls_curl() {{ curl --proto '=https' --tlsv1.3 --silent --show-error --fail \
   --pinnedpubkey '{pin}' \"$@\"; }}\n\
 tls_curl --config <(printf 'header = \"Authorization: Bearer %s\"\\n' \"$FORGEFLEET_ENROLLMENT_TOKEN\") \
   'https://{server}:{port}/onboard/bootstrap.sh?name={name}&ip={intended_ip}' \
-  | sudo --preserve-env=FORGEFLEET_ENROLLMENT_TOKEN,OP_SERVICE_ACCOUNT_TOKEN bash",
+  | sudo --preserve-env=FORGEFLEET_ENROLLMENT_TOKEN bash",
         ca = trust.ca_pem_b64,
         server = trust.server_name,
         port = ENROLLMENT_TLS_PORT,
@@ -246,6 +395,7 @@ tls_curl --config <(printf 'header = \"Authorization: Bearer %s\"\\n' \"$FORGEFL
 
 async fn issue_enrollment(
     pool: &sqlx::PgPool,
+    local_identity: &str,
     name: &str,
     ip: IpAddr,
     ssh_user: &str,
@@ -259,17 +409,21 @@ async fn issue_enrollment(
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&*random)
     ));
     let token_hash: [u8; 32] = Sha256::digest(&*random).into();
-    let created_by = std::env::var("USER").unwrap_or_else(|_| "ff-onboard".to_owned());
+    let created_by = format!(
+        "{}@{}",
+        std::env::var("USER").unwrap_or_else(|_| "ff-onboard".to_owned()),
+        local_identity
+    );
 
     let mut tx = pool.begin().await?;
-    let authority = lock_enrollment_authority(&mut tx).await?;
+    let authority = lock_enrollment_authority(&mut tx, local_identity).await?;
     ensure_identity_available(&mut tx, name, ip).await?;
 
     // A newly issued credential supersedes any still-pending credential for
     // this exact identity, avoiding ambiguous concurrent claims.
     sqlx::query(
-        "UPDATE fleet_enrollment_tokens SET expires_at = clock_timestamp() \
-         WHERE consumed_at IS NULL AND expires_at > clock_timestamp() \
+        "UPDATE fleet_enrollment_tokens SET revoked_at = clock_timestamp() \
+         WHERE consumed_at IS NULL AND revoked_at IS NULL \
            AND (node_name = $1 OR intended_ip = $2::inet)",
     )
     .bind(name)
@@ -304,10 +458,6 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
-
     match cmd {
         crate::OnboardCommand::Show {
             name,
@@ -316,6 +466,9 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
             role,
             runtime,
         } => {
+            ff_db::validate_secure_enrollment_schema(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("secure enrollment schema validation: {e}"))?;
             anyhow::ensure!(
                 canonical_node_name(&name),
                 "--name must be a canonical lowercase node name"
@@ -334,8 +487,17 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
             // Load only public trust material before creating a credential. A
             // 1Password failure therefore cannot leave an unusable live token.
             let trust = load_client_trust(&pool).await?;
-            let (token, authority) =
-                issue_enrollment(&pool, &name, ip, &ssh_user, &role, &runtime).await?;
+            let local_identity = canonical_local_issuer(&pool).await?;
+            let (token, authority) = issue_enrollment(
+                &pool,
+                &local_identity,
+                &name,
+                ip,
+                &ssh_user,
+                &role,
+                &runtime,
+            )
+            .await?;
             let command = render_bootstrap_command(&trust, &authority, &name, ip);
 
             println!("One-time enrollment token (expires in {TOKEN_TTL_MINUTES} minutes):");
@@ -399,6 +561,9 @@ pub async fn handle_onboard(cmd: crate::OnboardCommand) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
+
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 
     const WEB_ONBOARDING_PAGE: &str =
         include_str!("../../../web-forge-fleet/app/(console)/onboarding/page.tsx");
@@ -414,8 +579,96 @@ mod tests {
         }
     }
 
+    async fn isolated_postgres() -> Option<sqlx::PgPool> {
+        let database_url = match std::env::var("FF_ENROLLMENT_TEST_DATABASE_URL") {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!(
+                    "skipping real PostgreSQL issuance test: FF_ENROLLMENT_TEST_DATABASE_URL is unset"
+                );
+                return None;
+            }
+        };
+        let admin_options = PgConnectOptions::from_str(&database_url).unwrap();
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(admin_options.clone())
+            .await
+            .unwrap();
+        let database = format!("ff_issuance_{}", uuid::Uuid::new_v4().simple());
+        sqlx::query(&format!("CREATE DATABASE {database}"))
+            .execute(&admin)
+            .await
+            .unwrap();
+        admin.close().await;
+        PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(admin_options.database(&database))
+            .await
+            .ok()
+    }
+
+    async fn install_issuance_schema(pool: &sqlx::PgPool) {
+        sqlx::raw_sql(
+            r#"
+            CREATE EXTENSION IF NOT EXISTS pgcrypto;
+            CREATE TABLE computers (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                name TEXT NOT NULL UNIQUE,
+                primary_ip TEXT,
+                status TEXT
+            );
+            CREATE TABLE fleet_workers (
+                name TEXT PRIMARY KEY,
+                ip TEXT NOT NULL
+            );
+            CREATE TABLE fleet_leader_state (
+                singleton_key TEXT PRIMARY KEY DEFAULT 'current' CHECK (singleton_key='current'),
+                computer_id UUID NOT NULL REFERENCES computers(id),
+                member_name TEXT NOT NULL,
+                epoch BIGINT NOT NULL,
+                heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                relinquishing_until TIMESTAMPTZ
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS)
+            .execute(pool)
+            .await
+            .unwrap();
+        // Re-running the forward migration is allowed only when the existing
+        // authority objects still match the exact reviewed definitions.
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS)
+            .execute(pool)
+            .await
+            .unwrap();
+        let leader_ip = route_selected_local_ip("192.0.2.1".parse().unwrap()).unwrap();
+        let computer_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id,name,primary_ip,status) VALUES ($1,'testleader',$2,'online')")
+            .bind(computer_id)
+            .bind(leader_ip.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO fleet_workers (name,ip) VALUES ('testleader',$1)")
+            .bind(leader_ip.to_string())
+            .execute(pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO fleet_leader_state (computer_id,member_name,epoch) VALUES ($1,'testleader',7)",
+        )
+        .bind(computer_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     #[test]
-    fn generated_command_is_https_pinned_and_prompts_for_secret() {
+    fn generated_command_is_https_pinned_and_carries_only_one_time_token() {
         let command = render_bootstrap_command(
             &trust(),
             &EnrollmentAuthority {
@@ -433,10 +686,9 @@ mod tests {
         assert!(command.contains("--pinnedpubkey 'sha256//"));
         assert!(command.contains("--resolve 'enroll.forgefleet.local:51443:192.168.5.116'"));
         assert!(command.contains("read -r -s -p 'Enrollment token: '"));
-        assert!(command.contains("read -r -s -p '1Password service-account token: '"));
-        assert!(
-            command.contains("--preserve-env=FORGEFLEET_ENROLLMENT_TOKEN,OP_SERVICE_ACCOUNT_TOKEN")
-        );
+        assert!(command.contains("--preserve-env=FORGEFLEET_ENROLLMENT_TOKEN bash"));
+        assert!(!command.contains("OP_SERVICE_ACCOUNT_TOKEN"));
+        assert!(!command.contains("1Password service-account token"));
         assert!(!command.contains("token="));
         assert!(!command.contains("http://"));
         assert!(!command.contains(" -k"));
@@ -456,6 +708,50 @@ mod tests {
         assert!(valid_op_reference("op://ForgeFleet/enrollment/ca"));
         assert!(!valid_op_reference("/tmp/enrollment-ca.pem"));
         assert!(valid_spki_pin(&trust().spki_pin));
+        assert!(
+            TRUSTED_OP_PATHS
+                .iter()
+                .all(|path| std::path::Path::new(path).is_absolute())
+        );
+        assert!(!include_str!("onboard_cmd.rs").contains("Command::new(\"op\")"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn op_trust_rejects_symlink_canonical_owner_and_mode_violations() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = std::env::temp_dir().join(format!(
+            "ff-op-trust-terminal-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let attacker = directory.join("attacker-op");
+        std::fs::write(&attacker, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&attacker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let approved = directory.join("op");
+        symlink(&attacker, &approved).unwrap();
+        let error = validate_trusted_op_candidate(approved.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+        std::fs::remove_file(&approved).unwrap();
+
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let noncanonical = nested.join("..").join("attacker-op");
+        let error = validate_trusted_op_candidate(noncanonical.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("outside its approved path"));
+
+        let error = validate_trusted_op_candidate(attacker.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("not root-owned"));
+        std::fs::set_permissions(&attacker, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = validate_trusted_op_candidate(attacker.to_str().unwrap()).unwrap_err();
+        assert!(error.to_string().contains("group/world writable"));
+
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let metadata = directory.symlink_metadata().unwrap();
+        let error = validate_trusted_op_path_component(&directory, &metadata, false).unwrap_err();
+        assert!(error.to_string().contains("group/world writable"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -465,5 +761,90 @@ mod tests {
         assert!(WEB_ONBOARDING_PAGE.contains("No bootstrap command was generated"));
         assert!(!WEB_ONBOARDING_PAGE.contains(&token_query));
         assert!(!WEB_ONBOARDING_PAGE.contains("enrollment.shared_secret"));
+    }
+
+    #[test]
+    fn issuance_source_requires_leader_lock_and_no_request_side_migration() {
+        let source = include_str!("onboard_cmd.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source before test module");
+        for required in [
+            "pg_advisory_xact_lock",
+            "FOR UPDATE OF l, c, w",
+            "leader_name == local_identity",
+            "routed_local_ip == leader_ip",
+            "LOCK TABLE computers, fleet_workers IN SHARE ROW EXCLUSIVE MODE",
+            "validate_secure_enrollment_schema",
+        ] {
+            assert!(
+                production.contains(required),
+                "missing issuer fence: {required}"
+            );
+        }
+        assert!(!production.contains("run_postgres_migrations(&pool)"));
+    }
+
+    #[tokio::test]
+    async fn postgres_concurrent_issuance_has_one_active_identity_claim() {
+        let Some(pool) = isolated_postgres().await else {
+            return;
+        };
+        install_issuance_schema(&pool).await;
+        ff_db::validate_secure_enrollment_schema(&pool)
+            .await
+            .unwrap();
+        let intended_ip: IpAddr = "192.0.2.200".parse().unwrap();
+        let (first, second) = tokio::join!(
+            issue_enrollment(
+                &pool,
+                "testleader",
+                "new-node",
+                intended_ip,
+                "new-node",
+                "builder",
+                "auto",
+            ),
+            issue_enrollment(
+                &pool,
+                "testleader",
+                "new-node",
+                intended_ip,
+                "new-node",
+                "builder",
+                "auto",
+            ),
+        );
+        let (first_token, first_authority) = first.unwrap();
+        let (second_token, second_authority) = second.unwrap();
+        assert_ne!(first_token.as_str(), second_token.as_str());
+        assert_eq!(first_authority.leader_epoch, 7);
+        assert_eq!(second_authority.leader_epoch, 7);
+        let (total, active, revoked): (i64, i64, i64) = sqlx::query_as(
+            "SELECT count(*), count(*) FILTER (WHERE consumed_at IS NULL AND revoked_at IS NULL), \
+                    count(*) FILTER (WHERE revoked_at IS NOT NULL) \
+             FROM fleet_enrollment_tokens WHERE node_name='new-node'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((total, active, revoked), (2, 1, 1));
+
+        assert!(
+            issue_enrollment(
+                &pool,
+                "notleader",
+                "other-node",
+                "192.0.2.201".parse().unwrap(),
+                "other-node",
+                "builder",
+                "auto",
+            )
+            .await
+            .is_err(),
+            "a non-leader local identity must not issue"
+        );
+        pool.close().await;
     }
 }

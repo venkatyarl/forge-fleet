@@ -17,11 +17,11 @@
 #
 # This script expects to be run with sudo on the new machine:
 #   read -rsp 'Enrollment token: ' FORGEFLEET_ENROLLMENT_TOKEN; echo
-#   read -rsp '1Password service-account token: ' OP_SERVICE_ACCOUNT_TOKEN; echo
-#   export FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN
+#   export FORGEFLEET_ENROLLMENT_TOKEN
 #   (use the `ff onboard show` command; it pins both CA and SPKI)
-# Both credentials are accepted only through the inherited environment; never
-# put them in this script's URL or command-line arguments.
+# The one-time credential is accepted only through the inherited environment;
+# no 1Password service-account token or other fleet-wide credential is ever
+# accepted by, rendered into, or forwarded through this joining-node script.
 #
 # It is intentionally bash, self-contained, and idempotent: re-running it on
 # a computer that's already partially set up just advances to the next unfinished
@@ -51,19 +51,10 @@ if [[ ! "$TOKEN" =~ ^ffe1_[A-Za-z0-9_-]{43}$ ]]; then
   exit 1
 fi
 
-# Non-secret 1Password authority references. Operators may override these IDs
-# out-of-band without editing the rendered bootstrap. Secret values themselves
-# are never accepted through argv, files, enrollment APIs, or progress reports.
-OP_VAULT_REF="${FORGEFLEET_OP_VAULT_REF:-mtfbfuettwrsog55of33tbribq}"
-OP_GITHUB_SSH_ITEM_REF="${FORGEFLEET_OP_GITHUB_SSH_ITEM_REF:-ww3gtuioogq3sdfpyfdlqaryhi}"
-OP_CLAUDE_CREDENTIAL_DOCUMENT_REF="${FORGEFLEET_OP_CLAUDE_CREDENTIAL_DOCUMENT_REF:-z4zjqnfchtpv5ynody4mesmysa}"
-OP_CODEX_CREDENTIAL_DOCUMENT_REF="${FORGEFLEET_OP_CODEX_CREDENTIAL_DOCUMENT_REF:-u432zsofisggkhraw6c2he7yei}"
-OP_KIMI_CREDENTIAL_DOCUMENT_REF="${FORGEFLEET_OP_KIMI_CREDENTIAL_DOCUMENT_REF:-wls3pwdwilxbgmuh6qxwc676ga}"
-
-# Retain both values as shell-local state, but stop exporting them to every
-# child process. Each direct `op` invocation below receives its token through
-# a command-local environment assignment; self-enroll receives TOKEN on stdin.
-export -n FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN 2>/dev/null || true
+# Retain the one-time value as shell-local state and stop exporting it to every
+# child process. Enrollment requests receive it through curl's anonymous stdin
+# configuration; only the final sudo hop explicitly preserves it.
+export -n FORGEFLEET_ENROLLMENT_TOKEN 2>/dev/null || true
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -138,121 +129,6 @@ as_root() {
     sudo "$@"
   fi
 }
-
-# Validate a JSON document into a same-directory, mode-0600 temporary file and
-# only then atomically replace its canonical destination.  The caller supplies
-# the document on stdin so credential material never enters a process argv.
-# A validation/write failure removes only the temporary file; an existing
-# credential file remains byte-for-byte untouched.
-atomic_install_json_credential() {
-  local final_path="$1" final_dir temp_path
-  final_dir="${final_path%/*}"
-  run_as_user mkdir -p "$final_dir" || return 1
-  temp_path="$(run_as_user mktemp "$final_dir/.forgefleet-credential.XXXXXX")" \
-    || return 1
-  if ! run_as_user chmod 600 "$temp_path"; then
-    run_as_user rm -f "$temp_path"
-    return 1
-  fi
-  if ! run_as_user sh -c 'umask 077; python3 -m json.tool > "$1"' \
-    forgefleet-json-install "$temp_path"; then
-    run_as_user rm -f "$temp_path"
-    return 1
-  fi
-  if ! run_as_user chmod 600 "$temp_path" \
-    || ! run_as_user mv -f "$temp_path" "$final_path"; then
-    run_as_user rm -f "$temp_path"
-    return 1
-  fi
-}
-
-# BEGIN github-key-pair-publication-helper
-# Restore both canonical key paths to the exact state captured before a
-# publication attempt.  Existing files are restored from same-filesystem
-# backups; paths that were absent are removed.  Always attempt both restores so
-# one error cannot prevent recovery of the other half of the pair.
-restore_github_key_pair() {
-  local final_private="$1" final_public="$2" backup_dir="$3"
-  local private_existed="$4" public_existed="$5" restore_failed=""
-
-  if [ "$private_existed" = "yes" ]; then
-    run_as_user mv -f "$backup_dir/private" "$final_private" || restore_failed=1
-  else
-    run_as_user rm -f "$final_private" || restore_failed=1
-  fi
-  if [ "$public_existed" = "yes" ]; then
-    run_as_user mv -f "$backup_dir/public" "$final_public" || restore_failed=1
-  else
-    run_as_user rm -f "$final_public" || restore_failed=1
-  fi
-
-  [ -z "$restore_failed" ]
-}
-
-# Publish a pre-validated staged private/public pair while retaining enough
-# same-directory state to roll back *both* canonical paths if either rename
-# reports failure. Return 2 when publication failed and rollback itself was not
-# complete; callers must treat both non-zero results as fatal.
-publish_github_key_pair() {
-  local staged_private="$1" staged_public="$2" final_private="$3" final_public="$4"
-  local final_dir backup_dir private_existed="no" public_existed="no"
-  final_dir="${final_private%/*}"
-
-  [ "${final_public%/*}" = "$final_dir" ] || return 2
-  [ -f "$staged_private" ] && [ -f "$staged_public" ] || return 2
-  if { [ -e "$final_private" ] && [ ! -f "$final_private" ]; } \
-    || { [ -e "$final_public" ] && [ ! -f "$final_public" ]; }; then
-    return 2
-  fi
-
-  backup_dir="$(run_as_user mktemp -d "$final_dir/.forgefleet-key-pair-backup.XXXXXX")" \
-    || return 2
-  if [ -e "$final_private" ]; then
-    private_existed="yes"
-    if ! run_as_user cp -p "$final_private" "$backup_dir/private"; then
-      run_as_user rmdir "$backup_dir" 2>/dev/null || true
-      return 2
-    fi
-  fi
-  if [ -e "$final_public" ]; then
-    public_existed="yes"
-    if ! run_as_user cp -p "$final_public" "$backup_dir/public"; then
-      run_as_user rm -f "$backup_dir/private"
-      run_as_user rmdir "$backup_dir" 2>/dev/null || true
-      return 2
-    fi
-  fi
-
-  # Publish the public half first.  If this rename, or the private rename that
-  # follows, returns failure, restore the prior contents/absence of both paths.
-  if ! run_as_user mv -f "$staged_public" "$final_public" \
-    || ! run_as_user mv -f "$staged_private" "$final_private"; then
-    local rollback_ok="yes"
-    restore_github_key_pair \
-      "$final_private" "$final_public" "$backup_dir" \
-      "$private_existed" "$public_existed" \
-      || rollback_ok="no"
-    run_as_user rm -f "$staged_private" "$staged_public"
-    if [ "$rollback_ok" = "yes" ]; then
-      run_as_user rm -f "$backup_dir/private" "$backup_dir/public"
-      run_as_user rmdir "$backup_dir" 2>/dev/null || true
-      return 1
-    fi
-    # Retain any not-yet-restored backup instead of deleting the last recovery
-    # copy.  The caller reports a terminal error and the recovery directory.
-    GITHUB_KEY_PAIR_RECOVERY_DIR="$backup_dir"
-    return 2
-  fi
-
-  if ! run_as_user rm -f "$backup_dir/private" "$backup_dir/public"; then
-    GITHUB_KEY_PAIR_RECOVERY_DIR="$backup_dir"
-    return 2
-  fi
-  run_as_user rmdir "$backup_dir" 2>/dev/null || true
-  unset GITHUB_KEY_PAIR_RECOVERY_DIR
-  return 0
-}
-# END github-key-pair-publication-helper
 
 # Report unexpected early exits — previously a truncated/aborted run died
 # silently and the operator stared at a stuck "running" step forever.
@@ -457,9 +333,8 @@ case "$OS_ID" in
       >/dev/null 2>&1 || die "apt-get install (prereqs) failed"
 
     # Install the signed 1Password CLI package from its official APT
-    # repository. `op` is a required onboarding tool, not an upgrade-only
-    # optional: a fresh node must be able to use the fleet's service-account
-    # authority without persisting secrets locally.
+    # repository. Installing the client is harmless, but enrollment deliberately
+    # performs no vault authentication and receives no service-account token.
     if ! command -v op >/dev/null 2>&1; then
       as_root install -d -m 0755 \
         /usr/share/keyrings \
@@ -486,30 +361,6 @@ case "$OS_ID" in
     systemctl enable --now ssh >/dev/null 2>&1 || true
     ;;
 esac
-OP_BIN="$(run_as_user bash -lc 'command -v op' 2>/dev/null || true)"
-[ -n "$OP_BIN" ] && [ -x "$OP_BIN" ] \
-  || die "1Password CLI is missing from the target user's login PATH after prerequisites"
-
-# Fail closed before the first secret read. `op` inherits the service-account
-# token from this process; the value is never copied into argv, a file, an
-# enrollment report, or ForgeFleet storage. The explicit item/document refs
-# above are non-secret IDs and may be overridden through environment variables.
-[ -n "${OP_SERVICE_ACCOUNT_TOKEN:-}" ] \
-  || die "OP_SERVICE_ACCOUNT_TOKEN is required out-of-band before 1Password retrieval"
-for op_ref_name in \
-  OP_VAULT_REF \
-  OP_GITHUB_SSH_ITEM_REF \
-  OP_CLAUDE_CREDENTIAL_DOCUMENT_REF \
-  OP_CODEX_CREDENTIAL_DOCUMENT_REF \
-  OP_KIMI_CREDENTIAL_DOCUMENT_REF; do
-  op_ref_value="${!op_ref_name}"
-  [ -n "$op_ref_value" ] || die "required non-secret 1Password reference is unset: $op_ref_name"
-done
-unset op_ref_name op_ref_value
-if ! OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
-  "$OP_BIN" whoami >/dev/null 2>&1; then
-  die "1Password service-account authentication failed; verify the out-of-band token and vault access"
-fi
 report "prereqs" ok
 
 # ─── 3. Rust toolchain (as the invoking user) ─────────────────────────────
@@ -572,87 +423,12 @@ run_as_user git config --global user.name 'Venkat Yarlagadda'
 run_as_user git config --global user.email 'venkatyarl@users.noreply.github.com'
 report "git_identity" ok
 
-# ─── 5d. Canonical GitHub deploy key ─────────────────────────────────────
-# Materialize the fleet's canonical GitHub identity before cloning. This
-# avoids an HTTPS staging clone that is rewritten only after ff is built.
-report "github_deploy_key" running
-if ! VENKAT_PRIV="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
-  "$OP_BIN" read "op://${OP_VAULT_REF}/${OP_GITHUB_SSH_ITEM_REF}/private_key" 2>/dev/null)" \
-  || [ -z "$VENKAT_PRIV" ]; then
-  die "1Password GitHub SSH private-key retrieval failed; verify the configured item reference and service-account access"
-fi
-if ! VENKAT_PUB="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
-  "$OP_BIN" read "op://${OP_VAULT_REF}/${OP_GITHUB_SSH_ITEM_REF}/public_key" 2>/dev/null)" \
-  || [ -z "$VENKAT_PUB" ]; then
-  die "1Password GitHub SSH public-key retrieval failed; verify the configured item reference and service-account access"
-fi
-run_as_user mkdir -p "$USER_HOME/.ssh"
-run_as_user chmod 700 "$USER_HOME/.ssh"
-
-# Stage both key files in their final directory.  Validate the public material
-# supplied by 1Password against `ssh-keygen -y` output from the private key,
-# comparing the algorithm and base64 fields while deliberately ignoring any
-# comment.  No canonical key is replaced until all validation has succeeded.
-VENKAT_PRIV_TMP="$(run_as_user mktemp "$USER_HOME/.ssh/.id_venkat.private.XXXXXX")" \
-  || die "failed to stage the GitHub SSH private key"
-VENKAT_PUB_TMP="$(run_as_user mktemp "$USER_HOME/.ssh/.id_venkat.public.XXXXXX")" \
-  || {
-    run_as_user rm -f "$VENKAT_PRIV_TMP"
-    die "failed to stage the GitHub SSH public key"
-  }
-if ! printf '%s\n' "$VENKAT_PRIV" \
-  | run_as_user sh -c 'umask 077; cat > "$1"' forgefleet-key-install "$VENKAT_PRIV_TMP" \
-  || ! printf '%s\n' "$VENKAT_PUB" \
-  | run_as_user sh -c 'umask 077; cat > "$1"' forgefleet-key-install "$VENKAT_PUB_TMP"; then
-  unset VENKAT_PRIV VENKAT_PUB
-  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-  die "failed to stage the GitHub SSH key pair"
-fi
-unset VENKAT_PRIV VENKAT_PUB
-run_as_user chmod 600 "$VENKAT_PRIV_TMP" \
-  || {
-    run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-    die "failed to restrict the staged GitHub SSH private key"
-  }
-run_as_user chmod 644 "$VENKAT_PUB_TMP" \
-  || {
-    run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-    die "failed to set the staged GitHub SSH public-key mode"
-  }
-if ! DERIVED_VENKAT_PUB="$(run_as_user ssh-keygen -y -f "$VENKAT_PRIV_TMP" 2>/dev/null)" \
-  || ! STORED_VENKAT_PUB="$(run_as_user awk 'NF >= 2 { print $1 " " $2; found=1; exit } END { if (!found) exit 1 }' "$VENKAT_PUB_TMP")" \
-  || ! run_as_user ssh-keygen -l -f "$VENKAT_PUB_TMP" >/dev/null 2>&1; then
-  unset DERIVED_VENKAT_PUB STORED_VENKAT_PUB
-  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-  die "1Password GitHub SSH key pair is malformed"
-fi
-DERIVED_VENKAT_MATERIAL="$(printf '%s\n' "$DERIVED_VENKAT_PUB" \
-  | awk 'NF >= 2 { print $1 " " $2; found=1; exit } END { if (!found) exit 1 }')" \
-  || {
-    unset DERIVED_VENKAT_PUB STORED_VENKAT_PUB
-    run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-    die "failed to derive GitHub SSH public-key material"
-  }
-if [ "$DERIVED_VENKAT_MATERIAL" != "$STORED_VENKAT_PUB" ]; then
-  unset DERIVED_VENKAT_PUB DERIVED_VENKAT_MATERIAL STORED_VENKAT_PUB
-  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-  die "1Password GitHub SSH private/public key pair does not match"
-fi
-unset DERIVED_VENKAT_PUB DERIVED_VENKAT_MATERIAL STORED_VENKAT_PUB
-if publish_github_key_pair \
-  "$VENKAT_PRIV_TMP" \
-  "$VENKAT_PUB_TMP" \
-  "$USER_HOME/.ssh/id_venkat" \
-  "$USER_HOME/.ssh/id_venkat.pub"; then
-  :
-else
-  KEY_PAIR_PUBLISH_RC=$?
-  run_as_user rm -f "$VENKAT_PRIV_TMP" "$VENKAT_PUB_TMP"
-  if [ "$KEY_PAIR_PUBLISH_RC" -eq 1 ]; then
-    die "failed to publish the GitHub SSH key pair; the prior canonical pair was restored"
-  fi
-  die "failed to publish the GitHub SSH key pair and fully restore its prior state; do not use the canonical key paths; recovery snapshot: ${GITHUB_KEY_PAIR_RECOVERY_DIR:-unavailable}"
-fi
+# ─── 5d. Repository/bootstrap credential boundary ─────────────────────────
+# forge-fleet is readable over HTTPS, so first install needs no GitHub private
+# key. Push/API/cloud credentials are distributed only after the node has been
+# admitted and is under fleet policy; a joining node never receives the
+# vault-wide 1Password authority or centralized OAuth documents.
+report "github_deploy_key" ok "deferred until after authenticated enrollment"
 
 # Pin GitHub's published host keys in a dedicated trust file.  These values and
 # fingerprints come from https://docs.github.com/en/authentication/
@@ -739,7 +515,7 @@ if ! run_as_user grep -qFx 'Include ~/.ssh/config.d/forgefleet-github.conf' "$SS
     }
 fi
 run_as_user chmod 600 "$SSH_CONFIG"
-report "github_deploy_key" ok "validated and atomically installed id_venkat with pinned GitHub host trust"
+report "github_host_trust" ok "pinned GitHub SSH host keys installed for later post-enrollment auth"
 
 # ─── 6. Clone forge-fleet + build ff ─────────────────────────────────────
 #
@@ -759,9 +535,6 @@ fi
 run_as_user mkdir -p "$(dirname "$REPO_DIR")"
 if [ ! -d "$REPO_DIR/.git" ]; then
   CLONE_URL="https://github.com/${GITHUB_OWNER}/forge-fleet.git"
-  if [ -f "$USER_HOME/.ssh/id_venkat" ]; then
-    CLONE_URL="git@github.com-venkat:${GITHUB_OWNER}/forge-fleet.git"
-  fi
   run_as_user git clone --depth 50 "$CLONE_URL" "$REPO_DIR" \
     || die "git clone failed"
 else
@@ -814,9 +587,10 @@ report "nodejs" ok "$(node --version)"
     fi ;;
 esac
 
-# ─── 6b. Cloud coding CLIs + centralized auth ────────────────────────────
-# Install every supported cloud CLI as the target user, then materialize the
-# allowlisted centralized OAuth tokens at each CLI's canonical credential path.
+# ─── 6b. Cloud coding CLIs; authentication remains post-enrollment ────────
+# Install every supported cloud CLI as the target user. Centralized OAuth
+# documents are deliberately not copied during bootstrap; the authenticated
+# fleet distributor owns that lifecycle after admission.
 report "cloud_clis" running
 if ! run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' \
@@ -836,42 +610,7 @@ if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
   run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
 fi
 
-if ! CLAUDE_CREDENTIALS="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
-  "$OP_BIN" document get "$OP_CLAUDE_CREDENTIAL_DOCUMENT_REF" --vault "$OP_VAULT_REF" 2>/dev/null)" \
-  || [ -z "$CLAUDE_CREDENTIALS" ]; then
-  die "1Password Claude credential-document retrieval failed; verify its configured reference and service-account access"
-fi
-if ! CODEX_CREDENTIALS="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
-  "$OP_BIN" document get "$OP_CODEX_CREDENTIAL_DOCUMENT_REF" --vault "$OP_VAULT_REF" 2>/dev/null)" \
-  || [ -z "$CODEX_CREDENTIALS" ]; then
-  die "1Password Codex credential-document retrieval failed; verify its configured reference and service-account access"
-fi
-if ! KIMI_CREDENTIALS="$(OP_SERVICE_ACCOUNT_TOKEN="$OP_SERVICE_ACCOUNT_TOKEN" \
-  "$OP_BIN" document get "$OP_KIMI_CREDENTIAL_DOCUMENT_REF" --vault "$OP_VAULT_REF" 2>/dev/null)" \
-  || [ -z "$KIMI_CREDENTIALS" ]; then
-  die "1Password Kimi credential-document retrieval failed; verify its configured reference and service-account access"
-fi
-# No more secret retrieval occurs after this point. Drop the service-account
-# credential from the bootstrap environment before parsing or writing documents.
-unset OP_SERVICE_ACCOUNT_TOKEN
-run_as_user mkdir -p "$USER_HOME/.claude" "$USER_HOME/.codex" "$USER_HOME/.kimi/credentials"
-if ! printf '%s' "$CLAUDE_CREDENTIALS" \
-  | atomic_install_json_credential "$USER_HOME/.claude/.credentials.json"; then
-  unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
-  die "invalid Claude credential document from 1Password; existing credentials were preserved"
-fi
-if ! printf '%s' "$CODEX_CREDENTIALS" \
-  | atomic_install_json_credential "$USER_HOME/.codex/auth.json"; then
-  unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
-  die "invalid Codex credential document from 1Password; existing credentials were preserved"
-fi
-if ! printf '%s' "$KIMI_CREDENTIALS" \
-  | atomic_install_json_credential "$USER_HOME/.kimi/credentials/kimi-code.json"; then
-  unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
-  die "invalid Kimi credential document from 1Password; existing credentials were preserved"
-fi
-unset CLAUDE_CREDENTIALS CODEX_CREDENTIALS KIMI_CREDENTIALS
-report "cloud_clis" ok "claude, codex, kimi"
+report "cloud_clis" ok "claude, codex, kimi installed; auth deferred to fleet distributor"
 
 report "web_build" running
 run_as_user bash -lc "cd '$REPO_DIR/web-forge-fleet' && npm install --no-audit --no-fund --silent 2>&1 | tail -2 && npm run build 2>&1 | tail -3" \
@@ -1378,23 +1117,6 @@ else
   report "mcp-config" failed "ff mcp install exited $MCP_CONFIG_RC; inspect bootstrap output"
   die "ff mcp install failed"
 fi
-
-# ─── GitHub SSH identity verification ────────────────────────────────────
-# The keypair was read directly from 1Password before clone. Do not replace
-# it here from a database-backed sync path: 1Password is the sole credential
-# authority for onboarding.
-report "github-identity" running
-[ -s "$USER_HOME/.ssh/id_venkat" ] && [ -s "$USER_HOME/.ssh/id_venkat.pub" ] \
-  || die "1Password-backed GitHub SSH identity is missing after installation"
-# Flip the forge-fleet remote from HTTPS to the SSH alias. The flip is
-# idempotent and leaves an already-canonical SSH remote unchanged.
-run_as_user bash -lc "cd '$REPO_DIR' && \
-  old=\$(git remote get-url origin 2>/dev/null); \
-  if [[ \"\$old\" =~ ^https://github.com/(.+)\$ ]]; then \
-    path=\${BASH_REMATCH[1]%.git}.git; \
-    git remote set-url origin git@github.com-venkat:\$path; \
-  fi" || die "failed to enforce the 1Password-backed GitHub SSH remote"
-report "github-identity" ok "1Password-backed id_venkat installed"
 
 # ─── Skills catalog sync (V105) ──────────────────────────────────────────
 # Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/

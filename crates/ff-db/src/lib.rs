@@ -27,7 +27,9 @@ pub mod work_queue;
 pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
-pub use migrations::run_postgres_migrations;
+pub use migrations::{
+    SECURE_ENROLLMENT_XACT_LOCK_KEY, run_postgres_migrations, validate_secure_enrollment_schema,
+};
 pub use model_integrity::{
     HashWriteDecision, ModelLibraryHashAssertion, ModelLibraryHashCasOutcome,
     pg_compare_or_cas_model_library_sha256,

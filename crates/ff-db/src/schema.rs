@@ -12655,49 +12655,258 @@ ON CONFLICT (id) DO UPDATE SET
 /// enrollment listener. Only SHA-256 digests are persisted; plaintext bearer
 /// tokens exist solely in the issuing CLI and enrolling client processes.
 pub const SCHEMA_V289_SECURE_ENROLLMENT_TOKENS: &str = r#"
-CREATE TABLE IF NOT EXISTS fleet_enrollment_tokens (
-    token_hash       BYTEA PRIMARY KEY,
-    node_name        TEXT NOT NULL,
-    intended_ip      INET NOT NULL,
-    ssh_user         TEXT NOT NULL,
-    role             TEXT NOT NULL,
-    runtime          TEXT NOT NULL,
-    purpose          TEXT NOT NULL DEFAULT 'node-enrollment',
-    leader_name      TEXT NOT NULL,
-    leader_epoch     BIGINT NOT NULL,
-    expires_at       TIMESTAMPTZ NOT NULL,
-    consumed_at      TIMESTAMPTZ,
-    consumed_peer_ip INET,
-    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    created_by       TEXT,
-    CONSTRAINT fleet_enrollment_tokens_hash_length
-        CHECK (octet_length(token_hash) = 32),
-    CONSTRAINT fleet_enrollment_tokens_canonical_name
-        CHECK (node_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
-    CONSTRAINT fleet_enrollment_tokens_canonical_ssh_user
-        CHECK (ssh_user ~ '^[a-z_][a-z0-9_-]{0,63}$'),
-    CONSTRAINT fleet_enrollment_tokens_role
-        CHECK (role IN ('builder', 'gateway', 'testbed')),
-    CONSTRAINT fleet_enrollment_tokens_runtime
-        CHECK (runtime ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
-    CONSTRAINT fleet_enrollment_tokens_purpose
-        CHECK (purpose = 'node-enrollment'),
-    CONSTRAINT fleet_enrollment_tokens_epoch
-        CHECK (leader_epoch >= 0),
-    CONSTRAINT fleet_enrollment_tokens_expiry
-        CHECK (expires_at > created_at
-            AND expires_at <= created_at + interval '15 minutes'),
-    CONSTRAINT fleet_enrollment_tokens_consumption
-        CHECK ((consumed_at IS NULL AND consumed_peer_ip IS NULL)
-            OR (consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL))
-);
+DO $secure_enrollment_migration$
+DECLARE
+    actual_columns TEXT[];
+    expected_columns CONSTANT TEXT[] := ARRAY[
+        'token_hash:bytea:required',
+        'node_name:text:required',
+        'intended_ip:inet:required',
+        'ssh_user:text:required',
+        'role:text:required',
+        'runtime:text:required',
+        'purpose:text:required',
+        'leader_name:text:required',
+        'leader_epoch:bigint:required',
+        'expires_at:timestamp with time zone:required',
+        'consumed_at:timestamp with time zone:nullable',
+        'consumed_peer_ip:inet:nullable',
+        'created_at:timestamp with time zone:required',
+        'created_by:text:nullable',
+        'revoked_at:timestamp with time zone:nullable'
+    ];
+    actual_defaults TEXT[];
+    expected_defaults CONSTANT TEXT[] := ARRAY[
+        'created_at:clock_timestamp()',
+        'purpose:''node-enrollment''::text'
+    ];
+    actual_constraints TEXT[];
+    expected_constraints CONSTANT TEXT[] := ARRAY[
+        'fleet_enrollment_tokens_canonical_leader',
+        'fleet_enrollment_tokens_canonical_name',
+        'fleet_enrollment_tokens_canonical_ssh_user',
+        'fleet_enrollment_tokens_consumption',
+        'fleet_enrollment_tokens_epoch',
+        'fleet_enrollment_tokens_expiry',
+        'fleet_enrollment_tokens_hash_length',
+        'fleet_enrollment_tokens_pkey',
+        'fleet_enrollment_tokens_purpose',
+        'fleet_enrollment_tokens_revocation',
+        'fleet_enrollment_tokens_role',
+        'fleet_enrollment_tokens_runtime'
+    ];
+    actual_constraint_defs TEXT[];
+    expected_constraint_defs CONSTANT TEXT[] := ARRAY[
+        'fleet_enrollment_tokens_canonical_leader:CHECK (leader_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_name:CHECK (node_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_ssh_user:CHECK (ssh_user ~ ''^[a-z_][a-z0-9_-]{0,63}$''::text)',
+        'fleet_enrollment_tokens_consumption:CHECK (consumed_at IS NULL AND consumed_peer_ip IS NULL OR consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)',
+        'fleet_enrollment_tokens_epoch:CHECK (leader_epoch >= 0)',
+        'fleet_enrollment_tokens_expiry:CHECK (expires_at > created_at AND expires_at <= (created_at + ''00:15:00''::interval))',
+        'fleet_enrollment_tokens_hash_length:CHECK (octet_length(token_hash) = 32)',
+        'fleet_enrollment_tokens_pkey:PRIMARY KEY (token_hash)',
+        'fleet_enrollment_tokens_purpose:CHECK (purpose = ''node-enrollment''::text)',
+        'fleet_enrollment_tokens_revocation:CHECK (revoked_at IS NULL OR consumed_at IS NULL AND revoked_at >= created_at)',
+        'fleet_enrollment_tokens_role:CHECK (role = ANY (ARRAY[''builder''::text, ''gateway''::text, ''testbed''::text]))',
+        'fleet_enrollment_tokens_runtime:CHECK (runtime ~ ''^[a-z0-9][a-z0-9._-]{0,31}$''::text)'
+    ];
+BEGIN
+    IF to_regclass('public.fleet_enrollment_tokens') IS NULL THEN
+        CREATE TABLE public.fleet_enrollment_tokens (
+            token_hash       BYTEA PRIMARY KEY,
+            node_name        TEXT NOT NULL,
+            intended_ip      INET NOT NULL,
+            ssh_user         TEXT NOT NULL,
+            role             TEXT NOT NULL,
+            runtime          TEXT NOT NULL,
+            purpose          TEXT NOT NULL DEFAULT 'node-enrollment',
+            leader_name      TEXT NOT NULL,
+            leader_epoch     BIGINT NOT NULL,
+            expires_at       TIMESTAMPTZ NOT NULL,
+            consumed_at      TIMESTAMPTZ,
+            consumed_peer_ip INET,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            created_by       TEXT,
+            revoked_at       TIMESTAMPTZ,
+            CONSTRAINT fleet_enrollment_tokens_hash_length
+                CHECK (octet_length(token_hash) = 32),
+            CONSTRAINT fleet_enrollment_tokens_canonical_name
+                CHECK (node_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+            CONSTRAINT fleet_enrollment_tokens_canonical_ssh_user
+                CHECK (ssh_user ~ '^[a-z_][a-z0-9_-]{0,63}$'),
+            CONSTRAINT fleet_enrollment_tokens_role
+                CHECK (role IN ('builder', 'gateway', 'testbed')),
+            CONSTRAINT fleet_enrollment_tokens_runtime
+                CHECK (runtime ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
+            CONSTRAINT fleet_enrollment_tokens_purpose
+                CHECK (purpose = 'node-enrollment'),
+            CONSTRAINT fleet_enrollment_tokens_canonical_leader
+                CHECK (leader_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+            CONSTRAINT fleet_enrollment_tokens_epoch
+                CHECK (leader_epoch >= 0),
+            CONSTRAINT fleet_enrollment_tokens_expiry
+                CHECK (expires_at > created_at
+                    AND expires_at <= created_at + interval '15 minutes'),
+            CONSTRAINT fleet_enrollment_tokens_consumption
+                CHECK ((consumed_at IS NULL AND consumed_peer_ip IS NULL)
+                    OR (consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)),
+            CONSTRAINT fleet_enrollment_tokens_revocation
+                CHECK (revoked_at IS NULL
+                    OR (consumed_at IS NULL AND revoked_at >= created_at))
+        );
+    ELSE
+        SELECT array_agg(
+                   a.attname || ':' || format_type(a.atttypid, a.atttypmod) || ':' ||
+                   CASE WHEN a.attnotnull THEN 'required' ELSE 'nullable' END
+                   ORDER BY a.attnum
+               )
+          INTO actual_columns
+          FROM pg_attribute a
+         WHERE a.attrelid = 'public.fleet_enrollment_tokens'::regclass
+           AND a.attnum > 0
+           AND NOT a.attisdropped;
+        IF actual_columns IS DISTINCT FROM expected_columns THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'preexisting fleet_enrollment_tokens has an unsafe shape',
+                DETAIL = format('expected columns %, found %', expected_columns, actual_columns),
+                HINT = 'use a reviewed forward-only enrollment schema repair migration; onboarding never repairs authority tables';
+        END IF;
+
+        SELECT array_agg(
+                   a.attname || ':' || pg_get_expr(d.adbin, d.adrelid)
+                   ORDER BY a.attname
+               )
+          INTO actual_defaults
+          FROM pg_attribute a
+          JOIN pg_attrdef d
+            ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+         WHERE a.attrelid = 'public.fleet_enrollment_tokens'::regclass
+           AND a.attnum > 0
+           AND NOT a.attisdropped;
+        IF actual_defaults IS DISTINCT FROM expected_defaults THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'preexisting fleet_enrollment_tokens has unsafe defaults',
+                DETAIL = format('expected defaults %, found %', expected_defaults, actual_defaults),
+                HINT = 'use a reviewed forward-only enrollment schema repair migration; onboarding never repairs authority tables';
+        END IF;
+
+        SELECT array_agg(c.conname ORDER BY c.conname),
+               array_agg(
+                   c.conname || ':' || pg_get_constraintdef(c.oid, true)
+                   ORDER BY c.conname
+               )
+          INTO actual_constraints, actual_constraint_defs
+          FROM pg_constraint c
+         WHERE c.conrelid = 'public.fleet_enrollment_tokens'::regclass;
+        IF actual_constraints IS DISTINCT FROM expected_constraints
+           OR actual_constraint_defs IS DISTINCT FROM expected_constraint_defs
+           OR EXISTS (
+               SELECT 1 FROM pg_constraint c
+                WHERE c.conrelid = 'public.fleet_enrollment_tokens'::regclass
+                  AND NOT c.convalidated
+           ) THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'preexisting fleet_enrollment_tokens has unsafe constraints',
+                DETAIL = format(
+                    'expected constraints %, found names %, definitions %',
+                    expected_constraint_defs, actual_constraints, actual_constraint_defs
+                ),
+                HINT = 'use a reviewed forward-only enrollment schema repair migration; onboarding never repairs authority tables';
+        END IF;
+    END IF;
+END
+$secure_enrollment_migration$;
+
+-- Enrollment allocates one canonical name/IP across both roster projections.
+-- PostgreSQL cannot express cross-table uniqueness, so the transaction also
+-- takes the shared enrollment advisory lock and checks both tables together;
+-- these indexes make each projection independently race-safe.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_canonical_name
+    ON computers (lower(name));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_primary_ip
+    ON computers (primary_ip)
+    WHERE NULLIF(primary_ip, '') IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_canonical_name
+    ON fleet_workers (lower(name));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_ip
+    ON fleet_workers (ip)
+    WHERE NULLIF(ip, '') IS NOT NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_pending_name
+    ON fleet_enrollment_tokens (lower(node_name))
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_pending_ip
+    ON fleet_enrollment_tokens (intended_ip)
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_expiry
     ON fleet_enrollment_tokens (expires_at)
-    WHERE consumed_at IS NULL;
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_node
     ON fleet_enrollment_tokens (node_name, created_at DESC);
+
+COMMENT ON TABLE fleet_enrollment_tokens IS
+    'forgefleet secure enrollment authority schema v289; forward-only migrations only';
+
+DO $secure_enrollment_indexes$
+DECLARE
+    actual_index_defs TEXT[];
+    expected_index_defs CONSTANT TEXT[] := ARRAY[
+        'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)',
+        'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name ON public.fleet_workers USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip ON public.fleet_workers USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)'
+    ];
+BEGIN
+    SELECT array_agg(pg_get_indexdef(x.indexrelid) ORDER BY i.relname)
+      INTO actual_index_defs
+      FROM pg_index x
+      JOIN pg_class i ON i.oid = x.indexrelid
+     WHERE i.relname IN (
+        'fleet_enrollment_tokens_pkey',
+        'idx_computers_enrollment_canonical_name',
+        'idx_computers_enrollment_primary_ip',
+        'idx_fleet_enrollment_tokens_expiry',
+        'idx_fleet_enrollment_tokens_node',
+        'idx_fleet_enrollment_tokens_pending_ip',
+        'idx_fleet_enrollment_tokens_pending_name',
+        'idx_fleet_workers_enrollment_canonical_name',
+        'idx_fleet_workers_enrollment_ip'
+     );
+    IF actual_index_defs IS DISTINCT FROM expected_index_defs
+       OR (SELECT count(*) FROM pg_index
+            WHERE indrelid = 'public.fleet_enrollment_tokens'::regclass) <> 5
+       OR EXISTS (
+           SELECT 1
+             FROM pg_index x
+             JOIN pg_class i ON i.oid = x.indexrelid
+            WHERE i.relname IN (
+                'fleet_enrollment_tokens_pkey',
+                'idx_computers_enrollment_canonical_name',
+                'idx_computers_enrollment_primary_ip',
+                'idx_fleet_enrollment_tokens_expiry',
+                'idx_fleet_enrollment_tokens_node',
+                'idx_fleet_enrollment_tokens_pending_ip',
+                'idx_fleet_enrollment_tokens_pending_name',
+                'idx_fleet_workers_enrollment_canonical_name',
+                'idx_fleet_workers_enrollment_ip'
+            )
+              AND (NOT x.indisvalid OR NOT x.indisready)
+       ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'fleet_enrollment_tokens indexes do not match the reviewed authority schema',
+            DETAIL = format('expected indexes %, found %', expected_index_defs, actual_index_defs),
+            HINT = 'use a reviewed forward-only enrollment schema repair migration';
+    END IF;
+END
+$secure_enrollment_indexes$;
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

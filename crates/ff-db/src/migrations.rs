@@ -12,6 +12,10 @@ use crate::schema;
 /// The highest migration version baked into the squashed fresh-DB bootstrap.
 const BOOTSTRAP_BASELINE_VERSION: u32 = schema::PG_BASELINE_VERSION;
 
+/// Transaction-scoped lock shared by enrollment issuance and consumption.
+/// The value is the stable ASCII tag `FF_ENROL` encoded as a signed i64.
+pub const SECURE_ENROLLMENT_XACT_LOCK_KEY: i64 = 0x4646_5f45_4e52_4f4c;
+
 // ─── Postgres Migrations ─────────────────────────────────────────────────────
 
 /// A single Postgres migration step.
@@ -1296,6 +1300,145 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         sql: schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS,
     },
 ];
+
+/// Fail closed unless the enrollment authority table is exactly the reviewed
+/// v289 shape. This is intentionally validation-only: callers such as
+/// `ff onboard` and the TLS supervisor must never repair or create authority
+/// schema as an ordinary request side effect. Only the forward migration runner
+/// owns that lifecycle.
+pub async fn validate_secure_enrollment_schema(pool: &PgPool) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        r#"
+        WITH relation AS (
+            SELECT to_regclass('public.fleet_enrollment_tokens') AS oid
+        ),
+        expected_columns(attnum, attname, type_name, required, default_expr) AS (
+            VALUES
+                (1, 'token_hash', 'bytea', true, NULL::text),
+                (2, 'node_name', 'text', true, NULL::text),
+                (3, 'intended_ip', 'inet', true, NULL::text),
+                (4, 'ssh_user', 'text', true, NULL::text),
+                (5, 'role', 'text', true, NULL::text),
+                (6, 'runtime', 'text', true, NULL::text),
+                (7, 'purpose', 'text', true, '''node-enrollment''::text'),
+                (8, 'leader_name', 'text', true, NULL::text),
+                (9, 'leader_epoch', 'bigint', true, NULL::text),
+                (10, 'expires_at', 'timestamp with time zone', true, NULL::text),
+                (11, 'consumed_at', 'timestamp with time zone', false, NULL::text),
+                (12, 'consumed_peer_ip', 'inet', false, NULL::text),
+                (13, 'created_at', 'timestamp with time zone', true, 'clock_timestamp()'),
+                (14, 'created_by', 'text', false, NULL::text),
+                (15, 'revoked_at', 'timestamp with time zone', false, NULL::text)
+        ),
+        actual_columns AS (
+            SELECT a.attnum::integer AS attnum,
+                   a.attname,
+                   format_type(a.atttypid, a.atttypmod) AS type_name,
+                   a.attnotnull AS required,
+                   pg_get_expr(d.adbin, d.adrelid) AS default_expr
+              FROM relation r
+              JOIN pg_attribute a ON a.attrelid = r.oid
+              LEFT JOIN pg_attrdef d
+                ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+             WHERE a.attnum > 0 AND NOT a.attisdropped
+        ),
+        expected_constraints(conname, condef) AS (
+            VALUES
+                ('fleet_enrollment_tokens_canonical_leader', 'CHECK (leader_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)'),
+                ('fleet_enrollment_tokens_canonical_name', 'CHECK (node_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)'),
+                ('fleet_enrollment_tokens_canonical_ssh_user', 'CHECK (ssh_user ~ ''^[a-z_][a-z0-9_-]{0,63}$''::text)'),
+                ('fleet_enrollment_tokens_consumption', 'CHECK (consumed_at IS NULL AND consumed_peer_ip IS NULL OR consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)'),
+                ('fleet_enrollment_tokens_epoch', 'CHECK (leader_epoch >= 0)'),
+                ('fleet_enrollment_tokens_expiry', 'CHECK (expires_at > created_at AND expires_at <= (created_at + ''00:15:00''::interval))'),
+                ('fleet_enrollment_tokens_hash_length', 'CHECK (octet_length(token_hash) = 32)'),
+                ('fleet_enrollment_tokens_pkey', 'PRIMARY KEY (token_hash)'),
+                ('fleet_enrollment_tokens_purpose', 'CHECK (purpose = ''node-enrollment''::text)'),
+                ('fleet_enrollment_tokens_revocation', 'CHECK (revoked_at IS NULL OR consumed_at IS NULL AND revoked_at >= created_at)'),
+                ('fleet_enrollment_tokens_role', 'CHECK (role = ANY (ARRAY[''builder''::text, ''gateway''::text, ''testbed''::text]))'),
+                ('fleet_enrollment_tokens_runtime', 'CHECK (runtime ~ ''^[a-z0-9][a-z0-9._-]{0,31}$''::text)')
+        ),
+        actual_constraints AS (
+            SELECT c.conname, pg_get_constraintdef(c.oid, true) AS condef,
+                   c.convalidated
+              FROM relation r
+              JOIN pg_constraint c ON c.conrelid = r.oid
+        ),
+        expected_indexes(indexname, indexdef) AS (
+            VALUES
+                ('fleet_enrollment_tokens_pkey', 'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)'),
+                ('idx_computers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))'),
+                ('idx_computers_enrollment_primary_ip', 'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)'),
+                ('idx_fleet_enrollment_tokens_expiry', 'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
+                ('idx_fleet_enrollment_tokens_node', 'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)'),
+                ('idx_fleet_enrollment_tokens_pending_ip', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
+                ('idx_fleet_enrollment_tokens_pending_name', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
+                ('idx_fleet_workers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name ON public.fleet_workers USING btree (lower(name))'),
+                ('idx_fleet_workers_enrollment_ip', 'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip ON public.fleet_workers USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)')
+        ),
+        actual_indexes AS (
+            SELECT i.relname AS indexname, x.indisvalid, x.indisready,
+                   pg_get_indexdef(x.indexrelid) AS indexdef
+              FROM pg_index x
+              JOIN pg_class i ON i.oid = x.indexrelid
+             WHERE i.relname IN (SELECT indexname FROM expected_indexes)
+        ),
+        token_index_count AS (
+            SELECT count(*) AS count
+              FROM relation r
+              JOIN pg_index x ON x.indrelid = r.oid
+        )
+        SELECT
+            (SELECT oid IS NOT NULL FROM relation)
+            AND (SELECT count(*) FROM actual_columns) = 15
+            AND NOT EXISTS (
+                SELECT attnum, attname, type_name, required, default_expr FROM expected_columns
+                EXCEPT
+                SELECT attnum, attname, type_name, required, default_expr FROM actual_columns
+            )
+            AND NOT EXISTS (
+                SELECT attnum, attname, type_name, required, default_expr FROM actual_columns
+                EXCEPT
+                SELECT attnum, attname, type_name, required, default_expr FROM expected_columns
+            )
+            AND (SELECT count(*) FROM actual_constraints) = 12
+            AND NOT EXISTS (
+                SELECT conname, condef FROM expected_constraints
+                EXCEPT SELECT conname, condef FROM actual_constraints
+            )
+            AND NOT EXISTS (
+                SELECT conname, condef FROM actual_constraints
+                EXCEPT SELECT conname, condef FROM expected_constraints
+            )
+            AND NOT EXISTS (SELECT 1 FROM actual_constraints WHERE NOT convalidated)
+            AND (SELECT count FROM token_index_count) = 5
+            AND (SELECT count(*) FROM actual_indexes) = 9
+            AND NOT EXISTS (
+                SELECT indexname, indexdef FROM expected_indexes
+                EXCEPT SELECT indexname, indexdef FROM actual_indexes
+            )
+            AND NOT EXISTS (
+                SELECT indexname, indexdef FROM actual_indexes
+                EXCEPT SELECT indexname, indexdef FROM expected_indexes
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM actual_indexes WHERE NOT indisvalid OR NOT indisready
+            )
+            AND obj_description(
+                    (SELECT oid FROM relation), 'pg_class'
+                ) = 'forgefleet secure enrollment authority schema v289; forward-only migrations only'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::Migration(
+            "fleet_enrollment_tokens is missing or not the exact reviewed v289 shape; run the controlled forward migration before enrollment".to_string(),
+        ))
+    }
+}
 
 /// Postgres advisory-lock key guarding the migration runner.
 ///
@@ -3143,7 +3286,7 @@ mod tests {
     }
 
     #[test]
-    fn v289_stores_only_bound_one_time_token_hashes() {
+    fn v289_is_controlled_exact_shape_enrollment_authority() {
         let migration = PG_MIGRATIONS
             .iter()
             .find(|migration| migration.version == 289)
@@ -3152,16 +3295,21 @@ mod tests {
         for required in [
             "token_hash       BYTEA PRIMARY KEY",
             "octet_length(token_hash) = 32",
-            "node_name",
-            "intended_ip      INET",
-            "leader_name",
-            "leader_epoch",
-            "expires_at",
-            "consumed_at",
-            "consumed_peer_ip",
+            "to_regclass('public.fleet_enrollment_tokens') IS NULL",
+            "preexisting fleet_enrollment_tokens has an unsafe shape",
+            "expected_columns",
+            "expected_constraints",
+            "revoked_at",
+            "idx_fleet_enrollment_tokens_pending_name",
+            "idx_fleet_enrollment_tokens_pending_ip",
+            "forward-only enrollment schema repair migration",
         ] {
-            assert!(migration.sql.contains(required), "missing {required}");
+            assert!(
+                migration.sql.contains(required),
+                "V289 lacks controlled schema contract: {required}"
+            );
         }
+        assert!(!migration.sql.contains("CREATE TABLE IF NOT EXISTS"));
         assert!(!migration.sql.contains("plaintext"));
         assert!(!migration.sql.contains("token_value"));
     }
