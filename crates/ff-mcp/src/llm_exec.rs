@@ -26,9 +26,14 @@ use uuid::Uuid;
 /// required and an absent key keeps conservative defaults.
 pub const LOCAL_ROUTE_POLICY_KEY: &str = "ff_mcp.local_route_policy.v1";
 
-const DEFAULT_TOTAL_TIMEOUT_MS: u64 = 180_000;
+/// Keep the server's absolute deadline 15 seconds below the observed
+/// 120-second MCP client request envelope. This margin lets us return typed
+/// failure evidence instead of having the client tear down the transport first.
+const SERVER_HARD_TOTAL_TIMEOUT_MS: u64 = 105_000;
+const SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS: u64 = 90_000;
+const DEFAULT_TOTAL_TIMEOUT_MS: u64 = SERVER_HARD_TOTAL_TIMEOUT_MS;
 const DEFAULT_MIN_START_BUDGET_MS: u64 = 5_000;
-const DEFAULT_MAX_ATTEMPT_TIMEOUT_MS: u64 = 120_000;
+const DEFAULT_MAX_ATTEMPT_TIMEOUT_MS: u64 = SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS;
 const DEFAULT_MAX_DISTINCT_ATTEMPTS: usize = 3;
 const DEFAULT_COOLDOWN_MS: u64 = 60_000;
 const DEFAULT_MAX_COOLDOWN_ENTRIES: usize = 512;
@@ -96,7 +101,7 @@ impl LocalRoutePolicy {
                 .map_err(|error| format!("invalid {LOCAL_ROUTE_POLICY_KEY}: {error}"))?,
             None => LocalRoutePolicyOverride::default(),
         };
-        let policy = Self {
+        let mut policy = Self {
             total_timeout: Duration::from_millis(
                 overlay.total_timeout_ms.unwrap_or(DEFAULT_TOTAL_TIMEOUT_MS),
             ),
@@ -130,8 +135,22 @@ impl LocalRoutePolicy {
                 Duration::from_secs(timeouts.tier4.unwrap_or(300)),
             ],
         };
+        policy.enforce_server_ceilings();
         policy.validate()?;
         Ok(policy)
+    }
+
+    /// Operational configuration may make a request stricter, but it cannot
+    /// expand the MCP server's safety envelope. This is also applied at the
+    /// executor boundary so a future programmatic caller cannot bypass the
+    /// same hard limits by constructing `LocalRoutePolicy` directly.
+    fn enforce_server_ceilings(&mut self) {
+        self.total_timeout = self
+            .total_timeout
+            .min(Duration::from_millis(SERVER_HARD_TOTAL_TIMEOUT_MS));
+        self.max_attempt_timeout = self
+            .max_attempt_timeout
+            .min(Duration::from_millis(SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS));
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -727,8 +746,9 @@ impl GatewayLlmExec {
         pool: sqlx::PgPool,
         workload: WorkloadClass,
         completion_ceiling: Option<CompletionBudget>,
-        policy: LocalRoutePolicy,
+        mut policy: LocalRoutePolicy,
     ) -> Self {
+        policy.enforce_server_ceilings();
         let clock: Arc<dyn MonotonicClock> = Arc::new(SystemClock);
         let started_at = clock.now();
         let deadline = started_at
@@ -1148,8 +1168,9 @@ impl GatewayLlmExec {
         reservations: Arc<ReservationRegistry>,
         clock: Arc<dyn MonotonicClock>,
         workload: WorkloadClass,
-        policy: LocalRoutePolicy,
+        mut policy: LocalRoutePolicy,
     ) -> Self {
+        policy.enforce_server_ceilings();
         let started_at = clock.now();
         let deadline = started_at.checked_add(policy.total_timeout).unwrap();
         Self {
@@ -1276,6 +1297,7 @@ mod tests {
         Payload(Value),
         Failure(FailureReasonCode, &'static str),
         AdvanceThenPayload(Duration, Value),
+        Never,
     }
 
     struct FakeTransport {
@@ -1296,13 +1318,15 @@ mod tests {
             _attempt_timeout: Duration,
         ) -> Result<TransportResponse, ExecutionFailure> {
             self.seen.lock().unwrap().push(target.deployment_id);
-            match self.replies.lock().unwrap().pop_front().unwrap() {
+            let reply = self.replies.lock().unwrap().pop_front().unwrap();
+            match reply {
                 FakeReply::Payload(payload) => Ok(TransportResponse { target, payload }),
                 FakeReply::Failure(code, message) => Err(ExecutionFailure::new(code, message)),
                 FakeReply::AdvanceThenPayload(duration, payload) => {
                     self.clock.advance(duration);
                     Ok(TransportResponse { target, payload })
                 }
+                FakeReply::Never => std::future::pending().await,
             }
         }
     }
@@ -2202,5 +2226,124 @@ mod tests {
         assert_eq!(policy.total_timeout, Duration::from_secs(9));
         assert_eq!(policy.tier_timeout(3), Duration::from_secs(33));
         assert_eq!(policy.max_distinct_attempts, 2);
+    }
+
+    #[test]
+    fn policy_defaults_and_oversized_overrides_obey_server_hard_ceilings() {
+        let timeouts = LlmTimeouts {
+            tier1: None,
+            tier2: None,
+            tier3: None,
+            tier4: None,
+        };
+        let defaults = LocalRoutePolicy::from_config(&timeouts, None).unwrap();
+        assert_eq!(defaults.total_timeout, Duration::from_millis(105_000));
+        assert_eq!(
+            defaults.max_attempt_timeout,
+            Duration::from_millis(90_000)
+        );
+
+        let clamped = LocalRoutePolicy::from_config(
+            &timeouts,
+            Some(
+                r#"{"total_timeout_ms":999999,"max_attempt_timeout_ms":999999,"min_start_budget_ms":100}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(clamped.total_timeout, defaults.total_timeout);
+        assert_eq!(clamped.max_attempt_timeout, defaults.max_attempt_timeout);
+        assert_eq!(
+            remaining_attempt_budget(
+                Instant::now(),
+                Instant::now() + clamped.total_timeout,
+                clamped.min_start_budget,
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+                clamped.max_attempt_timeout,
+            ),
+            Some(Duration::from_millis(SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS))
+        );
+    }
+
+    #[test]
+    fn policy_preserves_lower_overrides_and_rejects_invalid_clamped_combinations() {
+        let timeouts = LlmTimeouts {
+            tier1: None,
+            tier2: None,
+            tier3: None,
+            tier4: None,
+        };
+        let lower = LocalRoutePolicy::from_config(
+            &timeouts,
+            Some(
+                r#"{"total_timeout_ms":7000,"max_attempt_timeout_ms":6000,"min_start_budget_ms":100}"#,
+            ),
+        )
+        .unwrap();
+        assert_eq!(lower.total_timeout, Duration::from_secs(7));
+        assert_eq!(lower.max_attempt_timeout, Duration::from_secs(6));
+
+        let invalid = LocalRoutePolicy::from_config(
+            &timeouts,
+            Some(r#"{"total_timeout_ms":999999,"min_start_budget_ms":110000}"#),
+        )
+        .unwrap_err();
+        assert!(invalid.contains("min_start_budget_ms exceeds total_timeout_ms"));
+    }
+
+    #[test]
+    fn executor_reapplies_hard_ceilings_to_programmatic_policy() {
+        let mut policy = test_policy();
+        policy.total_timeout = Duration::from_secs(180);
+        policy.max_attempt_timeout = Duration::from_secs(120);
+        let (exec, _, _) = executor(
+            vec![candidate(70)],
+            vec![FakeReply::Payload(valid("unused"))],
+            FakeClock::new(),
+            Arc::new(ReservationRegistry::default()),
+            policy,
+        );
+        assert_eq!(
+            exec.policy.total_timeout,
+            Duration::from_millis(SERVER_HARD_TOTAL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            exec.policy.max_attempt_timeout,
+            Duration::from_millis(SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS)
+        );
+    }
+
+    #[tokio::test]
+    async fn hanging_transport_is_bounded_and_recorded_as_typed_timeout() {
+        let mut policy = test_policy();
+        policy.total_timeout = Duration::from_millis(100);
+        policy.min_start_budget = Duration::from_millis(1);
+        policy.max_attempt_timeout = Duration::from_millis(10);
+        policy.max_distinct_attempts = 1;
+        policy.tier_timeouts = [Duration::from_secs(1); 4];
+        let (exec, _, _) = executor(
+            vec![candidate(71)],
+            vec![FakeReply::Never],
+            FakeClock::new(),
+            Arc::new(ReservationRegistry::default()),
+            policy,
+        );
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            exec.complete(1, "write", 256, Duration::from_secs(1)),
+        )
+        .await
+        .expect("the server-side attempt timeout must resolve first")
+        .unwrap_err();
+        assert!(error.starts_with("timeout:"), "{error}");
+        let evidence = exec.evidence();
+        assert_eq!(evidence.attempts.len(), 1);
+        assert_eq!(evidence.attempts[0].attempt_timeout_ms, 10);
+        assert_eq!(
+            evidence.attempts[0].reason_code,
+            Some(FailureReasonCode::Timeout)
+        );
+        assert_eq!(evidence.last_failure, Some(FailureReasonCode::Timeout));
     }
 }
