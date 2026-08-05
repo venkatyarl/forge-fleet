@@ -5,6 +5,13 @@ services:
     container_name: forgefleet-falkordb-replica
     restart: unless-stopped
     network_mode: host
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nodev,nosuid,noexec,size=64m
     volumes:
       - forgefleet-falkordb-replica-data:/var/lib/falkordb/data
     environment:

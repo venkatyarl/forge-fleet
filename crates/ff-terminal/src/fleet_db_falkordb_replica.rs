@@ -8,7 +8,7 @@
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 use std::collections::BTreeMap;
@@ -40,6 +40,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const SSH_TIMEOUT: Duration = Duration::from_secs(30);
 const COMPOSE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const REPLICA_READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+const FULL_NODE_QUERY: &str = "MATCH (n) RETURN labels(n), properties(n)";
+const FULL_RELATIONSHIP_QUERY: &str = "MATCH (a)-[r]->(b) RETURN labels(a), properties(a), type(r), properties(r), labels(b), properties(b)";
 
 const UPSERT_PRIMARY_SQL: &str = "INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'falkordb','primary','running',0,NOW(),$2,$3) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='primary',status='running',lag_bytes=0,last_sync_at=NOW(),bootstrapped_from_backup_id=$2,notes=$3";
 const UPSERT_REPLICA_SQL: &str = "INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'falkordb','replica','running',$2,NOW(),$3,$4) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='replica',status='running',lag_bytes=$2,last_sync_at=NOW(),bootstrapped_from_backup_id=$3,notes=$4";
@@ -64,8 +66,15 @@ struct Computer {
 struct GraphEvidence {
     nodes: u64,
     relationships: u64,
-    node_sample_sha256: String,
-    relationship_sample_sha256: String,
+    node_full_sha256: String,
+    relationship_full_sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ImageEvidence {
+    image_id: String,
+    repo_digests: Vec<String>,
+    configured_user: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -107,6 +116,8 @@ struct PlanMaterial {
     backup: BackupEvidence,
     target_state: TargetState,
     image: &'static str,
+    image_id: String,
+    image_user: String,
     primary_port: u16,
     replica_port: u16,
     firewall_policy: &'static str,
@@ -144,10 +155,19 @@ impl Plan {
     }
 }
 
+fn validate_plan_id(plan: &Plan, supplied: &str) -> Result<()> {
+    if plan.id() != supplied {
+        bail!("FalkorDB replica plan-id is stale or mismatched; run plan again");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TargetAttestation {
     docker_version: String,
     image_id: String,
+    image_repo_digests: Vec<String>,
+    image_user: String,
     container: Option<String>,
     volume_present: bool,
     ram_bytes: u64,
@@ -168,12 +188,60 @@ struct FirewallEvidence {
     ipv4_target_allow: bool,
     ipv4_default_deny: bool,
     ipv6_default_deny: bool,
+    ipv6_forward_default_deny: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirewallStatus {
+    ok: bool,
+    interface: String,
+    source_ipv4: String,
+    destination_ipv4: String,
+    port: u16,
+    allow_v4: bool,
+    deny_v4: bool,
+    deny_v6: bool,
+    allow_v4_position: u64,
+    deny_v4_position: u64,
+    deny_v6_position: u64,
+    deny_v6_forward_position: u64,
+    persistence: FirewallPersistence,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirewallPersistence {
+    unit: String,
+    unit_active: bool,
+    unit_enabled: bool,
+    environment_file: String,
+    environment_file_present: bool,
+    helper: String,
+    helper_present: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RestoreReceipt {
+    proof: String,
+    input_checksum_sha256: String,
+    image_reference: String,
+    image_id: String,
+    network: String,
+    query_mode: String,
+    expected_min_keys: u64,
+    observed_keys: u64,
+    expected_min_graph_nodes: u64,
+    observed_graphs: u64,
+    observed_graph_nodes: u64,
 }
 
 #[derive(Debug, Clone)]
 struct PurgeEvidence {
     target: Computer,
     primary: Computer,
+    primary_image: ImageEvidence,
     backup: BackupEvidence,
 }
 
@@ -194,13 +262,14 @@ impl PrimaryProbe {
 impl PurgeEvidence {
     fn proof(&self) -> String {
         let canonical = format!(
-            "falkordb-purge-v1\0{}\0{}\0{}\0{}\0{}\0{}",
+            "falkordb-purge-v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.target.id,
             self.target.name,
             self.primary.id,
             FALKORDB_VOLUME,
             self.backup.backup_id,
             self.backup.checksum_sha256,
+            self.primary_image.image_id,
         );
         sha256(canonical.as_bytes())
     }
@@ -360,10 +429,18 @@ async fn run_on_node(node: &Computer, script: &str, timeout: Duration) -> Result
 }
 
 async fn primary_probe(primary: &Computer) -> Result<PrimaryProbe> {
+    node_loopback_probe(primary, PRIMARY_PORT, "Priya").await
+}
+
+async fn node_loopback_probe(
+    node: &Computer,
+    remote_port: u16,
+    label: &str,
+) -> Result<PrimaryProbe> {
     let local_name = ff_agent::fleet_info::resolve_this_worker_name().await;
-    if local_name.eq_ignore_ascii_case(&primary.name) {
+    if local_name.eq_ignore_ascii_case(&node.name) {
         return Ok(PrimaryProbe {
-            url: format!("redis://127.0.0.1:{PRIMARY_PORT}"),
+            url: format!("redis://127.0.0.1:{remote_port}"),
             tunnel: None,
         });
     }
@@ -372,7 +449,7 @@ async fn primary_probe(primary: &Computer) -> Result<PrimaryProbe> {
         .context("reserve local FalkorDB proof tunnel port")?;
     let port = listener.local_addr()?.port();
     drop(listener);
-    let forward = format!("127.0.0.1:{port}:127.0.0.1:{PRIMARY_PORT}");
+    let forward = format!("127.0.0.1:{port}:127.0.0.1:{remote_port}");
     let mut child = tokio::process::Command::new("ssh")
         .args([
             "-N",
@@ -389,17 +466,17 @@ async fn primary_probe(primary: &Computer) -> Result<PrimaryProbe> {
             "-o",
             "ServerAliveCountMax=2",
             "-p",
-            &primary.ssh_port.to_string(),
+            &node.ssh_port.to_string(),
             "-L",
             &forward,
-            &format!("{}@{}", primary.ssh_user, primary.ip),
+            &format!("{}@{}", node.ssh_user, node.ip),
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true)
         .spawn()
-        .context("open bounded SSH tunnel for local Priya proof")?;
+        .with_context(|| format!("open bounded SSH tunnel for local {label} proof"))?;
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -412,25 +489,106 @@ async fn primary_probe(primary: &Computer) -> Result<PrimaryProbe> {
             });
         }
         if child.try_wait()?.is_some() {
-            bail!("Priya SSH proof tunnel exited before becoming ready");
+            bail!("{label} SSH proof tunnel exited before becoming ready");
         }
         if std::time::Instant::now() >= deadline {
-            bail!("Priya SSH proof tunnel did not become ready");
+            bail!("{label} SSH proof tunnel did not become ready");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
 fn field<'a>(raw: &'a str, name: &str) -> Result<&'a str> {
-    raw.lines()
-        .find_map(|line| line.strip_prefix(&format!("{name}=")))
-        .context(format!("remote attestation field {name} is missing"))
+    let prefix = format!("{name}=");
+    let matches: Vec<&str> = raw
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect();
+    if matches.len() != 1 {
+        bail!(
+            "remote attestation field {name} must appear exactly once (found {})",
+            matches.len()
+        );
+    }
+    Ok(matches[0])
+}
+
+fn valid_sha256_id(value: &str) -> bool {
+    value.len() == 71
+        && value.starts_with("sha256:")
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_image_evidence(evidence: &ImageEvidence) -> Result<()> {
+    if !valid_sha256_id(&evidence.image_id) {
+        bail!("daemon-resolved FalkorDB image ID is not canonical lowercase SHA-256");
+    }
+    let exact_digest_count = evidence
+        .repo_digests
+        .iter()
+        .filter(|digest| digest.as_str() == FALKORDB_IMAGE)
+        .count();
+    if exact_digest_count != 1 {
+        bail!("pinned FalkorDB reference does not resolve exactly once in daemon RepoDigests");
+    }
+    let mut dedup = evidence.repo_digests.clone();
+    dedup.sort();
+    dedup.dedup();
+    if dedup.len() != evidence.repo_digests.len() {
+        bail!("daemon FalkorDB RepoDigests contain duplicates");
+    }
+    Ok(())
+}
+
+fn parse_image_evidence(raw: &str) -> Result<ImageEvidence> {
+    let evidence = ImageEvidence {
+        image_id: field(raw, "IMAGE")?.trim().to_string(),
+        repo_digests: serde_json::from_str(field(raw, "IMAGE_REPO_DIGESTS")?.trim())
+            .context("parse daemon FalkorDB RepoDigests")?,
+        configured_user: field(raw, "IMAGE_USER")?.trim().to_string(),
+    };
+    validate_image_evidence(&evidence)?;
+    Ok(evidence)
+}
+
+fn image_attestation_script() -> String {
+    format!(
+        r#"set -eu
+printf 'IMAGE='
+docker image inspect --format '{{{{.Id}}}}' '{FALKORDB_IMAGE}'
+printf 'IMAGE_REPO_DIGESTS='
+docker image inspect --format '{{{{json .RepoDigests}}}}' '{FALKORDB_IMAGE}'
+printf 'IMAGE_USER='
+docker image inspect --format '{{{{.Config.User}}}}' '{FALKORDB_IMAGE}'
+"#,
+    )
+}
+
+async fn attest_image(node: &Computer) -> Result<ImageEvidence> {
+    let output = run_on_node(node, &image_attestation_script(), SSH_TIMEOUT)
+        .await
+        .with_context(|| {
+            format!(
+                "resolve pinned FalkorDB image on {} Docker daemon",
+                node.name
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "pinned FalkorDB image resolution failed on {}: {}",
+            node.name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    parse_image_evidence(&String::from_utf8_lossy(&output.stdout))
 }
 
 fn parse_target_attestation(raw: &str) -> Result<TargetAttestation> {
     let docker_version = field(raw, "DOCKER")?.trim().to_string();
-    let image_id = field(raw, "IMAGE")?.trim().to_string();
-    if docker_version.is_empty() || image_id.is_empty() {
+    let image = parse_image_evidence(raw)?;
+    if docker_version.is_empty() {
         bail!("target Docker or pinned-image identity is empty");
     }
     let container = match field(raw, "CONTAINER")?.trim() {
@@ -453,7 +611,9 @@ fn parse_target_attestation(raw: &str) -> Result<TargetAttestation> {
         .context("parse target disk attestation")?;
     Ok(TargetAttestation {
         docker_version,
-        image_id,
+        image_id: image.image_id,
+        image_repo_digests: image.repo_digests,
+        image_user: image.configured_user,
         container,
         volume_present,
         ram_bytes: ram_kib.saturating_mul(1024),
@@ -476,9 +636,13 @@ printf 'DOCKER='
 docker info --format '{{{{.ServerVersion}}}}'
 printf 'IMAGE='
 docker image inspect --format '{{{{.Id}}}}' '{FALKORDB_IMAGE}'
+printf 'IMAGE_REPO_DIGESTS='
+docker image inspect --format '{{{{json .RepoDigests}}}}' '{FALKORDB_IMAGE}'
+printf 'IMAGE_USER='
+docker image inspect --format '{{{{.Config.User}}}}' '{FALKORDB_IMAGE}'
 if docker container inspect '{FALKORDB_CONTAINER}' >/dev/null 2>&1; then
   printf 'CONTAINER='
-  docker container inspect --format '{{{{.Image}}}}|{{{{.State.Running}}}}|{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}|{{{{.HostConfig.RestartPolicy.Name}}}}|{{{{.HostConfig.NetworkMode}}}}|{{{{json .HostConfig.PortBindings}}}}|{{{{json .Config.Env}}}}|{{{{range .Mounts}}}}{{{{.Name}}}}:{{{{.Destination}}}};{{{{end}}}}' '{FALKORDB_CONTAINER}'
+  docker container inspect --format '{{{{.Image}}}}|{{{{.Config.Image}}}}|{{{{.State.Running}}}}|{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}|{{{{.HostConfig.RestartPolicy.Name}}}}|{{{{.HostConfig.NetworkMode}}}}|{{{{json .HostConfig.PortBindings}}}}|{{{{json .Config.Env}}}}|{{{{range .Mounts}}}}{{{{.Type}}}}:{{{{.Name}}}}:{{{{.Destination}}}}:{{{{.RW}}}};{{{{end}}}}|{{{{.HostConfig.ReadonlyRootfs}}}}|{{{{json .HostConfig.CapDrop}}}}|{{{{json .HostConfig.CapAdd}}}}|{{{{json .HostConfig.SecurityOpt}}}}|{{{{.HostConfig.Privileged}}}}|{{{{json .HostConfig.Devices}}}}|{{{{json .HostConfig.Tmpfs}}}}|{{{{json .HostConfig.Binds}}}}|{{{{.Config.User}}}}|{{{{json .Config.Healthcheck}}}}' '{FALKORDB_CONTAINER}'
 else
   echo 'CONTAINER=absent'
 fi
@@ -493,21 +657,27 @@ printf 'PORT_63380_NON_LOOPBACK=%s\n' "$(printf '%s\n' "$listeners" | awk 'NF &&
     )
 }
 
-fn validate_existing_container(fingerprint: &str, image_id: &str, primary_ip: &str) -> Result<()> {
-    let fields: Vec<&str> = fingerprint.splitn(8, '|').collect();
-    if fields.len() != 8 {
+fn validate_existing_container(
+    fingerprint: &str,
+    image_id: &str,
+    image_user: &str,
+    primary_ip: &str,
+) -> Result<()> {
+    let fields: Vec<&str> = fingerprint.splitn(19, '|').collect();
+    if fields.len() != 19 {
         bail!("existing FalkorDB container fingerprint is incomplete");
     }
     if fields[0] != image_id
-        || fields[1] != "true"
-        || fields[2] != "healthy"
-        || fields[3] != "unless-stopped"
-        || fields[4] != "host"
+        || fields[1] != FALKORDB_IMAGE
+        || fields[2] != "true"
+        || fields[3] != "healthy"
+        || fields[4] != "unless-stopped"
+        || fields[5] != "host"
     {
         bail!("existing FalkorDB container is not exact, running, and healthy");
     }
     let ports: serde_json::Value =
-        serde_json::from_str(fields[5]).context("parse FalkorDB port bindings")?;
+        serde_json::from_str(fields[6]).context("parse FalkorDB port bindings")?;
     if !ports.is_null()
         && ports
             .as_object()
@@ -516,7 +686,7 @@ fn validate_existing_container(fingerprint: &str, image_id: &str, primary_ip: &s
         bail!("existing FalkorDB host-network container has unexpected published-port bindings");
     }
     let env: Vec<String> =
-        serde_json::from_str(fields[6]).context("parse FalkorDB container environment")?;
+        serde_json::from_str(fields[7]).context("parse FalkorDB container environment")?;
     let redis_args = format!("REDIS_ARGS={}", expected_redis_args(primary_ip));
     let redis_args_count = env
         .iter()
@@ -539,8 +709,86 @@ fn validate_existing_container(fingerprint: &str, image_id: &str, primary_ip: &s
     {
         bail!("existing FalkorDB container has non-canonical replication arguments");
     }
-    if fields[7] != format!("{FALKORDB_VOLUME}:/var/lib/falkordb/data;") {
+    if fields[8] != format!("volume:{FALKORDB_VOLUME}:/var/lib/falkordb/data:true;") {
         bail!("existing FalkorDB container does not have the exact durable volume");
+    }
+    if fields[9] != "true" {
+        bail!("existing FalkorDB container root filesystem is not read-only");
+    }
+    let normalized_set = |raw: &str, label: &str| -> Result<Vec<String>> {
+        let mut values: Vec<String> = if raw == "null" {
+            Vec::new()
+        } else {
+            serde_json::from_str(raw).with_context(|| format!("parse {label}"))?
+        };
+        values.sort();
+        values.dedup();
+        Ok(values)
+    };
+    if normalized_set(fields[10], "FalkorDB CapDrop")? != ["ALL"] {
+        bail!("existing FalkorDB container must drop all Linux capabilities");
+    }
+    if !normalized_set(fields[11], "FalkorDB CapAdd")?.is_empty() {
+        bail!("existing FalkorDB container unexpectedly adds Linux capabilities");
+    }
+    if normalized_set(fields[12], "FalkorDB security options")? != ["no-new-privileges:true"] {
+        bail!("existing FalkorDB container lacks exact no-new-privileges hardening");
+    }
+    if fields[13] != "false" {
+        bail!("existing FalkorDB container is privileged");
+    }
+    let devices: serde_json::Value =
+        serde_json::from_str(fields[14]).context("parse FalkorDB device mappings")?;
+    if !devices.is_null() && devices.as_array().is_none_or(|items| !items.is_empty()) {
+        bail!("existing FalkorDB container has unexpected device mappings");
+    }
+    let tmpfs: BTreeMap<String, String> =
+        serde_json::from_str(fields[15]).context("parse FalkorDB tmpfs mounts")?;
+    if tmpfs.len() != 1 {
+        bail!("existing FalkorDB container must have exactly one approved tmpfs mount");
+    }
+    let tmp_options = tmpfs
+        .get("/tmp")
+        .context("existing FalkorDB container has no /tmp tmpfs")?;
+    let option_set: std::collections::BTreeSet<&str> = tmp_options.split(',').collect();
+    for required in ["rw", "nodev", "nosuid", "noexec"] {
+        if !option_set.contains(required) {
+            bail!("existing FalkorDB /tmp tmpfs lacks {required}");
+        }
+    }
+    if !option_set
+        .iter()
+        .any(|value| *value == "size=64m" || *value == "size=67108864")
+    {
+        bail!("existing FalkorDB /tmp tmpfs size is not exactly 64 MiB");
+    }
+    let binds: serde_json::Value =
+        serde_json::from_str(fields[16]).context("parse FalkorDB bind mounts")?;
+    if !binds.is_null() && binds.as_array().is_none_or(|items| !items.is_empty()) {
+        bail!("existing FalkorDB container has unexpected bind mounts");
+    }
+    if fields[17] != image_user {
+        bail!("existing FalkorDB runtime user differs from the pinned image contract");
+    }
+    let health: serde_json::Value =
+        serde_json::from_str(fields[18]).context("parse FalkorDB healthcheck")?;
+    if health.get("Test")
+        != Some(&serde_json::json!([
+            "CMD",
+            "redis-cli",
+            "-p",
+            "63380",
+            "PING"
+        ]))
+        || health.get("Interval").and_then(serde_json::Value::as_u64) != Some(5_000_000_000)
+        || health.get("Timeout").and_then(serde_json::Value::as_u64) != Some(3_000_000_000)
+        || health.get("Retries").and_then(serde_json::Value::as_u64) != Some(24)
+        || health
+            .get("StartPeriod")
+            .and_then(serde_json::Value::as_u64)
+            != Some(30_000_000_000)
+    {
+        bail!("existing FalkorDB container healthcheck is not exact");
     }
     Ok(())
 }
@@ -560,7 +808,12 @@ async fn attest_target(
     }
     let attestation = parse_target_attestation(&String::from_utf8_lossy(&output.stdout))?;
     let state = if let Some(fingerprint) = &attestation.container {
-        validate_existing_container(fingerprint, &attestation.image_id, primary_ip)?;
+        validate_existing_container(
+            fingerprint,
+            &attestation.image_id,
+            &attestation.image_user,
+            primary_ip,
+        )?;
         if attestation.replica_port_listeners != 1 || attestation.replica_port_non_loopback != 0 {
             bail!("exact FalkorDB container is not listening once on IPv4 loopback 63380");
         }
@@ -583,26 +836,48 @@ async fn attest_target(
     Ok((attestation, state))
 }
 
+fn validate_plan_image(plan: &Plan, attestation: &TargetAttestation) -> Result<()> {
+    if attestation.image_id != plan.material.image_id
+        || attestation.image_user != plan.material.image_user
+        || plan.material.image != FALKORDB_IMAGE
+    {
+        bail!("pinned FalkorDB image resolution changed; the lifecycle plan is stale");
+    }
+    Ok(())
+}
+
 fn firewall_attestation_script() -> &'static str {
     r#"set -eu
 unit='forgefleet-falkordb-source-firewall.service'
-echo FIREWALL_JSON_BEGIN
 sudo -n sh -c 'set -a; . /etc/forgefleet/falkordb-source-firewall.env; exec /usr/local/sbin/forgefleet-falkor-source-firewall --json status'
-echo FIREWALL_JSON_END
 echo "SERVICE_AFTER=$(systemctl show "$unit" -p After --value)"
 echo "SERVICE_REQUIRES=$(systemctl show "$unit" -p Requires --value)"
 echo "SERVICE_PARTOF=$(systemctl show "$unit" -p PartOf --value)"
 "#
 }
 
-fn firewall_json(raw: &str) -> Result<serde_json::Value> {
-    let (_, tail) = raw
-        .split_once("FIREWALL_JSON_BEGIN\n")
-        .context("firewall JSON begin marker is missing")?;
-    let (json, _) = tail
-        .split_once("\nFIREWALL_JSON_END")
-        .context("firewall JSON end marker is missing")?;
-    serde_json::from_str(json.trim()).context("parse firewall helper status JSON")
+fn firewall_status(raw: &str) -> Result<(FirewallStatus, &str)> {
+    if raw.chars().next().is_some_and(char::is_whitespace) {
+        bail!("firewall helper status has unexpected stdout before its JSON document");
+    }
+    let mut documents = serde_json::Deserializer::from_str(raw).into_iter::<FirewallStatus>();
+    let status = documents
+        .next()
+        .context("firewall helper emitted no JSON status document")?
+        .context("parse strict firewall helper status JSON")?;
+    let remainder = &raw[documents.byte_offset()..];
+    let lines: Vec<&str> = remainder
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    if lines.len() != 3
+        || !lines[0].starts_with("SERVICE_AFTER=")
+        || !lines[1].starts_with("SERVICE_REQUIRES=")
+        || !lines[2].starts_with("SERVICE_PARTOF=")
+    {
+        bail!("firewall attestation suffix is not the exact three systemd dependency fields");
+    }
+    Ok((status, remainder))
 }
 
 fn validate_firewall_attestation(
@@ -610,30 +885,13 @@ fn validate_firewall_attestation(
     target: &Computer,
     primary: &Computer,
 ) -> Result<FirewallEvidence> {
-    let status = firewall_json(raw)?;
-    let status_obj = status
-        .as_object()
-        .context("firewall helper status must be a JSON object")?;
-    let persistence = status
-        .get("persistence")
-        .and_then(serde_json::Value::as_object)
-        .context("firewall helper status is missing persistence evidence")?;
-    let bool_field = |object: &serde_json::Map<String, serde_json::Value>, key: &str| {
-        object.get(key).and_then(serde_json::Value::as_bool) == Some(true)
-    };
-    let exact_string = |key: &str, expected: &str| {
-        status.get(key).and_then(serde_json::Value::as_str) == Some(expected)
-    };
-    let exact_position = |key: &str, expected: u64| {
-        status.get(key).and_then(serde_json::Value::as_u64) == Some(expected)
-    };
-
-    let unit_enabled = bool_field(persistence, "unit_enabled");
-    let unit_active = bool_field(persistence, "unit_active");
-    let unit_result_success = status.get("ok").and_then(serde_json::Value::as_bool) == Some(true);
-    let after = field(raw, "SERVICE_AFTER")?;
-    let requires = field(raw, "SERVICE_REQUIRES")?;
-    let part_of = field(raw, "SERVICE_PARTOF")?;
+    let (status, systemd) = firewall_status(raw)?;
+    let unit_enabled = status.persistence.unit_enabled;
+    let unit_active = status.persistence.unit_active;
+    let unit_result_success = status.ok;
+    let after = field(systemd, "SERVICE_AFTER")?;
+    let requires = field(systemd, "SERVICE_REQUIRES")?;
+    let part_of = field(systemd, "SERVICE_PARTOF")?;
     let docker_lifecycle_bound = after
         .split_whitespace()
         .any(|item| item == "docker.service")
@@ -644,31 +902,21 @@ fn validate_firewall_attestation(
             .split_whitespace()
             .any(|item| item == "docker.service");
 
-    let identity_exact = exact_string("interface", "enp3s0")
-        && exact_string("source_ipv4", &target.ip)
-        && exact_string("destination_ipv4", &primary.ip)
-        && status.get("port").and_then(serde_json::Value::as_u64) == Some(u64::from(PRIMARY_PORT));
-    let persistence_exact = persistence.get("unit").and_then(serde_json::Value::as_str)
-        == Some("forgefleet-falkordb-source-firewall.service")
-        && persistence
-            .get("environment_file")
-            .and_then(serde_json::Value::as_str)
-            == Some("/etc/forgefleet/falkordb-source-firewall.env")
-        && persistence
-            .get("helper")
-            .and_then(serde_json::Value::as_str)
-            == Some("/usr/local/sbin/forgefleet-falkor-source-firewall")
-        && bool_field(persistence, "environment_file_present")
-        && bool_field(persistence, "helper_present");
-    let ipv4_target_allow = bool_field(status_obj, "allow_v4")
-        && exact_position("allow_v4_position", 1)
-        && identity_exact;
-    let ipv4_default_deny = bool_field(status_obj, "deny_v4")
-        && exact_position("deny_v4_position", 2)
-        && identity_exact;
-    let ipv6_default_deny = bool_field(status_obj, "deny_v6")
-        && exact_position("deny_v6_position", 1)
-        && identity_exact;
+    let identity_exact = status.interface == "enp3s0"
+        && status.source_ipv4 == target.ip
+        && status.destination_ipv4 == primary.ip
+        && status.port == PRIMARY_PORT;
+    let persistence_exact = status.persistence.unit
+        == "forgefleet-falkordb-source-firewall.service"
+        && status.persistence.environment_file == "/etc/forgefleet/falkordb-source-firewall.env"
+        && status.persistence.helper == "/usr/local/sbin/forgefleet-falkor-source-firewall"
+        && status.persistence.environment_file_present
+        && status.persistence.helper_present;
+    let ipv4_target_allow = status.allow_v4 && status.allow_v4_position == 1 && identity_exact;
+    let ipv4_default_deny = status.deny_v4 && status.deny_v4_position == 2 && identity_exact;
+    let ipv6_default_deny = status.deny_v6 && status.deny_v6_position == 1 && identity_exact;
+    let ipv6_forward_default_deny =
+        status.deny_v6 && status.deny_v6_forward_position == 1 && identity_exact;
 
     let evidence = FirewallEvidence {
         target_id: target.id,
@@ -681,6 +929,7 @@ fn validate_firewall_attestation(
         ipv4_target_allow,
         ipv4_default_deny,
         ipv6_default_deny,
+        ipv6_forward_default_deny,
     };
     if !evidence.unit_enabled
         || !evidence.unit_active
@@ -689,6 +938,7 @@ fn validate_firewall_attestation(
         || !evidence.ipv4_target_allow
         || !evidence.ipv4_default_deny
         || !evidence.ipv6_default_deny
+        || !evidence.ipv6_forward_default_deny
         || !persistence_exact
     {
         bail!("Priya source-specific FalkorDB firewall gate is not exact and Docker-persistent");
@@ -794,19 +1044,55 @@ fn encode_redis_value(value: &redis::Value, output: &mut Vec<u8>) -> Result<()> 
     Ok(())
 }
 
-fn graph_payload_hash(value: &redis::Value) -> Result<String> {
+fn graph_full_hash(
+    value: &redis::Value,
+    expected_rows: u64,
+    require_unique_rows: bool,
+) -> Result<String> {
     let redis::Value::Array(parts) = value else {
         bail!("FalkorDB query proof is not an array");
     };
-    if parts.len() < 2 {
+    let rows_index = if matches!(parts.first(), Some(redis::Value::Int(_))) {
+        2
+    } else {
+        1
+    };
+    if parts.len() <= rows_index {
         bail!("FalkorDB query proof lacks header and rows");
     }
-    // FalkorDB's final element is timing/statistics. It is intentionally not
-    // hashed; the exact header and rows are.
-    let stable = redis::Value::Array(parts[..parts.len() - 1].to_vec());
-    let mut encoded = Vec::new();
-    encode_redis_value(&stable, &mut encoded)?;
-    Ok(sha256(&encoded))
+    let redis::Value::Array(rows) = &parts[rows_index] else {
+        bail!("FalkorDB full graph proof rows are not an array");
+    };
+    if u64::try_from(rows.len()).ok() != Some(expected_rows) {
+        bail!(
+            "FalkorDB full graph query returned {} rows, expected exact count {expected_rows}",
+            rows.len()
+        );
+    }
+
+    // Hash a sorted multiset of complete canonical Redis rows. This avoids
+    // internal FalkorDB IDs and query-return order while retaining duplicate
+    // nodes/relationships. Every scalar is type-tagged and length-delimited by
+    // encode_redis_value; unsupported/nondeterministic RESP shapes fail closed.
+    let mut encoded_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut encoded = Vec::new();
+        encode_redis_value(row, &mut encoded)?;
+        encoded_rows.push(encoded);
+    }
+    encoded_rows.sort();
+    if require_unique_rows && encoded_rows.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!(
+            "FalkorDB node content is not a unique portable endpoint identity; complete cross-daemon relationship equality is unavailable"
+        );
+    }
+    let mut digest = Sha256::new();
+    digest.update(expected_rows.to_be_bytes());
+    for row in encoded_rows {
+        digest.update((row.len() as u64).to_be_bytes());
+        digest.update(row);
+    }
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 fn graph_count(value: &redis::Value) -> Result<u64> {
@@ -867,7 +1153,9 @@ async fn graph_inventory(url: &str) -> Result<BTreeMap<String, GraphEvidence>> {
     .context("GRAPH.LIST timed out")?
     .context("query GRAPH.LIST")?;
     graphs.sort();
-    graphs.dedup();
+    if graphs.windows(2).any(|pair| pair[0] == pair[1]) {
+        bail!("FalkorDB authority returned duplicate graph identities");
+    }
     if graphs.is_empty() {
         bail!("FalkorDB authority reports no graphs");
     }
@@ -880,29 +1168,23 @@ async fn graph_inventory(url: &str) -> Result<BTreeMap<String, GraphEvidence>> {
         let nodes = graph_count(&graph_query(url, &graph, "MATCH (n) RETURN count(n)").await?)?;
         let relationships =
             graph_count(&graph_query(url, &graph, "MATCH ()-[r]->() RETURN count(r)").await?)?;
-        let node_sample_sha256 = graph_payload_hash(
-            &graph_query(
-                url,
-                &graph,
-                "MATCH (n) RETURN id(n), labels(n), properties(n) ORDER BY id(n) LIMIT 128",
-            )
-            .await?,
+        let node_full_sha256 = graph_full_hash(
+            &graph_query(url, &graph, FULL_NODE_QUERY).await?,
+            nodes,
+            true,
         )?;
-        let relationship_sample_sha256 = graph_payload_hash(
-            &graph_query(
-                url,
-                &graph,
-                "MATCH (a)-[r]->(b) RETURN id(a), type(r), properties(r), id(b) ORDER BY id(a), id(b), type(r) LIMIT 128",
-            )
-            .await?,
+        let relationship_full_sha256 = graph_full_hash(
+            &graph_query(url, &graph, FULL_RELATIONSHIP_QUERY).await?,
+            relationships,
+            false,
         )?;
         evidence.insert(
             graph,
             GraphEvidence {
                 nodes,
                 relationships,
-                node_sample_sha256,
-                relationship_sample_sha256,
+                node_full_sha256,
+                relationship_full_sha256,
             },
         );
     }
@@ -996,57 +1278,68 @@ async fn validate_unauthenticated_primary(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn restore_receipt(detail: &str, expected_checksum: &str) -> Result<()> {
-    let (_, tail) = detail
-        .split_once("receipt=")
-        .context("restore drill detail has no exact receipt")?;
-    let json = tail.split_once("; ").map_or(tail, |(json, _)| json);
-    let receipt: serde_json::Value =
-        serde_json::from_str(json).context("parse FalkorDB restore receipt")?;
-    let exact = |field: &str, expected: &str| -> Result<()> {
-        if receipt.get(field).and_then(serde_json::Value::as_str) != Some(expected) {
-            bail!("FalkorDB restore receipt field {field} is not exact");
-        }
-        Ok(())
-    };
-    exact("proof", "falkordb_exact_restore_v1")?;
-    exact("input_checksum_sha256", expected_checksum)?;
-    exact("image_reference", FALKORDB_IMAGE)?;
-    exact("network", "none")?;
-    exact("query_mode", "GRAPH.RO_QUERY")?;
-    let image_id = receipt
-        .get("image_id")
-        .and_then(serde_json::Value::as_str)
-        .context("FalkorDB restore receipt has no image identity")?;
-    if image_id.len() != 71
-        || !image_id.starts_with("sha256:")
-        || !image_id[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("FalkorDB restore receipt image identity is not a SHA-256 image ID");
+fn restore_receipt(detail: &str, expected_checksum: &str, expected_image_id: &str) -> Result<()> {
+    if detail.match_indices("receipt=").count() != 1 {
+        bail!("restore drill detail must contain exactly one receipt envelope");
     }
-    for (observed, expected) in [
-        ("observed_keys", "expected_min_keys"),
-        ("observed_graph_nodes", "expected_min_graph_nodes"),
-    ] {
-        let observed = receipt
-            .get(observed)
-            .and_then(serde_json::Value::as_u64)
-            .context("restore receipt observed count is missing")?;
-        let expected = receipt
-            .get(expected)
-            .and_then(serde_json::Value::as_u64)
-            .context("restore receipt expected count is missing")?;
-        if observed < expected {
-            bail!("FalkorDB restore receipt did not meet its minimum count");
+    let framed = detail
+        .strip_prefix("restore drill passed; receipt=")
+        .context("restore drill detail does not use the exact receipt envelope")?;
+    let mut documents = serde_json::Deserializer::from_str(framed).into_iter::<RestoreReceipt>();
+    let receipt = documents
+        .next()
+        .context("restore drill receipt JSON is missing")?
+        .context("parse strict FalkorDB restore receipt")?;
+    let capacity = &framed[documents.byte_offset()..];
+    if capacity != "; capacity=ok" {
+        let normalized = capacity.trim_start_matches("; ").replace(';', "");
+        let tokens: Vec<&str> = normalized.split_whitespace().collect();
+        let numeric = |token: &str, prefix: &str| {
+            token
+                .strip_prefix(prefix)
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some()
+        };
+        if tokens.len() != 11
+            || tokens[0] != "capacity"
+            || !numeric(tokens[1], "required=")
+            || !numeric(tokens[2], "available=")
+            || tokens[3] != "bytes"
+            || tokens[4] != "policy"
+            || !numeric(tokens[5], "encrypted_max=")
+            || !numeric(tokens[6], "extracted_max=")
+            || !numeric(tokens[7], "effective_extracted=")
+            || !numeric(tokens[8], "files_max=")
+            || !numeric(tokens[9], "expansion_ratio=")
+            || !numeric(tokens[10], "reserve=")
+        {
+            bail!("restore drill receipt has a malformed capacity evidence suffix");
         }
     }
-    if receipt
-        .get("observed_graphs")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0)
-        == 0
+    if receipt.proof != "falkordb_exact_restore_v1"
+        || receipt.input_checksum_sha256 != expected_checksum
+        || receipt.image_reference != FALKORDB_IMAGE
+        || receipt.image_id != expected_image_id
+        || receipt.network != "none"
+        || receipt.query_mode != "GRAPH.RO_QUERY"
     {
-        bail!("FalkorDB restore receipt did not observe a graph");
+        bail!("FalkorDB restore receipt identity is not exact");
+    }
+    if !valid_sha256_id(&receipt.image_id)
+        || expected_checksum.len() != 64
+        || !expected_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("FalkorDB restore receipt digest is not canonical lowercase SHA-256");
+    }
+    if receipt.expected_min_keys == 0
+        || receipt.expected_min_graph_nodes == 0
+        || receipt.observed_keys < receipt.expected_min_keys
+        || receipt.observed_graph_nodes < receipt.expected_min_graph_nodes
+        || receipt.observed_graphs == 0
+    {
+        bail!("FalkorDB restore receipt did not meet its exact minimum dataset proof");
     }
     Ok(())
 }
@@ -1105,7 +1398,11 @@ async fn authority_url(pool: &sqlx::PgPool, primary: &Computer) -> Result<String
     Ok(canonical)
 }
 
-async fn backup_evidence(pool: &sqlx::PgPool, primary: &Computer) -> Result<BackupEvidence> {
+async fn backup_evidence(
+    pool: &sqlx::PgPool,
+    primary: &Computer,
+    primary_image_id: &str,
+) -> Result<BackupEvidence> {
     let policy_rows = sqlx::query(
         "SELECT source_host,dest_hosts,encrypt,enabled
            FROM fleet_backup_config WHERE kind='falkordb'",
@@ -1177,7 +1474,7 @@ async fn backup_evidence(pool: &sqlx::PgPool, primary: &Computer) -> Result<Back
         let drill_id: Uuid = row.get("drill_id");
         let detail: String = row.get("detail");
         let proof = (|| -> Result<()> {
-            restore_receipt(&detail, &checksum_sha256)?;
+            restore_receipt(&detail, &checksum_sha256, primary_image_id)?;
             for destination in &destination_nodes {
                 crate::fleet_cmd::validate_remote_backup_receipt(
                     &distribution_status,
@@ -1236,7 +1533,7 @@ async fn primary_evidence(
 )> {
     validate_unauthenticated_primary(url).await?;
     let replication = redis_info(url, "replication").await?;
-    let (replid, _) = primary_identity(&replication)?;
+    let (replid, offset_before) = primary_identity(&replication)?;
     let server = redis_info(url, "server").await?;
     let version = server
         .get("redis_version")
@@ -1264,6 +1561,16 @@ async fn primary_evidence(
     }
     let primary_dbsize = dbsize(url).await?;
     let graphs = graph_inventory(url).await?;
+    let replication_after = redis_info(url, "replication").await?;
+    let (replid_after, offset_after) = primary_identity(&replication_after)?;
+    if replid_after != replid
+        || offset_after != offset_before
+        || dbsize(url).await? != primary_dbsize
+    {
+        bail!(
+            "Priya changed during the complete FalkorDB graph scan; retry from a fresh quiescent proof"
+        );
+    }
     Ok((
         replid,
         version,
@@ -1300,10 +1607,18 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
             return Err(error).context("probe canonical Priya FalkorDB through SSH loopback");
         }
     };
-    let backup = backup_evidence(pool, &primary).await?;
+    let primary_image = attest_image(&primary).await?;
+    let backup = backup_evidence(pool, &primary, &primary_image.image_id).await?;
     attest_firewall(&primary, &target).await?;
     attest_target_source_route(&target, &primary).await?;
     let (target_attestation, target_state) = attest_target(&target, &primary.ip).await?;
+    if target_attestation.image_id != primary_image.image_id
+        || target_attestation.image_user != primary_image.configured_user
+    {
+        bail!(
+            "target and canonical Priya Docker daemons do not resolve the pinned FalkorDB image identically"
+        );
+    }
 
     let required_bytes = primary_used_memory.saturating_mul(2).max(MIN_TARGET_BYTES);
     if target_attestation.ram_bytes < required_bytes
@@ -1316,7 +1631,7 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
 
     Ok(Plan {
         material: PlanMaterial {
-            version: "falkordb-replica-plan-v1",
+            version: "falkordb-replica-plan-v2",
             target_id: target.id,
             target_name: target.name,
             target_ip: target.ip,
@@ -1335,9 +1650,11 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
             backup,
             target_state,
             image: FALKORDB_IMAGE,
+            image_id: primary_image.image_id,
+            image_user: primary_image.configured_user,
             primary_port: PRIMARY_PORT,
             replica_port: REPLICA_PORT,
-            firewall_policy: "ff-falkordb-firewall-v1",
+            firewall_policy: "forgefleet-falkordb-source-firewall-v1-four-rule",
             automatic_failover: false,
             read_routing: false,
         },
@@ -1357,10 +1674,55 @@ fn lifecycle_signature(target_id: Uuid) -> String {
     sha256(format!("falkordb-replica-lifecycle-v1\0{target_id}").as_bytes())
 }
 
+fn lifecycle_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed" | "cancelled")
+}
+
+fn validate_lifecycle_payload(
+    payload: &serde_json::Value,
+    target: &Computer,
+    action: &str,
+    proof_id: &str,
+    command: &str,
+) -> Result<()> {
+    let deferred = payload
+        .get("deferred_payload")
+        .and_then(serde_json::Value::as_object)
+        .context("existing FalkorDB lifecycle task has no structured deferred payload")?;
+    let exact = |key: &str, expected: &str| {
+        deferred.get(key).and_then(serde_json::Value::as_str) == Some(expected)
+    };
+    if !exact("action", action)
+        || !exact("command", command)
+        || !exact("command_sha256", &sha256(command.as_bytes()))
+        || !exact("proof_id", proof_id)
+        || deferred
+            .get("target_computer_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(target.id.to_string().as_str())
+        || deferred
+            .get("database_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some("falkordb")
+        || deferred
+            .get("automatic_failover")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+        || deferred
+            .get("read_routing")
+            .and_then(serde_json::Value::as_bool)
+            != Some(false)
+    {
+        bail!("existing FalkorDB lifecycle task command/proof/target binding is mismatched");
+    }
+    Ok(())
+}
+
 async fn enqueue_lifecycle_action(
     pool: &sqlx::PgPool,
     target: &Computer,
     action: &str,
+    proof_id: &str,
     command: String,
 ) -> Result<Uuid> {
     let signature = lifecycle_signature(target.id);
@@ -1372,33 +1734,45 @@ async fn enqueue_lifecycle_action(
         .execute(&mut *tx)
         .await?;
     let existing = sqlx::query(
-        "SELECT id,payload->'deferred_payload'->>'command' AS command
+        "SELECT id,status,payload
            FROM fleet_tasks WHERE dedup_signature=$1
-            AND status IN ('pending','dispatchable','running')
-          ORDER BY created_at DESC",
+          ORDER BY created_at DESC FOR UPDATE",
     )
     .bind(&signature)
     .fetch_all(&mut *tx)
     .await?;
     if existing.len() > 1 {
-        bail!("multiple active FalkorDB lifecycle tasks exist for the exact target UUID");
+        bail!("multiple FalkorDB lifecycle rows carry the exact target signature");
     }
     if let Some(row) = existing.first() {
-        let existing_command = row
-            .try_get::<Option<String>, _>("command")?
-            .unwrap_or_default();
-        if existing_command == command {
+        let id: Uuid = row.get("id");
+        let status: String = row.get("status");
+        if lifecycle_terminal(&status) {
+            let cleared = sqlx::query(
+                "UPDATE fleet_tasks SET dedup_signature=NULL
+                  WHERE id=$1 AND dedup_signature=$2
+                    AND status IN ('completed','failed','cancelled')",
+            )
+            .bind(id)
+            .bind(&signature)
+            .execute(&mut *tx)
+            .await?;
+            if cleared.rows_affected() != 1 {
+                bail!("terminal FalkorDB lifecycle signature changed during locked rollover");
+            }
+        } else {
+            let payload: serde_json::Value = row.get("payload");
+            validate_lifecycle_payload(&payload, target, action, proof_id, &command)?;
             let id: Uuid = row.get("id");
             tx.commit().await?;
             return Ok(id);
         }
-        bail!(
-            "another FalkorDB lifecycle action is active for target {}; wait or reconcile it first",
-            target.id
-        );
     }
     let deferred_payload = serde_json::json!({
-        "command": command,
+        "command": command.clone(),
+        "command_sha256": sha256(command.as_bytes()),
+        "action": action,
+        "proof_id": proof_id,
         "summary": summary,
         "operation": format!("falkordb_replica_{action}"),
         "target_computer_id": target.id,
@@ -1417,20 +1791,45 @@ async fn enqueue_lifecycle_action(
         "attempts": 0,
         "max_attempts": 1,
     });
-    let id: Uuid = sqlx::query_scalar(
+    let new_id = Uuid::new_v4();
+    let inserted: Option<Uuid> = sqlx::query_scalar(
         "INSERT INTO fleet_tasks
-           (task_type,summary,payload,priority,requires_capability,
+           (id,task_type,summary,payload,priority,requires_capability,
             preferred_computer_id,status,created_at,task_class,dedup_signature)
-         VALUES ('shell',$1,$2,50,$3,$4,'pending',NOW(),'deferred',$5)
+         VALUES ($1,'shell',$2,$3,50,$4,$5,'pending',NOW(),'deferred',$6)
+         ON CONFLICT (dedup_signature) WHERE dedup_signature IS NOT NULL DO NOTHING
          RETURNING id",
     )
+    .bind(new_id)
     .bind(&summary)
     .bind(&payload)
     .bind(&required_caps)
     .bind(target.id)
     .bind(&signature)
-    .fetch_one(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
+    let id = if let Some(id) = inserted {
+        id
+    } else {
+        let rows = sqlx::query(
+            "SELECT id,status,payload FROM fleet_tasks
+              WHERE dedup_signature=$1 ORDER BY created_at DESC FOR UPDATE",
+        )
+        .bind(&signature)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.len() != 1 {
+            bail!("FalkorDB lifecycle unique-index race did not resolve to exactly one row");
+        }
+        let row = &rows[0];
+        let status: String = row.get("status");
+        if lifecycle_terminal(&status) {
+            bail!("FalkorDB lifecycle unique-index race resolved to a terminal row");
+        }
+        let payload: serde_json::Value = row.get("payload");
+        validate_lifecycle_payload(&payload, target, action, proof_id, &command)?;
+        row.get("id")
+    };
     tx.commit().await?;
     Ok(id)
 }
@@ -1438,6 +1837,12 @@ async fn enqueue_lifecycle_action(
 async fn validate_compose(plan: &Plan) -> Result<()> {
     if !std::path::Path::new(FALKORDB_COMPOSE).is_file() {
         bail!("run from a ForgeFleet checkout containing the FalkorDB follower compose template");
+    }
+    let runtime_compose = tokio::fs::read_to_string(FALKORDB_COMPOSE)
+        .await
+        .context("read runtime FalkorDB follower Compose template")?;
+    if runtime_compose != include_str!("../../../deploy/docker-compose.falkordb-follower.yml") {
+        bail!("runtime FalkorDB follower Compose differs from the reviewed binary contract");
     }
     let status = tokio::time::timeout(
         Duration::from_secs(30),
@@ -1592,6 +1997,51 @@ async fn prove_write_rejection(url: &str, graph: &str) -> Result<()> {
     Ok(())
 }
 
+async fn prove_replica_once(plan: &Plan, primary_url: &str, replica_url: &str) -> Result<i64> {
+    let primary_before = redis_info(primary_url, "replication").await?;
+    let (replid, primary_offset) = primary_identity(&primary_before)?;
+    if replid != plan.material.primary_replid {
+        bail!("Priya FalkorDB replication identity changed; plan is stale");
+    }
+    let replica_before = redis_info(replica_url, "replication").await?;
+    let lag = replica_identity(&replica_before, plan, primary_offset)?;
+    let server = redis_info(replica_url, "server").await?;
+    if server.get("redis_version").map(String::as_str)
+        != Some(plan.material.primary_version.as_str())
+        || graph_module_version(replica_url).await? != plan.material.graph_module_version
+        || dbsize(primary_url).await? != plan.material.primary_dbsize
+        || dbsize(replica_url).await? != plan.material.primary_dbsize
+    {
+        bail!("FalkorDB replica server/module/key identity does not match the plan");
+    }
+    let primary_graphs = graph_inventory(primary_url).await?;
+    if primary_graphs != plan.material.graphs {
+        bail!("Priya complete graph inventory changed; generate a fresh plan");
+    }
+    let replica_graphs = graph_inventory(replica_url).await?;
+    if replica_graphs != plan.material.graphs {
+        bail!("FalkorDB replica complete graph inventory differs from canonical Priya");
+    }
+    let primary_after = redis_info(primary_url, "replication").await?;
+    let (replid_after, primary_offset_after) = primary_identity(&primary_after)?;
+    let replica_after = redis_info(replica_url, "replication").await?;
+    let lag_after = replica_identity(&replica_after, plan, primary_offset_after)?;
+    if replid_after != replid || primary_offset_after != primary_offset || lag_after != lag {
+        bail!(
+            "FalkorDB replication advanced during the complete graph proof; retry from a quiescent snapshot"
+        );
+    }
+    prove_safe_config(replica_url).await?;
+    let graph = plan
+        .material
+        .graphs
+        .keys()
+        .next()
+        .context("plan has no graph for write-rejection proof")?;
+    prove_write_rejection(replica_url, graph).await?;
+    Ok(lag)
+}
+
 async fn prove_replica(plan: &Plan) -> Result<i64> {
     let primary_url = format!(
         "redis://{}:{}",
@@ -1600,43 +2050,12 @@ async fn prove_replica(plan: &Plan) -> Result<i64> {
     let replica_url = replica_url();
     let deadline = std::time::Instant::now() + REPLICA_READY_TIMEOUT;
     loop {
-        let primary_info = redis_info(&primary_url, "replication").await?;
-        let (replid, primary_offset) = primary_identity(&primary_info)?;
-        if replid != plan.material.primary_replid {
-            bail!("Priya FalkorDB replication identity changed; plan is stale");
-        }
-        if let Ok(replica_info) = redis_info(&replica_url, "replication").await {
-            if let Ok(lag) = replica_identity(&replica_info, plan, primary_offset) {
-                let server = redis_info(&replica_url, "server").await?;
-                if server.get("redis_version").map(String::as_str)
-                    != Some(plan.material.primary_version.as_str())
-                    || graph_module_version(&replica_url).await?
-                        != plan.material.graph_module_version
-                    || dbsize(&replica_url).await? != plan.material.primary_dbsize
-                {
-                    bail!("FalkorDB replica server/module/key identity does not match the plan");
-                }
-                let primary_graphs = graph_inventory(&primary_url).await?;
-                if primary_graphs != plan.material.graphs {
-                    bail!("Priya graph inventory changed; generate a fresh plan");
-                }
-                let replica_graphs = graph_inventory(&replica_url).await?;
-                if replica_graphs == plan.material.graphs {
-                    prove_safe_config(&replica_url).await?;
-                    let graph = plan
-                        .material
-                        .graphs
-                        .keys()
-                        .next()
-                        .context("plan has no graph for write-rejection proof")?;
-                    prove_write_rejection(&replica_url, graph).await?;
-                    return Ok(lag);
-                }
-            }
+        if let Ok(lag) = prove_replica_once(plan, &primary_url, &replica_url).await {
+            return Ok(lag);
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "FalkorDB replica did not reach exact INFO, graph-count/hash, and write-rejection proof within 10 minutes"
+                "FalkorDB replica did not reach exact INFO, complete graph, and write-rejection proof within 10 minutes"
             );
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1724,10 +2143,11 @@ async fn register_topology(pool: &sqlx::PgPool, plan: &Plan, lag_bytes: i64) -> 
         .bind(lag_bytes)
         .bind(plan.material.backup.backup_id)
         .bind(format!(
-            "primary={};plan={};image={};backup={};drill={};endpoint=127.0.0.1:{};read_only=yes;stale_data=no;automatic_failover=disabled;read_routing=disabled",
+            "primary={};plan={};image={};image_id={};backup={};drill={};endpoint=127.0.0.1:{};read_only=yes;rootfs_read_only=yes;cap_drop=ALL;no_new_privileges=yes;stale_data=no;automatic_failover=disabled;read_routing=disabled",
             plan.material.primary_name,
             plan.id(),
             FALKORDB_IMAGE,
+            plan.material.image_id,
             plan.material.backup.backup_id,
             plan.material.backup.drill_id,
             REPLICA_PORT,
@@ -1749,7 +2169,14 @@ async fn local_apply_inner(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     let primary = resolve_computer(pool, &plan.material.primary_name).await?;
     let target = resolve_computer(pool, &plan.material.target_name).await?;
     attest_firewall(&primary, &target).await?;
-    let (_, state) = attest_target(&target, &primary.ip).await?;
+    let primary_image = attest_image(&primary).await?;
+    if primary_image.image_id != plan.material.image_id
+        || primary_image.configured_user != plan.material.image_user
+    {
+        bail!("Priya Docker image resolution changed after planning; refusing target mutation");
+    }
+    let (attestation, state) = attest_target(&target, &primary.ip).await?;
+    validate_plan_image(plan, &attestation)?;
     match state {
         TargetState::Absent => {
             start_replica(plan).await?;
@@ -1761,7 +2188,11 @@ async fn local_apply_inner(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     }
     let first_lag = prove_replica(plan).await?;
     let second_lag = restart_and_reprove(plan).await?;
-    attest_target(&target, &primary.ip).await?;
+    let (final_attestation, final_state) = attest_target(&target, &primary.ip).await?;
+    validate_plan_image(plan, &final_attestation)?;
+    if !matches!(final_state, TargetState::ExactHealthy { .. }) {
+        bail!("FalkorDB target stopped being exact-healthy before topology registration");
+    }
     attest_firewall(&primary, &target).await?;
     register_topology(pool, plan, first_lag.max(second_lag)).await
 }
@@ -1795,11 +2226,11 @@ async fn read_target_attestation(target: &Computer) -> Result<TargetAttestation>
     parse_target_attestation(&String::from_utf8_lossy(&output.stdout))
 }
 
-fn decommission_proof(target: &Computer, primary: &Computer) -> String {
+fn decommission_proof(target: &Computer, primary: &Computer, image_id: &str) -> String {
     sha256(
         format!(
-            "falkordb-decommission-v1\0{}\0{}\0{}\0{}\0{}",
-            target.id, target.name, primary.id, FALKORDB_IMAGE, FALKORDB_VOLUME,
+            "falkordb-decommission-v2\0{}\0{}\0{}\0{}\0{}\0{}",
+            target.id, target.name, primary.id, FALKORDB_IMAGE, image_id, FALKORDB_VOLUME,
         )
         .as_bytes(),
     )
@@ -1837,7 +2268,12 @@ async fn decommission_preflight(
     let attestation = read_target_attestation(target).await?;
     match &attestation.container {
         Some(fingerprint) => {
-            validate_existing_container(fingerprint, &attestation.image_id, &primary.ip)?;
+            validate_existing_container(
+                fingerprint,
+                &attestation.image_id,
+                &attestation.image_user,
+                &primary.ip,
+            )?;
             if !attestation.volume_present {
                 bail!("exact FalkorDB replica has no durable volume to preserve");
             }
@@ -1864,9 +2300,6 @@ async fn local_decommission(
             target.name
         );
     }
-    if proof != decommission_proof(target, primary) {
-        bail!("FalkorDB decommission proof is stale or mismatched");
-    }
     let key = format!("falkordb-replica:{}", target.id);
     let mut lock = pool.acquire().await?;
     sqlx::query("SELECT pg_advisory_lock(hashtext($1))")
@@ -1876,6 +2309,9 @@ async fn local_decommission(
     let outcome = async {
         let role = topology_role(pool, target.id).await?;
         let attestation = read_target_attestation(target).await?;
+        if proof != decommission_proof(target, primary, &attestation.image_id) {
+            bail!("FalkorDB decommission proof is stale or mismatched");
+        }
         match (&role, &attestation.container) {
             (Some(role), _) if role != "replica" => {
                 bail!("FalkorDB topology role changed before decommission")
@@ -1884,7 +2320,12 @@ async fn local_decommission(
                 bail!("unregistered FalkorDB container requires manual audit, not hidden cleanup")
             }
             (_, Some(fingerprint)) => {
-                validate_existing_container(fingerprint, &attestation.image_id, &primary.ip)?;
+                validate_existing_container(
+                    fingerprint,
+                    &attestation.image_id,
+                    &attestation.image_user,
+                    &primary.ip,
+                )?;
                 if !attestation.volume_present {
                     bail!("FalkorDB preservation volume disappeared before decommission");
                 }
@@ -1958,10 +2399,12 @@ async fn purge_evidence(
     if attestation.container.is_some() || !attestation.volume_present {
         bail!("purge proof requires an absent container and exactly one preserved volume");
     }
-    let backup = backup_evidence(pool, &primary).await?;
+    let primary_image = attest_image(&primary).await?;
+    let backup = backup_evidence(pool, &primary, &primary_image.image_id).await?;
     Ok(PurgeEvidence {
         target,
         primary,
+        primary_image,
         backup,
     })
 }
@@ -1973,6 +2416,15 @@ fn local_purge_command(evidence: &PurgeEvidence) -> String {
         shell_escape_single(&evidence.primary.name),
         shell_escape_single(&evidence.proof()),
     )
+}
+
+fn require_purge_confirmation(yes: bool) -> Result<()> {
+    if !yes {
+        bail!(
+            "PREVIEW: permanent FalkorDB volume purge was not executed; pass --yes with the exact status proof (preview intentionally exits nonzero)"
+        );
+    }
+    Ok(())
 }
 
 async fn local_purge_volume(pool: &sqlx::PgPool, evidence: &PurgeEvidence) -> Result<()> {
@@ -1993,7 +2445,12 @@ async fn local_purge_volume(pool: &sqlx::PgPool, evidence: &PurgeEvidence) -> Re
         if topology_role(pool, evidence.target.id).await?.is_some() {
             bail!("FalkorDB topology reappeared; refusing volume purge");
         }
-        let current_backup = backup_evidence(pool, &evidence.primary).await?;
+        let current_image = attest_image(&evidence.primary).await?;
+        if current_image != evidence.primary_image {
+            bail!("Priya pinned FalkorDB image resolution changed; issue a fresh purge proof");
+        }
+        let current_backup =
+            backup_evidence(pool, &evidence.primary, &current_image.image_id).await?;
         if current_backup != evidence.backup {
             bail!("FalkorDB backup/receipt proof changed; issue a fresh purge proof");
         }
@@ -2022,6 +2479,52 @@ async fn local_purge_volume(pool: &sqlx::PgPool, evidence: &PurgeEvidence) -> Re
     outcome
 }
 
+async fn prove_replica_via_tunnels(
+    plan: &Plan,
+    primary: &Computer,
+    target: &Computer,
+) -> Result<i64> {
+    let primary_probe = primary_probe(primary).await?;
+    let replica_probe = match node_loopback_probe(target, REPLICA_PORT, "target FalkorDB").await {
+        Ok(probe) => probe,
+        Err(error) => {
+            primary_probe.close().await;
+            return Err(error);
+        }
+    };
+    let result = prove_replica_once(plan, &primary_probe.url, &replica_probe.url).await;
+    replica_probe.close().await;
+    primary_probe.close().await;
+    result
+}
+
+fn validate_status_topology(
+    role: &str,
+    status: &str,
+    registered_backup: Option<Uuid>,
+    plan: &Plan,
+) -> Result<()> {
+    if role != "replica" || status != "running" {
+        bail!("BLOCKED: FalkorDB topology row is not exact replica/running");
+    }
+    if registered_backup != Some(plan.material.backup.backup_id) {
+        bail!("BLOCKED: FalkorDB topology backup identity is stale or missing");
+    }
+    let TargetState::ExactHealthy { image_id } = &plan.material.target_state else {
+        bail!("BLOCKED: registered FalkorDB replica container is not exact-healthy");
+    };
+    if image_id != &plan.material.image_id {
+        bail!("BLOCKED: running FalkorDB image differs from daemon-resolved plan image");
+    }
+    Ok(())
+}
+
+fn preserved_volume_status_result() -> Result<()> {
+    bail!(
+        "BLOCKED: preserved FalkorDB volume is not an exact-healthy replica; the emitted purge proof is a non-mutating preview"
+    )
+}
+
 async fn show_status(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result<()> {
     reject_vinny(to)?;
     let target = resolve_computer(pool, to).await?;
@@ -2030,60 +2533,62 @@ async fn show_status(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Resul
         bail!("FalkorDB status authority must be canonical Priya");
     }
     let topology = sqlx::query(
-        "SELECT role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes
+        "SELECT role,status,bootstrapped_from_backup_id
            FROM database_replicas WHERE computer_id=$1 AND database_kind='falkordb'",
     )
     .bind(target.id)
     .fetch_optional(pool)
     .await?;
-    let attestation = read_target_attestation(&target).await?;
-    let container_state = if let Some(fingerprint) = &attestation.container {
-        validate_existing_container(fingerprint, &attestation.image_id, &primary.ip)?;
-        "exact-healthy"
-    } else if attestation.volume_present {
-        "decommissioned-volume-preserved"
-    } else {
-        "absent"
-    };
-    println!(
-        "{CYAN}FalkorDB replica status (read-only; Priya authoritative){RESET}\n  target: {} ({})\n  container: {}\n  durable volume: {}",
-        target.name,
-        target.id,
-        container_state,
-        if attestation.volume_present {
-            "present"
-        } else {
-            "absent"
-        },
-    );
     if let Some(row) = topology {
+        let role: String = row.get("role");
+        let status: String = row.get("status");
+        let registered_backup = row.try_get::<Option<Uuid>, _>("bootstrapped_from_backup_id")?;
+        let plan = build_plan(pool, to, primary_name).await?;
+        validate_status_topology(&role, &status, registered_backup, &plan)?;
+        let fresh_lag = prove_replica_via_tunnels(&plan, &primary, &target)
+            .await
+            .context("BLOCKED: fresh live FalkorDB replica proof failed")?;
+        let (after, after_state) = attest_target(&target, &primary.ip).await?;
+        validate_plan_image(&plan, &after)?;
+        if !matches!(after_state, TargetState::ExactHealthy { .. }) {
+            bail!("BLOCKED: FalkorDB target changed after fresh live proof");
+        }
+        attest_firewall(&primary, &target).await?;
         println!(
-            "  topology: role={} status={} lag_bytes={} last_sync={} backup={}\n  notes: {}",
-            row.get::<String, _>("role"),
-            row.get::<String, _>("status"),
-            row.try_get::<Option<i64>, _>("lag_bytes")?.unwrap_or(-1),
-            row.try_get::<Option<DateTime<Utc>>, _>("last_sync_at")?
-                .map(|value| value.to_rfc3339())
-                .unwrap_or_else(|| "never".into()),
-            row.try_get::<Option<Uuid>, _>("bootstrapped_from_backup_id")?
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".into()),
-            row.try_get::<Option<String>, _>("notes")?
-                .unwrap_or_default(),
+            "{CYAN}FalkorDB replica status (fresh live proof; Priya authoritative){RESET}\n  target: {} ({})\n  container: exact-healthy\n  durable volume: present\n  topology: role=replica status=running backup={}\n  fresh lag_bytes: {}\n  image: {}\n  complete graphs: {}\n  automatic failover: disabled\n  read routing: disabled",
+            target.name,
+            target.id,
+            registered_backup.expect("validated registered backup identity"),
+            fresh_lag,
+            plan.material.image_id,
+            plan.material.graphs.len(),
         );
     } else {
-        println!("  topology: absent");
-        if attestation.container.is_none() && attestation.volume_present {
-            match purge_evidence(pool, to, primary_name).await {
-                Ok(evidence) => println!(
-                    "  purge-proof: {}\n  purge is permanent and still requires --yes",
-                    evidence.proof()
-                ),
-                Err(error) => println!("  purge-proof: BLOCKED ({error:#})"),
-            }
+        let attestation = read_target_attestation(&target).await?;
+        if attestation.container.is_some() {
+            bail!("BLOCKED: FalkorDB container exists without a topology row");
+        }
+        if attestation.replica_port_listeners != 0 || attestation.replica_port_non_loopback != 0 {
+            bail!("BLOCKED: topology-absent target still has FalkorDB listener evidence");
+        }
+        if attestation.volume_present {
+            let evidence = purge_evidence(pool, to, primary_name)
+                .await
+                .context("BLOCKED: preserved-volume purge proof is unavailable")?;
+            println!(
+                "{CYAN}FalkorDB replica status (read-only; Priya authoritative){RESET}\n  target: {} ({})\n  container: decommissioned-volume-preserved\n  durable volume: present\n  topology: absent\n  purge-proof: {}\n  purge is permanent and still requires --yes\n  automatic failover: disabled\n  read routing: disabled",
+                target.name,
+                target.id,
+                evidence.proof(),
+            );
+            preserved_volume_status_result()?;
+        } else {
+            println!(
+                "{CYAN}FalkorDB replica status (read-only; Priya authoritative){RESET}\n  target: {} ({})\n  container: absent\n  durable volume: absent\n  topology: absent\n  automatic failover: disabled\n  read routing: disabled",
+                target.name, target.id,
+            );
         }
     }
-    println!("  automatic failover: disabled\n  read routing: disabled");
     Ok(())
 }
 
@@ -2092,11 +2597,12 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
         FleetDbFalkordbReplicaCommand::Plan { to, primary } => {
             let plan = build_plan(pool, &to, &primary).await?;
             println!(
-                "{CYAN}FalkorDB replica plan (read-only; no promotion/failover/read routing){RESET}\n  target: {} ({})\n  primary authority: {} ({}:{PRIMARY_PORT})\n  replica endpoint: 127.0.0.1:{REPLICA_PORT}\n  immutable image: {FALKORDB_IMAGE}\n  graphs: {}\n  restore-proven distributed backup: {} (drill {})\n  source firewall: exact target allow + IPv4/IPv6 default deny + Docker-persistent unit\n  target state: {:?}\n  plan-id: {}\n\nApply with:\n  ff fleet db falkordb-replica apply --to {} --primary {} --plan-id {} --yes",
+                "{CYAN}FalkorDB replica plan (read-only; no promotion/failover/read routing){RESET}\n  target: {} ({})\n  primary authority: {} ({}:{PRIMARY_PORT})\n  replica endpoint: 127.0.0.1:{REPLICA_PORT}\n  immutable image: {FALKORDB_IMAGE}\n  daemon image id: {}\n  graphs: {} (complete deterministic hashes)\n  restore-proven distributed backup: {} (drill {})\n  source firewall: exact target allow + IPv4 deny + IPv6 INPUT/FORWARD deny + Docker-persistent unit\n  target state: {:?}\n  plan-id: {}\n\nApply with:\n  ff fleet db falkordb-replica apply --to {} --primary {} --plan-id {} --yes",
                 plan.material.target_name,
                 plan.material.target_id,
                 plan.material.primary_name,
                 plan.material.primary_ip,
+                plan.material.image_id,
                 plan.material.graphs.len(),
                 plan.material.backup.backup_id,
                 plan.material.backup.drill_id,
@@ -2117,12 +2623,16 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
                 bail!("FalkorDB replica apply requires --yes; no changes made");
             }
             let plan = build_plan(pool, &to, &primary).await?;
-            if plan.id() != plan_id {
-                bail!("FalkorDB replica plan-id is stale or mismatched; run plan again");
-            }
+            validate_plan_id(&plan, &plan_id)?;
             let target = plan.target();
-            let task = enqueue_lifecycle_action(pool, &target, "apply", local_apply_command(&plan))
-                .await?;
+            let task = enqueue_lifecycle_action(
+                pool,
+                &target,
+                "apply",
+                &plan.id(),
+                local_apply_command(&plan),
+            )
+            .await?;
             println!(
                 "{GREEN}✓{RESET} queued exact FalkorDB replica apply on '{}' as deferred task {}; Priya remains authoritative",
                 target.name, task
@@ -2146,12 +2656,13 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
             if !primary.name.eq_ignore_ascii_case(PRIMARY_NAME) {
                 bail!("FalkorDB decommission authority must be canonical Priya");
             }
-            decommission_preflight(pool, &target, &primary).await?;
-            let proof = decommission_proof(&target, &primary);
+            let attestation = decommission_preflight(pool, &target, &primary).await?;
+            let proof = decommission_proof(&target, &primary, &attestation.image_id);
             let task = enqueue_lifecycle_action(
                 pool,
                 &target,
                 "decommission",
+                &proof,
                 local_decommission_command(&target, &primary, &proof),
             )
             .await?;
@@ -2165,9 +2676,7 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
             proof,
             yes,
         } => {
-            if !yes {
-                bail!("permanent FalkorDB volume purge requires --yes; no changes made");
-            }
+            require_purge_confirmation(yes)?;
             let evidence = purge_evidence(pool, &to, &primary).await?;
             if evidence.proof() != proof {
                 bail!("FalkorDB purge proof is stale or mismatched; run status again");
@@ -2176,6 +2685,7 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
                 pool,
                 &evidence.target,
                 "purge-volume",
+                &evidence.proof(),
                 local_purge_command(&evidence),
             )
             .await?;
@@ -2187,9 +2697,7 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
             plan_id,
         } => {
             let plan = build_plan(pool, &to, &primary).await?;
-            if plan.id() != plan_id {
-                bail!("FalkorDB replica plan-id is stale or mismatched");
-            }
+            validate_plan_id(&plan, &plan_id)?;
             println!(
                 "{YELLOW}Applying FalkorDB replica plan {} on {}; Priya remains authoritative{RESET}",
                 plan.id(),
@@ -2269,13 +2777,13 @@ mod tests {
             GraphEvidence {
                 nodes: 10,
                 relationships: 2,
-                node_sample_sha256: "b".repeat(64),
-                relationship_sample_sha256: "c".repeat(64),
+                node_full_sha256: "b".repeat(64),
+                relationship_full_sha256: "c".repeat(64),
             },
         );
         Plan {
             material: PlanMaterial {
-                version: "falkordb-replica-plan-v1",
+                version: "falkordb-replica-plan-v2",
                 target_id: Uuid::from_u128(1),
                 target_name: "sophie".into(),
                 target_ip: "192.168.5.103".into(),
@@ -2294,9 +2802,11 @@ mod tests {
                 backup: backup(),
                 target_state: TargetState::Absent,
                 image: FALKORDB_IMAGE,
+                image_id: format!("sha256:{}", "d".repeat(64)),
+                image_user: String::new(),
                 primary_port: PRIMARY_PORT,
                 replica_port: REPLICA_PORT,
-                firewall_policy: "ff-falkordb-firewall-v1",
+                firewall_policy: "forgefleet-falkordb-source-firewall-v1-four-rule",
                 automatic_failover: false,
                 read_routing: false,
             },
@@ -2344,12 +2854,62 @@ mod tests {
             image_id: "sha256:image".into(),
         };
         assert_ne!(backup_changed, plan.id());
+        let state_changed = plan.id();
+        plan.material.image_id = format!("sha256:{}", "e".repeat(64));
+        assert_ne!(state_changed, plan.id());
+        assert!(validate_plan_id(&plan, &plan.id()).is_ok());
+        assert!(validate_plan_id(&plan, &state_changed).is_err());
     }
 
     #[test]
-    fn graph_hash_excludes_only_statistics_and_binds_rows() {
+    fn pinned_image_evidence_requires_exact_digest_mapping_and_canonical_id() {
+        let image_id = format!("sha256:{}", "d".repeat(64));
+        let raw =
+            format!("IMAGE={image_id}\nIMAGE_REPO_DIGESTS=[\"{FALKORDB_IMAGE}\"]\nIMAGE_USER=\n");
+        assert_eq!(parse_image_evidence(&raw).unwrap().image_id, image_id);
+        assert!(parse_image_evidence(&raw.replace(FALKORDB_IMAGE, "falkordb:latest")).is_err());
+        assert!(parse_image_evidence(&raw.replace("sha256:dddd", "sha256:DDDD")).is_err());
+        assert!(parse_image_evidence(&format!("{raw}IMAGE={image_id}\n")).is_err());
+    }
+
+    #[test]
+    fn status_topology_rejects_stale_cached_or_nonhealthy_state() {
+        let mut plan = plan();
+        plan.material.target_state = TargetState::ExactHealthy {
+            image_id: plan.material.image_id.clone(),
+        };
+        assert!(validate_status_topology(
+            "replica",
+            "running",
+            Some(plan.material.backup.backup_id),
+            &plan,
+        )
+        .is_ok());
+        assert!(
+            validate_status_topology("replica", "running", Some(Uuid::from_u128(999)), &plan,)
+                .is_err()
+        );
+        assert!(validate_status_topology(
+            "replica",
+            "failed",
+            Some(plan.material.backup.backup_id),
+            &plan,
+        )
+        .is_err());
+        plan.material.target_state = TargetState::Absent;
+        assert!(validate_status_topology(
+            "replica",
+            "running",
+            Some(plan.material.backup.backup_id),
+            &plan,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn complete_graph_hash_excludes_statistics_binds_all_rows_and_ignores_row_order() {
         let first = redis::Value::Array(vec![
-            redis::Value::Array(vec![redis::Value::BulkString(b"id(n)".to_vec())]),
+            redis::Value::Array(vec![redis::Value::BulkString(b"properties(n)".to_vec())]),
             redis::Value::Array(vec![redis::Value::Array(vec![redis::Value::Int(1)])]),
             redis::Value::Array(vec![redis::Value::BulkString(
                 b"Cached execution: 0".to_vec(),
@@ -2360,17 +2920,71 @@ mod tests {
             parts[2] = redis::Value::SimpleString("Query internal execution time: 99".into());
         }
         assert_eq!(
-            graph_payload_hash(&first).unwrap(),
-            graph_payload_hash(&timing_changed).unwrap()
+            graph_full_hash(&first, 1, true).unwrap(),
+            graph_full_hash(&timing_changed, 1, true).unwrap()
         );
         let mut row_changed = first.clone();
         if let redis::Value::Array(parts) = &mut row_changed {
             parts[1] = redis::Value::Array(vec![redis::Value::Array(vec![redis::Value::Int(2)])]);
         }
         assert_ne!(
-            graph_payload_hash(&first).unwrap(),
-            graph_payload_hash(&row_changed).unwrap()
+            graph_full_hash(&first, 1, true).unwrap(),
+            graph_full_hash(&row_changed, 1, true).unwrap()
         );
+        assert!(graph_full_hash(&first, 2, true).is_err());
+
+        let mut many_rows: Vec<redis::Value> = (0..129)
+            .map(|value| redis::Value::Array(vec![redis::Value::Int(value)]))
+            .collect();
+        let original = redis::Value::Array(vec![
+            redis::Value::Array(vec![redis::Value::BulkString(b"properties(n)".to_vec())]),
+            redis::Value::Array(many_rows.clone()),
+            redis::Value::SimpleString("Query internal execution time: 0".into()),
+        ]);
+        let mut reordered_rows = if let redis::Value::Array(parts) = &original {
+            if let redis::Value::Array(rows) = &parts[1] {
+                rows.clone()
+            } else {
+                unreachable!()
+            }
+        } else {
+            unreachable!()
+        };
+        reordered_rows.reverse();
+        let reordered = redis::Value::Array(vec![
+            redis::Value::Array(vec![redis::Value::BulkString(b"properties(n)".to_vec())]),
+            redis::Value::Array(reordered_rows),
+            redis::Value::SimpleString("Query internal execution time: 9".into()),
+        ]);
+        assert_eq!(
+            graph_full_hash(&original, 129, true).unwrap(),
+            graph_full_hash(&reordered, 129, true).unwrap()
+        );
+        many_rows[128] = redis::Value::Array(vec![redis::Value::Int(999)]);
+        many_rows.reverse();
+        let changed_last = redis::Value::Array(vec![
+            redis::Value::Array(vec![redis::Value::BulkString(b"properties(n)".to_vec())]),
+            redis::Value::Array(many_rows),
+            redis::Value::SimpleString("Query internal execution time: 0".into()),
+        ]);
+        assert_ne!(
+            graph_full_hash(&original, 129, true).unwrap(),
+            graph_full_hash(&changed_last, 129, true).unwrap()
+        );
+        let duplicate_nodes = redis::Value::Array(vec![
+            redis::Value::Array(vec![redis::Value::BulkString(b"properties(n)".to_vec())]),
+            redis::Value::Array(vec![
+                redis::Value::Array(vec![redis::Value::Int(1)]),
+                redis::Value::Array(vec![redis::Value::Int(1)]),
+            ]),
+            redis::Value::SimpleString("Query internal execution time: 0".into()),
+        ]);
+        assert!(graph_full_hash(&duplicate_nodes, 2, true).is_err());
+        assert!(graph_full_hash(&duplicate_nodes, 2, false).is_ok());
+        assert!(!FULL_NODE_QUERY.contains("LIMIT"));
+        assert!(!FULL_RELATIONSHIP_QUERY.contains("LIMIT"));
+        assert!(!FULL_NODE_QUERY.contains("id("));
+        assert!(!FULL_RELATIONSHIP_QUERY.contains("id("));
     }
 
     #[test]
@@ -2392,11 +3006,12 @@ mod tests {
     #[test]
     fn exact_restore_receipt_is_checksum_image_and_count_bound() {
         let checksum = "a".repeat(64);
+        let image_id = format!("sha256:{}", "b".repeat(64));
         let receipt = serde_json::json!({
             "proof": "falkordb_exact_restore_v1",
             "input_checksum_sha256": checksum,
             "image_reference": FALKORDB_IMAGE,
-            "image_id": format!("sha256:{}", "b".repeat(64)),
+            "image_id": image_id,
             "network": "none",
             "query_mode": "GRAPH.RO_QUERY",
             "expected_min_keys": 1,
@@ -2406,11 +3021,41 @@ mod tests {
             "observed_graph_nodes": 56
         });
         let detail = format!("restore drill passed; receipt={receipt}; capacity=ok");
-        restore_receipt(&detail, &"a".repeat(64)).unwrap();
-        assert!(restore_receipt(&detail, &"c".repeat(64)).is_err());
+        let expected_image_id = format!("sha256:{}", "b".repeat(64));
+        restore_receipt(&detail, &"a".repeat(64), &expected_image_id).unwrap();
+        let production_detail = format!(
+            "restore drill passed; receipt={receipt}; capacity required=10 available=20 bytes; policy encrypted_max=30 extracted_max=40 effective_extracted=50 files_max=60 expansion_ratio=70 reserve=80"
+        );
+        restore_receipt(&production_detail, &"a".repeat(64), &expected_image_id).unwrap();
+        assert!(restore_receipt(&detail, &"c".repeat(64), &expected_image_id).is_err());
         assert!(restore_receipt(
             &detail.replace(FALKORDB_IMAGE, "falkordb:latest"),
-            &"a".repeat(64)
+            &"a".repeat(64),
+            &expected_image_id,
+        )
+        .is_err());
+        assert!(restore_receipt(
+            &format!("prefixed {detail}"),
+            &"a".repeat(64),
+            &expected_image_id,
+        )
+        .is_err());
+        assert!(restore_receipt(
+            &format!("{detail}; receipt={receipt}"),
+            &"a".repeat(64),
+            &expected_image_id,
+        )
+        .is_err());
+        assert!(restore_receipt(
+            &detail.replace("\"proof\":", "\"proof\":\"duplicate\",\"proof\":"),
+            &"a".repeat(64),
+            &expected_image_id,
+        )
+        .is_err());
+        assert!(restore_receipt(
+            &detail.replace("\"proof\":", "\"unknown\":true,\"proof\":"),
+            &"a".repeat(64),
+            &expected_image_id,
         )
         .is_err());
     }
@@ -2431,6 +3076,7 @@ mod tests {
             "allow_v4_position": 1,
             "deny_v4_position": 2,
             "deny_v6_position": 1,
+            "deny_v6_forward_position": 1,
             "persistence": {
                 "unit": "forgefleet-falkordb-source-firewall.service",
                 "unit_active": true,
@@ -2442,7 +3088,7 @@ mod tests {
             }
         });
         let raw = format!(
-            "FIREWALL_JSON_BEGIN\n{status}\nFIREWALL_JSON_END\nSERVICE_AFTER=network-online.target docker.service\nSERVICE_REQUIRES=docker.service\nSERVICE_PARTOF=docker.service\n"
+            "{status}\nSERVICE_AFTER=network-online.target docker.service\nSERVICE_REQUIRES=docker.service\nSERVICE_PARTOF=docker.service\n"
         );
         validate_firewall_attestation(&raw, &target, &primary).unwrap();
         assert!(validate_firewall_attestation(
@@ -2469,6 +3115,30 @@ mod tests {
             &primary
         )
         .is_err());
+        assert!(validate_firewall_attestation(
+            &raw.replace(
+                "\"deny_v6_forward_position\":1",
+                "\"deny_v6_forward_position\":2"
+            ),
+            &target,
+            &primary
+        )
+        .is_err());
+        assert!(
+            validate_firewall_attestation(&format!("garbage{raw}"), &target, &primary).is_err()
+        );
+        assert!(validate_firewall_attestation(
+            &raw.replace("\"ok\":true", "\"extra\":true,\"ok\":true"),
+            &target,
+            &primary
+        )
+        .is_err());
+        assert!(validate_firewall_attestation(
+            &raw.replace("\"ok\":true", "\"ok\":true,\"ok\":true"),
+            &target,
+            &primary
+        )
+        .is_err());
     }
 
     #[test]
@@ -2480,13 +3150,28 @@ mod tests {
             "BROWSER=0",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         ]);
+        let image_id = format!("sha256:{}", "d".repeat(64));
+        let cap_drop = serde_json::json!(["ALL"]);
+        let cap_add = serde_json::Value::Null;
+        let security = serde_json::json!(["no-new-privileges:true"]);
+        let devices = serde_json::json!([]);
+        let tmpfs = serde_json::json!({"/tmp": "rw,nodev,nosuid,noexec,size=67108864"});
+        let binds = serde_json::Value::Null;
+        let health = serde_json::json!({
+            "Test": ["CMD", "redis-cli", "-p", "63380", "PING"],
+            "Interval": 5_000_000_000_u64,
+            "Timeout": 3_000_000_000_u64,
+            "Retries": 24,
+            "StartPeriod": 30_000_000_000_u64
+        });
         let fingerprint = format!(
-            "sha256:image|true|healthy|unless-stopped|host|{ports}|{env}|{FALKORDB_VOLUME}:/var/lib/falkordb/data;"
+            "{image_id}|{FALKORDB_IMAGE}|true|healthy|unless-stopped|host|{ports}|{env}|volume:{FALKORDB_VOLUME}:/var/lib/falkordb/data:true;|true|{cap_drop}|{cap_add}|{security}|false|{devices}|{tmpfs}|{binds}||{health}"
         );
-        validate_existing_container(&fingerprint, "sha256:image", "192.168.5.104").unwrap();
+        validate_existing_container(&fingerprint, &image_id, "", "192.168.5.104").unwrap();
         assert!(validate_existing_container(
             &fingerprint.replace("--bind 127.0.0.1", "--bind 0.0.0.0"),
-            "sha256:image",
+            &image_id,
+            "",
             "192.168.5.104"
         )
         .is_err());
@@ -2495,7 +3180,29 @@ mod tests {
                 "replica-serve-stale-data no",
                 "replica-serve-stale-data yes"
             ),
-            "sha256:image",
+            &image_id,
+            "",
+            "192.168.5.104"
+        )
+        .is_err());
+        assert!(validate_existing_container(
+            &fingerprint.replacen("|true|[\"ALL\"]", "|false|[\"ALL\"]", 1),
+            &image_id,
+            "",
+            "192.168.5.104"
+        )
+        .is_err());
+        assert!(validate_existing_container(
+            &fingerprint.replace("[\"ALL\"]", "[]"),
+            &image_id,
+            "",
+            "192.168.5.104"
+        )
+        .is_err());
+        assert!(validate_existing_container(
+            &fingerprint.replace(FALKORDB_IMAGE, "falkordb/falkordb:latest"),
+            &image_id,
+            "",
             "192.168.5.104"
         )
         .is_err());
@@ -2512,11 +3219,154 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_payload_rejects_command_proof_action_and_target_mismatch() {
+        let target = computer(1, "sophie", "192.168.5.103");
+        let command = "ff fleet db falkordb-replica local-apply --to sophie";
+        let payload = serde_json::json!({
+            "deferred_payload": {
+                "command": command,
+                "command_sha256": sha256(command.as_bytes()),
+                "action": "apply",
+                "proof_id": "plan-1",
+                "target_computer_id": target.id,
+                "database_kind": "falkordb",
+                "automatic_failover": false,
+                "read_routing": false
+            }
+        });
+        validate_lifecycle_payload(&payload, &target, "apply", "plan-1", command).unwrap();
+        assert!(validate_lifecycle_payload(&payload, &target, "apply", "stale", command).is_err());
+        assert!(
+            validate_lifecycle_payload(&payload, &target, "decommission", "plan-1", command)
+                .is_err()
+        );
+        assert!(
+            validate_lifecycle_payload(&payload, &target, "apply", "plan-1", "different").is_err()
+        );
+        let other = computer(9, "other", "192.168.5.109");
+        assert!(validate_lifecycle_payload(&payload, &other, "apply", "plan-1", command).is_err());
+    }
+
+    #[test]
+    fn purge_preview_is_nonmutating_and_nonzero_by_contract() {
+        let preview = require_purge_confirmation(false).unwrap_err().to_string();
+        assert!(preview.contains("PREVIEW"));
+        assert!(preview.contains("nonzero"));
+        assert!(require_purge_confirmation(true).is_ok());
+        let blocked_status = preserved_volume_status_result().unwrap_err().to_string();
+        assert!(blocked_status.contains("BLOCKED"));
+        assert!(blocked_status.contains("preview"));
+    }
+
+    #[tokio::test]
+    async fn lifecycle_enqueue_reuses_active_then_rolls_terminal_signature() {
+        let db_url = match std::env::var("DATABASE_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+        {
+            Ok(url) => url,
+            Err(_) => {
+                let config_text = tokio::fs::read_to_string(
+                    dirs::home_dir()
+                        .expect("home directory")
+                        .join(".forgefleet/fleet.toml"),
+                )
+                .await
+                .expect("read fleet config for session-local PostgreSQL test");
+                let config: ff_core::config::FleetConfig =
+                    toml::from_str(&config_text).expect("parse fleet config");
+                config.database.url
+            }
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&db_url)
+            .await
+            .expect("connect PostgreSQL for session-local lifecycle test");
+        sqlx::query(
+            "CREATE TEMP TABLE fleet_tasks (
+                id UUID PRIMARY KEY,
+                task_type TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                priority INTEGER NOT NULL,
+                requires_capability JSONB NOT NULL,
+                preferred_computer_id UUID,
+                status TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                task_class TEXT,
+                dedup_signature TEXT
+             ) ON COMMIT PRESERVE ROWS",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE UNIQUE INDEX idx_fleet_tasks_dedup_signature
+               ON fleet_tasks(dedup_signature) WHERE dedup_signature IS NOT NULL",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let target = computer(1, "sophie", "192.168.5.103");
+        let command = "exact-command".to_string();
+        let first = enqueue_lifecycle_action(&pool, &target, "apply", "plan-1", command.clone())
+            .await
+            .unwrap();
+        let duplicate =
+            enqueue_lifecycle_action(&pool, &target, "apply", "plan-1", command.clone())
+                .await
+                .unwrap();
+        assert_eq!(first, duplicate);
+        assert!(
+            enqueue_lifecycle_action(&pool, &target, "apply", "plan-2", command.clone())
+                .await
+                .is_err()
+        );
+        assert!(enqueue_lifecycle_action(
+            &pool,
+            &target,
+            "apply",
+            "plan-1",
+            "different-command".into(),
+        )
+        .await
+        .is_err());
+        sqlx::query("UPDATE fleet_tasks SET status='completed' WHERE id=$1")
+            .bind(first)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let second = enqueue_lifecycle_action(&pool, &target, "apply", "plan-1", command)
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        let signed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM fleet_tasks WHERE dedup_signature IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let cleared: Option<String> =
+            sqlx::query_scalar("SELECT dedup_signature FROM fleet_tasks WHERE id=$1")
+                .bind(first)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(signed, 1);
+        assert!(cleared.is_none());
+    }
+
+    #[test]
     fn compose_is_immutable_loopback_durable_read_only_and_failover_free() {
         let compose = include_str!("../../../deploy/docker-compose.falkordb-follower.yml");
         assert!(compose.contains(FALKORDB_IMAGE));
         assert!(compose.contains("pull_policy: never"));
         assert!(compose.contains("network_mode: host"));
+        assert!(compose.contains("read_only: true"));
+        assert!(compose.contains("cap_drop:"));
+        assert!(compose.contains("- ALL"));
+        assert!(compose.contains("no-new-privileges:true"));
+        assert!(compose.contains("/tmp:rw,nodev,nosuid,noexec,size=64m"));
         assert!(compose.contains("--port 63380"));
         assert!(compose.contains("--bind 127.0.0.1"));
         assert!(compose.contains("BROWSER: \"0\""));
