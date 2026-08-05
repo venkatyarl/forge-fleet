@@ -112,7 +112,6 @@ struct PlanMaterial {
     primary_version: String,
     graph_module_version: i64,
     primary_dbsize: u64,
-    primary_used_memory: u64,
     graphs: BTreeMap<String, GraphEvidence>,
     backup: BackupEvidence,
     target_state: TargetState,
@@ -184,7 +183,9 @@ struct TargetAttestation {
 struct FirewallEvidence {
     target_id: Uuid,
     target_ip: String,
+    primary_id: Uuid,
     primary_ip: String,
+    primary_port: u16,
     unit_enabled: bool,
     unit_active: bool,
     unit_result_success: bool,
@@ -193,6 +194,33 @@ struct FirewallEvidence {
     ipv4_default_deny: bool,
     ipv6_default_deny: bool,
     ipv6_forward_default_deny: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TargetSourceRouteEvidence {
+    target_id: Uuid,
+    target_ip: String,
+    source_ip: String,
+    primary_id: Uuid,
+    primary_ip: String,
+    primary_port: u16,
+    tcp_reachable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DirectPrimaryAccess {
+    url: String,
+    target_id: Uuid,
+    target_ip: String,
+    primary_id: Uuid,
+    primary_ip: String,
+    primary_port: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimaryProofTransport {
+    AuthorizedTargetDirect,
+    StrictSsh,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +288,61 @@ impl PrimaryProbe {
             let _ = child.kill().await;
             let _ = child.wait().await;
         }
+    }
+}
+
+struct AuthorizedPrimaryProbe {
+    probe: PrimaryProbe,
+    transport: PrimaryProofTransport,
+    target_id: Uuid,
+    target_ip: String,
+    primary_id: Uuid,
+    primary_ip: String,
+    primary_port: u16,
+}
+
+impl AuthorizedPrimaryProbe {
+    fn url(&self) -> &str {
+        &self.probe.url
+    }
+
+    fn validate_for_plan(&self, plan: &Plan) -> Result<()> {
+        if self.target_id != plan.material.target_id
+            || self.target_ip != plan.material.target_ip
+            || self.primary_id != plan.material.primary_id
+            || self.primary_ip != plan.material.primary_ip
+            || self.primary_port != plan.material.primary_port
+        {
+            bail!("authorized Priya proof transport is not bound to this FalkorDB plan");
+        }
+        match self.transport {
+            PrimaryProofTransport::AuthorizedTargetDirect => {
+                if self.probe.tunnel.is_some()
+                    || self.probe.url
+                        != format!("redis://{}:{}", self.primary_ip, self.primary_port)
+                {
+                    bail!("authorized target-direct Priya proof transport is malformed");
+                }
+            }
+            PrimaryProofTransport::StrictSsh => {
+                if self.probe.tunnel.is_none() || !self.probe.url.starts_with("redis://127.0.0.1:")
+                {
+                    bail!("strict SSH Priya proof transport is malformed");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn require_target_direct(&self) -> Result<()> {
+        if self.transport != PrimaryProofTransport::AuthorizedTargetDirect {
+            bail!("target-owned FalkorDB apply requires authorized target-direct Priya proof");
+        }
+        Ok(())
+    }
+
+    async fn close(self) {
+        self.probe.close().await;
     }
 }
 
@@ -432,8 +515,129 @@ async fn run_on_node(node: &Computer, script: &str, timeout: Duration) -> Result
         .with_context(|| format!("run bounded command on {}", node.name))
 }
 
-async fn primary_probe(primary: &Computer) -> Result<PrimaryProbe> {
-    node_loopback_probe(primary, PRIMARY_PORT, "Priya").await
+fn primary_proof_transport(local_name: &str, target: &Computer) -> PrimaryProofTransport {
+    if local_name.eq_ignore_ascii_case(&target.name) {
+        PrimaryProofTransport::AuthorizedTargetDirect
+    } else {
+        PrimaryProofTransport::StrictSsh
+    }
+}
+
+fn validate_primary_access_evidence(
+    target: &Computer,
+    primary: &Computer,
+    firewall: &FirewallEvidence,
+    route: &TargetSourceRouteEvidence,
+) -> Result<()> {
+    if target.id == primary.id || target.ip == primary.ip {
+        bail!("FalkorDB primary-proof target and authority must be distinct");
+    }
+    if firewall.target_id != target.id
+        || firewall.target_ip != target.ip
+        || firewall.primary_id != primary.id
+        || firewall.primary_ip != primary.ip
+        || firewall.primary_port != PRIMARY_PORT
+        || !firewall.unit_enabled
+        || !firewall.unit_active
+        || !firewall.unit_result_success
+        || !firewall.docker_lifecycle_bound
+        || !firewall.ipv4_target_allow
+        || !firewall.ipv4_default_deny
+        || !firewall.ipv6_default_deny
+        || !firewall.ipv6_forward_default_deny
+    {
+        bail!("Priya firewall evidence is not bound to the exact FalkorDB target and authority");
+    }
+    if route.target_id != target.id
+        || route.target_ip != target.ip
+        || route.source_ip != target.ip
+        || route.primary_id != primary.id
+        || route.primary_ip != primary.ip
+        || route.primary_port != PRIMARY_PORT
+        || !route.tcp_reachable
+    {
+        bail!(
+            "target source-route evidence is not bound to the exact FalkorDB target and authority"
+        );
+    }
+    Ok(())
+}
+
+fn authorize_target_direct_primary(
+    local_name: &str,
+    target: &Computer,
+    primary: &Computer,
+    canonical_authority: &str,
+    firewall: &FirewallEvidence,
+    route: &TargetSourceRouteEvidence,
+) -> Result<DirectPrimaryAccess> {
+    reject_vinny(&target.name)?;
+    if !primary.name.eq_ignore_ascii_case(PRIMARY_NAME) {
+        bail!("target-direct FalkorDB proof authority must be canonical Priya");
+    }
+    if !local_name.eq_ignore_ascii_case(&target.name) {
+        bail!("target-direct Priya proof is authorized only on the exact target worker");
+    }
+    validate_primary_access_evidence(target, primary, firewall, route)?;
+    let url = normalized_url(canonical_authority, &primary.ip)?;
+    Ok(DirectPrimaryAccess {
+        url,
+        target_id: target.id,
+        target_ip: target.ip.clone(),
+        primary_id: primary.id,
+        primary_ip: primary.ip.clone(),
+        primary_port: PRIMARY_PORT,
+    })
+}
+
+async fn acquire_authorized_primary_probe(
+    canonical_authority: &str,
+    primary: &Computer,
+    target: &Computer,
+) -> Result<AuthorizedPrimaryProbe> {
+    validate_target_identity(target, primary)?;
+    let firewall = attest_firewall(primary, target).await?;
+    let route = attest_target_source_route(target, primary).await?;
+    validate_primary_access_evidence(target, primary, &firewall, &route)?;
+    let local_name = ff_agent::fleet_info::resolve_this_worker_name().await;
+    let transport = primary_proof_transport(&local_name, target);
+    let probe = match transport {
+        PrimaryProofTransport::AuthorizedTargetDirect => {
+            let access = authorize_target_direct_primary(
+                &local_name,
+                target,
+                primary,
+                canonical_authority,
+                &firewall,
+                &route,
+            )?;
+            if access.target_id != target.id
+                || access.target_ip != target.ip
+                || access.primary_id != primary.id
+                || access.primary_ip != primary.ip
+                || access.primary_port != PRIMARY_PORT
+            {
+                bail!("target-direct Priya proof authorization changed during acquisition");
+            }
+            PrimaryProbe {
+                url: access.url,
+                tunnel: None,
+            }
+        }
+        PrimaryProofTransport::StrictSsh => {
+            normalized_url(canonical_authority, &primary.ip)?;
+            strict_ssh_loopback_probe(primary, PRIMARY_PORT, "Priya").await?
+        }
+    };
+    Ok(AuthorizedPrimaryProbe {
+        probe,
+        transport,
+        target_id: target.id,
+        target_ip: target.ip.clone(),
+        primary_id: primary.id,
+        primary_ip: primary.ip.clone(),
+        primary_port: PRIMARY_PORT,
+    })
 }
 
 async fn node_loopback_probe(
@@ -448,6 +652,37 @@ async fn node_loopback_probe(
             tunnel: None,
         });
     }
+    strict_ssh_loopback_probe(node, remote_port, label).await
+}
+
+fn strict_ssh_loopback_args(node: &Computer, forward: &str) -> Vec<String> {
+    vec![
+        "-N".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        "ConnectTimeout=5".into(),
+        "-o".into(),
+        "ExitOnForwardFailure=yes".into(),
+        "-o".into(),
+        "ServerAliveInterval=5".into(),
+        "-o".into(),
+        "ServerAliveCountMax=2".into(),
+        "-p".into(),
+        node.ssh_port.to_string(),
+        "-L".into(),
+        forward.into(),
+        format!("{}@{}", node.ssh_user, node.ip),
+    ]
+}
+
+async fn strict_ssh_loopback_probe(
+    node: &Computer,
+    remote_port: u16,
+    label: &str,
+) -> Result<PrimaryProbe> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .context("reserve local FalkorDB proof tunnel port")?;
@@ -455,26 +690,7 @@ async fn node_loopback_probe(
     drop(listener);
     let forward = format!("127.0.0.1:{port}:127.0.0.1:{remote_port}");
     let mut child = tokio::process::Command::new("ssh")
-        .args([
-            "-N",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=yes",
-            "-o",
-            "ConnectTimeout=5",
-            "-o",
-            "ExitOnForwardFailure=yes",
-            "-o",
-            "ServerAliveInterval=5",
-            "-o",
-            "ServerAliveCountMax=2",
-            "-p",
-            &node.ssh_port.to_string(),
-            "-L",
-            &forward,
-            &format!("{}@{}", node.ssh_user, node.ip),
-        ])
+        .args(strict_ssh_loopback_args(node, &forward))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -496,6 +712,8 @@ async fn node_loopback_probe(
             bail!("{label} SSH proof tunnel exited before becoming ready");
         }
         if std::time::Instant::now() >= deadline {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
             bail!("{label} SSH proof tunnel did not become ready");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -938,7 +1156,9 @@ fn validate_firewall_attestation(
     let evidence = FirewallEvidence {
         target_id: target.id,
         target_ip: target.ip.clone(),
+        primary_id: primary.id,
         primary_ip: primary.ip.clone(),
+        primary_port: PRIMARY_PORT,
         unit_enabled,
         unit_active,
         unit_result_success,
@@ -973,7 +1193,10 @@ async fn attest_firewall(primary: &Computer, target: &Computer) -> Result<Firewa
     validate_firewall_attestation(&String::from_utf8_lossy(&output.stdout), target, primary)
 }
 
-async fn attest_target_source_route(target: &Computer, primary: &Computer) -> Result<()> {
+async fn attest_target_source_route(
+    target: &Computer,
+    primary: &Computer,
+) -> Result<TargetSourceRouteEvidence> {
     let script = format!(
         r#"set -eu
 command -v ip >/dev/null
@@ -1005,7 +1228,15 @@ echo 'TCP_REACHABLE=yes'
     {
         bail!("target-to-Priya FalkorDB route does not use the canonical target source IP");
     }
-    Ok(())
+    Ok(TargetSourceRouteEvidence {
+        target_id: target.id,
+        target_ip: target.ip.clone(),
+        source_ip: target.ip.clone(),
+        primary_id: primary.id,
+        primary_ip: primary.ip.clone(),
+        primary_port: PRIMARY_PORT,
+        tcp_reachable: true,
+    })
 }
 
 async fn redis_value(url: &str, command: &str, args: &[&str]) -> Result<redis::Value> {
@@ -1563,15 +1794,7 @@ async fn primary_evidence(
             "FalkorDB graph module version is {graph_version}, expected {EXPECTED_GRAPH_MODULE_VERSION}"
         );
     }
-    let memory = redis_info(url, "memory").await?;
-    let used_memory = memory
-        .get("used_memory")
-        .context("FalkorDB authority has no used_memory")?
-        .parse::<u64>()
-        .context("parse FalkorDB used_memory")?;
-    if used_memory == 0 {
-        bail!("FalkorDB authority reported zero used memory");
-    }
+    let used_memory = primary_used_memory(url).await?;
     let primary_dbsize = dbsize(url).await?;
     let graphs = graph_inventory(url).await?;
     let replication_after = redis_info(url, "replication").await?;
@@ -1594,6 +1817,32 @@ async fn primary_evidence(
     ))
 }
 
+async fn primary_used_memory(url: &str) -> Result<u64> {
+    let memory = redis_info(url, "memory").await?;
+    let used_memory = memory
+        .get("used_memory")
+        .context("FalkorDB authority has no used_memory")?
+        .parse::<u64>()
+        .context("parse FalkorDB used_memory")?;
+    if used_memory == 0 {
+        bail!("FalkorDB authority reported zero used memory");
+    }
+    Ok(used_memory)
+}
+
+fn validate_target_capacity(target: &TargetAttestation, primary_used_memory: u64) -> Result<()> {
+    if primary_used_memory == 0 {
+        bail!("FalkorDB authority reported zero used memory");
+    }
+    let required_bytes = primary_used_memory.saturating_mul(2).max(MIN_TARGET_BYTES);
+    if target.ram_bytes < required_bytes || target.disk_free_bytes < required_bytes {
+        bail!(
+            "FalkorDB target needs at least {required_bytes} bytes RAM and free disk (2x source data with 2 GiB floor)"
+        );
+    }
+    Ok(())
+}
+
 async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result<Plan> {
     reject_vinny(to)?;
     let target = resolve_computer(pool, to).await?;
@@ -1601,8 +1850,8 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
     validate_target_identity(&target, &primary)?;
     validate_topology_for_plan(pool, &target, &primary).await?;
 
-    let _canonical_authority = authority_url(pool, &primary).await?;
-    let probe = primary_probe(&primary).await?;
+    let canonical_authority = authority_url(pool, &primary).await?;
+    let probe = acquire_authorized_primary_probe(&canonical_authority, &primary, &target).await?;
     let (
         primary_replid,
         primary_version,
@@ -1610,20 +1859,19 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
         primary_dbsize,
         primary_used_memory,
         graphs,
-    ) = match primary_evidence(&probe.url).await {
+    ) = match primary_evidence(probe.url()).await {
         Ok(evidence) => {
             probe.close().await;
             evidence
         }
         Err(error) => {
             probe.close().await;
-            return Err(error).context("probe canonical Priya FalkorDB through SSH loopback");
+            return Err(error)
+                .context("probe canonical Priya FalkorDB through authorized transport");
         }
     };
     let primary_image = attest_image(&primary).await?;
     let backup = backup_evidence(pool, &primary).await?;
-    attest_firewall(&primary, &target).await?;
-    attest_target_source_route(&target, &primary).await?;
     let (target_attestation, target_state) = attest_target(&target, &primary.ip).await?;
     if target_attestation.image_user != primary_image.configured_user {
         bail!(
@@ -1631,18 +1879,11 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
         );
     }
 
-    let required_bytes = primary_used_memory.saturating_mul(2).max(MIN_TARGET_BYTES);
-    if target_attestation.ram_bytes < required_bytes
-        || target_attestation.disk_free_bytes < required_bytes
-    {
-        bail!(
-            "FalkorDB target needs at least {required_bytes} bytes RAM and free disk (2x source data with 2 GiB floor)"
-        );
-    }
+    validate_target_capacity(&target_attestation, primary_used_memory)?;
 
     Ok(Plan {
         material: PlanMaterial {
-            version: "falkordb-replica-plan-v3",
+            version: "falkordb-replica-plan-v4",
             target_id: target.id,
             target_name: target.name,
             target_ip: target.ip,
@@ -1656,7 +1897,6 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
             primary_version,
             graph_module_version,
             primary_dbsize,
-            primary_used_memory,
             graphs,
             backup,
             target_state,
@@ -2056,15 +2296,12 @@ async fn prove_replica_once(plan: &Plan, primary_url: &str, replica_url: &str) -
     Ok(lag)
 }
 
-async fn prove_replica(plan: &Plan) -> Result<i64> {
-    let primary_url = format!(
-        "redis://{}:{}",
-        plan.material.primary_ip, plan.material.primary_port
-    );
+async fn prove_replica(plan: &Plan, primary_probe: &AuthorizedPrimaryProbe) -> Result<i64> {
+    primary_probe.validate_for_plan(plan)?;
     let replica_url = replica_url();
     let deadline = std::time::Instant::now() + REPLICA_READY_TIMEOUT;
     loop {
-        if let Ok(lag) = prove_replica_once(plan, &primary_url, &replica_url).await {
+        if let Ok(lag) = prove_replica_once(plan, primary_probe.url(), &replica_url).await {
             return Ok(lag);
         }
         if std::time::Instant::now() >= deadline {
@@ -2076,13 +2313,14 @@ async fn prove_replica(plan: &Plan) -> Result<i64> {
     }
 }
 
-async fn restart_and_reprove(plan: &Plan) -> Result<i64> {
+async fn restart_and_reprove(plan: &Plan, primary_probe: &AuthorizedPrimaryProbe) -> Result<i64> {
+    primary_probe.validate_for_plan(plan)?;
     let output = docker_output(&["restart", FALKORDB_CONTAINER]).await?;
     if !output.status.success() {
         bail!("exact FalkorDB replica container restart failed");
     }
     wait_exact_healthy(plan).await?;
-    prove_replica(plan).await
+    prove_replica(plan, primary_probe).await
 }
 
 async fn register_topology(pool: &sqlx::PgPool, plan: &Plan, lag_bytes: i64) -> Result<()> {
@@ -2186,11 +2424,17 @@ async fn local_apply_inner(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     }
     let primary = resolve_computer(pool, &plan.material.primary_name).await?;
     let target = resolve_computer(pool, &plan.material.target_name).await?;
-    attest_firewall(&primary, &target).await?;
+    let canonical_authority = authority_url(pool, &primary).await?;
+    let first_primary_probe =
+        acquire_authorized_primary_probe(&canonical_authority, &primary, &target).await?;
+    first_primary_probe.validate_for_plan(plan)?;
+    first_primary_probe.require_target_direct()?;
     let primary_image = attest_image(&primary).await?;
     validate_primary_plan_image(plan, &primary_image)?;
     let (attestation, state) = attest_target(&target, &primary.ip).await?;
     validate_plan_image(plan, &attestation)?;
+    let current_primary_used_memory = primary_used_memory(first_primary_probe.url()).await?;
+    validate_target_capacity(&attestation, current_primary_used_memory)?;
     match state {
         TargetState::Absent => {
             start_replica(plan).await?;
@@ -2200,15 +2444,41 @@ async fn local_apply_inner(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
             // An exact, healthy deployment is the only retry state accepted.
         }
     }
-    let first_lag = prove_replica(plan).await?;
-    let second_lag = restart_and_reprove(plan).await?;
+    let first_lag = prove_replica(plan, &first_primary_probe).await?;
+    first_primary_probe.close().await;
+
+    let restart_primary_probe =
+        acquire_authorized_primary_probe(&canonical_authority, &primary, &target).await?;
+    restart_primary_probe.validate_for_plan(plan)?;
+    restart_primary_probe.require_target_direct()?;
+    let second_lag = restart_and_reprove(plan, &restart_primary_probe).await?;
+    restart_primary_probe.close().await;
     let (final_attestation, final_state) = attest_target(&target, &primary.ip).await?;
     validate_plan_image(plan, &final_attestation)?;
     if !matches!(final_state, TargetState::ExactHealthy { .. }) {
         bail!("FalkorDB target stopped being exact-healthy before topology registration");
     }
-    attest_firewall(&primary, &target).await?;
-    register_topology(pool, plan, first_lag.max(second_lag)).await
+    let final_primary_probe =
+        acquire_authorized_primary_probe(&canonical_authority, &primary, &target).await?;
+    final_primary_probe.validate_for_plan(plan)?;
+    final_primary_probe.require_target_direct()?;
+    let final_lag = prove_replica(plan, &final_primary_probe).await?;
+    final_primary_probe.close().await;
+
+    let registration_primary_probe =
+        acquire_authorized_primary_probe(&canonical_authority, &primary, &target).await?;
+    registration_primary_probe.validate_for_plan(plan)?;
+    registration_primary_probe.require_target_direct()?;
+    let registration_used_memory = primary_used_memory(registration_primary_probe.url()).await?;
+    let (registration_attestation, registration_state) =
+        attest_target(&target, &primary.ip).await?;
+    validate_plan_image(plan, &registration_attestation)?;
+    validate_target_capacity(&registration_attestation, registration_used_memory)?;
+    if !matches!(registration_state, TargetState::ExactHealthy { .. }) {
+        bail!("FalkorDB target stopped being exact-healthy before topology registration");
+    }
+    registration_primary_probe.close().await;
+    register_topology(pool, plan, first_lag.max(second_lag).max(final_lag)).await
 }
 
 async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
@@ -2492,12 +2762,16 @@ async fn local_purge_volume(pool: &sqlx::PgPool, evidence: &PurgeEvidence) -> Re
     outcome
 }
 
-async fn prove_replica_via_tunnels(
+async fn prove_replica_via_bounded_probes(
+    pool: &sqlx::PgPool,
     plan: &Plan,
     primary: &Computer,
     target: &Computer,
 ) -> Result<i64> {
-    let primary_probe = primary_probe(primary).await?;
+    let canonical_authority = authority_url(pool, primary).await?;
+    let primary_probe =
+        acquire_authorized_primary_probe(&canonical_authority, primary, target).await?;
+    primary_probe.validate_for_plan(plan)?;
     let replica_probe = match node_loopback_probe(target, REPLICA_PORT, "target FalkorDB").await {
         Ok(probe) => probe,
         Err(error) => {
@@ -2505,7 +2779,7 @@ async fn prove_replica_via_tunnels(
             return Err(error);
         }
     };
-    let result = prove_replica_once(plan, &primary_probe.url, &replica_probe.url).await;
+    let result = prove_replica_once(plan, primary_probe.url(), &replica_probe.url).await;
     replica_probe.close().await;
     primary_probe.close().await;
     result
@@ -2558,7 +2832,7 @@ async fn show_status(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Resul
         let registered_backup = row.try_get::<Option<Uuid>, _>("bootstrapped_from_backup_id")?;
         let plan = build_plan(pool, to, primary_name).await?;
         validate_status_topology(&role, &status, registered_backup, &plan)?;
-        let fresh_lag = prove_replica_via_tunnels(&plan, &primary, &target)
+        let fresh_lag = prove_replica_via_bounded_probes(pool, &plan, &primary, &target)
             .await
             .context("BLOCKED: fresh live FalkorDB replica proof failed")?;
         let (after, after_state) = attest_target(&target, &primary.ip).await?;
@@ -2798,7 +3072,7 @@ mod tests {
         );
         Plan {
             material: PlanMaterial {
-                version: "falkordb-replica-plan-v3",
+                version: "falkordb-replica-plan-v4",
                 target_id: Uuid::from_u128(1),
                 target_name: "sophie".into(),
                 target_ip: "192.168.5.103".into(),
@@ -2812,7 +3086,6 @@ mod tests {
                 primary_version: EXPECTED_REDIS_VERSION.into(),
                 graph_module_version: EXPECTED_GRAPH_MODULE_VERSION,
                 primary_dbsize: 6,
-                primary_used_memory: 1024,
                 graphs,
                 backup: backup(),
                 target_state: TargetState::Absent,
@@ -2828,6 +3101,36 @@ mod tests {
                 automatic_failover: false,
                 read_routing: false,
             },
+        }
+    }
+
+    fn firewall_evidence(target: &Computer, primary: &Computer) -> FirewallEvidence {
+        FirewallEvidence {
+            target_id: target.id,
+            target_ip: target.ip.clone(),
+            primary_id: primary.id,
+            primary_ip: primary.ip.clone(),
+            primary_port: PRIMARY_PORT,
+            unit_enabled: true,
+            unit_active: true,
+            unit_result_success: true,
+            docker_lifecycle_bound: true,
+            ipv4_target_allow: true,
+            ipv4_default_deny: true,
+            ipv6_default_deny: true,
+            ipv6_forward_default_deny: true,
+        }
+    }
+
+    fn route_evidence(target: &Computer, primary: &Computer) -> TargetSourceRouteEvidence {
+        TargetSourceRouteEvidence {
+            target_id: target.id,
+            target_ip: target.ip.clone(),
+            source_ip: target.ip.clone(),
+            primary_id: primary.id,
+            primary_ip: primary.ip.clone(),
+            primary_port: PRIMARY_PORT,
+            tcp_reachable: true,
         }
     }
 
@@ -2888,7 +3191,7 @@ mod tests {
         let id = original.id();
 
         let mut changed = original.clone();
-        changed.material.version = "falkordb-replica-plan-v2";
+        changed.material.version = "falkordb-replica-plan-v3";
         assert_ne!(id, changed.id());
 
         let mut changed = original.clone();
@@ -2921,6 +3224,221 @@ mod tests {
             replica_port_listeners: 0,
             replica_port_non_loopback: 0,
         }
+    }
+
+    #[test]
+    fn target_direct_primary_authorization_is_exact_and_evidence_bound() {
+        let target = computer(1, "sophie", "192.168.5.103");
+        let primary = computer(2, "priya", "192.168.5.104");
+        let firewall = firewall_evidence(&target, &primary);
+        let route = route_evidence(&target, &primary);
+        let canonical = "redis://192.168.5.104:63379";
+        let access = authorize_target_direct_primary(
+            "sophie", &target, &primary, canonical, &firewall, &route,
+        )
+        .unwrap();
+        assert_eq!(
+            access,
+            DirectPrimaryAccess {
+                url: canonical.into(),
+                target_id: target.id,
+                target_ip: target.ip.clone(),
+                primary_id: primary.id,
+                primary_ip: primary.ip.clone(),
+                primary_port: PRIMARY_PORT,
+            }
+        );
+        assert!(authorize_target_direct_primary(
+            "SOPHIE", &target, &primary, canonical, &firewall, &route,
+        )
+        .is_ok());
+        for wrong in ["sophie-worker", "priya", "adele", ""] {
+            assert!(authorize_target_direct_primary(
+                wrong, &target, &primary, canonical, &firewall, &route,
+            )
+            .is_err());
+        }
+
+        for bad_authority in [
+            "redis://127.0.0.1:63379",
+            "redis://192.168.5.103:63379",
+            "redis://192.168.5.104:6379",
+            "redis://192.168.5.104:63380",
+            "redis://user@192.168.5.104:63379",
+            "rediss://192.168.5.104:63379",
+            "redis://192.168.5.104:63379/1",
+            "redis://192.168.5.104:63379?x=1",
+            "redis://192.168.5.104:63379/#fragment",
+        ] {
+            assert!(authorize_target_direct_primary(
+                "sophie",
+                &target,
+                &primary,
+                bad_authority,
+                &firewall,
+                &route,
+            )
+            .is_err());
+        }
+
+        let mut changed = firewall.clone();
+        changed.target_id = Uuid::from_u128(99);
+        assert!(authorize_target_direct_primary(
+            "sophie", &target, &primary, canonical, &changed, &route,
+        )
+        .is_err());
+        let mut changed = firewall.clone();
+        changed.primary_id = Uuid::from_u128(99);
+        assert!(authorize_target_direct_primary(
+            "sophie", &target, &primary, canonical, &changed, &route,
+        )
+        .is_err());
+        let mut changed = firewall.clone();
+        changed.primary_port = 6379;
+        assert!(authorize_target_direct_primary(
+            "sophie", &target, &primary, canonical, &changed, &route,
+        )
+        .is_err());
+        let mut changed = firewall;
+        changed.ipv4_target_allow = false;
+        assert!(authorize_target_direct_primary(
+            "sophie", &target, &primary, canonical, &changed, &route,
+        )
+        .is_err());
+
+        let mut changed = route.clone();
+        changed.source_ip = "192.168.5.102".into();
+        assert!(authorize_target_direct_primary(
+            "sophie",
+            &target,
+            &primary,
+            canonical,
+            &firewall_evidence(&target, &primary),
+            &changed,
+        )
+        .is_err());
+        let mut changed = route;
+        changed.tcp_reachable = false;
+        assert!(authorize_target_direct_primary(
+            "sophie",
+            &target,
+            &primary,
+            canonical,
+            &firewall_evidence(&target, &primary),
+            &changed,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn primary_probe_mode_is_direct_only_on_exact_target() {
+        let target = computer(1, "sophie", "192.168.5.103");
+        assert_eq!(
+            primary_proof_transport("sophie", &target),
+            PrimaryProofTransport::AuthorizedTargetDirect
+        );
+        assert_eq!(
+            primary_proof_transport("SOPHIE", &target),
+            PrimaryProofTransport::AuthorizedTargetDirect
+        );
+        for worker in ["adele", "priya", "lily", ""] {
+            assert_eq!(
+                primary_proof_transport(worker, &target),
+                PrimaryProofTransport::StrictSsh
+            );
+        }
+    }
+
+    #[test]
+    fn authorized_primary_probe_cannot_cross_plan_identity() {
+        let original = plan();
+        let probe = AuthorizedPrimaryProbe {
+            probe: PrimaryProbe {
+                url: "redis://192.168.5.104:63379".into(),
+                tunnel: None,
+            },
+            transport: PrimaryProofTransport::AuthorizedTargetDirect,
+            target_id: original.material.target_id,
+            target_ip: original.material.target_ip.clone(),
+            primary_id: original.material.primary_id,
+            primary_ip: original.material.primary_ip.clone(),
+            primary_port: PRIMARY_PORT,
+        };
+        probe.validate_for_plan(&original).unwrap();
+
+        let mut changed = original.clone();
+        changed.material.target_id = Uuid::from_u128(99);
+        assert!(probe.validate_for_plan(&changed).is_err());
+        let mut changed = original.clone();
+        changed.material.target_ip = "192.168.5.109".into();
+        assert!(probe.validate_for_plan(&changed).is_err());
+        let mut changed = original.clone();
+        changed.material.primary_id = Uuid::from_u128(98);
+        assert!(probe.validate_for_plan(&changed).is_err());
+        let mut changed = original;
+        changed.material.primary_port = 6379;
+        assert!(probe.validate_for_plan(&changed).is_err());
+
+        assert!(probe.require_target_direct().is_ok());
+        let mut wrong_transport = probe;
+        wrong_transport.transport = PrimaryProofTransport::StrictSsh;
+        assert!(wrong_transport.require_target_direct().is_err());
+    }
+
+    #[test]
+    fn strict_primary_tunnel_is_fail_closed_and_exact() {
+        let primary = computer(2, "priya", "192.168.5.104");
+        let args = strict_ssh_loopback_args(&primary, "127.0.0.1:45678:127.0.0.1:63379");
+        for exact in [
+            "BatchMode=yes",
+            "StrictHostKeyChecking=yes",
+            "ConnectTimeout=5",
+            "ExitOnForwardFailure=yes",
+            "ServerAliveInterval=5",
+            "ServerAliveCountMax=2",
+        ] {
+            assert!(args.iter().any(|arg| arg == exact), "missing {exact}");
+        }
+        assert!(args.windows(2).any(|pair| pair == ["-p", "22"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| { pair == ["-L", "127.0.0.1:45678:127.0.0.1:63379"] }));
+        assert_eq!(args.last().map(String::as_str), Some("priya@192.168.5.104"));
+    }
+
+    #[test]
+    fn capacity_is_live_not_plan_bound_and_enforces_floor_and_double_source() {
+        let plan = plan();
+        let plan_id = plan.id();
+        let serialized = serde_json::to_value(&plan.material).unwrap();
+        assert_eq!(serialized["version"], "falkordb-replica-plan-v4");
+        assert!(serialized.get("primary_used_memory").is_none());
+
+        let mut target = target_attestation(&plan);
+        assert!(validate_target_capacity(&target, 0).is_err());
+        validate_target_capacity(&target, 1).unwrap();
+        validate_target_capacity(&target, 8 * 1024 * 1024 * 1024).unwrap();
+        assert_eq!(plan_id, plan.id());
+
+        target.ram_bytes = MIN_TARGET_BYTES;
+        target.disk_free_bytes = MIN_TARGET_BYTES;
+        validate_target_capacity(&target, 1).unwrap();
+        target.ram_bytes -= 1;
+        assert!(validate_target_capacity(&target, 1).is_err());
+        target.ram_bytes = MIN_TARGET_BYTES;
+        target.disk_free_bytes -= 1;
+        assert!(validate_target_capacity(&target, 1).is_err());
+
+        let used_memory = 4 * 1024 * 1024 * 1024;
+        let required = used_memory * 2;
+        target.ram_bytes = required;
+        target.disk_free_bytes = required;
+        validate_target_capacity(&target, used_memory).unwrap();
+        target.ram_bytes -= 1;
+        assert!(validate_target_capacity(&target, used_memory).is_err());
+        target.ram_bytes = required;
+        target.disk_free_bytes -= 1;
+        assert!(validate_target_capacity(&target, used_memory).is_err());
     }
 
     #[test]
