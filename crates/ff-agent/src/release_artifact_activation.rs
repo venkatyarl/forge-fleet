@@ -305,6 +305,7 @@ pub async fn activate_local_release_pair(
                 platform,
                 home_for_worker,
                 &SystemCommandRunner,
+                true,
             )
         })
         .await??;
@@ -437,6 +438,7 @@ pub async fn prove_local_release_rollback(
             platform,
             home,
             &SystemCommandRunner,
+            false,
         )
     })
     .await??
@@ -932,8 +934,11 @@ async fn ensure_local_custody(
         })?;
     if peer.name != origin.holder_name_at_registration
         || peer.name.eq_ignore_ascii_case("vinny")
-        || peer.status != "active"
-        || peer.computer_status.as_deref() != Some("active")
+        || !canonical_live_status(&peer.status)
+        || !peer
+            .computer_status
+            .as_deref()
+            .is_some_and(canonical_live_status)
     {
         return Err(ReleaseActivationError::Refused(format!(
             "custodian {} is not an exact active canonical peer",
@@ -983,6 +988,10 @@ async fn ensure_local_custody(
         origin_computer_id: origin.computer_id,
         origin_holder: origin.holder_name_at_registration,
     })
+}
+
+fn canonical_live_status(status: &str) -> bool {
+    matches!(status, "active" | "online")
 }
 
 /// The first immutable verifier is the origin. Later recipient custody rows do
@@ -1685,6 +1694,7 @@ fn inspect_committed_activation(
     platform: ServicePlatform,
     home: PathBuf,
     runner: &dyn CommandRunner,
+    archive_terminal_rollback: bool,
 ) -> Result<Option<InspectedCommittedActivation>> {
     if identity.name.eq_ignore_ascii_case("vinny") {
         return Err(ReleaseActivationError::Refused(
@@ -1697,6 +1707,19 @@ fn inspect_committed_activation(
     let manifest_path = activation_dir.join(format!("{transaction_id}.manifest.json"));
     let journal_path = activation_dir.join(format!("{transaction_id}.journal.jsonl"));
     let receipt_path = activation_dir.join(format!("{transaction_id}.receipt.json"));
+    if archive_terminal_rollback
+        && !receipt_path.exists()
+        && archive_terminal_rollback_for_retry(
+            &activation_dir,
+            transaction_id,
+            &identity,
+            platform,
+            &home,
+            runner,
+        )?
+    {
+        return Ok(None);
+    }
     let present = [
         manifest_path.exists(),
         journal_path.exists(),
@@ -1766,6 +1789,180 @@ fn inspect_committed_activation(
         proof,
         _operation_lock: operation_lock,
     }))
+}
+
+fn terminal_rollback_archive_dir(
+    activation_dir: &Path,
+    transaction_id: Uuid,
+    manifest_raw: &str,
+) -> PathBuf {
+    let manifest_sha256 = format!("{:x}", Sha256::digest(manifest_raw.as_bytes()));
+    activation_dir
+        .join("retired")
+        .join(format!("{transaction_id}-rolled-back-{manifest_sha256}"))
+}
+
+fn ensure_private_directory(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            sync_parent(path)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.into()),
+    }
+    validate_owned_directory(path)
+}
+
+fn incomplete_terminal_archive(retired: &Path, transaction_id: Uuid) -> Result<Option<PathBuf>> {
+    if !retired.exists() {
+        return Ok(None);
+    }
+    validate_owned_directory(retired)?;
+    let prefix = format!("{transaction_id}-rolled-back-");
+    let mut incomplete = Vec::new();
+    for entry in fs::read_dir(retired)? {
+        let entry = entry?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(ReleaseActivationError::Refused(
+                "retired release authority contains a non-UTF8 entry".into(),
+            ));
+        };
+        let Some(digest) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(ReleaseActivationError::Refused(
+                "retired release authority has a malformed terminal archive name".into(),
+            ));
+        }
+        let path = entry.path();
+        validate_owned_directory(&path)?;
+        let manifest = path.join(format!("{transaction_id}.manifest.json"));
+        let journal = path.join(format!("{transaction_id}.journal.jsonl"));
+        if file_exists_at_path(&manifest)? && !file_exists_at_path(&journal)? {
+            incomplete.push(path);
+        }
+    }
+    if incomplete.len() > 1 {
+        return Err(ReleaseActivationError::Refused(
+            "multiple incomplete terminal rollback archives are ambiguous".into(),
+        ));
+    }
+    Ok(incomplete.pop())
+}
+
+fn archive_terminal_rollback_for_retry(
+    activation_dir: &Path,
+    transaction_id: Uuid,
+    identity: &LocalComputerIdentity,
+    platform: ServicePlatform,
+    home: &Path,
+    runner: &dyn CommandRunner,
+) -> Result<bool> {
+    if identity.name.eq_ignore_ascii_case("vinny") {
+        return Err(ReleaseActivationError::Refused(
+            "terminal release retry is forbidden on Vinny".into(),
+        ));
+    }
+    let manifest_live = activation_dir.join(format!("{transaction_id}.manifest.json"));
+    let journal_live = activation_dir.join(format!("{transaction_id}.journal.jsonl"));
+    let retired = activation_dir.join("retired");
+    let live_manifest_exists = file_exists_at_path(&manifest_live)?;
+    let live_journal_exists = file_exists_at_path(&journal_live)?;
+    if live_manifest_exists && live_journal_exists {
+        if last_journal_state(&journal_live)?.as_deref() != Some("rolled_back") {
+            return Ok(false);
+        }
+    } else if live_manifest_exists || !live_journal_exists {
+        return Ok(false);
+    }
+
+    let (journal_path, manifest_raw, archive) = if live_manifest_exists {
+        let manifest_raw =
+            read_private_authority_text(&manifest_live, 4 * 1024 * 1024, "rollback manifest")?;
+        let archive = terminal_rollback_archive_dir(activation_dir, transaction_id, &manifest_raw);
+        (journal_live.clone(), manifest_raw, archive)
+    } else {
+        let archive = incomplete_terminal_archive(&retired, transaction_id)?.ok_or_else(|| {
+            ReleaseActivationError::Refused(
+                "terminal rollback manifest is missing from live and retired authority".into(),
+            )
+        })?;
+        let archived_manifest = archive.join(format!("{transaction_id}.manifest.json"));
+        let manifest_raw = read_private_authority_text(
+            &archived_manifest,
+            4 * 1024 * 1024,
+            "retired rollback manifest",
+        )?;
+        (journal_live.clone(), manifest_raw, archive)
+    };
+    if last_journal_state(&journal_path)?.as_deref() != Some("rolled_back") {
+        return Ok(false);
+    }
+    ensure_private_directory(&retired)?;
+    ensure_private_directory(&archive)?;
+    let manifest_archived = archive.join(format!("{transaction_id}.manifest.json"));
+    let journal_archived = archive.join(format!("{transaction_id}.journal.jsonl"));
+
+    let manifest: RollbackManifest = serde_json::from_str(&manifest_raw)?;
+    if manifest.transaction_id != transaction_id
+        || manifest.computer_id != identity.id
+        || manifest.computer_name != identity.name
+        || manifest.platform != platform
+        || last_journal_state(&journal_path)?.as_deref() != Some("rolled_back")
+    {
+        return Err(ReleaseActivationError::Refused(
+            "terminal rollback authority does not prove this exact local transaction".into(),
+        ));
+    }
+    let entries = entries_from_manifest(&manifest, home)?;
+    verify_restored_entries(&entries, platform, runner)?;
+    for entry in &entries {
+        if optional_path_identity(entry.dir.as_raw_fd(), os_from_cstr(&entry.stage))?.is_some()
+            || optional_path_identity(entry.dir.as_raw_fd(), os_from_cstr(&entry.backup))?.is_some()
+        {
+            return Err(ReleaseActivationError::Refused(
+                "terminal rollback still retains a stage or rollback pathname".into(),
+            ));
+        }
+    }
+    if probe_installed_pair_identity(home, runner)? != manifest.prior_release_identity {
+        return Err(ReleaseActivationError::Refused(
+            "terminal rollback predecessor authority differs from the installed pair".into(),
+        ));
+    }
+
+    for (live, archived) in [
+        (&manifest_live, &manifest_archived),
+        (&journal_live, &journal_archived),
+    ] {
+        match (file_exists_at_path(live)?, file_exists_at_path(archived)?) {
+            (true, false) => {
+                rename_path_noreplace(live, archived)?;
+                sync_parent(live)?;
+            }
+            (false, true) => {}
+            _ => {
+                return Err(ReleaseActivationError::Refused(
+                    "terminal rollback archive changed during reconciliation".into(),
+                ));
+            }
+        }
+    }
+    read_private_authority_text(&manifest_archived, 4 * 1024 * 1024, "retired manifest")?;
+    if last_journal_state(&journal_archived)?.as_deref() != Some("rolled_back") {
+        return Err(ReleaseActivationError::Refused(
+            "retired terminal journal lost its rolled_back state".into(),
+        ));
+    }
+    sync_parent(&manifest_archived)?;
+    sync_parent(&archive)?;
+    Ok(true)
 }
 
 fn prepare_explicit_rollback(
@@ -4282,6 +4479,18 @@ mod tests {
     }
 
     #[test]
+    fn canonical_peer_status_accepts_live_projections_only() {
+        assert!(canonical_live_status("active"));
+        assert!(canonical_live_status("online"));
+        for status in ["", "ready", "draining", "offline", "failed", "ONLINE"] {
+            assert!(
+                !canonical_live_status(status),
+                "unexpected live status: {status}"
+            );
+        }
+    }
+
+    #[test]
     fn canonical_ubuntu_release_requires_id_and_supported_version() {
         assert_eq!(
             parse_ubuntu_release("ID=ubuntu\nVERSION_ID=\"24.04\"\n").unwrap(),
@@ -4875,6 +5084,141 @@ mod tests {
         (id, identity, platform, ports)
     }
 
+    fn rolled_back_activation_fixture(
+        home: &Path,
+    ) -> (Uuid, LocalComputerIdentity, ServicePlatform) {
+        let prior = PriorReleaseIdentity::LegacyReported {
+            short_sha: "5c1b63fb".into(),
+        };
+        let (id, identity, platform, _ports) = committed_activation_fixture(home, prior.clone());
+        let activation_dir = home.join(".forgefleet/release-activations");
+        let manifest: RollbackManifest = read_private_json(
+            &activation_dir.join(format!("{id}.manifest.json")),
+            "rollback manifest",
+        )
+        .unwrap();
+        let entries = entries_from_manifest(&manifest, home).unwrap();
+        for entry in &entries {
+            unlink_at_checked(entry.dir.as_raw_fd(), os_from_cstr(&entry.destination)).unwrap();
+            rename_noreplace(
+                entry.dir.as_raw_fd(),
+                os_from_cstr(&entry.backup),
+                entry.dir.as_raw_fd(),
+                os_from_cstr(&entry.destination),
+            )
+            .unwrap();
+            fsync_fd(entry.dir.as_raw_fd()).unwrap();
+        }
+        fs::remove_file(activation_dir.join(format!("{id}.receipt.json"))).unwrap();
+        append_journal(
+            &activation_dir.join(format!("{id}.journal.jsonl")),
+            "rolled_back",
+            "fixture restored exact predecessor",
+        )
+        .unwrap();
+        (id, identity, platform)
+    }
+
+    #[test]
+    fn terminal_rollback_archive_is_auditable_idempotent_and_retry_safe() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, identity, platform) = rolled_back_activation_fixture(&home);
+        let activation_dir = home.join(".forgefleet/release-activations");
+        let runner = FakeRunner::new(home.clone()).with_prior_source("5c1b63fb");
+        let manifest_raw = read_private_authority_text(
+            &activation_dir.join(format!("{id}.manifest.json")),
+            4 * 1024 * 1024,
+            "rollback manifest",
+        )
+        .unwrap();
+        let manifest: RollbackManifest = serde_json::from_str(&manifest_raw).unwrap();
+
+        archive_terminal_rollback_for_retry(
+            &activation_dir,
+            id,
+            &identity,
+            platform,
+            &home,
+            &runner,
+        )
+        .unwrap();
+        let archive = terminal_rollback_archive_dir(&activation_dir, id, &manifest_raw);
+        assert!(!activation_dir.join(format!("{id}.manifest.json")).exists());
+        assert!(!activation_dir.join(format!("{id}.journal.jsonl")).exists());
+        assert!(archive.join(format!("{id}.manifest.json")).exists());
+        assert_eq!(
+            last_journal_state(&archive.join(format!("{id}.journal.jsonl")))
+                .unwrap()
+                .as_deref(),
+            Some("rolled_back")
+        );
+
+        archive_terminal_rollback_for_retry(
+            &activation_dir,
+            id,
+            &identity,
+            platform,
+            &home,
+            &runner,
+        )
+        .unwrap();
+        write_manifest(&activation_dir, &manifest).unwrap();
+        create_journal(
+            &activation_dir.join(format!("{id}.journal.jsonl")),
+            "prepared",
+            "same transaction may retry after durable retirement",
+        )
+        .unwrap();
+        assert!(
+            !archive_terminal_rollback_for_retry(
+                &activation_dir,
+                id,
+                &identity,
+                platform,
+                &home,
+                &runner,
+            )
+            .unwrap(),
+            "a nonterminal new attempt must not be mistaken for the retired rollback"
+        );
+    }
+
+    #[test]
+    fn terminal_rollback_archive_completes_a_crash_between_two_moves() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().to_path_buf();
+        let (id, identity, platform) = rolled_back_activation_fixture(&home);
+        let activation_dir = home.join(".forgefleet/release-activations");
+        let retired = activation_dir.join("retired");
+        ensure_private_directory(&retired).unwrap();
+        let manifest_raw = read_private_authority_text(
+            &activation_dir.join(format!("{id}.manifest.json")),
+            4 * 1024 * 1024,
+            "rollback manifest",
+        )
+        .unwrap();
+        let archive = terminal_rollback_archive_dir(&activation_dir, id, &manifest_raw);
+        ensure_private_directory(&archive).unwrap();
+        rename_path_noreplace(
+            &activation_dir.join(format!("{id}.manifest.json")),
+            &archive.join(format!("{id}.manifest.json")),
+        )
+        .unwrap();
+
+        archive_terminal_rollback_for_retry(
+            &activation_dir,
+            id,
+            &identity,
+            platform,
+            &home,
+            &FakeRunner::new(home.clone()).with_prior_source("5c1b63fb"),
+        )
+        .unwrap();
+        assert!(archive.join(format!("{id}.journal.jsonl")).exists());
+        assert!(!activation_dir.join(format!("{id}.journal.jsonl")).exists());
+    }
+
     #[test]
     fn legacy_reported_identity_is_strict_unambiguous_and_pair_consistent() {
         assert_eq!(
@@ -4990,6 +5334,7 @@ mod tests {
             platform,
             home.clone(),
             &FakeRunner::new(home.clone()),
+            false,
         )
         .unwrap()
         .expect("committed activation must be adoptable");
@@ -5017,6 +5362,7 @@ mod tests {
                 platform,
                 home.clone(),
                 &FakeRunner::new(home),
+                false,
             )
             .is_err(),
             "rollback proof must fail on retained predecessor tamper"

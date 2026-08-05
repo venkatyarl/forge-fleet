@@ -1125,9 +1125,49 @@ where
         Ok(())
     }
 
+    async fn refresh_and_renew(
+        &self,
+        transaction_id: Uuid,
+        expected_state: &str,
+    ) -> Result<RolloutStatus> {
+        let mut status = self.status(transaction_id).await?;
+        if status.transaction.state != expected_state {
+            return Ok(status);
+        }
+        let lease_token = status.transaction.lease_token;
+        let Some(renewed) = self.database.renew(&status.transaction).await? else {
+            // A same-token parent transition may have won the revision CAS.
+            // Adopt that authoritative state; every other renewal failure is
+            // a lost fence and must stop before selecting or mutating a target.
+            let latest = self.status(transaction_id).await?;
+            if latest.transaction.lease_token == lease_token
+                && latest.transaction.state != expected_state
+            {
+                return Ok(latest);
+            }
+            return Err(ReleaseRolloutError::LeaseLost(format!(
+                "{expected_state} loop lease renewal"
+            )));
+        };
+        status.transaction = renewed;
+        Ok(status)
+    }
+
     async fn drive_running(&self, mut status: RolloutStatus) -> Result<RolloutStatus> {
         loop {
-            status = self.status(status.transaction.id).await?;
+            status = self
+                .refresh_and_renew(status.transaction.id, "running")
+                .await?;
+            match status.transaction.state.as_str() {
+                "running" => {}
+                "rolling_back" => return self.drive_rollback(status).await,
+                "succeeded" | "failed" | "rolled_back" | "cancelled" => return Ok(status),
+                state => {
+                    return Err(ReleaseRolloutError::Refused(format!(
+                        "running rollout changed to unexpected parent state {state}"
+                    )));
+                }
+            }
             validate_status_invariants(&status.targets)?;
             if status
                 .targets
@@ -1396,11 +1436,13 @@ where
 
     async fn drive_rollback(&self, mut status: RolloutStatus) -> Result<RolloutStatus> {
         loop {
-            status = self.status(status.transaction.id).await?;
-            validate_status_invariants(&status.targets)?;
+            status = self
+                .refresh_and_renew(status.transaction.id, "rolling_back")
+                .await?;
             if status.transaction.state != "rolling_back" {
                 return Ok(status);
             }
+            validate_status_invariants(&status.targets)?;
             let candidate = status
                 .targets
                 .iter()
@@ -2285,6 +2327,8 @@ mod tests {
     struct FakeDbState {
         status: RolloutStatus,
         fail_renew: bool,
+        renew_count: usize,
+        transition_on_renew_to: Option<String>,
         fail_next_target_cas: bool,
     }
 
@@ -2294,6 +2338,8 @@ mod tests {
                 inner: Arc::new(Mutex::new(FakeDbState {
                     status,
                     fail_renew: false,
+                    renew_count: 0,
+                    transition_on_renew_to: None,
                     fail_next_target_cas: false,
                 })),
             }
@@ -2310,6 +2356,10 @@ mod tests {
                 .status
                 .transaction
                 .lease_expires_at = Utc::now() - chrono::TimeDelta::seconds(1);
+        }
+
+        fn renew_count(&self) -> usize {
+            self.inner.lock().unwrap().renew_count
         }
     }
 
@@ -2449,6 +2499,12 @@ mod tests {
             transaction: &ReleaseRolloutTransactionRow,
         ) -> Result<Option<ReleaseRolloutTransactionRow>> {
             let mut state = self.inner.lock().unwrap();
+            state.renew_count += 1;
+            if let Some(new_state) = state.transition_on_renew_to.take() {
+                state.status.transaction.state = new_state;
+                state.status.transaction.cas_revision += 1;
+                return Ok(None);
+            }
             if state.fail_renew
                 || state.status.transaction.lease_token != transaction.lease_token
                 || state.status.transaction.cas_revision != transaction.cas_revision
@@ -2802,6 +2858,63 @@ mod tests {
                     .position(|call| call == "health_bake:beyonce")
                     .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn serial_short_phases_renew_the_parent_lease_between_iterations() {
+        let state = status(&["pending", "pending", "pending"]);
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        let result = coordinator.resume(id).await.unwrap();
+
+        assert_eq!(result.transaction.state, "succeeded");
+        assert!(
+            result
+                .targets
+                .iter()
+                .all(|target| target.state == "succeeded")
+        );
+        assert!(
+            db.renew_count() >= 10,
+            "every short serial phase must cross an explicit parent lease fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn loop_renewal_loss_stops_before_selecting_or_mutating_a_target() {
+        let state = status(&["pending", "pending"]);
+        let id = state.transaction.id;
+        let db = FakeDb::new(state.clone());
+        db.inner.lock().unwrap().fail_renew = true;
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.resume(id).await,
+            Err(ReleaseRolloutError::LeaseLost(message))
+                if message == "running loop lease renewal"
+        ));
+        assert_eq!(db.state().targets, state.targets);
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn same_token_parent_transition_is_adopted_after_renewal_cas_loss() {
+        let state = status(&["pending"]);
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        db.inner.lock().unwrap().transition_on_renew_to = Some("rolling_back".into());
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        let result = coordinator.resume(id).await.unwrap();
+
+        assert_eq!(result.transaction.state, "rolled_back");
+        assert_eq!(result.targets[0].state, "skipped");
+        assert!(transport.calls().is_empty());
     }
 
     #[tokio::test]
