@@ -5,6 +5,38 @@ services:
     container_name: forgefleet-falkordb-replica
     restart: unless-stopped
     network_mode: host
+    # The pinned image's run.sh appends `--protected-mode no` after REDIS_ARGS.
+    # Invoke the verified server binary directly so `yes` is the sole/final value.
+    entrypoint:
+      - /usr/local/bin/redis-server
+    command:
+      - --port
+      - "63380"
+      - --bind
+      - 127.0.0.1
+      - --replicaof
+      - "${FALKORDB_PRIMARY_HOST:?set FALKORDB_PRIMARY_HOST}"
+      - "63379"
+      - --replica-read-only
+      - "yes"
+      - --replica-serve-stale-data
+      - "no"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60 1"
+      - --dir
+      - /var/lib/falkordb/data
+      - --loadmodule
+      - /var/lib/falkordb/bin/falkordb.so
+      - THREAD_COUNT
+      - "8"
+      - CACHE_SIZE
+      - "100"
+      - --protected-mode
+      - "yes"
     read_only: true
     cap_drop:
       - ALL

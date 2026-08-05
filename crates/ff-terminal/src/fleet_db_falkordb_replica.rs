@@ -402,6 +402,38 @@ fn expected_redis_args(primary_ip: &str) -> String {
     )
 }
 
+fn expected_container_command(primary_ip: &str) -> Vec<String> {
+    vec![
+        "--port".into(),
+        REPLICA_PORT.to_string(),
+        "--bind".into(),
+        "127.0.0.1".into(),
+        "--replicaof".into(),
+        primary_ip.into(),
+        PRIMARY_PORT.to_string(),
+        "--replica-read-only".into(),
+        "yes".into(),
+        "--replica-serve-stale-data".into(),
+        "no".into(),
+        "--appendonly".into(),
+        "yes".into(),
+        "--appendfsync".into(),
+        "everysec".into(),
+        "--save".into(),
+        "60 1".into(),
+        "--dir".into(),
+        "/var/lib/falkordb/data".into(),
+        "--loadmodule".into(),
+        "/var/lib/falkordb/bin/falkordb.so".into(),
+        "THREAD_COUNT".into(),
+        "8".into(),
+        "CACHE_SIZE".into(),
+        "100".into(),
+        "--protected-mode".into(),
+        "yes".into(),
+    ]
+}
+
 async fn resolve_computer(pool: &sqlx::PgPool, name: &str) -> Result<Computer> {
     let rows = sqlx::query(
         "SELECT id,name,primary_ip,ssh_user,ssh_port,status,os_family,
@@ -879,7 +911,7 @@ printf 'IMAGE_USER='
 docker image inspect --format '{{{{.Config.User}}}}' '{FALKORDB_IMAGE}'
 if docker container inspect '{FALKORDB_CONTAINER}' >/dev/null 2>&1; then
   printf 'CONTAINER='
-  docker container inspect --format '{{{{.Image}}}}|{{{{.Config.Image}}}}|{{{{.State.Running}}}}|{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}|{{{{.HostConfig.RestartPolicy.Name}}}}|{{{{.HostConfig.NetworkMode}}}}|{{{{json .HostConfig.PortBindings}}}}|{{{{json .Config.Env}}}}|{{{{range .Mounts}}}}{{{{.Type}}}}:{{{{.Name}}}}:{{{{.Destination}}}}:{{{{.RW}}}};{{{{end}}}}|{{{{.HostConfig.ReadonlyRootfs}}}}|{{{{json .HostConfig.CapDrop}}}}|{{{{json .HostConfig.CapAdd}}}}|{{{{json .HostConfig.SecurityOpt}}}}|{{{{.HostConfig.Privileged}}}}|{{{{json .HostConfig.Devices}}}}|{{{{json .HostConfig.Tmpfs}}}}|{{{{json .HostConfig.Binds}}}}|{{{{.Config.User}}}}|{{{{json .Config.Healthcheck}}}}' '{FALKORDB_CONTAINER}'
+  docker container inspect --format '{{{{.Image}}}}|{{{{.Config.Image}}}}|{{{{.State.Running}}}}|{{{{if .State.Health}}}}{{{{.State.Health.Status}}}}{{{{else}}}}none{{{{end}}}}|{{{{.HostConfig.RestartPolicy.Name}}}}|{{{{.HostConfig.NetworkMode}}}}|{{{{json .HostConfig.PortBindings}}}}|{{{{json .Config.Env}}}}|{{{{range .Mounts}}}}{{{{.Type}}}}:{{{{.Name}}}}:{{{{.Destination}}}}:{{{{.RW}}}};{{{{end}}}}|{{{{.HostConfig.ReadonlyRootfs}}}}|{{{{json .HostConfig.CapDrop}}}}|{{{{json .HostConfig.CapAdd}}}}|{{{{json .HostConfig.SecurityOpt}}}}|{{{{.HostConfig.Privileged}}}}|{{{{json .HostConfig.Devices}}}}|{{{{json .HostConfig.Tmpfs}}}}|{{{{json .HostConfig.Binds}}}}|{{{{json .Config.Entrypoint}}}}|{{{{json .Config.Cmd}}}}|{{{{.Config.User}}}}|{{{{json .Config.Healthcheck}}}}' '{FALKORDB_CONTAINER}'
 else
   echo 'CONTAINER=absent'
 fi
@@ -900,8 +932,8 @@ fn validate_existing_container(
     image_user: &str,
     primary_ip: &str,
 ) -> Result<()> {
-    let fields: Vec<&str> = fingerprint.splitn(19, '|').collect();
-    if fields.len() != 19 {
+    let fields: Vec<&str> = fingerprint.splitn(21, '|').collect();
+    if fields.len() != 21 {
         bail!("existing FalkorDB container fingerprint is incomplete");
     }
     if fields[0] != image_id
@@ -999,16 +1031,29 @@ fn validate_existing_container(
     {
         bail!("existing FalkorDB /tmp tmpfs size is not exactly 64 MiB");
     }
-    let binds: serde_json::Value =
+    let binds: Option<Vec<String>> =
         serde_json::from_str(fields[16]).context("parse FalkorDB bind mounts")?;
-    if !binds.is_null() && binds.as_array().is_none_or(|items| !items.is_empty()) {
-        bail!("existing FalkorDB container has unexpected bind mounts");
+    let expected_bind = format!("{FALKORDB_VOLUME}:/var/lib/falkordb/data:rw");
+    match binds.as_deref() {
+        None | Some([]) => {}
+        Some([bind]) if bind == &expected_bind => {}
+        _ => bail!("existing FalkorDB container has unexpected bind mounts"),
     }
-    if fields[17] != image_user {
+    let entrypoint: Vec<String> =
+        serde_json::from_str(fields[17]).context("parse FalkorDB container entrypoint")?;
+    if entrypoint.as_slice() != ["/usr/local/bin/redis-server"] {
+        bail!("existing FalkorDB container does not have the exact direct entrypoint");
+    }
+    let command: Vec<String> =
+        serde_json::from_str(fields[18]).context("parse FalkorDB container command")?;
+    if command != expected_container_command(primary_ip) {
+        bail!("existing FalkorDB container does not have the exact direct command");
+    }
+    if fields[19] != image_user {
         bail!("existing FalkorDB runtime user differs from the pinned image contract");
     }
     let health: serde_json::Value =
-        serde_json::from_str(fields[18]).context("parse FalkorDB healthcheck")?;
+        serde_json::from_str(fields[20]).context("parse FalkorDB healthcheck")?;
     if health.get("Test")
         != Some(&serde_json::json!([
             "CMD",
@@ -3887,7 +3932,11 @@ mod tests {
         let security = serde_json::json!(["no-new-privileges:true"]);
         let devices = serde_json::json!([]);
         let tmpfs = serde_json::json!({"/tmp": "rw,nodev,nosuid,noexec,size=67108864"});
-        let binds = serde_json::Value::Null;
+        // Exact Docker 27 HostConfig.Binds representation observed on Sophie.
+        let sophie_binds = r#"["forgefleet-falkordb-replica-data:/var/lib/falkordb/data:rw"]"#;
+        let direct_entrypoint = r#"["/usr/local/bin/redis-server"]"#;
+        let direct_command = expected_container_command("192.168.5.104");
+        let direct_command_json = serde_json::to_string(&direct_command).unwrap();
         let health = serde_json::json!({
             "Test": ["CMD", "redis-cli", "-p", "63380", "PING"],
             "Interval": 5_000_000_000_u64,
@@ -3896,9 +3945,107 @@ mod tests {
             "StartPeriod": 30_000_000_000_u64
         });
         let fingerprint = format!(
-            "{image_id}|{FALKORDB_IMAGE}|true|healthy|unless-stopped|host|{ports}|{env}|volume:{FALKORDB_VOLUME}:/var/lib/falkordb/data:true;|true|{cap_drop}|{cap_add}|{security}|false|{devices}|{tmpfs}|{binds}||{health}"
+            "{image_id}|{FALKORDB_IMAGE}|true|healthy|unless-stopped|host|{ports}|{env}|volume:{FALKORDB_VOLUME}:/var/lib/falkordb/data:true;|true|{cap_drop}|{cap_add}|{security}|false|{devices}|{tmpfs}|{sophie_binds}|{direct_entrypoint}|{direct_command_json}||{health}"
         );
-        validate_existing_container(&fingerprint, &image_id, "", "192.168.5.104").unwrap();
+        let exact_mount = format!("volume:{FALKORDB_VOLUME}:/var/lib/falkordb/data:true;");
+        for safe_binds in [sophie_binds, "null", "[]"] {
+            let safe_fingerprint = fingerprint.replacen(sophie_binds, safe_binds, 1);
+            validate_existing_container(&safe_fingerprint, &image_id, "", "192.168.5.104").unwrap();
+            for invalid_mount in [
+                "",
+                "volume:other-volume:/var/lib/falkordb/data:true;",
+                "volume:forgefleet-falkordb-replica-data:/var/lib/falkordb/other:true;",
+                "volume:forgefleet-falkordb-replica-data:/var/lib/falkordb/data:false;",
+            ] {
+                assert!(
+                    validate_existing_container(
+                        &safe_fingerprint.replacen(&exact_mount, invalid_mount, 1),
+                        &image_id,
+                        "",
+                        "192.168.5.104"
+                    )
+                    .is_err(),
+                    "accepted unsafe Mounts shape with allowed Binds={safe_binds}: {invalid_mount}"
+                );
+            }
+        }
+        for invalid_binds in [
+            r#"["/tmp/falkordb:/var/lib/falkordb/data:rw"]"#,
+            r#"["other-volume:/var/lib/falkordb/data:rw"]"#,
+            r#"["forgefleet-falkordb-replica-data:/var/lib/falkordb/other:rw"]"#,
+            r#"["forgefleet-falkordb-replica-data:/var/lib/falkordb/data:ro"]"#,
+            r#"["forgefleet-falkordb-replica-data:/var/lib/falkordb/data"]"#,
+            r#"["forgefleet-falkordb-replica-data:/var/lib/falkordb/data:rw","other-volume:/other:rw"]"#,
+        ] {
+            assert!(
+                validate_existing_container(
+                    &fingerprint.replacen(sophie_binds, invalid_binds, 1),
+                    &image_id,
+                    "",
+                    "192.168.5.104"
+                )
+                .is_err(),
+                "accepted unsafe HostConfig.Binds shape: {invalid_binds}"
+            );
+        }
+        for invalid_entrypoint in [
+            "null",
+            "[]",
+            r#"["/var/lib/falkordb/bin/run.sh"]"#,
+            r#"["/usr/local/bin/redis-server","--extra"]"#,
+            r#"["/bin/sh","/usr/local/bin/redis-server"]"#,
+        ] {
+            assert!(
+                validate_existing_container(
+                    &fingerprint.replacen(direct_entrypoint, invalid_entrypoint, 1),
+                    &image_id,
+                    "",
+                    "192.168.5.104"
+                )
+                .is_err(),
+                "accepted unsafe entrypoint: {invalid_entrypoint}"
+            );
+        }
+        let assert_invalid_command = |invalid_command: Vec<String>| {
+            let invalid_command_json = serde_json::to_string(&invalid_command).unwrap();
+            assert!(
+                validate_existing_container(
+                    &fingerprint.replacen(&direct_command_json, &invalid_command_json, 1),
+                    &image_id,
+                    "",
+                    "192.168.5.104"
+                )
+                .is_err(),
+                "accepted unsafe command: {invalid_command_json}"
+            );
+        };
+        for missing_command in ["null", "[]"] {
+            assert!(
+                validate_existing_container(
+                    &fingerprint.replacen(&direct_command_json, missing_command, 1),
+                    &image_id,
+                    "",
+                    "192.168.5.104"
+                )
+                .is_err(),
+                "accepted missing command: {missing_command}"
+            );
+        }
+        let mut extra_command = direct_command.clone();
+        extra_command.push("--extra".into());
+        assert_invalid_command(extra_command);
+        let mut reordered_command = direct_command.clone();
+        reordered_command.swap(0, 2);
+        assert_invalid_command(reordered_command);
+        let mut wrong_protected_mode = direct_command.clone();
+        *wrong_protected_mode.last_mut().unwrap() = "no".into();
+        assert_invalid_command(wrong_protected_mode);
+        let mut missing_protected_mode = direct_command.clone();
+        missing_protected_mode.truncate(missing_protected_mode.len() - 2);
+        assert_invalid_command(missing_protected_mode);
+        let mut wrong_primary = direct_command;
+        wrong_primary[5] = "192.168.5.199".into();
+        assert_invalid_command(wrong_primary);
         assert!(validate_existing_container(
             &fingerprint.replace("--bind 127.0.0.1", "--bind 0.0.0.0"),
             &image_id,
