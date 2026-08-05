@@ -1565,11 +1565,13 @@ async fn dispatch_one(
         &pg,
         &item,
         &worktree,
-        &head_sha,
-        &pr_url,
-        &backend_used,
-        builder_attribution.as_ref(),
-        Some(&review),
+        ReadyForReviewEvidence {
+            head_sha: &head_sha,
+            pr_url: &pr_url,
+            builder: &backend_used,
+            builder_attribution: builder_attribution.as_ref(),
+            review: Some(&review),
+        },
     )
     .await?;
     if !advanced {
@@ -2251,21 +2253,42 @@ async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
     Ok(true)
 }
 
+/// Borrowed evidence committed with the durable PR/review custody handoff.
+struct ReadyForReviewEvidence<'a> {
+    head_sha: &'a str,
+    pr_url: &'a str,
+    builder: &'a str,
+    builder_attribution: Option<&'a RoutedModelAttribution>,
+    review: Option<&'a ReviewOutcome>,
+}
+
+impl ReadyForReviewEvidence<'_> {
+    fn builder_computer(&self) -> Option<&str> {
+        self.builder_attribution
+            .map(|attribution| attribution.worker_name.as_str())
+    }
+
+    fn builder_port(&self) -> Option<i32> {
+        self.builder_attribution
+            .and_then(|attribution| route_endpoint_port(&attribution.endpoint))
+    }
+}
+
 async fn mark_ready_for_review(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
-    head_sha: &str,
-    pr_url: &str,
-    builder: &str,
-    builder_attribution: Option<&RoutedModelAttribution>,
-    review: Option<&ReviewOutcome>,
+    evidence: ReadyForReviewEvidence<'_>,
 ) -> Result<bool> {
-    let builder_computer = builder_attribution
-        .map(|attribution| attribution.worker_name.as_str())
-        .unwrap_or(&item.computer_name);
-    let builder_port =
-        builder_attribution.and_then(|attribution| route_endpoint_port(&attribution.endpoint));
+    let builder_computer = evidence.builder_computer().unwrap_or(&item.computer_name);
+    let builder_port = evidence.builder_port();
+    let ReadyForReviewEvidence {
+        head_sha,
+        pr_url,
+        builder,
+        review,
+        ..
+    } = evidence;
     let mut tx = pg.begin().await?;
     let transitioned = sqlx::query(
         "UPDATE work_items
@@ -8035,22 +8058,22 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
-        LocalReviewerSeparation, ReviewerStat, WorktreeRecord, affected_crate_manifests,
-        agent_output_tail, backend_failed_without_output, builder_excludes_480b,
-        canonical_route_endpoint, canonical_routed_model, check_dispatch_prerequisites,
-        classify_completed_output, classify_dispatch_outcome, collect_leftover_tmp_output,
-        command_display, complexity_at_least_moderate, contains_file_line_citation,
-        default_clone_path, dispatch_budget_for_host, dispatch_interaction_outcome,
-        dispatch_interaction_route, dispatch_prompt, dispatch_request_meta, expand_home,
-        is_build_timeout, legacy_acceptance_sql, local_failure_diagnosis_for,
-        local_failure_diagnosis_for_attempt, local_reviewer_separation, mark_local_retest_failed,
-        mark_local_retest_passed, mark_ready_for_review, mirror_repo_url, normalized_cloud_backend,
-        order_cloud_reviewers, parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis,
-        primary_or_default_backend, quick_empty_success_is_provider_failure,
-        record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
-        resolve_dispatch_repo_binding, retry_error_is_actionable, rewrite_github_host_alias,
-        route_endpoint_port, same_model_family, should_attempt_lane15, status_output_is_clean,
-        synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        LocalReviewerSeparation, ReadyForReviewEvidence, ReviewerStat, WorktreeRecord,
+        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
+        builder_excludes_480b, canonical_route_endpoint, canonical_routed_model,
+        check_dispatch_prerequisites, classify_completed_output, classify_dispatch_outcome,
+        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
+        contains_file_line_citation, default_clone_path, dispatch_budget_for_host,
+        dispatch_interaction_outcome, dispatch_interaction_route, dispatch_prompt,
+        dispatch_request_meta, expand_home, is_build_timeout, legacy_acceptance_sql,
+        local_failure_diagnosis_for, local_failure_diagnosis_for_attempt,
+        local_reviewer_separation, mark_local_retest_failed, mark_local_retest_passed,
+        mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
+        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
+        quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
+        repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
+        rewrite_github_host_alias, route_endpoint_port, same_model_family, should_attempt_lane15,
+        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
         try_acquire_lane15_480b_permit, use_local_lane, validate_local_routed_attribution,
         validate_manifest_fields,
     };
@@ -8339,11 +8362,13 @@ mod tests {
                 &pool,
                 &item,
                 &worktree,
-                "deadbeef",
-                &format!("https://example.invalid/pr/{work_item_id}"),
-                "codex",
-                None,
-                None,
+                ReadyForReviewEvidence {
+                    head_sha: "deadbeef",
+                    pr_url: &format!("https://example.invalid/pr/{work_item_id}"),
+                    builder: "codex",
+                    builder_attribution: None,
+                    review: None,
+                },
             )
             .await
             .expect("lease gate should return a transition result");
@@ -8814,6 +8839,34 @@ mod tests {
             tokens_in: 1,
             tokens_out: 1,
         }
+    }
+
+    #[test]
+    fn ready_for_review_evidence_preserves_builder_route_shape() {
+        let attribution = routed_attribution(
+            Uuid::new_v4(),
+            "http://192.168.5.116:55020/v1",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "Qwen3-Coder-30B",
+        );
+        let local = ReadyForReviewEvidence {
+            head_sha: "deadbeef",
+            pr_url: "https://example.invalid/pr/1",
+            builder: "local:qwen3-coder-30b",
+            builder_attribution: Some(&attribution),
+            review: None,
+        };
+        assert_eq!(local.builder_computer(), Some("sia"));
+        assert_eq!(local.builder_port(), Some(55020));
+
+        let cloud = ReadyForReviewEvidence {
+            builder: "codex",
+            builder_attribution: None,
+            ..local
+        };
+        assert_eq!(cloud.builder_computer(), None);
+        assert_eq!(cloud.builder_port(), None);
     }
 
     #[test]
