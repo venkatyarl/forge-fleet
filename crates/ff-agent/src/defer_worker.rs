@@ -138,11 +138,12 @@ async fn drain_queue(
         );
 
         let pool_clone = pool.clone();
+        let worker_name = worker_name.to_string();
         let nodes = ff_db::pg_list_nodes(pool).await.unwrap_or_default();
         tokio::spawn(async move {
             let _permit = permit; // hold for the duration of execution
 
-            let (success, result, err) = execute(&task, &nodes).await;
+            let (success, result, err) = execute(&pool_clone, &worker_name, &task, &nodes).await;
 
             if let Err(e) = ff_db::pg_finish_deferred(
                 &pool_clone,
@@ -173,6 +174,8 @@ async fn drain_queue(
 /// Execute one task by dispatching on its `kind`. Returns
 /// `(success, optional_result_value, optional_error_message)`.
 async fn execute(
+    pool: &PgPool,
+    worker_name: &str,
     task: &ff_db::DeferredTaskRow,
     nodes: &[ff_db::FleetNodeRow],
 ) -> (bool, Option<serde_json::Value>, Option<String>) {
@@ -217,6 +220,54 @@ async fn execute(
                 );
             };
             execute_shell(task.preferred_node.as_deref(), &script, nodes, max_duration).await
+        }
+        "backup_receipt" => {
+            let Some(preferred) = task.preferred_node.as_deref() else {
+                return (
+                    false,
+                    None,
+                    Some("backup receipt requires strict preferred-node affinity".into()),
+                );
+            };
+            if !preferred.eq_ignore_ascii_case(worker_name) {
+                return (
+                    false,
+                    None,
+                    Some(format!(
+                        "backup receipt for preferred worker {preferred:?} cannot run on {worker_name:?}"
+                    )),
+                );
+            }
+            let (backup_id, checksum) =
+                match crate::ha::backup::parse_backup_receipt_payload(&task.payload) {
+                    Ok(assertions) => assertions,
+                    Err(error) => {
+                        return (
+                            false,
+                            None,
+                            Some(format!("invalid backup receipt task: {error}")),
+                        );
+                    }
+                };
+            match crate::ha::backup::record_backup_distribution_receipt(
+                pool,
+                worker_name,
+                backup_id,
+                &checksum,
+                None,
+            )
+            .await
+            {
+                Ok(report) => match serde_json::to_value(report) {
+                    Ok(result) => (true, Some(result), None),
+                    Err(error) => (
+                        false,
+                        None,
+                        Some(format!("serialize backup receipt result: {error}")),
+                    ),
+                },
+                Err(error) => (false, None, Some(format!("backup receipt: {error}"))),
+            }
         }
         "internal" => {
             // ForgeFleet-internal tasks dispatched by title. Ported from the

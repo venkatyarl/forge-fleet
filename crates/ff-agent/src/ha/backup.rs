@@ -54,7 +54,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ff_db::leader_state::pg_get_current_leader;
-use ff_db::{pg_enqueue_deferred, pg_enqueue_deferred_delayed};
+use ff_db::{pg_enqueue_deferred, pg_enqueue_deferred_delayed, pg_enqueue_deferred_dependent};
 use ff_db::{pg_get_secret, pg_set_secret};
 
 /// fleet_secrets key that stores the age X25519 recipient (public key).
@@ -138,6 +138,16 @@ const SOURCE_KEEP_FLOOR: usize = RECENT_RETENTION + DAILY_RETENTION + WEEKLY_RET
 const PRUNE_INTERVAL_SECS: u64 = 3600;
 /// How often each node checks its OWN backup directory for stale replicas.
 const FRESHNESS_CHECK_INTERVAL_SECS: u64 = 60;
+/// Receipt proof older than this must be refreshed before a remote drill may
+/// trust that the destination still owns decryptable bytes.
+pub const BACKUP_RECEIPT_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+/// Closed receipt schema understood by the producer and remote-drill gate.
+pub const BACKUP_RECEIPT_VERSION: i64 = 1;
+/// Reconciliation is deliberately bounded: catalog inspection is cheap, while
+/// hashing/decrypt-probing multi-GiB artifacts is not.
+const RECEIPT_RECONCILE_SCAN_LIMIT: i64 = 128;
+const RECEIPT_RECONCILE_BATCH_SIZE: usize = 5;
+const BACKUP_RECEIPT_FUTURE_SKEW_SECS: i64 = 5 * 60;
 /// Alert policy seeded by DB migration V181.
 const STALE_LOCAL_BACKUP_POLICY_NAME: &str = "stale_local_backup";
 
@@ -232,6 +242,50 @@ pub struct BackupArtifactEvidence {
     /// `None` for plaintext artifacts, `Some(true)` only after an age reader
     /// unwraps the file key and reads a bounded plaintext probe.
     pub decrypt_probe_ok: Option<bool>,
+}
+
+/// Successful host-local proof persisted into `backups.distribution_status`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupReceiptReport {
+    pub backup_id: Uuid,
+    pub computer_id: Uuid,
+    pub host: String,
+    pub expected_checksum: String,
+    pub observed_checksum: String,
+    pub verified_at: chrono::DateTime<Utc>,
+    pub receipt: serde_json::Value,
+}
+
+/// Parse the complete typed receipt payload. Extra fields are rejected so a
+/// task cannot smuggle a host, path, key, evidence result, or timestamp across
+/// the trust boundary.
+pub fn parse_backup_receipt_payload(
+    payload: &serde_json::Value,
+) -> Result<(Uuid, String), BackupError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| BackupError::Cmd("backup receipt payload must be an object".to_string()))?;
+    if object.len() != 2
+        || !object.contains_key("backup_id")
+        || !object.contains_key("expected_checksum")
+    {
+        return Err(BackupError::Cmd(
+            "backup receipt payload permits only backup_id and expected_checksum".to_string(),
+        ));
+    }
+    let backup_id = object
+        .get("backup_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| BackupError::Cmd("backup receipt backup_id must be a UUID string".into()))?
+        .parse::<Uuid>()?;
+    let checksum = object
+        .get("expected_checksum")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            BackupError::Cmd("backup receipt expected_checksum must be a string".into())
+        })?;
+    validate_expected_sha256(checksum)?;
+    Ok((backup_id, checksum.to_ascii_lowercase()))
 }
 
 /// Per-kind backup policy from the `fleet_backup_config` table (schema V163).
@@ -413,14 +467,11 @@ impl BackupOrchestrator {
         my_node_name: String,
         backup_dir: Option<PathBuf>,
     ) -> Self {
-        let default_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".forgefleet/backups");
         Self {
             pg,
             my_computer_id,
             my_node_name,
-            backup_dir: backup_dir.unwrap_or(default_dir),
+            backup_dir: backup_dir.unwrap_or_else(default_backup_dir),
             postgres_interval_hours: DEFAULT_POSTGRES_INTERVAL_HOURS,
             redis_interval_hours: DEFAULT_REDIS_INTERVAL_HOURS,
         }
@@ -706,7 +757,7 @@ impl BackupOrchestrator {
             .await?;
 
         let targets = self
-            .enqueue_distribution("postgres", &file_name, cfg)
+            .enqueue_distribution("postgres", &file_name, backup_id, &sha256, cfg)
             .await?;
         if let Err(e) = self.enqueue_wal_archive_distribution(cfg).await {
             warn!(error = %e, "postgres WAL archive fan-out failed");
@@ -779,7 +830,7 @@ impl BackupOrchestrator {
                 .insert_backup_row("redis", &file_name_gz, size_bytes, &sha256)
                 .await?;
             let targets = self
-                .enqueue_distribution("redis", &file_name_gz, cfg)
+                .enqueue_distribution("redis", &file_name_gz, backup_id, &sha256, cfg)
                 .await?;
             return Ok(BackupReport {
                 kind: "redis".into(),
@@ -801,7 +852,9 @@ impl BackupOrchestrator {
         let backup_id = self
             .insert_backup_row("redis", &file_name, size_bytes, &sha256)
             .await?;
-        let targets = self.enqueue_distribution("redis", &file_name, cfg).await?;
+        let targets = self
+            .enqueue_distribution("redis", &file_name, backup_id, &sha256, cfg)
+            .await?;
 
         Ok(BackupReport {
             kind: "redis".into(),
@@ -862,7 +915,7 @@ impl BackupOrchestrator {
             .insert_backup_row("falkordb", &file_name, size_bytes, &sha256)
             .await?;
         let targets = self
-            .enqueue_distribution("falkordb", &file_name, cfg)
+            .enqueue_distribution("falkordb", &file_name, backup_id, &sha256, cfg)
             .await?;
 
         Ok(BackupReport {
@@ -958,8 +1011,11 @@ impl BackupOrchestrator {
         &self,
         kind: &str,
         file_name: &str,
+        backup_id: Uuid,
+        expected_checksum: &str,
         cfg: &BackupKindConfig,
     ) -> Result<Vec<String>, BackupError> {
+        validate_expected_sha256(expected_checksum)?;
         // Look up my own IP + SSH user so peers know where + as whom
         // to rsync from. REDIS.1 part 2 (2026-05-19): the original code
         // built the source as `<ip>:/path` with no user prefix, so each
@@ -1093,7 +1149,49 @@ impl BackupOrchestrator {
             )
             .await
             {
-                Ok(_id) => enqueued.push(name),
+                Ok(copy_task_id) => {
+                    // Receipt production is a separate typed child, not shell
+                    // text appended to rsync. A receipt/DB retry therefore
+                    // never retransmits a multi-GiB artifact, and the child
+                    // cannot race the copy because the deferred claimant
+                    // enforces depends_on_task_id.
+                    let receipt_title =
+                        format!("verify {kind} backup {backup_id} receipt on {name}");
+                    let receipt_payload = serde_json::json!({
+                        "backup_id": backup_id,
+                        "expected_checksum": expected_checksum.to_ascii_lowercase(),
+                    });
+                    match pg_enqueue_deferred_dependent(
+                        &self.pg,
+                        &receipt_title,
+                        "backup_receipt",
+                        &receipt_payload,
+                        "node_online",
+                        &trigger_spec,
+                        Some(&name),
+                        &required_caps,
+                        Some(&who),
+                        Some(5),
+                        &copy_task_id,
+                    )
+                    .await
+                    {
+                        Ok(receipt_task_id) => debug!(
+                            target_node = %name,
+                            %backup_id,
+                            copy_task_id,
+                            receipt_task_id,
+                            "backup distribution copy+receipt chain enqueued"
+                        ),
+                        Err(e) => warn!(
+                            target_node = %name,
+                            %backup_id,
+                            error = %e,
+                            "backup copy enqueued but receipt child enqueue failed; reconciler will repair"
+                        ),
+                    }
+                    enqueued.push(name);
+                }
                 Err(e) => {
                     warn!(target_node = %name, error = %e, "failed to enqueue rsync task");
                 }
@@ -1389,6 +1487,93 @@ impl BackupOrchestrator {
                 }
             }
         }
+        match self.reconcile_local_distribution_receipts().await {
+            Ok(verified) if verified > 0 => info!(
+                node = %self.my_node_name,
+                verified,
+                "backup distribution receipts reconciled"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                node = %self.my_node_name,
+                error = %e,
+                "backup distribution receipt reconciliation failed"
+            ),
+        }
+    }
+
+    /// Backfill receipts for exact catalog artifacts already present on this
+    /// non-source host and refresh aging proof. Runs on the existing per-node
+    /// freshness ticker, not through the PM work-item scheduler, so recovery
+    /// remains active while `work_item_execution_enabled=false`.
+    async fn reconcile_local_distribution_receipts(&self) -> Result<usize, BackupError> {
+        let rows: Vec<(Uuid, String, String, String, i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, database_kind, file_name, checksum_sha256, size_bytes,
+                    distribution_status
+               FROM backups
+              WHERE source_computer_id <> $1
+                AND database_kind IN ('postgres', 'redis', 'falkordb')
+              ORDER BY created_at DESC, id DESC
+              LIMIT $2",
+        )
+        .bind(self.my_computer_id)
+        .bind(RECEIPT_RECONCILE_SCAN_LIMIT)
+        .fetch_all(&self.pg)
+        .await?;
+
+        let now = Utc::now();
+        let mut attempted = 0usize;
+        let mut verified = 0usize;
+        for (backup_id, kind, file_name, checksum, size_bytes, distribution_status) in rows {
+            if existing_receipt_is_current(
+                &distribution_status,
+                backup_id,
+                self.my_computer_id,
+                &self.my_node_name,
+                &checksum,
+                size_bytes,
+                now,
+            ) {
+                continue;
+            }
+            if !is_known_backup_kind(&kind)
+                || validate_backup_component("file_name", &file_name).is_err()
+            {
+                warn!(%backup_id, kind, "unsafe backup catalog row skipped by receipt reconciler");
+                continue;
+            }
+            let artifact = self.backup_dir.join(kind_dir(&kind)).join(&file_name);
+            match tokio::fs::symlink_metadata(&artifact).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn!(%backup_id, error = %error, "backup receipt local metadata check failed");
+                    continue;
+                }
+            }
+            if attempted >= RECEIPT_RECONCILE_BATCH_SIZE {
+                break;
+            }
+            attempted += 1;
+            match record_backup_distribution_receipt(
+                &self.pg,
+                &self.my_node_name,
+                backup_id,
+                &checksum,
+                Some(&self.backup_dir),
+            )
+            .await
+            {
+                Ok(_) => verified += 1,
+                Err(error) => warn!(
+                    %backup_id,
+                    kind,
+                    error = %error,
+                    "local backup copy did not earn a distribution receipt"
+                ),
+            }
+        }
+        Ok(verified)
     }
 
     async fn expected_to_hold_backup(
@@ -1716,6 +1901,12 @@ impl BackupOrchestrator {
 }
 
 // ─── Free helpers ─────────────────────────────────────────────────────
+
+fn default_backup_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".forgefleet/backups")
+}
 
 pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupError> {
     let meta = tokio::fs::metadata(path).await?;
@@ -2119,6 +2310,239 @@ pub fn verify_backup_artifact(
             "descriptor-safe backup verification requires Unix",
         )))
     }
+}
+
+async fn canonical_receipt_host(
+    pool: &PgPool,
+    local_worker_name: &str,
+) -> Result<(Uuid, String), BackupError> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name
+           FROM computers
+          WHERE LOWER(name) = LOWER($1)
+          ORDER BY id",
+    )
+    .bind(local_worker_name)
+    .fetch_all(pool)
+    .await?;
+    match rows.as_slice() {
+        [(id, name)] => Ok((*id, name.clone())),
+        [] => Err(BackupError::Cmd(format!(
+            "local worker {local_worker_name:?} is not an enrolled computer"
+        ))),
+        _ => Err(BackupError::Cmd(format!(
+            "local worker identity {local_worker_name:?} is ambiguous"
+        ))),
+    }
+}
+
+async fn load_backup_identity(pool: &PgPool) -> Result<age::x25519::Identity, BackupError> {
+    let private_key = pg_get_secret(pool, BACKUP_ENC_PRIVKEY)
+        .await
+        .map_err(|e| BackupError::Cmd(format!("backup identity lookup failed: {e}")))?
+        .ok_or_else(|| BackupError::Cmd("backup encryption identity is unavailable".into()))?;
+    age::x25519::Identity::from_str(private_key.trim())
+        .map_err(|_| BackupError::Cmd("stored backup encryption identity is invalid".into()))
+}
+
+fn require_receipt_evidence(evidence: &BackupArtifactEvidence) -> Result<(), BackupError> {
+    if !evidence.checksum_match {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt checksum mismatch (expected {}, observed {})",
+            evidence.expected_sha256, evidence.observed_sha256
+        )));
+    }
+    if !evidence.age_encrypted {
+        return Err(BackupError::Cmd(
+            "backup receipt requires a valid age-encrypted artifact".into(),
+        ));
+    }
+    if evidence.decrypt_probe_ok != Some(true) {
+        return Err(BackupError::Cmd(
+            "backup receipt decrypt probe failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Verify and persist host-local possession of one exact catalog artifact.
+/// The task supplies only immutable UUID/SHA assertions. Host identity is
+/// derived from enrollment, path components come only from the catalog, the
+/// age identity is fetched internally, and all evidence flags/timestamps are
+/// produced here rather than trusted from task JSON.
+pub async fn record_backup_distribution_receipt(
+    pool: &PgPool,
+    local_worker_name: &str,
+    backup_id: Uuid,
+    enqueue_checksum: &str,
+    backup_root: Option<&Path>,
+) -> Result<BackupReceiptReport, BackupError> {
+    validate_expected_sha256(enqueue_checksum)?;
+    let enqueue_checksum = enqueue_checksum.to_ascii_lowercase();
+    let (computer_id, canonical_host) = canonical_receipt_host(pool, local_worker_name).await?;
+    let catalog: Option<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT database_kind, file_name, checksum_sha256, size_bytes
+           FROM backups
+          WHERE id = $1",
+    )
+    .bind(backup_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((database_kind, file_name, catalog_checksum, catalog_size)) = catalog else {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt catalog row {backup_id} does not exist"
+        )));
+    };
+    validate_expected_sha256(&catalog_checksum)?;
+    if !catalog_checksum.eq_ignore_ascii_case(&enqueue_checksum) {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt enqueue checksum no longer matches catalog row {backup_id}"
+        )));
+    }
+    if catalog_size <= 0 {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt catalog row {backup_id} has a non-positive size"
+        )));
+    }
+
+    let identity = load_backup_identity(pool).await?;
+    let root = backup_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_backup_dir);
+    let verify_kind = database_kind.clone();
+    let verify_file = file_name.clone();
+    let verify_checksum = enqueue_checksum.clone();
+    let evidence = tokio::task::spawn_blocking(move || {
+        verify_backup_artifact(
+            &root,
+            &verify_kind,
+            &verify_file,
+            &verify_checksum,
+            Some(&identity),
+        )
+    })
+    .await
+    .map_err(|e| BackupError::Cmd(format!("backup receipt verifier task failed: {e}")))??;
+    require_receipt_evidence(&evidence)?;
+    if evidence.size_bytes != catalog_size as u64 {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt size mismatch for catalog row {backup_id}"
+        )));
+    }
+
+    let host_key = computer_id.to_string();
+    let run_id = Uuid::new_v4();
+    let persisted = ff_db::pg_record_backup_distribution_receipt(
+        pool,
+        backup_id,
+        &enqueue_checksum,
+        &host_key,
+        computer_id,
+        &canonical_host,
+        &evidence.observed_sha256,
+        catalog_size,
+        BACKUP_RECEIPT_VERSION,
+        run_id,
+        &database_kind,
+        &file_name,
+    )
+    .await
+    .map_err(|error| BackupError::Cmd(format!("persist backup receipt: {error}")))?;
+    let Some((verified_at, receipt)) = persisted else {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt CAS refused catalog row {backup_id}; row changed or status map is malformed"
+        )));
+    };
+
+    Ok(BackupReceiptReport {
+        backup_id,
+        computer_id,
+        host: canonical_host,
+        expected_checksum: enqueue_checksum,
+        observed_checksum: evidence.observed_sha256,
+        verified_at,
+        receipt,
+    })
+}
+
+fn existing_receipt_is_current(
+    distribution_status: &serde_json::Value,
+    backup_id: Uuid,
+    computer_id: Uuid,
+    canonical_host: &str,
+    expected_checksum: &str,
+    expected_size: i64,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    if validate_expected_sha256(expected_checksum).is_err() || expected_size <= 0 {
+        return false;
+    }
+    let backup_id_string = backup_id.to_string();
+    let computer_id_string = computer_id.to_string();
+    let Some(receipt) = distribution_status
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|hosts| hosts.get(&computer_id_string))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if receipt.get("version").and_then(serde_json::Value::as_i64) != Some(BACKUP_RECEIPT_VERSION)
+        || receipt.get("backup_id").and_then(serde_json::Value::as_str)
+            != Some(backup_id_string.as_str())
+        || receipt
+            .get("computer_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(computer_id_string.as_str())
+        || receipt.get("host").and_then(serde_json::Value::as_str) != Some(canonical_host)
+        || receipt.get("checksum").and_then(serde_json::Value::as_str) != Some("ok")
+        || receipt.get("decrypt").and_then(serde_json::Value::as_str) != Some("ok")
+        || receipt
+            .get("age_format")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || receipt
+            .get("evidence_tier")
+            .and_then(serde_json::Value::as_str)
+            != Some("checksum_decrypt")
+        || receipt
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_i64)
+            != Some(expected_size)
+        || !receipt
+            .get("run_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|run_id| Uuid::parse_str(run_id).is_ok())
+    {
+        return false;
+    }
+    for field in ["expected_checksum", "observed_checksum"] {
+        if !receipt
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|checksum| checksum.eq_ignore_ascii_case(expected_checksum))
+        {
+            return false;
+        }
+    }
+    let parse_time = |field: &str| {
+        receipt
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+    };
+    let (Some(observed_at), Some(last_ok), Some(verified_at)) = (
+        parse_time("observed_at"),
+        parse_time("last_ok"),
+        parse_time("verified_at"),
+    ) else {
+        return false;
+    };
+    observed_at <= last_ok
+        && last_ok <= verified_at
+        && verified_at <= now + chrono::Duration::seconds(BACKUP_RECEIPT_FUTURE_SKEW_SECS)
+        && now.signed_duration_since(verified_at).num_seconds() <= BACKUP_RECEIPT_MAX_AGE_SECS
 }
 
 fn validate_expected_sha256(expected: &str) -> Result<(), BackupError> {
@@ -2797,6 +3221,170 @@ mod tests {
         (root, expected)
     }
 
+    #[test]
+    fn typed_receipt_payload_rejects_every_caller_controlled_proof_field() {
+        let backup_id = Uuid::new_v4();
+        let checksum = "a".repeat(64);
+        assert_eq!(
+            parse_backup_receipt_payload(&serde_json::json!({
+                "backup_id": backup_id,
+                "expected_checksum": checksum.to_ascii_uppercase(),
+            }))
+            .unwrap(),
+            (backup_id, checksum.clone())
+        );
+
+        for forbidden in [
+            "host",
+            "computer_id",
+            "path",
+            "file_name",
+            "database_kind",
+            "identity",
+            "observed_checksum",
+            "checksum",
+            "decrypt",
+            "verified_at",
+        ] {
+            let mut payload = serde_json::json!({
+                "backup_id": backup_id,
+                "expected_checksum": checksum,
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_string(), serde_json::json!("forged"));
+            assert!(
+                parse_backup_receipt_payload(&payload).is_err(),
+                "caller-controlled {forbidden} must fail closed"
+            );
+        }
+        for invalid in [
+            serde_json::json!({
+                "backup_id": "not-a-uuid",
+                "expected_checksum": "a".repeat(64),
+            }),
+            serde_json::json!({
+                "backup_id": backup_id,
+                "expected_checksum": "too-short",
+            }),
+            serde_json::json!([]),
+        ] {
+            assert!(parse_backup_receipt_payload(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn current_receipt_is_exact_identity_checksum_and_freshness_bound() {
+        let backup_id = Uuid::new_v4();
+        let computer_id = Uuid::new_v4();
+        let checksum = "b".repeat(64);
+        let now = Utc::now();
+        let receipt = |verified_at: chrono::DateTime<Utc>| {
+            serde_json::json!({
+                "hosts": {
+                    computer_id.to_string(): {
+                        "version": BACKUP_RECEIPT_VERSION,
+                        "backup_id": backup_id,
+                        "computer_id": computer_id,
+                        "host": "lily",
+                        "expected_checksum": checksum,
+                        "observed_checksum": checksum,
+                        "checksum": "ok",
+                        "decrypt": "ok",
+                        "age_format": true,
+                        "evidence_tier": "checksum_decrypt",
+                        "size_bytes": 8192,
+                        "run_id": Uuid::new_v4(),
+                        "observed_at": verified_at,
+                        "last_ok": verified_at,
+                        "verified_at": verified_at,
+                    }
+                }
+            })
+        };
+        let fresh = receipt(now - chrono::Duration::minutes(5));
+        assert!(existing_receipt_is_current(
+            &fresh,
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            backup_id,
+            computer_id,
+            "rihanna",
+            &checksum,
+            8192,
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            Uuid::new_v4(),
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &receipt(now - chrono::Duration::seconds(BACKUP_RECEIPT_MAX_AGE_SECS + 1)),
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            now,
+        ));
+        assert!(existing_receipt_is_current(
+            &receipt(now + chrono::Duration::seconds(1)),
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &receipt(now + chrono::Duration::seconds(BACKUP_RECEIPT_FUTURE_SKEW_SECS + 1),),
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            now,
+        ));
+        let mut incomplete = fresh.clone();
+        incomplete["hosts"][computer_id.to_string()]
+            .as_object_mut()
+            .unwrap()
+            .remove("run_id");
+        assert!(!existing_receipt_is_current(
+            &incomplete,
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            4096,
+            now,
+        ));
+        assert_eq!(RECEIPT_RECONCILE_BATCH_SIZE, 5);
+        assert!(RECEIPT_RECONCILE_SCAN_LIMIT >= RECEIPT_RECONCILE_BATCH_SIZE as i64);
+    }
+
     #[cfg(unix)]
     #[test]
     fn backup_artifact_verifier_streams_large_checksum_and_reports_mismatch() {
@@ -2820,6 +3408,7 @@ mod tests {
                 .unwrap();
         assert!(!mismatch.checksum_match);
         assert_eq!(mismatch.observed_sha256, expected);
+        assert!(require_receipt_evidence(&mismatch).is_err());
 
         let uppercase = expected.to_ascii_uppercase();
         let case_insensitive =
@@ -2862,6 +3451,7 @@ mod tests {
         .unwrap();
         assert!(matching.age_encrypted);
         assert_eq!(matching.decrypt_probe_ok, Some(true));
+        assert!(require_receipt_evidence(&matching).is_ok());
 
         let wrong = verify_backup_artifact(
             root.path(),
@@ -2873,6 +3463,7 @@ mod tests {
         .unwrap();
         assert!(wrong.age_encrypted);
         assert_eq!(wrong.decrypt_probe_ok, Some(false));
+        assert!(require_receipt_evidence(&wrong).is_err());
 
         let missing = verify_backup_artifact(
             root.path(),

@@ -961,35 +961,60 @@ fn remote_drill_payload(
 /// arrays and evidence for a different host/checksum fail closed.
 fn validate_remote_backup_receipt(
     distribution_status: &serde_json::Value,
-    node: &str,
+    expected_backup_id: uuid::Uuid,
+    expected_computer_id: uuid::Uuid,
+    canonical_node: &str,
     expected_checksum: &str,
+    expected_size: i64,
     backup_created_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> std::result::Result<(), String> {
+    if expected_checksum.len() != 64
+        || !expected_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("exact catalog checksum is not a SHA-256 digest".into());
+    }
+    if expected_size <= 0 {
+        return Err("exact catalog size must be positive".into());
+    }
     let hosts = distribution_status
         .get("hosts")
         .and_then(serde_json::Value::as_object)
         .ok_or_else(|| "distribution_status.hosts receipt map is missing".to_string())?;
-    let mut matches = hosts
-        .iter()
-        .filter(|(host, _)| host.eq_ignore_ascii_case(node));
-    let (_, receipt) = matches
-        .next()
-        .ok_or_else(|| format!("no verified distribution receipt for exact host {node}"))?;
-    if matches.next().is_some() {
-        return Err(format!(
-            "ambiguous case-insensitive distribution receipts for host {node}"
-        ));
-    }
+    let host_key = expected_computer_id.to_string();
+    let receipt = hosts.get(&host_key).ok_or_else(|| {
+        format!("no verified distribution receipt for exact host {canonical_node}")
+    })?;
     let receipt = receipt
         .as_object()
-        .ok_or_else(|| format!("distribution receipt for {node} is not an object"))?;
+        .ok_or_else(|| format!("distribution receipt for {canonical_node} is not an object"))?;
     let string = |field: &str| {
         receipt
             .get(field)
             .and_then(serde_json::Value::as_str)
             .ok_or_else(|| format!("receipt field {field} is missing or not a string"))
     };
+
+    if receipt.get("version").and_then(serde_json::Value::as_i64)
+        != Some(ff_agent::ha::backup::BACKUP_RECEIPT_VERSION)
+    {
+        return Err("receipt version is missing or unsupported".into());
+    }
+    let receipt_backup_id = uuid::Uuid::parse_str(string("backup_id")?)
+        .map_err(|_| "receipt backup_id is not a UUID".to_string())?;
+    if receipt_backup_id != expected_backup_id {
+        return Err("receipt is bound to another backup id".into());
+    }
+    let receipt_computer_id = uuid::Uuid::parse_str(string("computer_id")?)
+        .map_err(|_| "receipt computer_id is not a UUID".to_string())?;
+    if receipt_computer_id != expected_computer_id {
+        return Err("receipt is bound to another computer id".into());
+    }
+    if string("host")? != canonical_node {
+        return Err("receipt host does not match the canonical enrolled name".into());
+    }
 
     let tier = string("evidence_tier")?;
     if !matches!(tier, "checksum_decrypt" | "restore") {
@@ -1014,13 +1039,16 @@ fn validate_remote_backup_receipt(
             "receipt checksum {observed_checksum} does not match exact catalog checksum {expected_checksum}"
         ));
     }
-    if let Some(receipt_expected) = receipt
-        .get("expected_checksum")
-        .and_then(serde_json::Value::as_str)
+    let receipt_expected = string("expected_checksum")?;
+    if !receipt_expected.eq_ignore_ascii_case(expected_checksum) {
+        return Err("receipt expected_checksum is bound to another catalog version".into());
+    }
+    if receipt
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_i64)
+        != Some(expected_size)
     {
-        if !receipt_expected.eq_ignore_ascii_case(expected_checksum) {
-            return Err("receipt expected_checksum is bound to another catalog version".into());
-        }
+        return Err("receipt size is bound to another catalog artifact".into());
     }
     uuid::Uuid::parse_str(string("run_id")?)
         .map_err(|_| "receipt run_id is not a UUID".to_string())?;
@@ -1032,15 +1060,29 @@ fn validate_remote_backup_receipt(
     };
     let observed_at = parse_time("observed_at")?;
     let last_ok = parse_time("last_ok")?;
-    if observed_at < backup_created_at || last_ok < backup_created_at {
+    let verified_at = parse_time("verified_at")?;
+    if observed_at < backup_created_at
+        || last_ok < backup_created_at
+        || verified_at < backup_created_at
+    {
         return Err("receipt predates the exact backup catalog row".into());
     }
-    if last_ok < observed_at {
-        return Err("receipt last_ok predates its observed_at proof".into());
+    if last_ok < observed_at || verified_at < last_ok {
+        return Err(
+            "receipt timestamps are not ordered observed_at <= last_ok <= verified_at".into(),
+        );
     }
     let future_skew = chrono::Duration::minutes(5);
-    if observed_at > now + future_skew || last_ok > now + future_skew {
+    if observed_at > now + future_skew
+        || last_ok > now + future_skew
+        || verified_at > now + future_skew
+    {
         return Err("receipt timestamp is implausibly in the future".into());
+    }
+    if now.signed_duration_since(verified_at).num_seconds()
+        > ff_agent::ha::backup::BACKUP_RECEIPT_MAX_AGE_SECS
+    {
+        return Err("receipt verification is stale and must be reconciled".into());
     }
     Ok(())
 }
@@ -1060,13 +1102,22 @@ async fn enqueue_remote_drill(
     println!(
         "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (from={me}, backup={backup_id}, run={run_id})"
     );
-    let (checksum, created_at, distribution_status, database_kind): (
+    let (target_computer_id, canonical_node): (uuid::Uuid, String) =
+        sqlx::query_as("SELECT id, name FROM computers WHERE LOWER(name)=LOWER($1)")
+            .bind(node)
+            .fetch_optional(pool)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("remote drill target {node:?} is not an enrolled computer")
+            })?;
+    let (checksum, size_bytes, created_at, distribution_status, database_kind): (
         String,
+        i64,
         chrono::DateTime<chrono::Utc>,
         serde_json::Value,
         String,
     ) = sqlx::query_as(
-        "SELECT checksum_sha256, created_at, distribution_status, database_kind
+        "SELECT checksum_sha256, size_bytes, created_at, distribution_status, database_kind
            FROM backups
           WHERE id=$1 AND database_kind IN ('postgres', 'falkordb')",
     )
@@ -1080,31 +1131,35 @@ async fn enqueue_remote_drill(
     })?;
     validate_remote_backup_receipt(
         &distribution_status,
-        node,
+        backup_id,
+        target_computer_id,
+        &canonical_node,
         &checksum,
+        size_bytes,
         created_at,
         chrono::Utc::now(),
     )
     .map_err(|error| anyhow::anyhow!("remote backup receipt gate rejected {node}: {error}"))?;
 
-    ff_agent::ha::restore_drill::reserve_drill_run(pool, run_id, backup_id, node).await?;
-    let payload = remote_drill_payload(node, backup_id, run_id, &database_kind);
-    let trigger_spec = serde_json::json!({ "node": node });
+    ff_agent::ha::restore_drill::reserve_drill_run(pool, run_id, backup_id, &canonical_node)
+        .await?;
+    let payload = remote_drill_payload(&canonical_node, backup_id, run_id, &database_kind);
+    let trigger_spec = serde_json::json!({ "node": &canonical_node });
     let id = ff_db::pg_enqueue_deferred(
         pool,
-        &format!("backup restore-drill → {node}"),
+        &format!("backup restore-drill → {canonical_node}"),
         "shell",
         &payload,
         "node_online",
         &trigger_spec,
-        Some(node),
+        Some(&canonical_node),
         &serde_json::json!([]),
         Some("ff fleet db drill --backup-id/--run-id --on"),
         Some(3),
     )
     .await?;
     println!(
-        "{GREEN}✓{RESET} enqueued drill task {id} (preferred_node={node}, trigger=node_online)"
+        "{GREEN}✓{RESET} enqueued drill task {id} (preferred_node={canonical_node}, trigger=node_online)"
     );
     println!(
         "  waiting up to 30m for exact run {run_id} (the worker claims pending tasks ~every 15s)…"
@@ -1133,7 +1188,7 @@ async fn enqueue_remote_drill(
         )
         .bind(run_id)
         .bind(backup_id)
-        .bind(node)
+        .bind(&canonical_node)
         .fetch_optional(pool)
         .await?;
 
@@ -1186,19 +1241,28 @@ mod exact_restore_drill_tests {
     use super::*;
 
     fn receipt(
+        backup_id: uuid::Uuid,
+        computer_id: uuid::Uuid,
         node: &str,
         checksum: &str,
         observed_at: chrono::DateTime<chrono::Utc>,
     ) -> serde_json::Value {
         serde_json::json!({
             "hosts": {
-                node: {
+                computer_id.to_string(): {
+                    "version": ff_agent::ha::backup::BACKUP_RECEIPT_VERSION,
+                    "backup_id": backup_id,
+                    "computer_id": computer_id,
+                    "host": node,
                     "observed_at": observed_at,
                     "last_ok": observed_at,
+                    "verified_at": observed_at,
                     "run_id": uuid::Uuid::new_v4(),
                     "evidence_tier": "checksum_decrypt",
                     "checksum": "ok",
+                    "expected_checksum": checksum,
                     "observed_checksum": checksum,
+                    "size_bytes": 8192,
                     "decrypt": "ok",
                     "age_format": true,
                 }
@@ -1210,29 +1274,81 @@ mod exact_restore_drill_tests {
     fn verified_remote_receipt_is_bound_to_host_checksum_and_backup_time() {
         let now = chrono::Utc::now();
         let created = now - chrono::Duration::hours(1);
-        let status = receipt("priya", "ab12", now);
-        validate_remote_backup_receipt(&status, "PRIYA", "AB12", created, now).unwrap();
+        let backup_id = uuid::Uuid::new_v4();
+        let computer_id = uuid::Uuid::new_v4();
+        let checksum = "a".repeat(64);
+        let status = receipt(backup_id, computer_id, "priya", &checksum, now);
+        validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum.to_ascii_uppercase(),
+            8192,
+            created,
+            now,
+        )
+        .unwrap();
 
-        assert!(validate_remote_backup_receipt(&status, "vinny", "ab12", created, now).is_err());
-        assert!(
-            validate_remote_backup_receipt(&status, "priya", "different", created, now).is_err()
-        );
-        assert!(
-            validate_remote_backup_receipt(
-                &receipt("priya", "ab12", created - chrono::Duration::seconds(1)),
+        assert!(validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            uuid::Uuid::new_v4(),
+            "priya",
+            &checksum,
+            8192,
+            created,
+            now,
+        )
+        .is_err());
+        assert!(validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            computer_id,
+            "vinny",
+            &checksum,
+            8192,
+            created,
+            now,
+        )
+        .is_err());
+        assert!(validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            computer_id,
+            "priya",
+            "different",
+            8192,
+            created,
+            now,
+        )
+        .is_err());
+        assert!(validate_remote_backup_receipt(
+            &receipt(
+                backup_id,
+                computer_id,
                 "priya",
-                "ab12",
-                created,
-                now,
-            )
-            .is_err()
-        );
+                &checksum,
+                created - chrono::Duration::seconds(1),
+            ),
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            8192,
+            created,
+            now,
+        )
+        .is_err());
     }
 
     #[test]
     fn legacy_or_incomplete_distribution_evidence_fails_closed() {
         let now = chrono::Utc::now();
         let created = now - chrono::Duration::hours(1);
+        let backup_id = uuid::Uuid::new_v4();
+        let computer_id = uuid::Uuid::new_v4();
+        let checksum = "b".repeat(64);
         for status in [
             serde_json::json!(["priya"]),
             serde_json::json!({"hosts": {"priya": {"checksum": "ok"}}}),
@@ -1247,10 +1363,63 @@ mod exact_restore_drill_tests {
                 "age_format": false
             }}}),
         ] {
-            assert!(
-                validate_remote_backup_receipt(&status, "priya", "ab12", created, now).is_err()
-            );
+            assert!(validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                created,
+                now,
+            )
+            .is_err());
         }
+
+        let stale = receipt(
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            now - chrono::Duration::seconds(ff_agent::ha::backup::BACKUP_RECEIPT_MAX_AGE_SECS + 1),
+        );
+        assert!(validate_remote_backup_receipt(
+            &stale,
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            8192,
+            created - chrono::Duration::days(2),
+            now,
+        )
+        .is_err());
+
+        let mut forged = receipt(backup_id, computer_id, "priya", &checksum, now);
+        forged["hosts"][computer_id.to_string()]["backup_id"] =
+            serde_json::json!(uuid::Uuid::new_v4());
+        assert!(validate_remote_backup_receipt(
+            &forged,
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            8192,
+            created,
+            now,
+        )
+        .is_err());
+        assert!(validate_remote_backup_receipt(
+            &receipt(backup_id, computer_id, "priya", &checksum, now),
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            4096,
+            created,
+            now,
+        )
+        .is_err());
     }
 
     #[test]

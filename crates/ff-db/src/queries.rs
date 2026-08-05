@@ -3612,6 +3612,105 @@ pub async fn pg_delete_mesh_status_for_node(pool: &PgPool, node: &str) -> Result
     Ok(r.rows_affected())
 }
 
+// ─── Backup distribution receipts ─────────────────────────────────────────
+
+/// Atomically merge one verified host receipt into an exact backup row.
+/// Callers must produce the evidence themselves; this function supplies the
+/// database clock, exact catalog CAS, stable host-key merge, and monotonic
+/// same-host ordering. `None` means the catalog identity changed or the status
+/// map is structurally invalid.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_record_backup_distribution_receipt(
+    pool: &PgPool,
+    backup_id: uuid::Uuid,
+    expected_checksum: &str,
+    host_key: &str,
+    computer_id: uuid::Uuid,
+    canonical_host: &str,
+    observed_checksum: &str,
+    size_bytes: i64,
+    receipt_version: i64,
+    run_id: uuid::Uuid,
+    database_kind: &str,
+    file_name: &str,
+) -> Result<Option<(chrono::DateTime<chrono::Utc>, JsonValue)>> {
+    let row = sqlx::query(
+        r#"WITH proof AS (
+               SELECT clock_timestamp() AS verified_at
+           )
+           UPDATE backups AS b
+              SET distribution_status = jsonb_set(
+                    jsonb_set(
+                        b.distribution_status,
+                        '{hosts}',
+                        COALESCE(b.distribution_status->'hosts', '{}'::jsonb),
+                        true
+                    ),
+                    ARRAY['hosts', $3::text],
+                    jsonb_build_object(
+                        'version', $8::bigint,
+                        'backup_id', $1::uuid,
+                        'computer_id', $4::uuid,
+                        'host', $5::text,
+                        'expected_checksum', LOWER($2::text),
+                        'observed_checksum', LOWER($6::text),
+                        'size_bytes', $7::bigint,
+                        'checksum', 'ok',
+                        'decrypt', 'ok',
+                        'age_format', true,
+                        'evidence_tier', 'checksum_decrypt',
+                        'run_id', $9::uuid,
+                        'observed_at', proof.verified_at,
+                        'last_ok', proof.verified_at,
+                        'verified_at', proof.verified_at
+                    ),
+                    true
+                  )
+             FROM proof
+            WHERE b.id = $1
+              AND LOWER(b.checksum_sha256) = LOWER($2)
+              AND b.database_kind = $10
+              AND b.file_name = $11
+              AND b.size_bytes = $7
+              AND b.size_bytes > 0
+              AND $3::text = $4::uuid::text
+              AND LOWER($6::text) = LOWER($2::text)
+              AND LOWER($2::text) ~ '^[0-9a-f]{64}$'
+              AND $8::bigint > 0
+              AND BTRIM($5::text) <> ''
+              AND jsonb_typeof(b.distribution_status) = 'object'
+              AND (
+                    b.distribution_status->'hosts' IS NULL
+                    OR jsonb_typeof(b.distribution_status->'hosts') = 'object'
+                  )
+              AND CASE
+                    WHEN b.distribution_status->'hosts'->$3 IS NULL THEN true
+                    WHEN jsonb_typeof(b.distribution_status->'hosts'->$3) <> 'object' THEN true
+                    WHEN (b.distribution_status->'hosts'->$3->>'verified_at')
+                           ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]' THEN
+                        (b.distribution_status->'hosts'->$3->>'verified_at')::timestamptz
+                            <= proof.verified_at
+                    ELSE true
+                  END
+        RETURNING proof.verified_at,
+                  b.distribution_status->'hosts'->$3 AS receipt"#,
+    )
+    .bind(backup_id)
+    .bind(expected_checksum)
+    .bind(host_key)
+    .bind(computer_id)
+    .bind(canonical_host)
+    .bind(observed_checksum)
+    .bind(size_bytes)
+    .bind(receipt_version)
+    .bind(run_id)
+    .bind(database_kind)
+    .bind(file_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| (row.get("verified_at"), row.get("receipt"))))
+}
+
 // ─── Deferred Task Queue ───────────────────────────────────────────────────
 
 /// One row of the deferred_tasks table. Payload/trigger_spec/result/required_caps are free-form JSON.
@@ -3689,6 +3788,47 @@ pub async fn pg_enqueue_deferred(
         created_by,
         max_attempts,
         0,
+    )
+    .await
+}
+
+/// Insert a deferred task that may run only after `depends_on_task_id`
+/// completes successfully. The dependency lives in canonical
+/// `fleet_tasks.depends_on_task_id`; [`pg_claim_deferred`] enforces it for the
+/// folded deferred queue and terminal parent failures are propagated before a
+/// claim is attempted.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_deferred_dependent(
+    pool: &PgPool,
+    title: &str,
+    kind: &str,
+    payload: &JsonValue,
+    trigger_type: &str,
+    trigger_spec: &JsonValue,
+    preferred_node: Option<&str>,
+    required_caps: &JsonValue,
+    created_by: Option<&str>,
+    max_attempts: Option<i32>,
+    depends_on_task_id: &str,
+) -> Result<String> {
+    let dependency = sqlx::types::Uuid::parse_str(depends_on_task_id).map_err(|e| {
+        crate::error::DbError::NotFound(format!(
+            "bad deferred dependency uuid {depends_on_task_id}: {e}"
+        ))
+    })?;
+    pg_enqueue_deferred_delayed_with_dependency(
+        pool,
+        title,
+        kind,
+        payload,
+        trigger_type,
+        trigger_spec,
+        preferred_node,
+        required_caps,
+        created_by,
+        max_attempts,
+        0,
+        Some(dependency),
     )
     .await
 }
@@ -3853,10 +3993,42 @@ pub async fn pg_enqueue_deferred_delayed(
     max_attempts: Option<i32>,
     delay_secs: i64,
 ) -> Result<String> {
+    pg_enqueue_deferred_delayed_with_dependency(
+        pool,
+        title,
+        kind,
+        payload,
+        trigger_type,
+        trigger_spec,
+        preferred_node,
+        required_caps,
+        created_by,
+        max_attempts,
+        delay_secs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pg_enqueue_deferred_delayed_with_dependency(
+    pool: &PgPool,
+    title: &str,
+    kind: &str,
+    payload: &JsonValue,
+    trigger_type: &str,
+    trigger_spec: &JsonValue,
+    preferred_node: Option<&str>,
+    required_caps: &JsonValue,
+    created_by: Option<&str>,
+    max_attempts: Option<i32>,
+    delay_secs: i64,
+    depends_on_task_id: Option<sqlx::types::Uuid>,
+) -> Result<String> {
     let row = sqlx::query(
         "INSERT INTO fleet_tasks
             (task_type, summary, payload, priority, requires_capability, status,
-             created_at, task_class, not_before)
+             created_at, task_class, not_before, depends_on_task_id)
          VALUES (
              $2,
              $1,
@@ -3878,7 +4050,8 @@ pub async fn pg_enqueue_deferred_delayed(
              'pending',
              NOW(),
              'deferred',
-             CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END
+             CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END,
+             $11
          )
          RETURNING id",
     )
@@ -3892,6 +4065,7 @@ pub async fn pg_enqueue_deferred_delayed(
     .bind(created_by)
     .bind(max_attempts)
     .bind(delay_secs as f64)
+    .bind(depends_on_task_id)
     .fetch_one(pool)
     .await?;
     let id: sqlx::types::Uuid = row.get("id");
@@ -4270,18 +4444,36 @@ pub async fn pg_scheduler_pass(
 ///   3. Tasks whose `preferred_node` is set to a DIFFERENT node, but the task has
 ///      been `dispatchable` for >2 minutes — assume the preferred node has no
 ///      live worker and let any other worker pick it up and route via SSH.
+///
+/// Typed `backup_receipt` tasks are the exception to fallback stealing: their
+/// proof must be produced by the enrolled host that owns the bytes, so only the
+/// exact preferred worker may claim them.
 pub async fn pg_claim_deferred(
     pool: &PgPool,
     worker_node: &str,
 ) -> Result<Option<DeferredTaskRow>> {
+    pg_propagate_terminal_deferred_dependencies(pool).await?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query(&format!(
         "{DEFERRED_TASK_SELECT}
           AND t.status = 'dispatchable'
             AND (
-                 (t.payload->>'preferred_node') IS NULL
-              OR t.payload->>'preferred_node' = $1
-              OR t.not_before <= NOW() - INTERVAL '2 minutes'
+                 (t.task_type = 'backup_receipt'
+                  AND t.payload->>'preferred_node' = $1)
+              OR (t.task_type <> 'backup_receipt' AND (
+                     (t.payload->>'preferred_node') IS NULL
+                  OR t.payload->>'preferred_node' = $1
+                  OR t.not_before <= NOW() - INTERVAL '2 minutes'
+              ))
+            )
+            AND (
+                 t.depends_on_task_id IS NULL
+              OR EXISTS (
+                    SELECT 1
+                      FROM fleet_tasks dependency
+                     WHERE dependency.id = t.depends_on_task_id
+                       AND dependency.status = 'completed'
+              )
             )
             AND (t.not_before IS NULL OR t.not_before <= NOW())
           ORDER BY
@@ -4320,6 +4512,37 @@ pub async fn pg_claim_deferred(
 
     tx.commit().await?;
     Ok(claimed)
+}
+
+/// Fail/cancel deferred children whose dependency is terminally unsuccessful.
+/// Retrying parents remain `pending` and therefore do not reach this query; a
+/// child is terminalized only after the parent's retry budget is exhausted or
+/// an operator cancels it.
+pub async fn pg_propagate_terminal_deferred_dependencies(pool: &PgPool) -> Result<u64> {
+    let affected = sqlx::query(
+        "UPDATE fleet_tasks child
+            SET status = CASE
+                    WHEN dependency.status = 'cancelled' THEN 'cancelled'
+                    ELSE 'failed'
+                END,
+                error = format(
+                    'dependency %s ended in terminal status %s',
+                    dependency.id,
+                    dependency.status
+                ),
+                completed_at = NOW(),
+                claimed_at = NULL,
+                payload = child.payload - 'claimed_by'
+           FROM fleet_tasks dependency
+          WHERE child.task_class = 'deferred'
+            AND child.depends_on_task_id = dependency.id
+            AND child.status IN ('pending', 'dispatchable')
+            AND dependency.status IN ('failed', 'cancelled')",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
 }
 
 /// Operator-initiated promotion: flip a pending task (any trigger_type) to
@@ -5874,6 +6097,7 @@ mod tests {
                  created_by_computer_id UUID,
                  task_class TEXT,
                  not_before TIMESTAMPTZ,
+                 depends_on_task_id UUID,
                  dedup_signature TEXT,
                  parent_work_item_id UUID
              );
@@ -5897,6 +6121,14 @@ mod tests {
                  last_error TEXT,
                  result JSONB,
                  completed_at TIMESTAMPTZ
+             );
+             CREATE TABLE backups (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 database_kind TEXT NOT NULL,
+                 file_name TEXT NOT NULL,
+                 checksum_sha256 TEXT NOT NULL,
+                 size_bytes BIGINT NOT NULL,
+                 distribution_status JSONB NOT NULL DEFAULT '{}'::jsonb
              );",
         )
         .execute(&pool)
@@ -6710,6 +6942,307 @@ mod tests {
         .await
         .expect("count remaining dispatchable deferred tasks");
         assert_eq!(remaining, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_dependencies_order_receipts_and_propagate_terminal_parents() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+
+        let parent = pg_enqueue_deferred(
+            &pool,
+            "copy exact backup to lily",
+            "shell",
+            &serde_json::json!({"command": "true"}),
+            "node_online",
+            &serde_json::json!({"node": "lily"}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+        )
+        .await
+        .expect("enqueue rsync parent");
+        let receipt = pg_enqueue_deferred_dependent(
+            &pool,
+            "verify exact backup on lily",
+            "backup_receipt",
+            &serde_json::json!({
+                "backup_id": uuid::Uuid::new_v4(),
+                "expected_checksum": "a".repeat(64),
+            }),
+            "node_online",
+            &serde_json::json!({"node": "lily"}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+            &parent,
+        )
+        .await
+        .expect("enqueue dependent receipt");
+        let receipt_id = uuid::Uuid::parse_str(&receipt).unwrap();
+        sqlx::query(
+            "UPDATE fleet_tasks
+                SET status='dispatchable', not_before=NOW() - INTERVAL '5 minutes'
+              WHERE id=$1",
+        )
+        .bind(receipt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            pg_claim_deferred(&pool, "lily").await.unwrap().is_none(),
+            "receipt must not run before its copy dependency completes"
+        );
+        sqlx::query("UPDATE fleet_tasks SET status='completed', completed_at=NOW() WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(&parent).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            pg_claim_deferred(&pool, "rihanna").await.unwrap().is_none(),
+            "typed receipt must never fall back to a different worker"
+        );
+        let claimed = pg_claim_deferred(&pool, "lily")
+            .await
+            .unwrap()
+            .expect("preferred worker claims completed dependency child");
+        assert_eq!(claimed.id, receipt);
+        assert_eq!(claimed.kind, "backup_receipt");
+
+        let failed_parent = pg_enqueue_deferred(
+            &pool,
+            "failed copy",
+            "shell",
+            &serde_json::json!({"command": "false"}),
+            "now",
+            &serde_json::json!({}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let blocked_child = pg_enqueue_deferred_dependent(
+            &pool,
+            "blocked receipt",
+            "backup_receipt",
+            &serde_json::json!({
+                "backup_id": uuid::Uuid::new_v4(),
+                "expected_checksum": "b".repeat(64),
+            }),
+            "now",
+            &serde_json::json!({}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+            &failed_parent,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE fleet_tasks SET status='failed', completed_at=NOW() WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(&failed_parent).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pg_propagate_terminal_deferred_dependencies(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM fleet_tasks WHERE id=$1")
+                .bind(uuid::Uuid::parse_str(&blocked_child).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("terminal status failed"));
+
+        assert!(pg_enqueue_deferred_dependent(
+            &pool,
+            "bad dependency",
+            "backup_receipt",
+            &serde_json::json!({}),
+            "now",
+            &serde_json::json!({}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+            "not-a-uuid",
+        )
+        .await
+        .is_err());
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn backup_receipt_json_merge_is_atomic_monotonic_and_catalog_fenced() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+        let backup_id = uuid::Uuid::new_v4();
+        let checksum = "c".repeat(64);
+        sqlx::query(
+            "INSERT INTO backups
+                (id, database_kind, file_name, checksum_sha256, size_bytes)
+             VALUES ($1, 'postgres', 'pg-exact.tar.gz.age', $2, 8192)",
+        )
+        .bind(backup_id)
+        .bind(&checksum)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let lily_id = uuid::Uuid::new_v4();
+        let rihanna_id = uuid::Uuid::new_v4();
+        let lily_key = lily_id.to_string();
+        let rihanna_key = rihanna_id.to_string();
+        let lily = pg_record_backup_distribution_receipt(
+            &pool,
+            backup_id,
+            &checksum,
+            &lily_key,
+            lily_id,
+            "lily",
+            &checksum,
+            8192,
+            1,
+            uuid::Uuid::new_v4(),
+            "postgres",
+            "pg-exact.tar.gz.age",
+        );
+        let rihanna = pg_record_backup_distribution_receipt(
+            &pool,
+            backup_id,
+            &checksum,
+            &rihanna_key,
+            rihanna_id,
+            "rihanna",
+            &checksum,
+            8192,
+            1,
+            uuid::Uuid::new_v4(),
+            "postgres",
+            "pg-exact.tar.gz.age",
+        );
+        let (lily, rihanna) = tokio::join!(lily, rihanna);
+        let lily = lily.unwrap().expect("lily receipt persisted");
+        assert!(rihanna.unwrap().is_some(), "rihanna receipt persisted");
+
+        let status: JsonValue =
+            sqlx::query_scalar("SELECT distribution_status FROM backups WHERE id=$1")
+                .bind(backup_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status["hosts"][&lily_key]["host"], "lily");
+        assert_eq!(status["hosts"][&rihanna_key]["host"], "rihanna");
+        assert_eq!(status["hosts"].as_object().unwrap().len(), 2);
+
+        let before = status.clone();
+        assert!(
+            pg_record_backup_distribution_receipt(
+                &pool,
+                backup_id,
+                &"d".repeat(64),
+                &lily_key,
+                lily_id,
+                "lily",
+                &checksum,
+                8192,
+                1,
+                uuid::Uuid::new_v4(),
+                "postgres",
+                "pg-exact.tar.gz.age",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "enqueue/catalog checksum mismatch must fail the CAS"
+        );
+        let after_bad_cas: JsonValue =
+            sqlx::query_scalar("SELECT distribution_status FROM backups WHERE id=$1")
+                .bind(backup_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after_bad_cas, before);
+
+        // A future success represents a newer monotonic writer. An older retry
+        // using the database's current clock must not replace it.
+        sqlx::query(
+            "UPDATE backups
+                SET distribution_status = jsonb_set(
+                    distribution_status,
+                    ARRAY['hosts', $2::text, 'verified_at'],
+                    to_jsonb((NOW() + INTERVAL '1 hour')::timestamptz),
+                    false
+                )
+              WHERE id=$1",
+        )
+        .bind(backup_id)
+        .bind(&lily_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            pg_record_backup_distribution_receipt(
+                &pool,
+                backup_id,
+                &checksum,
+                &lily_key,
+                lily_id,
+                "lily",
+                &checksum,
+                8192,
+                1,
+                uuid::Uuid::new_v4(),
+                "postgres",
+                "pg-exact.tar.gz.age",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale same-host writer must not replace a newer receipt"
+        );
+        assert!(lily.0 <= chrono::Utc::now() + chrono::Duration::seconds(5));
+
+        sqlx::query(r#"UPDATE backups SET distribution_status='{"hosts":[]}'::jsonb WHERE id=$1"#)
+            .bind(backup_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            pg_record_backup_distribution_receipt(
+                &pool,
+                backup_id,
+                &checksum,
+                &lily_key,
+                lily_id,
+                "lily",
+                &checksum,
+                8192,
+                1,
+                uuid::Uuid::new_v4(),
+                "postgres",
+                "pg-exact.tar.gz.age",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "malformed hosts map must fail closed"
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
