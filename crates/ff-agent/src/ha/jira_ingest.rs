@@ -4,7 +4,7 @@
 //! `hireflow360` queue, then atomically refreshes Jira-owned work-item fields
 //! and the existing `jira_watch_state` rows without disturbing scheduler state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -17,6 +17,27 @@ const PROJECT_ID: &str = "hireflow360";
 const JIRA_BLOCKED_HOLD: &str = "jira_blocked";
 const JIRA_HOLD_PRIOR_STATUS: &str = "jira_hold_prior_status";
 const JIRA_HOLD_PRIOR_PARKED: &str = "jira_hold_prior_parked";
+const REPO_HOLD_REASON: &str = "jira_repo_resolution";
+const REPO_UNRESOLVED_HOLD: &str = "repo_unresolved";
+const REPO_MULTI_HOLD: &str = "repo_multi";
+const JIRA_REPO_HOLD: &str = "jira_repo_hold";
+const JIRA_REPO_HOLD_PRIOR_STATUS: &str = "jira_repo_hold_prior_status";
+
+#[derive(Clone, Debug, PartialEq, Eq, sqlx::FromRow)]
+struct ProjectRepo {
+    id: Uuid,
+    github_url: String,
+    name: Option<String>,
+    default_branch: String,
+    local_path: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RepoResolution<'a> {
+    Unique(&'a ProjectRepo),
+    NoExactMatch,
+    MultipleExactMatches(Vec<&'a ProjectRepo>),
+}
 
 #[derive(sqlx::FromRow)]
 struct JiraConfig {
@@ -69,6 +90,15 @@ struct JiraUser {
     account_id: String,
 }
 
+#[derive(sqlx::FromRow)]
+struct ExistingJiraParent {
+    id: Uuid,
+    status: String,
+    metadata: Value,
+    has_started: bool,
+    has_completed: bool,
+}
+
 /// Poll and ingest the configured HireFlow360 Jira queue once.
 ///
 /// This is registered as `LeaderOnly` by the daemon. A transaction advisory
@@ -115,8 +145,26 @@ pub async fn run_jira_ingest_tick(pg: &PgPool) -> Result<()> {
         return Ok(());
     }
 
+    // Repository rows are execution authority. Keep the exact-match snapshot
+    // stable until every Jira binding derived from it is committed. This
+    // avoids a rename/insert/delete changing cardinality between resolution
+    // and binding without requiring a schema migration.
+    sqlx::query("SET LOCAL lock_timeout = '5s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("LOCK TABLE project_repos IN SHARE MODE")
+        .execute(&mut *tx)
+        .await?;
+    let repos: Vec<ProjectRepo> = sqlx::query_as(
+        "SELECT id, github_url, name, default_branch, local_path \
+           FROM project_repos WHERE project_id = $1",
+    )
+    .bind(PROJECT_ID)
+    .fetch_all(&mut *tx)
+    .await?;
+
     for issue in issues.values() {
-        upsert_issue(&mut tx, &base_url, &config, issue).await?;
+        upsert_issue(&mut tx, &base_url, &config, issue, &repos).await?;
     }
     tx.commit().await?;
 
@@ -198,7 +246,9 @@ async fn upsert_issue(
     base_url: &str,
     config: &JiraConfig,
     issue: &JiraIssue,
+    repos: &[ProjectRepo],
 ) -> Result<()> {
+    let repo_resolution = resolve_repo(&issue.fields.labels, repos);
     let description = issue
         .fields
         .description
@@ -242,8 +292,9 @@ async fn upsert_issue(
             .map(|field| field.name.as_str()),
     );
 
-    let existing: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM work_items \
+    let existing: Option<ExistingJiraParent> = sqlx::query_as(
+        "SELECT id, status, metadata, started_at IS NOT NULL AS has_started, \
+                completed_at IS NOT NULL AS has_completed FROM work_items \
           WHERE project_id = $1 AND kind = 'jira' \
             AND metadata->>'jira_issue_id' = $2 \
           ORDER BY created_at LIMIT 1 FOR UPDATE",
@@ -253,7 +304,8 @@ async fn upsert_issue(
     .fetch_optional(&mut **tx)
     .await?;
 
-    let work_item_id = if let Some(id) = existing {
+    let work_item_id = if let Some(existing) = existing {
+        let id = existing.id;
         sqlx::query(
             "UPDATE work_items \
                 SET title = $2, description = $3, labels = $4, priority = $5, \
@@ -269,25 +321,136 @@ async fn upsert_issue(
         .bind(original_signal)
         .execute(&mut **tx)
         .await?;
+
+        match repo_resolution {
+            RepoResolution::Unique(repo) if repo_is_routable(repo) => {
+                bind_existing_repo(tx, &existing, repo).await?;
+            }
+            RepoResolution::Unique(repo) => {
+                hold_existing_for_repo_resolution(
+                    tx,
+                    &existing,
+                    REPO_UNRESOLVED_HOLD,
+                    "incomplete_repo_binding",
+                    repo_candidates(&[repo]),
+                )
+                .await?;
+            }
+            RepoResolution::NoExactMatch => {
+                hold_existing_for_repo_resolution(
+                    tx,
+                    &existing,
+                    REPO_UNRESOLVED_HOLD,
+                    "no_exact_match",
+                    routable_repo_candidates(repos),
+                )
+                .await?;
+            }
+            RepoResolution::MultipleExactMatches(matches) => {
+                hold_existing_for_repo_resolution(
+                    tx,
+                    &existing,
+                    REPO_MULTI_HOLD,
+                    "multiple_exact_matches",
+                    repo_candidates(&matches),
+                )
+                .await?;
+            }
+        }
         id
     } else {
-        sqlx::query_scalar(
-            "INSERT INTO work_items \
-                (project_id, kind, title, description, labels, status, priority, \
-                 created_by, metadata, original_signal) \
-             VALUES ($1, 'jira', $2, $3, $4, 'ready', $5, \
-                     'jira_ingest_tick', $6, $7) \
-             RETURNING id",
-        )
-        .bind(PROJECT_ID)
-        .bind(title)
-        .bind(description)
-        .bind(labels)
-        .bind(priority)
-        .bind(metadata.clone())
-        .bind(original_signal)
-        .fetch_one(&mut **tx)
-        .await?
+        match repo_resolution {
+            RepoResolution::Unique(repo) if repo_is_routable(repo) => {
+                let repo_path =
+                    routable_repo_path(repo).context("resolved Jira repo has no local path")?;
+                sqlx::query_scalar(
+                    "INSERT INTO work_items \
+                        (project_id, kind, title, description, labels, status, priority, \
+                         created_by, metadata, original_signal, repo_id, repo_url, \
+                         repo_path, base_branch) \
+                     VALUES ($1, 'jira', $2, $3, $4, 'ready', $5, \
+                             'jira_ingest_tick', $6 || $7, $8, $9, $10, $11, $12) \
+                     RETURNING id",
+                )
+                .bind(PROJECT_ID)
+                .bind(title)
+                .bind(description)
+                .bind(labels)
+                .bind(priority)
+                .bind(metadata.clone())
+                .bind(repo_bound_metadata(repo))
+                .bind(original_signal)
+                .bind(repo.id)
+                .bind(&repo.github_url)
+                .bind(repo_path)
+                .bind(&repo.default_branch)
+                .fetch_one(&mut **tx)
+                .await?
+            }
+            RepoResolution::Unique(repo) => {
+                let held_metadata = merge_metadata(
+                    &metadata,
+                    repo_hold_metadata(
+                        REPO_UNRESOLVED_HOLD,
+                        "incomplete_repo_binding",
+                        repo_candidates(&[repo]),
+                        "ready",
+                    ),
+                );
+                insert_held_issue(
+                    tx,
+                    &title,
+                    description.as_deref(),
+                    &labels,
+                    priority,
+                    &held_metadata,
+                    &original_signal,
+                )
+                .await?
+            }
+            RepoResolution::NoExactMatch => {
+                let held_metadata = merge_metadata(
+                    &metadata,
+                    repo_hold_metadata(
+                        REPO_UNRESOLVED_HOLD,
+                        "no_exact_match",
+                        routable_repo_candidates(repos),
+                        "ready",
+                    ),
+                );
+                insert_held_issue(
+                    tx,
+                    &title,
+                    description.as_deref(),
+                    &labels,
+                    priority,
+                    &held_metadata,
+                    &original_signal,
+                )
+                .await?
+            }
+            RepoResolution::MultipleExactMatches(matches) => {
+                let held_metadata = merge_metadata(
+                    &metadata,
+                    repo_hold_metadata(
+                        REPO_MULTI_HOLD,
+                        "multiple_exact_matches",
+                        repo_candidates(&matches),
+                        "ready",
+                    ),
+                );
+                insert_held_issue(
+                    tx,
+                    &title,
+                    description.as_deref(),
+                    &labels,
+                    priority,
+                    &held_metadata,
+                    &original_signal,
+                )
+                .await?
+            }
+        }
     };
 
     if blocked_status {
@@ -314,6 +477,228 @@ async fn upsert_issue(
     .await?;
 
     Ok(())
+}
+
+fn resolve_repo<'a>(labels: &[String], repos: &'a [ProjectRepo]) -> RepoResolution<'a> {
+    let labels: BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+    let mut matches: Vec<&ProjectRepo> = repos
+        .iter()
+        .filter(|repo| canonical_repo_name(repo).is_some_and(|name| labels.contains(name)))
+        .collect();
+    matches.sort_by(|left, right| {
+        canonical_repo_name(left)
+            .cmp(&canonical_repo_name(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    match matches.len() {
+        0 => RepoResolution::NoExactMatch,
+        1 => RepoResolution::Unique(matches[0]),
+        _ => RepoResolution::MultipleExactMatches(matches),
+    }
+}
+
+fn repo_candidates(repos: &[&ProjectRepo]) -> Vec<Value> {
+    repos
+        .iter()
+        .map(|repo| {
+            json!({
+                "id": repo.id,
+                "name": canonical_repo_name(repo),
+                "repo_url": repo.github_url,
+                "repo_path": routable_repo_path(repo),
+                "base_branch": repo.default_branch
+            })
+        })
+        .collect()
+}
+
+fn routable_repo_candidates(repos: &[ProjectRepo]) -> Vec<Value> {
+    let mut candidates: Vec<&ProjectRepo> =
+        repos.iter().filter(|repo| repo_is_routable(repo)).collect();
+    candidates.sort_by(|left, right| {
+        canonical_repo_name(left)
+            .cmp(&canonical_repo_name(right))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    repo_candidates(&candidates)
+}
+
+fn canonical_repo_name(repo: &ProjectRepo) -> Option<&str> {
+    repo.name.as_deref().filter(|name| !name.trim().is_empty())
+}
+
+fn routable_repo_path(repo: &ProjectRepo) -> Option<&str> {
+    repo.local_path
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+}
+
+fn repo_is_routable(repo: &ProjectRepo) -> bool {
+    canonical_repo_name(repo).is_some()
+        && routable_repo_path(repo).is_some()
+        && !repo.github_url.trim().is_empty()
+        && !repo.default_branch.trim().is_empty()
+}
+
+fn repo_bound_metadata(repo: &ProjectRepo) -> Value {
+    json!({
+        "jira_repo_id": repo.id,
+        "jira_repo_name": canonical_repo_name(repo),
+        "jira_repo_resolution_state": "bound"
+    })
+}
+
+fn repo_hold_metadata(
+    repo_hold: &str,
+    detail: &str,
+    allowed_repos: Vec<Value>,
+    previous_status: &str,
+) -> Value {
+    json!({
+        "jira_repo_hold": repo_hold,
+        "jira_repo_hold_prior_status": previous_status,
+        "jira_repo_resolution": {
+            "reason": REPO_HOLD_REASON,
+            "detail": detail,
+            "allowed_repos": allowed_repos
+        }
+    })
+}
+
+fn merge_metadata(base: &Value, extra: Value) -> Value {
+    let mut merged = base.clone();
+    if let (Some(merged), Some(extra)) = (merged.as_object_mut(), extra.as_object()) {
+        merged.extend(extra.clone());
+    }
+    merged
+}
+
+fn repo_hold_previous_status(existing: &ExistingJiraParent) -> String {
+    if let Some(status) = existing
+        .metadata
+        .get(JIRA_REPO_HOLD_PRIOR_STATUS)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| matches!(*status, "ready" | "idea" | "blocked" | "decomposed"))
+    {
+        return status.to_owned();
+    }
+    if existing
+        .metadata
+        .get("jira_execution_hold")
+        .and_then(Value::as_str)
+        == Some(JIRA_BLOCKED_HOLD)
+        && let Some(status) = existing
+            .metadata
+            .get(JIRA_HOLD_PRIOR_STATUS)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|status| matches!(*status, "ready" | "idea" | "blocked" | "decomposed"))
+    {
+        return status.to_owned();
+    }
+    existing.status.clone()
+}
+
+fn repo_binding_may_change(existing: &ExistingJiraParent) -> bool {
+    !existing.has_started
+        && !existing.has_completed
+        && matches!(existing.status.as_str(), "ready" | "idea" | "blocked")
+}
+
+async fn bind_existing_repo(
+    tx: &mut Transaction<'_, Postgres>,
+    existing: &ExistingJiraParent,
+    repo: &ProjectRepo,
+) -> Result<()> {
+    if !repo_binding_may_change(existing) {
+        return Ok(());
+    }
+    let repo_path = routable_repo_path(repo).context("resolved Jira repo has no local path")?;
+    sqlx::query(
+        "UPDATE work_items \
+            SET status = CASE \
+                  WHEN status = 'blocked' \
+                   AND NULLIF(BTRIM(COALESCE(metadata->>'jira_execution_hold', '')), '') IS NULL \
+                   AND metadata->>$7 IN ('ready', 'idea', 'decomposed') \
+                  THEN metadata->>$7 ELSE status END, \
+                repo_id = $2, repo_url = $3, repo_path = $4, base_branch = $5, \
+                metadata = (metadata - $6 - $7 - 'jira_repo_resolution') || $8 \
+          WHERE id = $1 AND started_at IS NULL AND completed_at IS NULL \
+            AND status IN ('ready', 'blocked', 'idea')",
+    )
+    .bind(existing.id)
+    .bind(repo.id)
+    .bind(&repo.github_url)
+    .bind(repo_path)
+    .bind(&repo.default_branch)
+    .bind(JIRA_REPO_HOLD)
+    .bind(JIRA_REPO_HOLD_PRIOR_STATUS)
+    .bind(repo_bound_metadata(repo))
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn hold_existing_for_repo_resolution(
+    tx: &mut Transaction<'_, Postgres>,
+    existing: &ExistingJiraParent,
+    repo_hold: &str,
+    detail: &str,
+    allowed_repos: Vec<Value>,
+) -> Result<()> {
+    if !repo_binding_may_change(existing) {
+        return Ok(());
+    }
+    let hold_metadata = repo_hold_metadata(
+        repo_hold,
+        detail,
+        allowed_repos,
+        &repo_hold_previous_status(existing),
+    );
+    sqlx::query(
+        "UPDATE work_items \
+            SET status = CASE WHEN status = 'ready' THEN 'blocked' ELSE status END, \
+                repo_id = NULL, repo_url = NULL, repo_path = NULL, base_branch = NULL, \
+                metadata = (metadata - 'jira_repo_id' - 'jira_repo_name' \
+                                      - 'jira_repo_resolution_state') || $2 \
+          WHERE id = $1 AND started_at IS NULL AND completed_at IS NULL \
+            AND status IN ('ready', 'blocked', 'idea')",
+    )
+    .bind(existing.id)
+    .bind(hold_metadata)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn insert_held_issue(
+    tx: &mut Transaction<'_, Postgres>,
+    title: &str,
+    description: Option<&str>,
+    labels: &Value,
+    priority: &str,
+    metadata: &Value,
+    original_signal: &Value,
+) -> Result<Uuid> {
+    Ok(sqlx::query_scalar(
+        "INSERT INTO work_items \
+            (project_id, kind, title, description, labels, status, priority, \
+             created_by, metadata, original_signal) \
+         VALUES ($1, 'jira', $2, $3, $4, 'blocked', $5, \
+                 'jira_ingest_tick', $6, $7) \
+         RETURNING id",
+    )
+    .bind(PROJECT_ID)
+    .bind(title)
+    .bind(description)
+    .bind(labels)
+    .bind(priority)
+    .bind(metadata)
+    .bind(original_signal)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 async fn hold_jira_parent_and_descendants(
@@ -428,7 +813,9 @@ async fn restore_jira_parent_and_descendants(
 ) -> Result<()> {
     sqlx::query(
         "UPDATE work_items \
-            SET status = metadata->>$2, \
+            SET status = CASE \
+                  WHEN NULLIF(BTRIM(COALESCE(metadata->>'jira_repo_hold', '')), '') IS NOT NULL \
+                  THEN 'blocked' ELSE metadata->>$2 END, \
                 parked = CASE metadata->>$3 \
                     WHEN 'true' THEN true \
                     WHEN 'false' THEN false \
@@ -543,6 +930,26 @@ fn adf_text(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    fn repo(name: &str, id: u128) -> ProjectRepo {
+        ProjectRepo {
+            id: Uuid::from_u128(id),
+            github_url: format!("https://github.com/example/{name}.git"),
+            name: Some(name.to_owned()),
+            default_branch: "main".to_owned(),
+            local_path: Some(format!("/srv/{name}")),
+        }
+    }
+
+    fn existing(status: &str, metadata: Value) -> ExistingJiraParent {
+        ExistingJiraParent {
+            id: Uuid::nil(),
+            status: status.to_owned(),
+            metadata,
+            has_started: false,
+            has_completed: false,
+        }
+    }
+
     #[test]
     fn parses_paginated_jira_response() {
         let page: JiraSearchPage = serde_json::from_value(json!({
@@ -567,6 +974,122 @@ mod tests {
         assert_eq!(normalize_priority(Some("Major")), "high");
         assert_eq!(normalize_priority(Some("Minor")), "low");
         assert_eq!(normalize_priority(None), "normal");
+    }
+
+    #[test]
+    fn exact_case_sensitive_repo_label_resolves_unique_repo() {
+        let repos = vec![repo("api", 1), repo("web", 2)];
+        assert_eq!(
+            resolve_repo(&["web".to_owned()], &repos),
+            RepoResolution::Unique(&repos[1])
+        );
+        for label in ["Web", "web ", "web-api"] {
+            assert_eq!(
+                resolve_repo(&[label.to_owned()], &repos),
+                RepoResolution::NoExactMatch
+            );
+        }
+        let stored_with_spaces = repo(" web ", 3);
+        assert_eq!(
+            resolve_repo(&["web".to_owned()], &[stored_with_spaces]),
+            RepoResolution::NoExactMatch
+        );
+    }
+
+    #[test]
+    fn zero_and_multiple_repo_matches_fail_closed_with_candidates() {
+        let repos = vec![repo("web", 2), repo("api", 1)];
+        assert_eq!(
+            resolve_repo(&["unknown".to_owned()], &repos),
+            RepoResolution::NoExactMatch
+        );
+        assert_eq!(routable_repo_candidates(&repos).len(), 2);
+
+        let RepoResolution::MultipleExactMatches(matches) =
+            resolve_repo(&["web".to_owned(), "api".to_owned()], &repos)
+        else {
+            panic!("expected multiple exact matches");
+        };
+        let candidates = repo_candidates(&matches);
+        assert_eq!(candidates[0]["name"], "api");
+        assert_eq!(candidates[1]["name"], "web");
+    }
+
+    #[test]
+    fn incomplete_exact_repo_is_not_routable() {
+        let mut incomplete = repo("app", 1);
+        incomplete.local_path = None;
+        assert_eq!(
+            resolve_repo(&["app".to_owned()], std::slice::from_ref(&incomplete)),
+            RepoResolution::Unique(&incomplete)
+        );
+        assert!(!repo_is_routable(&incomplete));
+    }
+
+    #[test]
+    fn repo_hold_state_is_independent_of_jira_execution_hold() {
+        let held = repo_hold_metadata(REPO_UNRESOLVED_HOLD, "no_exact_match", Vec::new(), "ready");
+        assert_eq!(held[JIRA_REPO_HOLD], REPO_UNRESOLVED_HOLD);
+        assert_eq!(held[JIRA_REPO_HOLD_PRIOR_STATUS], "ready");
+        assert!(held.get("jira_execution_hold").is_none());
+
+        let unrelated = existing(
+            "blocked",
+            json!({"jira_execution_hold": "awaiting_council"}),
+        );
+        assert_eq!(repo_hold_previous_status(&unrelated), "blocked");
+
+        let jira_blocked = existing(
+            "blocked",
+            json!({
+                "jira_execution_hold": JIRA_BLOCKED_HOLD,
+                "jira_hold_prior_status": "ready"
+            }),
+        );
+        assert_eq!(repo_hold_previous_status(&jira_blocked), "ready");
+
+        let jira_blocked_decomposed = existing(
+            "blocked",
+            json!({
+                "jira_execution_hold": JIRA_BLOCKED_HOLD,
+                "jira_hold_prior_status": "decomposed"
+            }),
+        );
+        assert_eq!(
+            repo_hold_previous_status(&jira_blocked_decomposed),
+            "decomposed"
+        );
+    }
+
+    #[test]
+    fn repository_binding_never_rewrites_started_active_review_or_terminal_rows() {
+        for status in [
+            "building",
+            "in_review",
+            "decomposed",
+            "done",
+            "failed",
+            "merged",
+        ] {
+            assert!(
+                !repo_binding_may_change(&existing(status, json!({}))),
+                "{status}"
+            );
+        }
+        for status in ["ready", "idea", "blocked"] {
+            assert!(
+                repo_binding_may_change(&existing(status, json!({}))),
+                "{status}"
+            );
+        }
+
+        let mut started = existing("ready", json!({}));
+        started.has_started = true;
+        assert!(!repo_binding_may_change(&started));
+
+        let mut completed = existing("blocked", json!({}));
+        completed.has_completed = true;
+        assert!(!repo_binding_may_change(&completed));
     }
 
     #[test]
@@ -897,6 +1420,16 @@ mod tests {
         };
         let ruleset_id = format!("test-ruleset-{}", Uuid::new_v4());
         ensure_test_project(&mut tx, PROJECT_ID).await;
+        let app_repo: ProjectRepo = sqlx::query_as(
+            "INSERT INTO project_repos
+                (project_id, github_url, name, default_branch, local_path)
+             VALUES ($1, 'https://github.com/example/app.git', 'app', 'main', '/srv/app')
+             RETURNING id, github_url, name, default_branch, local_path",
+        )
+        .bind(PROJECT_ID)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("insert test project repository");
         sqlx::query(
             "INSERT INTO jira_rulesets (id, name, version, content_hash) \
              VALUES ($1, 'test ruleset', 1, 'test-content-hash')",
@@ -926,6 +1459,7 @@ mod tests {
             "https://jira.example.test",
             &config,
             &jira_issue(&blocked_issue_id, "HFPROD-1", "Blocked on Vinny"),
+            std::slice::from_ref(&app_repo),
         )
         .await
         .expect("upsert blocked issue");
@@ -934,6 +1468,7 @@ mod tests {
             "https://jira.example.test",
             &config,
             &jira_issue(&ready_issue_id, "HFPROD-2", "To Do"),
+            std::slice::from_ref(&app_repo),
         )
         .await
         .expect("upsert ready issue");
@@ -975,6 +1510,7 @@ mod tests {
             "https://jira.example.test",
             &config,
             &jira_issue(&blocked_issue_id, "HFPROD-1", "Blocked"),
+            std::slice::from_ref(&app_repo),
         )
         .await
         .expect("replay blocked issue");
@@ -999,6 +1535,7 @@ mod tests {
             "https://jira.example.test",
             &config,
             &jira_issue(&blocked_issue_id, "HFPROD-1", "In Progress"),
+            std::slice::from_ref(&app_repo),
         )
         .await
         .expect("resume blocked issue");
@@ -1026,6 +1563,100 @@ mod tests {
         .expect("read ready insert");
         assert_eq!(ready_status, "ready");
         assert_eq!(ready_hold, None);
+
+        let decomposed_issue_id = Uuid::new_v4().to_string();
+        let decomposed_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items
+                (project_id, kind, title, status, priority, labels, created_by,
+                 metadata, original_signal, repo_id, repo_url, repo_path, base_branch)
+             VALUES ($1, 'jira', 'decomposed parent', 'decomposed', 'normal',
+                     '[\"app\"]'::jsonb, 'test', $2, '{}'::jsonb,
+                     $3, $4, $5, $6)
+             RETURNING id",
+        )
+        .bind(PROJECT_ID)
+        .bind(json!({
+            "jira_issue_id": decomposed_issue_id.clone(),
+            "jira_issue_key": "HFPROD-3",
+            "jira_status": "In Progress",
+            "jira_repo_resolution_state": "bound"
+        }))
+        .bind(app_repo.id)
+        .bind(&app_repo.github_url)
+        .bind(app_repo.local_path.as_deref())
+        .bind(&app_repo.default_branch)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("insert bound decomposed parent");
+
+        hold_jira_parent_and_descendants(&mut tx, decomposed_id)
+            .await
+            .expect("Jira-block decomposed parent");
+        upsert_issue(
+            &mut tx,
+            "https://jira.example.test",
+            &config,
+            &jira_issue(&decomposed_issue_id, "HFPROD-3", "Blocked"),
+            &[],
+        )
+        .await
+        .expect("make blocked parent repository-unresolved");
+        upsert_issue(
+            &mut tx,
+            "https://jira.example.test",
+            &config,
+            &jira_issue(&decomposed_issue_id, "HFPROD-3", "In Progress"),
+            &[],
+        )
+        .await
+        .expect("resume Jira while repository remains unresolved");
+        let (held_status, jira_hold, repo_hold, repo_prior): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, metadata->>'jira_execution_hold',
+                    metadata->>'jira_repo_hold',
+                    metadata->>'jira_repo_hold_prior_status'
+               FROM work_items WHERE id = $1",
+        )
+        .bind(decomposed_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read repository-held decomposed parent");
+        assert_eq!(held_status, "blocked");
+        assert_eq!(jira_hold, None);
+        assert_eq!(repo_hold.as_deref(), Some(REPO_UNRESOLVED_HOLD));
+        assert_eq!(repo_prior.as_deref(), Some("decomposed"));
+
+        upsert_issue(
+            &mut tx,
+            "https://jira.example.test",
+            &config,
+            &jira_issue(&decomposed_issue_id, "HFPROD-3", "In Progress"),
+            std::slice::from_ref(&app_repo),
+        )
+        .await
+        .expect("rebind resumed decomposed parent");
+        let (status, repo_hold, resolution_state, repo_id): (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT status, metadata->>'jira_repo_hold',
+                    metadata->>'jira_repo_resolution_state', repo_id
+               FROM work_items WHERE id = $1",
+        )
+        .bind(decomposed_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read rebound decomposed parent");
+        assert_eq!(status, "decomposed");
+        assert_eq!(repo_hold, None);
+        assert_eq!(resolution_state.as_deref(), Some("bound"));
+        assert_eq!(repo_id, Some(app_repo.id));
 
         tx.rollback().await.expect("rollback test transaction");
     }
@@ -1234,6 +1865,7 @@ mod tests {
             key: key.to_owned(),
             fields: JiraFields {
                 summary: "summary".to_owned(),
+                labels: vec!["app".to_owned()],
                 status: Some(NamedField {
                     name: status.to_owned(),
                 }),

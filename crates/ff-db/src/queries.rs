@@ -10989,12 +10989,14 @@ const JIRA_ANCESTOR_GUARD_SQL: &str = "\
 AND NOT EXISTS (
     WITH RECURSIVE ancestors AS (
         SELECT p.id, p.project_id, p.parent_id, p.kind, p.status,
-               p.metadata, p.repo_id, p.repo_url, ARRAY[p.id] AS path
+               p.metadata, p.repo_id, p.repo_url, p.repo_path, p.base_branch,
+               ARRAY[p.id] AS path
           FROM work_items p
          WHERE p.id = w.parent_id
         UNION ALL
         SELECT p.id, p.project_id, p.parent_id, p.kind, p.status,
-               p.metadata, p.repo_id, p.repo_url, a.path || p.id
+               p.metadata, p.repo_id, p.repo_url, p.repo_path, p.base_branch,
+               a.path || p.id
           FROM ancestors a
           JOIN work_items p ON p.id = a.parent_id
          WHERE NOT p.id = ANY(a.path)
@@ -11006,17 +11008,24 @@ AND NOT EXISTS (
            LOWER(BTRIM(COALESCE(a.status, ''))) IN ('blocked', 'blocked on vinny')
         OR LOWER(BTRIM(COALESCE(a.metadata->>'jira_status', ''))) IN ('blocked', 'blocked on vinny')
         OR NULLIF(BTRIM(COALESCE(a.metadata->>'jira_execution_hold', '')), '') IS NOT NULL
+        OR NULLIF(BTRIM(COALESCE(a.metadata->>'jira_repo_hold', '')), '') IS NOT NULL
+        OR a.metadata->>'jira_repo_resolution_state' IS DISTINCT FROM 'bound'
+        OR a.repo_id IS NULL
+        OR NULLIF(BTRIM(COALESCE(a.repo_url, '')), '') IS NULL
+        OR NULLIF(BTRIM(COALESCE(a.repo_path, '')), '') IS NULL
+        OR NULLIF(BTRIM(COALESCE(a.base_branch, '')), '') IS NULL
         OR LOWER(BTRIM(COALESCE(a.metadata->>'repo_binding_required', ''))) NOT IN ('', 'false', '0', 'no')
         OR NOT EXISTS (
             SELECT 1
               FROM project_repos pr
              WHERE pr.project_id = a.project_id
+               AND pr.id = a.repo_id
                AND NULLIF(BTRIM(pr.github_url), '') IS NOT NULL
-               AND (
-                   (a.repo_id IS NOT NULL AND pr.id = a.repo_id)
-                OR (NULLIF(BTRIM(COALESCE(a.repo_url, '')), '') IS NOT NULL
-                    AND pr.github_url = a.repo_url)
-               )
+               AND NULLIF(BTRIM(COALESCE(pr.local_path, '')), '') IS NOT NULL
+               AND NULLIF(BTRIM(pr.default_branch), '') IS NOT NULL
+               AND pr.github_url = a.repo_url
+               AND pr.local_path = a.repo_path
+               AND pr.default_branch = a.base_branch
         )
        )
 )";
@@ -12889,6 +12898,7 @@ mod jira_claim_guard_tests {
                  github_url TEXT NOT NULL,
                  name TEXT,
                  default_branch TEXT NOT NULL DEFAULT 'main',
+                 local_path TEXT,
                  is_primary BOOLEAN NOT NULL DEFAULT FALSE,
                  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
              );
@@ -12912,6 +12922,8 @@ mod jira_claim_guard_tests {
                  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                  repo_id UUID,
                  repo_url TEXT,
+                 repo_path TEXT,
+                 base_branch TEXT,
                  assigned_computer TEXT,
                  risk_score REAL NOT NULL DEFAULT 0,
                  retry_count INTEGER NOT NULL DEFAULT 0,
@@ -12968,9 +12980,10 @@ mod jira_claim_guard_tests {
             .await
             .unwrap();
         let repo_id = sqlx::query_scalar(
-            "INSERT INTO project_repos (project_id, github_url, name, is_primary)
+            "INSERT INTO project_repos
+                (project_id, github_url, name, default_branch, local_path, is_primary)
              VALUES ('hireflow360', 'git@github.com-venkat:HireFlow360-INC/hf-auth-api.git',
-                     'hf-auth-api', true)
+                     'hf-auth-api', 'main', '/srv/hf-auth-api', true)
              RETURNING id",
         )
         .fetch_one(pool)
@@ -12999,10 +13012,13 @@ mod jira_claim_guard_tests {
         repo_id: Option<uuid::Uuid>,
         repo_url: Option<&str>,
     ) -> uuid::Uuid {
+        let repo_path = repo_url.map(|_| "/srv/hf-auth-api");
+        let base_branch = repo_url.map(|_| "main");
         sqlx::query_scalar(
             "INSERT INTO work_items
-                (project_id, kind, title, status, parent_id, metadata, repo_id, repo_url)
-             VALUES ('hireflow360', $1, $2, $3, $4, $5, $6, $7)
+                (project_id, kind, title, status, parent_id, metadata, repo_id,
+                 repo_url, repo_path, base_branch)
+             VALUES ('hireflow360', $1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING id",
         )
         .bind(kind)
@@ -13012,6 +13028,8 @@ mod jira_claim_guard_tests {
         .bind(metadata)
         .bind(repo_id)
         .bind(repo_url)
+        .bind(repo_path)
+        .bind(base_branch)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -13077,14 +13095,37 @@ mod jira_claim_guard_tests {
             None,
         )
         .await;
-        let bound_parent = insert_work_item(
+        let stale_metadata_parent = insert_work_item(
             &pool,
             "jira",
             "ready",
             None,
             json!({"jira_status": "To Do"}),
             Some(repo_id),
+            Some("git@github.com-venkat:HireFlow360-INC/hf-auth-api.git"),
+        )
+        .await;
+        let stale_metadata_child = insert_work_item(
+            &pool,
+            "task",
+            "ready",
+            Some(stale_metadata_parent),
+            json!({}),
             None,
+            None,
+        )
+        .await;
+        let bound_parent = insert_work_item(
+            &pool,
+            "jira",
+            "ready",
+            None,
+            json!({
+                "jira_status": "To Do",
+                "jira_repo_resolution_state": "bound"
+            }),
+            Some(repo_id),
+            Some("git@github.com-venkat:HireFlow360-INC/hf-auth-api.git"),
         )
         .await;
         let bound_child = insert_work_item(
@@ -13107,6 +13148,17 @@ mod jira_claim_guard_tests {
             !pg_assign_work_item(&pool, unbound_child, sub_agent_id, computer_id, 600)
                 .await
                 .unwrap()
+        );
+        assert!(
+            !pg_assign_work_item(
+                &pool,
+                stale_metadata_child,
+                sub_agent_id,
+                computer_id,
+                600,
+            )
+            .await
+            .unwrap()
         );
         assert!(
             pg_assign_work_item(&pool, bound_child, sub_agent_id, computer_id, 600)
