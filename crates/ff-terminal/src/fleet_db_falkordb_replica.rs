@@ -84,6 +84,7 @@ struct BackupEvidence {
     checksum_sha256: String,
     size_bytes: i64,
     drill_id: Uuid,
+    restore_image_id: String,
     created_at: DateTime<Utc>,
     verified_restorable_at: DateTime<Utc>,
     distributed_to: Vec<Uuid>,
@@ -116,7 +117,10 @@ struct PlanMaterial {
     backup: BackupEvidence,
     target_state: TargetState,
     image: &'static str,
-    image_id: String,
+    primary_image_id: String,
+    primary_image_repo_digests: Vec<String>,
+    target_image_id: String,
+    target_image_repo_digests: Vec<String>,
     image_user: String,
     primary_port: u16,
     replica_port: u16,
@@ -543,12 +547,13 @@ fn validate_image_evidence(evidence: &ImageEvidence) -> Result<()> {
 }
 
 fn parse_image_evidence(raw: &str) -> Result<ImageEvidence> {
-    let evidence = ImageEvidence {
+    let mut evidence = ImageEvidence {
         image_id: field(raw, "IMAGE")?.trim().to_string(),
         repo_digests: serde_json::from_str(field(raw, "IMAGE_REPO_DIGESTS")?.trim())
             .context("parse daemon FalkorDB RepoDigests")?,
         configured_user: field(raw, "IMAGE_USER")?.trim().to_string(),
     };
+    evidence.repo_digests.sort();
     validate_image_evidence(&evidence)?;
     Ok(evidence)
 }
@@ -837,11 +842,23 @@ async fn attest_target(
 }
 
 fn validate_plan_image(plan: &Plan, attestation: &TargetAttestation) -> Result<()> {
-    if attestation.image_id != plan.material.image_id
+    if attestation.image_id != plan.material.target_image_id
+        || attestation.image_repo_digests != plan.material.target_image_repo_digests
         || attestation.image_user != plan.material.image_user
         || plan.material.image != FALKORDB_IMAGE
     {
         bail!("pinned FalkorDB image resolution changed; the lifecycle plan is stale");
+    }
+    Ok(())
+}
+
+fn validate_primary_plan_image(plan: &Plan, evidence: &ImageEvidence) -> Result<()> {
+    if evidence.image_id != plan.material.primary_image_id
+        || evidence.repo_digests != plan.material.primary_image_repo_digests
+        || evidence.configured_user != plan.material.image_user
+        || plan.material.image != FALKORDB_IMAGE
+    {
+        bail!("Priya Docker image resolution changed after planning; refusing target mutation");
     }
     Ok(())
 }
@@ -1278,7 +1295,7 @@ async fn validate_unauthenticated_primary(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn restore_receipt(detail: &str, expected_checksum: &str, expected_image_id: &str) -> Result<()> {
+fn restore_receipt(detail: &str, expected_checksum: &str) -> Result<String> {
     if detail.match_indices("receipt=").count() != 1 {
         bail!("restore drill detail must contain exactly one receipt envelope");
     }
@@ -1319,7 +1336,6 @@ fn restore_receipt(detail: &str, expected_checksum: &str, expected_image_id: &st
     if receipt.proof != "falkordb_exact_restore_v1"
         || receipt.input_checksum_sha256 != expected_checksum
         || receipt.image_reference != FALKORDB_IMAGE
-        || receipt.image_id != expected_image_id
         || receipt.network != "none"
         || receipt.query_mode != "GRAPH.RO_QUERY"
     {
@@ -1341,7 +1357,7 @@ fn restore_receipt(detail: &str, expected_checksum: &str, expected_image_id: &st
     {
         bail!("FalkorDB restore receipt did not meet its exact minimum dataset proof");
     }
-    Ok(())
+    Ok(receipt.image_id)
 }
 
 async fn validate_topology_for_plan(
@@ -1398,11 +1414,7 @@ async fn authority_url(pool: &sqlx::PgPool, primary: &Computer) -> Result<String
     Ok(canonical)
 }
 
-async fn backup_evidence(
-    pool: &sqlx::PgPool,
-    primary: &Computer,
-    primary_image_id: &str,
-) -> Result<BackupEvidence> {
+async fn backup_evidence(pool: &sqlx::PgPool, primary: &Computer) -> Result<BackupEvidence> {
     let policy_rows = sqlx::query(
         "SELECT source_host,dest_hosts,encrypt,enabled
            FROM fleet_backup_config WHERE kind='falkordb'",
@@ -1473,8 +1485,8 @@ async fn backup_evidence(
         let distribution_status: serde_json::Value = row.get("distribution_status");
         let drill_id: Uuid = row.get("drill_id");
         let detail: String = row.get("detail");
-        let proof = (|| -> Result<()> {
-            restore_receipt(&detail, &checksum_sha256, primary_image_id)?;
+        let proof = (|| -> Result<String> {
+            let restore_image_id = restore_receipt(&detail, &checksum_sha256)?;
             for destination in &destination_nodes {
                 crate::fleet_cmd::validate_remote_backup_receipt(
                     &distribution_status,
@@ -1490,16 +1502,17 @@ async fn backup_evidence(
                 )
                 .map_err(anyhow::Error::msg)?;
             }
-            Ok(())
+            Ok(restore_image_id)
         })();
         match proof {
-            Ok(()) => {
+            Ok(restore_image_id) => {
                 return Ok(BackupEvidence {
                     backup_id,
                     file_name,
                     checksum_sha256,
                     size_bytes,
                     drill_id,
+                    restore_image_id,
                     created_at,
                     verified_restorable_at,
                     distributed_to: destination_nodes
@@ -1608,15 +1621,13 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
         }
     };
     let primary_image = attest_image(&primary).await?;
-    let backup = backup_evidence(pool, &primary, &primary_image.image_id).await?;
+    let backup = backup_evidence(pool, &primary).await?;
     attest_firewall(&primary, &target).await?;
     attest_target_source_route(&target, &primary).await?;
     let (target_attestation, target_state) = attest_target(&target, &primary.ip).await?;
-    if target_attestation.image_id != primary_image.image_id
-        || target_attestation.image_user != primary_image.configured_user
-    {
+    if target_attestation.image_user != primary_image.configured_user {
         bail!(
-            "target and canonical Priya Docker daemons do not resolve the pinned FalkorDB image identically"
+            "target and canonical Priya Docker daemons disagree on the pinned FalkorDB image user"
         );
     }
 
@@ -1631,7 +1642,7 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
 
     Ok(Plan {
         material: PlanMaterial {
-            version: "falkordb-replica-plan-v2",
+            version: "falkordb-replica-plan-v3",
             target_id: target.id,
             target_name: target.name,
             target_ip: target.ip,
@@ -1650,7 +1661,10 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Result
             backup,
             target_state,
             image: FALKORDB_IMAGE,
-            image_id: primary_image.image_id,
+            primary_image_id: primary_image.image_id,
+            primary_image_repo_digests: primary_image.repo_digests,
+            target_image_id: target_attestation.image_id,
+            target_image_repo_digests: target_attestation.image_repo_digests,
             image_user: primary_image.configured_user,
             primary_port: PRIMARY_PORT,
             replica_port: REPLICA_PORT,
@@ -2143,11 +2157,15 @@ async fn register_topology(pool: &sqlx::PgPool, plan: &Plan, lag_bytes: i64) -> 
         .bind(lag_bytes)
         .bind(plan.material.backup.backup_id)
         .bind(format!(
-            "primary={};plan={};image={};image_id={};backup={};drill={};endpoint=127.0.0.1:{};read_only=yes;rootfs_read_only=yes;cap_drop=ALL;no_new_privileges=yes;stale_data=no;automatic_failover=disabled;read_routing=disabled",
+            "primary={};plan={};image={};primary_image_id={};target_image_id={};restore_image_id={};primary_repo_digest={};target_repo_digest={};backup={};drill={};endpoint=127.0.0.1:{};read_only=yes;rootfs_read_only=yes;cap_drop=ALL;no_new_privileges=yes;stale_data=no;automatic_failover=disabled;read_routing=disabled",
             plan.material.primary_name,
             plan.id(),
             FALKORDB_IMAGE,
-            plan.material.image_id,
+            plan.material.primary_image_id,
+            plan.material.target_image_id,
+            plan.material.backup.restore_image_id,
+            FALKORDB_IMAGE,
+            FALKORDB_IMAGE,
             plan.material.backup.backup_id,
             plan.material.backup.drill_id,
             REPLICA_PORT,
@@ -2170,11 +2188,7 @@ async fn local_apply_inner(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     let target = resolve_computer(pool, &plan.material.target_name).await?;
     attest_firewall(&primary, &target).await?;
     let primary_image = attest_image(&primary).await?;
-    if primary_image.image_id != plan.material.image_id
-        || primary_image.configured_user != plan.material.image_user
-    {
-        bail!("Priya Docker image resolution changed after planning; refusing target mutation");
-    }
+    validate_primary_plan_image(plan, &primary_image)?;
     let (attestation, state) = attest_target(&target, &primary.ip).await?;
     validate_plan_image(plan, &attestation)?;
     match state {
@@ -2400,7 +2414,7 @@ async fn purge_evidence(
         bail!("purge proof requires an absent container and exactly one preserved volume");
     }
     let primary_image = attest_image(&primary).await?;
-    let backup = backup_evidence(pool, &primary, &primary_image.image_id).await?;
+    let backup = backup_evidence(pool, &primary).await?;
     Ok(PurgeEvidence {
         target,
         primary,
@@ -2449,8 +2463,7 @@ async fn local_purge_volume(pool: &sqlx::PgPool, evidence: &PurgeEvidence) -> Re
         if current_image != evidence.primary_image {
             bail!("Priya pinned FalkorDB image resolution changed; issue a fresh purge proof");
         }
-        let current_backup =
-            backup_evidence(pool, &evidence.primary, &current_image.image_id).await?;
+        let current_backup = backup_evidence(pool, &evidence.primary).await?;
         if current_backup != evidence.backup {
             bail!("FalkorDB backup/receipt proof changed; issue a fresh purge proof");
         }
@@ -2513,7 +2526,7 @@ fn validate_status_topology(
     let TargetState::ExactHealthy { image_id } = &plan.material.target_state else {
         bail!("BLOCKED: registered FalkorDB replica container is not exact-healthy");
     };
-    if image_id != &plan.material.image_id {
+    if image_id != &plan.material.target_image_id {
         bail!("BLOCKED: running FalkorDB image differs from daemon-resolved plan image");
     }
     Ok(())
@@ -2560,7 +2573,7 @@ async fn show_status(pool: &sqlx::PgPool, to: &str, primary_name: &str) -> Resul
             target.id,
             registered_backup.expect("validated registered backup identity"),
             fresh_lag,
-            plan.material.image_id,
+            plan.material.target_image_id,
             plan.material.graphs.len(),
         );
     } else {
@@ -2597,12 +2610,13 @@ pub async fn handle(pool: &sqlx::PgPool, command: FleetDbFalkordbReplicaCommand)
         FleetDbFalkordbReplicaCommand::Plan { to, primary } => {
             let plan = build_plan(pool, &to, &primary).await?;
             println!(
-                "{CYAN}FalkorDB replica plan (read-only; no promotion/failover/read routing){RESET}\n  target: {} ({})\n  primary authority: {} ({}:{PRIMARY_PORT})\n  replica endpoint: 127.0.0.1:{REPLICA_PORT}\n  immutable image: {FALKORDB_IMAGE}\n  daemon image id: {}\n  graphs: {} (complete deterministic hashes)\n  restore-proven distributed backup: {} (drill {})\n  source firewall: exact target allow + IPv4 deny + IPv6 INPUT/FORWARD deny + Docker-persistent unit\n  target state: {:?}\n  plan-id: {}\n\nApply with:\n  ff fleet db falkordb-replica apply --to {} --primary {} --plan-id {} --yes",
+                "{CYAN}FalkorDB replica plan (read-only; no promotion/failover/read routing){RESET}\n  target: {} ({})\n  primary authority: {} ({}:{PRIMARY_PORT})\n  replica endpoint: 127.0.0.1:{REPLICA_PORT}\n  immutable image: {FALKORDB_IMAGE}\n  primary daemon image id: {}\n  target daemon image id: {}\n  graphs: {} (complete deterministic hashes)\n  restore-proven distributed backup: {} (drill {})\n  source firewall: exact target allow + IPv4 deny + IPv6 INPUT/FORWARD deny + Docker-persistent unit\n  target state: {:?}\n  plan-id: {}\n\nApply with:\n  ff fleet db falkordb-replica apply --to {} --primary {} --plan-id {} --yes",
                 plan.material.target_name,
                 plan.material.target_id,
                 plan.material.primary_name,
                 plan.material.primary_ip,
-                plan.material.image_id,
+                plan.material.primary_image_id,
+                plan.material.target_image_id,
                 plan.material.graphs.len(),
                 plan.material.backup.backup_id,
                 plan.material.backup.drill_id,
@@ -2760,6 +2774,7 @@ mod tests {
             checksum_sha256: "a".repeat(64),
             size_bytes: 7040,
             drill_id: Uuid::from_u128(11),
+            restore_image_id: format!("sha256:{}", "9".repeat(64)),
             created_at: DateTime::parse_from_rfc3339("2026-08-05T00:34:49Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -2783,7 +2798,7 @@ mod tests {
         );
         Plan {
             material: PlanMaterial {
-                version: "falkordb-replica-plan-v2",
+                version: "falkordb-replica-plan-v3",
                 target_id: Uuid::from_u128(1),
                 target_name: "sophie".into(),
                 target_ip: "192.168.5.103".into(),
@@ -2802,7 +2817,10 @@ mod tests {
                 backup: backup(),
                 target_state: TargetState::Absent,
                 image: FALKORDB_IMAGE,
-                image_id: format!("sha256:{}", "d".repeat(64)),
+                primary_image_id: format!("sha256:{}", "d".repeat(64)),
+                primary_image_repo_digests: vec![FALKORDB_IMAGE.into()],
+                target_image_id: format!("sha256:{}", "e".repeat(64)),
+                target_image_repo_digests: vec![FALKORDB_IMAGE.into()],
                 image_user: String::new(),
                 primary_port: PRIMARY_PORT,
                 replica_port: REPLICA_PORT,
@@ -2855,10 +2873,111 @@ mod tests {
         };
         assert_ne!(backup_changed, plan.id());
         let state_changed = plan.id();
-        plan.material.image_id = format!("sha256:{}", "e".repeat(64));
+        plan.material.primary_image_id = format!("sha256:{}", "f".repeat(64));
         assert_ne!(state_changed, plan.id());
+        let primary_image_changed = plan.id();
+        plan.material.target_image_id = format!("sha256:{}", "a".repeat(64));
+        assert_ne!(primary_image_changed, plan.id());
         assert!(validate_plan_id(&plan, &plan.id()).is_ok());
         assert!(validate_plan_id(&plan, &state_changed).is_err());
+    }
+
+    #[test]
+    fn plan_id_binds_version_and_each_cross_daemon_image_identity() {
+        let original = plan();
+        let id = original.id();
+
+        let mut changed = original.clone();
+        changed.material.version = "falkordb-replica-plan-v2";
+        assert_ne!(id, changed.id());
+
+        let mut changed = original.clone();
+        changed.material.primary_image_id = format!("sha256:{}", "1".repeat(64));
+        assert_ne!(id, changed.id());
+
+        let mut changed = original.clone();
+        changed.material.target_image_id = format!("sha256:{}", "2".repeat(64));
+        assert_ne!(id, changed.id());
+
+        let mut changed = original.clone();
+        changed.material.primary_image_repo_digests = vec!["changed-primary".into()];
+        assert_ne!(id, changed.id());
+
+        let mut changed = original;
+        changed.material.target_image_repo_digests = vec!["changed-target".into()];
+        assert_ne!(id, changed.id());
+    }
+
+    fn target_attestation(plan: &Plan) -> TargetAttestation {
+        TargetAttestation {
+            docker_version: "29.6.0".into(),
+            image_id: plan.material.target_image_id.clone(),
+            image_repo_digests: plan.material.target_image_repo_digests.clone(),
+            image_user: plan.material.image_user.clone(),
+            container: None,
+            volume_present: false,
+            ram_bytes: 32 * 1024 * 1024 * 1024,
+            disk_free_bytes: 100 * 1024 * 1024 * 1024,
+            replica_port_listeners: 0,
+            replica_port_non_loopback: 0,
+        }
+    }
+
+    #[test]
+    fn cross_daemon_local_ids_pass_but_each_daemon_drift_fails() {
+        let plan = plan();
+        assert_ne!(
+            plan.material.primary_image_id,
+            plan.material.target_image_id
+        );
+        let primary = ImageEvidence {
+            image_id: plan.material.primary_image_id.clone(),
+            repo_digests: plan.material.primary_image_repo_digests.clone(),
+            configured_user: plan.material.image_user.clone(),
+        };
+        let target = target_attestation(&plan);
+        validate_image_evidence(&primary).unwrap();
+        validate_image_evidence(&ImageEvidence {
+            image_id: target.image_id.clone(),
+            repo_digests: target.image_repo_digests.clone(),
+            configured_user: target.image_user.clone(),
+        })
+        .unwrap();
+        validate_primary_plan_image(&plan, &primary).unwrap();
+        validate_plan_image(&plan, &target).unwrap();
+
+        let mut changed = primary.clone();
+        changed.image_id = format!("sha256:{}", "3".repeat(64));
+        assert!(validate_primary_plan_image(&plan, &changed).is_err());
+        let mut changed = primary.clone();
+        changed.repo_digests = vec!["changed-primary".into()];
+        assert!(validate_primary_plan_image(&plan, &changed).is_err());
+        let mut changed = primary;
+        changed.configured_user = "1000:1000".into();
+        assert!(validate_primary_plan_image(&plan, &changed).is_err());
+
+        let mut changed = target.clone();
+        changed.image_id = format!("sha256:{}", "4".repeat(64));
+        assert!(validate_plan_image(&plan, &changed).is_err());
+        let mut changed = target.clone();
+        changed.image_repo_digests = vec!["changed-target".into()];
+        assert!(validate_plan_image(&plan, &changed).is_err());
+        let mut changed = target;
+        changed.image_user = "1000:1000".into();
+        assert!(validate_plan_image(&plan, &changed).is_err());
+
+        let mut changed_plan = plan;
+        changed_plan.material.image = "falkordb/falkordb:latest";
+        assert!(validate_primary_plan_image(&changed_plan, &primary_image(&changed_plan)).is_err());
+        assert!(validate_plan_image(&changed_plan, &target_attestation(&changed_plan)).is_err());
+    }
+
+    fn primary_image(plan: &Plan) -> ImageEvidence {
+        ImageEvidence {
+            image_id: plan.material.primary_image_id.clone(),
+            repo_digests: plan.material.primary_image_repo_digests.clone(),
+            configured_user: plan.material.image_user.clone(),
+        }
     }
 
     #[test]
@@ -2868,15 +2987,41 @@ mod tests {
             format!("IMAGE={image_id}\nIMAGE_REPO_DIGESTS=[\"{FALKORDB_IMAGE}\"]\nIMAGE_USER=\n");
         assert_eq!(parse_image_evidence(&raw).unwrap().image_id, image_id);
         assert!(parse_image_evidence(&raw.replace(FALKORDB_IMAGE, "falkordb:latest")).is_err());
+        assert!(parse_image_evidence(&raw.replace(
+            &format!("[\"{FALKORDB_IMAGE}\"]"),
+            &format!("[\"{FALKORDB_IMAGE}\",\"{FALKORDB_IMAGE}\"]"),
+        ))
+        .is_err());
+        assert!(
+            parse_image_evidence(&raw.replace(&format!("[\"{FALKORDB_IMAGE}\"]"), "[]",)).is_err()
+        );
+        assert!(
+            parse_image_evidence(&raw.replace(&format!("[\"{FALKORDB_IMAGE}\"]"), "null",))
+                .is_err()
+        );
         assert!(parse_image_evidence(&raw.replace("sha256:dddd", "sha256:DDDD")).is_err());
         assert!(parse_image_evidence(&format!("{raw}IMAGE={image_id}\n")).is_err());
+
+        let alias = format!("example.invalid/falkor@sha256:{}", "1".repeat(64));
+        let first = raw.replace(
+            &format!("[\"{FALKORDB_IMAGE}\"]"),
+            &format!("[\"{alias}\",\"{FALKORDB_IMAGE}\"]"),
+        );
+        let second = raw.replace(
+            &format!("[\"{FALKORDB_IMAGE}\"]"),
+            &format!("[\"{FALKORDB_IMAGE}\",\"{alias}\"]"),
+        );
+        assert_eq!(
+            parse_image_evidence(&first).unwrap(),
+            parse_image_evidence(&second).unwrap()
+        );
     }
 
     #[test]
     fn status_topology_rejects_stale_cached_or_nonhealthy_state() {
         let mut plan = plan();
         plan.material.target_state = TargetState::ExactHealthy {
-            image_id: plan.material.image_id.clone(),
+            image_id: plan.material.target_image_id.clone(),
         };
         assert!(validate_status_topology(
             "replica",
@@ -3021,41 +3166,48 @@ mod tests {
             "observed_graph_nodes": 56
         });
         let detail = format!("restore drill passed; receipt={receipt}; capacity=ok");
-        let expected_image_id = format!("sha256:{}", "b".repeat(64));
-        restore_receipt(&detail, &"a".repeat(64), &expected_image_id).unwrap();
+        assert_eq!(
+            restore_receipt(&detail, &"a".repeat(64)).unwrap(),
+            format!("sha256:{}", "b".repeat(64))
+        );
         let production_detail = format!(
             "restore drill passed; receipt={receipt}; capacity required=10 available=20 bytes; policy encrypted_max=30 extracted_max=40 effective_extracted=50 files_max=60 expansion_ratio=70 reserve=80"
         );
-        restore_receipt(&production_detail, &"a".repeat(64), &expected_image_id).unwrap();
-        assert!(restore_receipt(&detail, &"c".repeat(64), &expected_image_id).is_err());
+        restore_receipt(&production_detail, &"a".repeat(64)).unwrap();
+        assert!(restore_receipt(&detail, &"c".repeat(64)).is_err());
+        assert!(restore_receipt(
+            &detail.replace(
+                &format!("sha256:{}", "b".repeat(64)),
+                &format!("sha256:{}", "c".repeat(64)),
+            ),
+            &"a".repeat(64),
+        )
+        .is_ok());
+        assert!(restore_receipt(
+            &detail.replace(
+                &format!("sha256:{}", "b".repeat(64)),
+                "sha256:NOT-CANONICAL",
+            ),
+            &"a".repeat(64),
+        )
+        .is_err());
         assert!(restore_receipt(
             &detail.replace(FALKORDB_IMAGE, "falkordb:latest"),
             &"a".repeat(64),
-            &expected_image_id,
         )
         .is_err());
-        assert!(restore_receipt(
-            &format!("prefixed {detail}"),
-            &"a".repeat(64),
-            &expected_image_id,
-        )
-        .is_err());
-        assert!(restore_receipt(
-            &format!("{detail}; receipt={receipt}"),
-            &"a".repeat(64),
-            &expected_image_id,
-        )
-        .is_err());
+        assert!(restore_receipt(&format!("prefixed {detail}"), &"a".repeat(64),).is_err());
+        assert!(
+            restore_receipt(&format!("{detail}; receipt={receipt}"), &"a".repeat(64),).is_err()
+        );
         assert!(restore_receipt(
             &detail.replace("\"proof\":", "\"proof\":\"duplicate\",\"proof\":"),
             &"a".repeat(64),
-            &expected_image_id,
         )
         .is_err());
         assert!(restore_receipt(
             &detail.replace("\"proof\":", "\"unknown\":true,\"proof\":"),
             &"a".repeat(64),
-            &expected_image_id,
         )
         .is_err());
     }
