@@ -1209,6 +1209,22 @@ impl BackupOrchestrator {
         &self,
         cfg: &BackupKindConfig,
     ) -> Result<Vec<String>, BackupError> {
+        // The deferred rsync runs later and trusts this archive as immutable.
+        // Prove its custody invariants before even consulting destination or
+        // coalescing state: an invalid source must enqueue exactly zero work.
+        let backup_root = self.backup_dir.clone();
+        let custody =
+            tokio::task::spawn_blocking(move || validate_postgres_wal_archive_source(&backup_root))
+                .await
+                .map_err(|e| {
+                    BackupError::Cmd(format!("WAL archive custody verifier failed: {e}"))
+                })??;
+        debug!(
+            segments = custody.segments,
+            auxiliary_files = custody.auxiliary_files,
+            "Postgres WAL archive source custody verified"
+        );
+
         let row =
             sqlx::query("SELECT primary_ip, COALESCE(ssh_user, 'root') AS ssh_user FROM computers WHERE id = $1")
                 .bind(self.my_computer_id)
@@ -2044,12 +2060,42 @@ fn is_kind_backup_file(kind: &str, name: &str) -> bool {
     }
 }
 
-fn is_postgres_wal_archive_name(name: &str) -> bool {
-    if let Some(timeline) = name.strip_suffix(".history") {
-        return timeline.len() == 8 && timeline.chars().all(|c| c.is_ascii_hexdigit());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresWalArchiveEntryKind {
+    Segment,
+    History,
+    Backup,
+}
+
+fn is_postgres_archive_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
+fn postgres_wal_archive_entry_kind(name: &str) -> Option<PostgresWalArchiveEntryKind> {
+    if is_postgres_archive_hex(name, 24) {
+        return Some(PostgresWalArchiveEntryKind::Segment);
     }
-    let base = name.strip_suffix(".backup").unwrap_or(name);
-    (base.len() == 24 || base.len() == 40) && base.chars().all(|c| c.is_ascii_hexdigit())
+    if let Some(timeline) = name.strip_suffix(".history") {
+        return is_postgres_archive_hex(timeline, 8)
+            .then_some(PostgresWalArchiveEntryKind::History);
+    }
+    let backup = name.strip_suffix(".backup")?;
+    let (segment, offset) = backup.split_once('.')?;
+    if backup.matches('.').count() == 1
+        && is_postgres_archive_hex(segment, 24)
+        && is_postgres_archive_hex(offset, 8)
+    {
+        Some(PostgresWalArchiveEntryKind::Backup)
+    } else {
+        None
+    }
+}
+
+fn is_postgres_wal_archive_name(name: &str) -> bool {
+    postgres_wal_archive_entry_kind(name).is_some()
 }
 
 /// On-disk folder name for a kind under `~/.forgefleet/backups/`. The
@@ -2646,30 +2692,80 @@ fn validate_backup_component(label: &str, value: &str) -> Result<(), BackupError
     )))
 }
 
+const POSTGRES_WAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+const POSTGRES_WAL_DIRECTORY_MODE: u32 = 0o2770;
+const POSTGRES_WAL_FILE_MODE: u32 = 0o640;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalArchiveCustodyEvidence {
+    segments: usize,
+    auxiliary_files: usize,
+}
+
 #[cfg(unix)]
-fn open_backup_artifact(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixCustodyState {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mode: u32,
+    nlink: u64,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn unix_custody_state(metadata: &std::fs::Metadata) -> UnixCustodyState {
+    use std::os::unix::fs::MetadataExt;
+
+    UnixCustodyState {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.size(),
+        mode: metadata.mode(),
+        nlink: metadata.nlink(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_at(
+    parent: std::os::fd::RawFd,
+    component: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn open_backup_kind_directory(
     backup_root: &Path,
     kind_dir_name: &str,
-    file_name: &str,
 ) -> Result<std::fs::File, BackupError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-
-    fn open_dir_at(parent: RawFd, component: &CString) -> std::io::Result<std::fs::File> {
-        let fd = unsafe {
-            libc::openat(
-                parent,
-                component.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if fd < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-        }
-    }
 
     let root_c = CString::new(backup_root.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
@@ -2687,11 +2783,311 @@ fn open_backup_artifact(
         return Err(std::io::Error::last_os_error().into());
     }
     let root = unsafe { std::fs::File::from_raw_fd(root_fd) };
-
     let kind_c = CString::new(kind_dir_name).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "kind contains a NUL byte")
     })?;
-    let kind = open_dir_at(root.as_raw_fd(), &kind_c)?;
+    open_directory_at(root.as_raw_fd(), &kind_c).map_err(BackupError::from)
+}
+
+#[cfg(unix)]
+fn open_file_at(
+    directory: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    nonblocking: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if nonblocking {
+        // A malicious FIFO must be rejected from metadata, not hang the
+        // blocking verifier while waiting for a writer.
+        flags |= libc::O_NONBLOCK;
+    }
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reset_readdir_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn reset_readdir_errno() {
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn reset_readdir_errno() {}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn readdir_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn readdir_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn readdir_errno() -> i32 {
+    0
+}
+
+#[cfg(unix)]
+fn descriptor_directory_names(directory: &std::fs::File) -> std::io::Result<Vec<String>> {
+    use std::ffi::CStr;
+    use std::os::fd::IntoRawFd;
+
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    let duplicate = duplicate_artifact(directory)?;
+    let duplicate_fd = duplicate.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(duplicate_fd) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate_fd) };
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        reset_readdir_errno();
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let errno = readdir_errno();
+            if errno != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(name).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL archive contains a non-UTF-8 entry name",
+            )
+        })?;
+        names.push(name.to_string());
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn wal_custody_rejection(reason: impl Into<String>) -> BackupError {
+    BackupError::Cmd(format!(
+        "Postgres WAL archive source rejected: {}",
+        reason.into()
+    ))
+}
+
+#[cfg(unix)]
+fn validate_wal_entry_custody(
+    name: &str,
+    kind: PostgresWalArchiveEntryKind,
+    state: UnixCustodyState,
+    directory_state: UnixCustodyState,
+) -> Result<(), BackupError> {
+    // Darwin's libc exposes mode_t/S_IF* as u16 while MetadataExt::mode is
+    // u32; normalize the constants so this stays source-compatible on macOS.
+    if state.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} is not a regular file"
+        )));
+    }
+    if state.nlink != 1 {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} must have exactly one link"
+        )));
+    }
+    if state.uid != directory_state.uid || state.gid != directory_state.gid {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} ownership differs from archive directory"
+        )));
+    }
+    if state.mode & 0o7777 != POSTGRES_WAL_FILE_MODE {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} mode must be {POSTGRES_WAL_FILE_MODE:#05o}"
+        )));
+    }
+    match kind {
+        PostgresWalArchiveEntryKind::Segment if state.size != POSTGRES_WAL_SEGMENT_BYTES => {
+            Err(wal_custody_rejection(format!(
+                "WAL segment {name} must be exactly {POSTGRES_WAL_SEGMENT_BYTES} bytes"
+            )))
+        }
+        PostgresWalArchiveEntryKind::History | PostgresWalArchiveEntryKind::Backup
+            if state.size == 0 || state.size > POSTGRES_WAL_SEGMENT_BYTES =>
+        {
+            Err(wal_custody_rejection(format!(
+                "auxiliary WAL entry {name} must be nonempty and at most {POSTGRES_WAL_SEGMENT_BYTES} bytes"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn validate_postgres_wal_archive_source_with_hook<F>(
+    backup_root: &Path,
+    before_recheck: F,
+) -> Result<WalArchiveCustodyEvidence, BackupError>
+where
+    F: FnOnce(),
+{
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    struct ValidatedEntry {
+        name: String,
+        state: UnixCustodyState,
+    }
+
+    let directory =
+        open_backup_kind_directory(backup_root, kind_dir("postgres_wal")).map_err(|e| {
+            wal_custody_rejection(format!(
+                "archive directory is not a real no-follow directory: {e}"
+            ))
+        })?;
+    let directory_metadata = directory.metadata()?;
+    if !directory_metadata.file_type().is_dir() {
+        return Err(wal_custody_rejection(
+            "archive descriptor is not a directory",
+        ));
+    }
+    let directory_state = unix_custody_state(&directory_metadata);
+    if directory_state.mode & 0o7777 != POSTGRES_WAL_DIRECTORY_MODE {
+        return Err(wal_custody_rejection(format!(
+            "archive directory mode must be {POSTGRES_WAL_DIRECTORY_MODE:#06o}"
+        )));
+    }
+
+    let names = descriptor_directory_names(&directory)
+        .map_err(|e| wal_custody_rejection(format!("cannot enumerate archive descriptor: {e}")))?;
+    if names.is_empty() {
+        return Err(wal_custody_rejection("archive directory is empty"));
+    }
+
+    let mut entries = Vec::with_capacity(names.len());
+    let mut segments = 0usize;
+    let mut auxiliary_files = 0usize;
+    for name in names {
+        let Some(kind) = postgres_wal_archive_entry_kind(&name) else {
+            // Do not echo an untrusted filename into logs or task output.
+            return Err(wal_custody_rejection(
+                "archive contains a non-canonical PostgreSQL entry name",
+            ));
+        };
+        let c_name = CString::new(name.as_bytes()).map_err(|_| {
+            wal_custody_rejection("canonical archive entry unexpectedly contains NUL")
+        })?;
+        let file = open_file_at(directory.as_raw_fd(), &c_name, true).map_err(|e| {
+            wal_custody_rejection(format!(
+                "canonical entry {name} cannot be opened safely: {e}"
+            ))
+        })?;
+        let metadata = file.metadata()?;
+        let state = unix_custody_state(&metadata);
+        validate_wal_entry_custody(&name, kind, state, directory_state)?;
+        if kind == PostgresWalArchiveEntryKind::Segment {
+            segments += 1;
+        } else {
+            auxiliary_files += 1;
+        }
+        // Do not hold one descriptor per retained WAL segment: the source
+        // normally carries thousands and may legitimately exceed RLIMIT_NOFILE.
+        // The final descriptor-relative re-open below proves identity/state
+        // again while keeping descriptor use constant.
+        entries.push(ValidatedEntry { name, state });
+    }
+    if segments == 0 {
+        return Err(wal_custody_rejection(
+            "archive contains no complete WAL segment",
+        ));
+    }
+
+    before_recheck();
+
+    for entry in &entries {
+        let c_name = CString::new(entry.name.as_bytes()).map_err(|_| {
+            wal_custody_rejection("canonical archive entry unexpectedly contains NUL")
+        })?;
+        let reopened = open_file_at(directory.as_raw_fd(), &c_name, true).map_err(|e| {
+            wal_custody_rejection(format!(
+                "canonical entry {} changed before re-open: {e}",
+                entry.name
+            ))
+        })?;
+        if unix_custody_state(&reopened.metadata()?) != entry.state {
+            return Err(wal_custody_rejection(format!(
+                "canonical entry {} was replaced or mutated during validation",
+                entry.name
+            )));
+        }
+    }
+    if unix_custody_state(&directory.metadata()?) != directory_state {
+        return Err(wal_custody_rejection(
+            "archive directory mutated during validation",
+        ));
+    }
+
+    Ok(WalArchiveCustodyEvidence {
+        segments,
+        auxiliary_files,
+    })
+}
+
+fn validate_postgres_wal_archive_source(
+    backup_root: &Path,
+) -> Result<WalArchiveCustodyEvidence, BackupError> {
+    #[cfg(unix)]
+    {
+        validate_postgres_wal_archive_source_with_hook(backup_root, || {})
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = backup_root;
+        Err(BackupError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-safe WAL archive verification requires Unix",
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn open_backup_artifact(
+    backup_root: &Path,
+    kind_dir_name: &str,
+    file_name: &str,
+) -> Result<std::fs::File, BackupError> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let kind = open_backup_kind_directory(backup_root, kind_dir_name)?;
 
     let file_c = CString::new(file_name).map_err(|_| {
         std::io::Error::new(
@@ -2699,17 +3095,7 @@ fn open_backup_artifact(
             "file_name contains a NUL byte",
         )
     })?;
-    let file_fd = unsafe {
-        libc::openat(
-            kind.as_raw_fd(),
-            file_c.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if file_fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+    let file = open_file_at(kind.as_raw_fd(), &file_c, false)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(BackupError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -3279,6 +3665,37 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    const WAL_SEGMENT_A: &str = "0000000100000000000000A1";
+    #[cfg(unix)]
+    const WAL_SEGMENT_B: &str = "0000000100000000000000A2";
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn sparse_file(path: &Path, size: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(size).unwrap();
+        set_mode(path, POSTGRES_WAL_FILE_MODE);
+    }
+
+    #[cfg(unix)]
+    fn wal_archive_fixture(with_segment: bool) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join(kind_dir("postgres_wal"));
+        std::fs::create_dir(&archive).unwrap();
+        set_mode(&archive, POSTGRES_WAL_DIRECTORY_MODE);
+        if with_segment {
+            sparse_file(&archive.join(WAL_SEGMENT_A), POSTGRES_WAL_SEGMENT_BYTES);
+        }
+        (root, archive)
+    }
+
+    #[cfg(unix)]
     fn write_verifier_fixture(
         kind: &str,
         file_name: &str,
@@ -3290,6 +3707,194 @@ mod tests {
         std::fs::write(dir.join(file_name), bytes).unwrap();
         let expected = format!("{:x}", Sha256::digest(bytes));
         (root, expected)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_accepts_canonical_archive() {
+        let (root, archive) = wal_archive_fixture(true);
+        sparse_file(&archive.join("00000002.history"), 1);
+        sparse_file(
+            &archive.join("0000000100000000000000A1.00000020.backup"),
+            512,
+        );
+
+        let evidence = validate_postgres_wal_archive_source(root.path()).unwrap();
+        assert_eq!(evidence.segments, 1);
+        assert_eq!(evidence.auxiliary_files, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_keeps_descriptor_use_bounded() {
+        // Priya retains thousands of segments. Exceed a common 1024-FD limit
+        // so this test catches implementations that hold every entry open.
+        let (root, archive) = wal_archive_fixture(false);
+        for index in 0..1_100u32 {
+            sparse_file(
+                &archive.join(format!("{index:024X}")),
+                POSTGRES_WAL_SEGMENT_BYTES,
+            );
+        }
+        let evidence = validate_postgres_wal_archive_source(root.path()).unwrap();
+        assert_eq!(evidence.segments, 1_100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_empty_and_no_segment_archives() {
+        let (empty_root, _) = wal_archive_fixture(false);
+        assert!(validate_postgres_wal_archive_source(empty_root.path()).is_err());
+
+        let (history_root, history_archive) = wal_archive_fixture(false);
+        sparse_file(&history_archive.join("00000002.history"), 1);
+        assert!(validate_postgres_wal_archive_source(history_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_wrong_directory_or_file_modes() {
+        let (directory_root, directory_archive) = wal_archive_fixture(true);
+        set_mode(&directory_archive, 0o770);
+        assert!(validate_postgres_wal_archive_source(directory_root.path()).is_err());
+
+        let (file_root, file_archive) = wal_archive_fixture(true);
+        set_mode(&file_archive.join(WAL_SEGMENT_A), 0o600);
+        assert!(validate_postgres_wal_archive_source(file_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_unexpected_and_wrong_size_entries() {
+        let (unexpected_root, unexpected_archive) = wal_archive_fixture(true);
+        sparse_file(&unexpected_archive.join("WAL.tmp"), 1);
+        assert!(validate_postgres_wal_archive_source(unexpected_root.path()).is_err());
+
+        let (segment_root, segment_archive) = wal_archive_fixture(true);
+        sparse_file(
+            &segment_archive.join(WAL_SEGMENT_A),
+            POSTGRES_WAL_SEGMENT_BYTES - 1,
+        );
+        assert!(validate_postgres_wal_archive_source(segment_root.path()).is_err());
+
+        let (aux_root, aux_archive) = wal_archive_fixture(true);
+        sparse_file(&aux_archive.join("00000002.history"), 0);
+        assert!(validate_postgres_wal_archive_source(aux_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_non_utf8_name_without_echoing_it() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (root, archive) = wal_archive_fixture(true);
+        let unsafe_name = std::ffi::OsString::from_vec(vec![b'W', b'A', b'L', 0xff]);
+        sparse_file(&archive.join(unsafe_name), 1);
+        let error = validate_postgres_wal_archive_source(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8 entry name"));
+        assert!(!error.contains(char::REPLACEMENT_CHARACTER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_symlink_directory_and_entries() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let linked_root = tempfile::tempdir().unwrap();
+        symlink(
+            outside.path(),
+            linked_root.path().join(kind_dir("postgres_wal")),
+        )
+        .unwrap();
+        assert!(validate_postgres_wal_archive_source(linked_root.path()).is_err());
+
+        let (entry_root, entry_archive) = wal_archive_fixture(true);
+        symlink(WAL_SEGMENT_A, entry_archive.join(WAL_SEGMENT_B)).unwrap();
+        assert!(validate_postgres_wal_archive_source(entry_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_hardlink_and_non_regular_entries() {
+        let (link_root, link_archive) = wal_archive_fixture(true);
+        std::fs::hard_link(
+            link_archive.join(WAL_SEGMENT_A),
+            link_archive.join(WAL_SEGMENT_B),
+        )
+        .unwrap();
+        assert!(validate_postgres_wal_archive_source(link_root.path()).is_err());
+
+        let (directory_root, directory_archive) = wal_archive_fixture(true);
+        std::fs::create_dir(directory_archive.join(WAL_SEGMENT_B)).unwrap();
+        assert!(validate_postgres_wal_archive_source(directory_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_checks_directory_ownership_match() {
+        let (root, archive) = wal_archive_fixture(true);
+        let directory = open_backup_kind_directory(root.path(), kind_dir("postgres_wal")).unwrap();
+        let directory_state = unix_custody_state(&directory.metadata().unwrap());
+        let file = std::fs::File::open(archive.join(WAL_SEGMENT_A)).unwrap();
+        let mut file_state = unix_custody_state(&file.metadata().unwrap());
+        file_state.uid = file_state.uid.wrapping_add(1);
+        assert!(validate_wal_entry_custody(
+            WAL_SEGMENT_A,
+            PostgresWalArchiveEntryKind::Segment,
+            file_state,
+            directory_state,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_file_and_directory_mutation() {
+        let (file_root, file_archive) = wal_archive_fixture(true);
+        let segment = file_archive.join(WAL_SEGMENT_A);
+        let file_error = validate_postgres_wal_archive_source_with_hook(file_root.path(), || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&segment)
+                .unwrap()
+                .set_len(POSTGRES_WAL_SEGMENT_BYTES - 1)
+                .unwrap();
+        });
+        assert!(file_error.is_err());
+
+        let (directory_root, directory_archive) = wal_archive_fixture(true);
+        let directory_error =
+            validate_postgres_wal_archive_source_with_hook(directory_root.path(), || {
+                sparse_file(&directory_archive.join("00000002.history"), 1);
+            });
+        assert!(directory_error.is_err());
+    }
+
+    #[test]
+    fn wal_distribution_custody_gate_precedes_every_database_operation() {
+        let source = include_str!("backup.rs");
+        let method = source
+            .split_once("async fn enqueue_wal_archive_distribution(")
+            .unwrap()
+            .1;
+        let gate = method.find("validate_postgres_wal_archive_source").unwrap();
+        let first_sql = method.find("sqlx::query").unwrap();
+        let first_enqueue = method.find("pg_enqueue_deferred_delayed").unwrap();
+        assert!(gate < first_sql);
+        assert!(gate < first_enqueue);
+    }
+
+    #[test]
+    fn postgres_wal_compose_custody_invariants_are_static() {
+        let compose = include_str!("../../../../deploy/docker-compose.yml");
+        let lines: Vec<_> = compose.lines().map(str::trim).collect();
+        assert!(lines.contains(&"- ${HOME}/.forgefleet/backups/postgres-wal:/wal_archive"));
+        assert!(lines.contains(
+            &"- \"archive_command=test -f /wal_archive/%f || install -m 0640 %p /wal_archive/%f\""
+        ));
     }
 
     #[test]
@@ -4034,9 +4639,16 @@ mod tests {
     fn postgres_wal_archive_name_guard_is_narrow() {
         assert!(is_postgres_wal_archive_name("0000000100000000000000A1"));
         assert!(is_postgres_wal_archive_name(
-            "0000000100000000000000A1.backup"
+            "0000000100000000000000A1.00000020.backup"
         ));
         assert!(is_postgres_wal_archive_name("00000002.history"));
+        assert!(!is_postgres_wal_archive_name(
+            "0000000100000000000000A100000020"
+        ));
+        assert!(!is_postgres_wal_archive_name(
+            "0000000100000000000000A1.backup"
+        ));
+        assert!(!is_postgres_wal_archive_name("0000000100000000000000a1"));
         assert!(!is_postgres_wal_archive_name("README"));
         assert!(!is_postgres_wal_archive_name(
             "pg-20260720T000000Z.tar.gz.age"
