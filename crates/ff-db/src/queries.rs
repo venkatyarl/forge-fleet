@@ -1964,8 +1964,21 @@ pub async fn pg_pick_agent_endpoint(
     min_ctx: i32,
     exclude_hosts: &[String],
 ) -> Result<Option<RouteCandidate>> {
+    pg_pick_agent_endpoint_for_workload(pool, min_ctx, None, exclude_hosts).await
+}
+
+/// Pick an agent-capable deployment while optionally requiring a canonical
+/// workload. This is the workload-aware form used by code crews: it keeps the
+/// same tool-calling, context, freshness, and load filters as the general
+/// agent picker instead of introducing a parallel routing path.
+pub async fn pg_pick_agent_endpoint_for_workload(
+    pool: &PgPool,
+    min_ctx: i32,
+    workload: Option<&str>,
+    exclude_hosts: &[String],
+) -> Result<Option<RouteCandidate>> {
     let filter = RouteFilter {
-        workload: None,
+        workload: workload.map(str::to_string),
         require_tool_calling: true,
         min_ctx: Some(min_ctx),
         exclude_hosts: exclude_hosts.to_vec(),
@@ -2005,16 +2018,31 @@ pub async fn pg_pick_agent_endpoint_soft(
     min_ctx: i32,
     soft_exclude: &[String],
 ) -> Result<(Option<RouteCandidate>, bool)> {
+    pg_pick_agent_endpoint_for_workload_soft(pool, min_ctx, None, soft_exclude).await
+}
+
+/// Workload-aware soft-exclude picker. The workload is a hard capability
+/// requirement in both passes; only the host exclusion is softened.
+pub async fn pg_pick_agent_endpoint_for_workload_soft(
+    pool: &PgPool,
+    min_ctx: i32,
+    workload: Option<&str>,
+    soft_exclude: &[String],
+) -> Result<(Option<RouteCandidate>, bool)> {
     if soft_exclude.is_empty() {
-        return Ok((pg_pick_agent_endpoint(pool, min_ctx, &[]).await?, false));
+        return Ok((
+            pg_pick_agent_endpoint_for_workload(pool, min_ctx, workload, &[]).await?,
+            false,
+        ));
     }
     // Pass 1: honor the preference.
-    let preferred = pg_pick_agent_endpoint(pool, min_ctx, soft_exclude).await?;
+    let preferred =
+        pg_pick_agent_endpoint_for_workload(pool, min_ctx, workload, soft_exclude).await?;
     if preferred.is_some() {
         return Ok((preferred, false));
     }
     // Pass 2: preference unsatisfiable — fall back to the full fleet.
-    let fallback = pg_pick_agent_endpoint(pool, min_ctx, &[]).await?;
+    let fallback = pg_pick_agent_endpoint_for_workload(pool, min_ctx, workload, &[]).await?;
     let used_excluded = soft_fallback_used(false, fallback.is_some());
     Ok((fallback, used_excluded))
 }
@@ -5782,10 +5810,21 @@ mod tests {
             .expect("route general request")
             .expect("general endpoint");
         assert_eq!(general.catalog_id.as_deref(), Some("near"));
+        let general_agent = pg_pick_agent_endpoint_for_workload(&pool, 16_384, None, &[])
+            .await
+            .expect("route general agent")
+            .expect("general agent endpoint");
+        assert_eq!(general_agent.catalog_id.as_deref(), Some("near"));
         assert!(
             pg_pick_offload_endpoint(&pool, 16_384, Some("code"), &[])
                 .await
                 .expect("route code without capable coder")
+                .is_none()
+        );
+        assert!(
+            pg_pick_agent_endpoint_for_workload(&pool, 16_384, Some("code-gen"), &[])
+                .await
+                .expect("route code agent without capable coder")
                 .is_none()
         );
 
@@ -5804,6 +5843,24 @@ mod tests {
             .expect("route capable code request")
             .expect("coder endpoint");
         assert_eq!(code.catalog_id.as_deref(), Some("mixed"));
+        let code_agent = pg_pick_agent_endpoint_for_workload(&pool, 16_384, Some("code-gen"), &[])
+            .await
+            .expect("route capable code agent")
+            .expect("code agent endpoint");
+        assert_eq!(code_agent.catalog_id.as_deref(), Some("mixed"));
+        let (soft_code_agent, used_soft_fallback) = pg_pick_agent_endpoint_for_workload_soft(
+            &pool,
+            16_384,
+            Some("code-gen"),
+            &["CODE-HOST".to_string()],
+        )
+        .await
+        .expect("soft-excluded code agent route");
+        assert!(used_soft_fallback);
+        assert_eq!(
+            soft_code_agent.and_then(|row| row.catalog_id),
+            Some("mixed".to_string())
+        );
         assert!(
             pg_pick_offload_endpoint(&pool, 16_384, Some("edits"), &["CODE-HOST".to_string()],)
                 .await

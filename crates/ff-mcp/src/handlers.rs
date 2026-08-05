@@ -2023,15 +2023,29 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     info!(task, repo_dir, project_id = ?project_id, "fleet_crew handler called");
 
     let started = Instant::now();
+    let (pattern, strategy, decomposed) = TemplateDecomposer::decompose(task);
     // Build the crew from the V112 `fleet_agents` catalog, routing each agent
     // through the agent-swarm capability router. Falls back to the hardcoded
     // TeamTemplates when the catalog / DB is unavailable (back-compat).
     let (team, crew_routing) = build_crew_team(applied_policy.as_ref()).await?;
+    // The handler's transport-only unit tests inject a loopback mock endpoint
+    // while deliberately making the fleet config invalid. Production builds
+    // never allow that unverified bypass.
+    let allow_unverified_test_endpoint = cfg!(test) && llm_base_url.is_some();
+    if decomposed
+        .iter()
+        .any(|subtask| crew_subtask_requires_code_model(subtask.task_type))
+        && crew_routing.used_template_fallback
+        && !allow_unverified_test_endpoint
+    {
+        return Err(format!(
+            "fleet_crew requires verified code-gen routing but the fleet agent catalog/router is unavailable"
+        ));
+    }
     let policy_notes = applied_policy
         .as_ref()
         .map(policy_notes_for_crew)
         .unwrap_or_default();
-    let (pattern, strategy, decomposed) = TemplateDecomposer::decompose(task);
     let decomposition = TemplateDecomposer::to_task_decomposition(task, &decomposed);
     let plan = Planner::plan(&decomposition)
         .map_err(|e| format!("failed to build execution plan: {e}"))?;
@@ -2055,6 +2069,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
             repo_dir,
             &subtask.title,
             &subtask.prompt,
+            decomposed_subtask.task_type,
             &assignment,
             &subtask.depends_on,
             if policy_notes.is_empty() {
@@ -2192,6 +2207,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let mut reviewer_failures = 0usize;
 
     let subtasks: Vec<Value> = decomposition
         .subtasks
@@ -2202,7 +2218,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
             let step_id = StepId::new(subtask.id.to_string());
             let step_result = run.results.get(&step_id);
 
-            let (status, output, error, attempts, duration_ms) = match step_result {
+            let (mut status, output, mut error, attempts, duration_ms) = match step_result {
                 Some(result) => {
                     let status = step_status_label(result.status);
                     match result.status {
@@ -2231,6 +2247,40 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 }
             };
 
+            let mut review_verdict = Value::Null;
+            if ds.task_type == SubTaskType::Review && status == "succeeded" {
+                match parse_crew_review_verdict(&output) {
+                    CrewReviewVerdict::Approve => {
+                        review_verdict = json!({"decision": "approve"});
+                    }
+                    CrewReviewVerdict::RequestChanges(reason) => {
+                        succeeded = succeeded.saturating_sub(1);
+                        failed += 1;
+                        reviewer_failures += 1;
+                        status = "review_rejected".to_string();
+                        error = Some(format!("reviewer requested changes: {reason}"));
+                        review_verdict = json!({
+                            "decision": "request_changes",
+                            "reason": reason
+                        });
+                    }
+                    CrewReviewVerdict::Invalid { tail } => {
+                        succeeded = succeeded.saturating_sub(1);
+                        failed += 1;
+                        reviewer_failures += 1;
+                        status = "review_invalid".to_string();
+                        error = Some(
+                            "reviewer response did not end with the required verdict contract"
+                                .to_string(),
+                        );
+                        review_verdict = json!({
+                            "decision": "invalid",
+                            "raw_tail": tail
+                        });
+                    }
+                }
+            }
+
             let step_json = json!({
                 "id": subtask.id,
                 "index": subtask.index,
@@ -2248,7 +2298,8 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 "attempts": attempts,
                 "duration_ms": duration_ms,
                 "output": output,
-                "error": error
+                "error": error,
+                "review_verdict": review_verdict
             });
 
             executed_steps.push(step_json.clone());
@@ -2267,15 +2318,17 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
         .collect();
 
     let total_steps = decomposition.subtasks.len();
-    let execution_status = if run.success { "completed" } else { "failed" };
+    let crew_success = run.success && reviewer_failures == 0;
+    let execution_status = if crew_success { "completed" } else { "failed" };
 
     let summary = json!({
         "total_steps": total_steps,
         "succeeded": succeeded,
         "failed": failed,
         "skipped": skipped,
-        "success": run.success,
-        "text": crew_summary_text(task, run.success, total_steps, succeeded, failed, skipped)
+        "success": crew_success,
+        "reviewer_failures": reviewer_failures,
+        "text": crew_summary_text(task, crew_success, total_steps, succeeded, failed, skipped)
     });
 
     let audit_details = json!({
@@ -3324,6 +3377,24 @@ impl CrewRouting {
     }
 }
 
+fn crew_role_workload(role: &AgentRole) -> Option<&'static str> {
+    match role {
+        AgentRole::Coder | AgentRole::Reviewer | AgentRole::Tester | AgentRole::Executor => {
+            Some("code-gen")
+        }
+        AgentRole::Researcher | AgentRole::Writer | AgentRole::Planner | AgentRole::Assistant => {
+            None
+        }
+    }
+}
+
+fn crew_subtask_requires_code_model(task_type: SubTaskType) -> bool {
+    matches!(
+        task_type,
+        SubTaskType::Code | SubTaskType::ToolUse | SubTaskType::Review
+    )
+}
+
 /// Build the crew [`TeamConfig`] from the V112 `fleet_agents` catalog. Each
 /// agent's endpoint is resolved through the agent-swarm capability router
 /// ([`ff_db::pg_pick_agent_endpoint`]) using the agent's `min_ctx`, so the
@@ -3380,9 +3451,15 @@ async fn build_crew_team(
     let mut built_any = false;
 
     for name in &names {
+        let expected_role = AgentAssignment::role_for_agent_name(name);
         let row = match ff_db::pg_get_agent(&pool, name).await {
             Ok(Some(r)) if r.enabled => r,
-            _ => continue, // missing/disabled — skip; fallback handles empties
+            _ if crew_role_workload(&expected_role).is_some() => {
+                return Err(format!(
+                    "fleet_crew required code agent {name:?} is missing or disabled"
+                ));
+            }
+            _ => continue,
         };
         let role = AgentAssignment::role_for_agent_name(&row.name);
         // Resolve the endpoint via the V111 capability router for this agent's
@@ -3391,10 +3468,20 @@ async fn build_crew_team(
         // default, so we record + log the degradation. A `true` fallback flag
         // means it had to use the leader (preference overridden) — recorded but
         // not degraded.
-        let (candidate, used_leader) =
-            ff_db::pg_pick_agent_endpoint_soft(&pool, row.min_ctx, &soft_exclude)
-                .await
-                .unwrap_or((None, false));
+        let required_workload = crew_role_workload(&role);
+        let (candidate, used_leader) = ff_db::pg_pick_agent_endpoint_for_workload_soft(
+            &pool,
+            row.min_ctx,
+            required_workload,
+            &soft_exclude,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "fleet_crew failed routing agent {:?} for workload {:?} with min_ctx {}: {error}",
+                row.name, required_workload, row.min_ctx
+            )
+        })?;
         if used_leader {
             routing.leader_fallbacks.push(row.name.clone());
         }
@@ -3412,6 +3499,12 @@ async fn build_crew_team(
                         )
                     })?;
                 (Some(endpoint), Some(model))
+            }
+            None if required_workload.is_some() => {
+                return Err(format!(
+                    "fleet_crew found no eligible endpoint for agent {:?}: required workload {:?}, tool_calling=true, min_ctx={}",
+                    row.name, required_workload, row.min_ctx
+                ));
             }
             None => (None, None),
         };
@@ -3599,6 +3692,7 @@ fn build_crew_step_prompt(
     repo_dir: &str,
     title: &str,
     subtask_prompt: &str,
+    task_type: SubTaskType,
     assignment: &AgentAssignment,
     depends_on: &[uuid::Uuid],
     policy_notes: Option<&str>,
@@ -3614,6 +3708,14 @@ fn build_crew_step_prompt(
     };
 
     let policy_block = policy_notes.unwrap_or("No project policy override.");
+    let review_contract = if task_type == SubTaskType::Review {
+        "\n\nReviewer verdict contract: your LAST non-empty line MUST be exactly one of:\n\
+         FF_REVIEW_VERDICT: APPROVE\n\
+         FF_REVIEW_VERDICT: REQUEST_CHANGES: <specific reason>\n\
+         Do not claim approval anywhere else. Missing or malformed verdicts fail closed."
+    } else {
+        ""
+    };
 
     format!(
         "Role: {role}\n\
@@ -3625,7 +3727,7 @@ fn build_crew_step_prompt(
          Project policy:\n{policy_block}\n\n\
          {system_prompt}\n\n\
          Subtask instructions:\n{subtask_prompt}\n\n\
-         Return concise, actionable output for the next step.",
+         Return concise, actionable output for the next step.{review_contract}",
         role = assignment.role,
         team_role = assignment.role,
         repo_dir = repo_dir,
@@ -3635,6 +3737,7 @@ fn build_crew_step_prompt(
         policy_block = policy_block,
         system_prompt = assignment.full_system_prompt(),
         subtask_prompt = subtask_prompt,
+        review_contract = review_contract,
     )
 }
 
@@ -3656,6 +3759,56 @@ fn step_status_label(status: StepStatus) -> String {
         StepStatus::TimedOut => "timed_out",
     }
     .to_string()
+}
+
+const CREW_REVIEW_TAIL_CHARS: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrewReviewVerdict {
+    Approve,
+    RequestChanges(String),
+    Invalid { tail: String },
+}
+
+fn bounded_review_tail(output: &str) -> String {
+    let mut chars = output
+        .chars()
+        .rev()
+        .take(CREW_REVIEW_TAIL_CHARS)
+        .collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+fn parse_crew_review_verdict(output: &str) -> CrewReviewVerdict {
+    let tail = bounded_review_tail(output);
+    let Some(line) = tail.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return CrewReviewVerdict::Invalid { tail };
+    };
+    let Some((marker, payload)) = line.trim().split_once(':') else {
+        return CrewReviewVerdict::Invalid { tail };
+    };
+    if !marker.trim().eq_ignore_ascii_case("FF_REVIEW_VERDICT") {
+        return CrewReviewVerdict::Invalid { tail };
+    }
+
+    let payload = payload.trim();
+    if payload
+        .trim_end_matches(['.', ';'])
+        .eq_ignore_ascii_case("APPROVE")
+    {
+        return CrewReviewVerdict::Approve;
+    }
+
+    let Some((decision, reason)) = payload.split_once(':') else {
+        return CrewReviewVerdict::Invalid { tail };
+    };
+    let reason = reason.trim();
+    if decision.trim().eq_ignore_ascii_case("REQUEST_CHANGES") && !reason.is_empty() {
+        CrewReviewVerdict::RequestChanges(reason.to_string())
+    } else {
+        CrewReviewVerdict::Invalid { tail }
+    }
 }
 
 fn crew_summary_text(
@@ -4471,6 +4624,57 @@ mod tests {
         assert!(validate_crew_route_identity("http://host:55000", Some("  "), None).is_err());
     }
 
+    #[test]
+    fn crew_code_roles_require_canonical_codegen_workload() {
+        for role in [
+            AgentRole::Coder,
+            AgentRole::Reviewer,
+            AgentRole::Tester,
+            AgentRole::Executor,
+        ] {
+            assert_eq!(crew_role_workload(&role), Some("code-gen"));
+        }
+        for role in [
+            AgentRole::Researcher,
+            AgentRole::Writer,
+            AgentRole::Planner,
+            AgentRole::Assistant,
+        ] {
+            assert_eq!(crew_role_workload(&role), None);
+        }
+        for task_type in [SubTaskType::Code, SubTaskType::ToolUse, SubTaskType::Review] {
+            assert!(crew_subtask_requires_code_model(task_type));
+        }
+        assert!(!crew_subtask_requires_code_model(SubTaskType::Planning));
+    }
+
+    #[test]
+    fn crew_reviewer_verdict_contract_is_bounded_and_fail_closed() {
+        assert_eq!(
+            parse_crew_review_verdict("findings\nff_review_verdict: approve.;  \n"),
+            CrewReviewVerdict::Approve
+        );
+        assert_eq!(
+            parse_crew_review_verdict(
+                "findings\nFF_REVIEW_VERDICT: REQUEST_CHANGES: add a race test"
+            ),
+            CrewReviewVerdict::RequestChanges("add a race test".to_string())
+        );
+        assert!(matches!(
+            parse_crew_review_verdict("APPROVE"),
+            CrewReviewVerdict::Invalid { .. }
+        ));
+        assert!(matches!(
+            parse_crew_review_verdict("FF_REVIEW_VERDICT: REQUEST_CHANGES:"),
+            CrewReviewVerdict::Invalid { .. }
+        ));
+        let oversized = format!("{}\nmissing contract", "x".repeat(8_192));
+        let CrewReviewVerdict::Invalid { tail } = parse_crew_review_verdict(&oversized) else {
+            panic!("missing verdict must fail closed");
+        };
+        assert!(tail.chars().count() <= CREW_REVIEW_TAIL_CHARS);
+    }
+
     #[tokio::test]
     async fn fleet_run_rejects_malformed_completion_policy_before_routing() {
         let workload_error = fleet_run(Some(json!({"prompt": "x", "workload": 7})))
@@ -4684,11 +4888,19 @@ mod tests {
         restore_test_db_env(db_path, prev_db_path);
     }
 
-    async fn spawn_mock_llm_server(always_fail: bool) -> (String, tokio::task::JoinHandle<()>) {
+    #[derive(Clone, Copy)]
+    enum MockLlmMode {
+        Approve,
+        RequestChanges,
+        InvalidReview,
+        TransportFailure,
+    }
+
+    async fn spawn_mock_llm_server(mode: MockLlmMode) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move |Json(payload): Json<Value>| async move {
-                if always_fail {
+                if matches!(mode, MockLlmMode::TransportFailure) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({"error": "forced failure"})),
@@ -4699,6 +4911,14 @@ mod tests {
                     .pointer("/messages/0/content")
                     .and_then(|v| v.as_str())
                     .unwrap_or("<missing prompt>");
+                let verdict = match mode {
+                    MockLlmMode::Approve => "FF_REVIEW_VERDICT: APPROVE",
+                    MockLlmMode::RequestChanges => {
+                        "FF_REVIEW_VERDICT: REQUEST_CHANGES: add a regression test"
+                    }
+                    MockLlmMode::InvalidReview => "review complete without contract",
+                    MockLlmMode::TransportFailure => unreachable!(),
+                };
 
                 (
                     StatusCode::OK,
@@ -4707,7 +4927,10 @@ mod tests {
                             {
                                 "finish_reason": "stop",
                                 "message": {
-                                    "content": format!("mock response: {}", prompt)
+                                    "content": format!(
+                                        "mock response: {}\n{}",
+                                        prompt, verdict
+                                    )
                                 }
                             }
                         ]
@@ -4782,7 +5005,7 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
-        let (base_url, server_handle) = spawn_mock_llm_server(false).await;
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::Approve).await;
 
         let repo_dir = std::env::temp_dir().join(format!("ff-mcp-repo-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&repo_dir).await.unwrap();
@@ -4816,11 +5039,88 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn fleet_crew_reviewer_request_changes_makes_run_unsuccessful() {
+        let _guard = env_lock().lock().unwrap();
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::RequestChanges).await;
+        let repo_dir =
+            std::env::temp_dir().join(format!("ff-mcp-review-reject-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+
+        let response = fleet_crew(Some(json!({
+            "task": "build a new API endpoint",
+            "repo_dir": repo_dir,
+            "llm_base_url": base_url
+        })))
+        .await
+        .expect("review rejection should return a structured unsuccessful run");
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["execution"]["summary"]["success"], false);
+        assert!(
+            response["execution"]["summary"]["reviewer_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        let rejected = response["execution"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["status"] == "review_rejected")
+            .expect("review rejection step");
+        assert_eq!(
+            rejected["review_verdict"]["reason"],
+            "add a regression test"
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fleet_crew_missing_reviewer_verdict_fails_closed() {
+        let _guard = env_lock().lock().unwrap();
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::InvalidReview).await;
+        let repo_dir =
+            std::env::temp_dir().join(format!("ff-mcp-review-invalid-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+
+        let response = fleet_crew(Some(json!({
+            "task": "build a new API endpoint",
+            "repo_dir": repo_dir,
+            "llm_base_url": base_url
+        })))
+        .await
+        .expect("invalid review should return a structured unsuccessful run");
+
+        assert_eq!(response["status"], "failed");
+        let invalid = response["execution"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["status"] == "review_invalid")
+            .expect("invalid review step");
+        assert!(
+            invalid["review_verdict"]["raw_tail"]
+                .as_str()
+                .unwrap()
+                .contains("without contract")
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_reports_failures_when_steps_fail() {
         let _guard = env_lock().lock().unwrap();
         let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
-        let (base_url, server_handle) = spawn_mock_llm_server(true).await;
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::TransportFailure).await;
 
         let repo_dir = std::env::temp_dir().join(format!("ff-mcp-repo-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&repo_dir).await.unwrap();
