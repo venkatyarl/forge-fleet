@@ -34,7 +34,6 @@ const MESH_PERSIST_MAX_IN_FLIGHT: usize = 8;
 const MESH_PERSIST_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const MESH_PERSIST_GLOBAL_TIMEOUT: Duration = Duration::from_secs(45);
 const MESH_DB_STEP_TIMEOUT: Duration = Duration::from_secs(10);
-const MESH_CHILD_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 const FULL_MESH_OPERATION_DEADLINE: Duration = Duration::from_secs(260);
 const MESH_OPERATION_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
 const MESH_SCAN_DEADLINE_ERROR: &str = "mesh scan deadline exceeded before probe completed";
@@ -535,8 +534,14 @@ where
             match timeout(MESH_OPERATION_CLEANUP_TIMEOUT, &mut task).await {
                 Ok(joined) => joined,
                 Err(_) => {
-                    task.abort();
-                    let _ = task.await;
+                    // Return to the daemon before its 300-second watchdog, but
+                    // detach (do not abort) the process-owning task. It keeps
+                    // the cancellation token and must finish its direct-child
+                    // wait/reap even if kernel cleanup takes unusually long.
+                    // Aborting here would turn a bounded error into a leaked
+                    // child/process group.
+                    drop(task);
+                    cancel_on_drop.disarm();
                     return Err(format!(
                         "{label} exceeded its full deadline and cleanup timeout"
                     ));
@@ -995,7 +1000,32 @@ enum CommandOutcome {
     Cancelled,
 }
 
-async fn terminate_and_reap_child(child: &mut tokio::process::Child, pid: Option<u32>) {
+#[cfg(unix)]
+fn process_group_exists(pid: u32) -> bool {
+    // SAFETY: signal 0 does not mutate the process group; it only performs the
+    // kernel's existence/permission check. EPERM still means that a member is
+    // alive, while ESRCH proves that the group has disappeared.
+    let result = unsafe { libc::kill(-(pid as i32), 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(pid: u32) {
+    while process_group_exists(pid) {
+        // Do not turn a slow init/subreaper into false cleanup success. The
+        // process-owning task keeps waiting after the outer 280-second
+        // operation budget returns an error to the daemon.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_process_group_exit(_pid: u32) {}
+
+async fn terminate_and_reap_child(
+    child: &mut tokio::process::Child,
+    pid: Option<u32>,
+) -> std::io::Result<()> {
     if let Some(pid) = pid {
         crate::task_runner::kill_process_group(pid);
     }
@@ -1004,11 +1034,17 @@ async fn terminate_and_reap_child(child: &mut tokio::process::Child, pid: Option
     {
         warn!(%error, "mesh command child could not be killed");
     }
-    match timeout(MESH_CHILD_REAP_TIMEOUT, child.wait()).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => warn!(%error, "mesh command child could not be reaped"),
-        Err(_) => warn!("mesh command child reap exceeded its hard timeout"),
+
+    // Once SIGKILL has been sent, waiting for this direct child is not an
+    // optional/best-effort cleanup step. Returning before wait(2) observes it
+    // would leak a zombie. The enclosing operation retains its independent
+    // 300-second watchdog contract; under Unix a SIGKILLed child cannot keep
+    // executing or ignore termination.
+    child.wait().await?;
+    if let Some(pid) = pid {
+        wait_for_process_group_exit(pid).await;
     }
+    Ok(())
 }
 
 /// Run one SSH process with cancellation that owns the process lifecycle.
@@ -1036,14 +1072,14 @@ async fn output_with_hard_timeout(
     let stdout = match child.stdout.take() {
         Some(stdout) => stdout,
         None => {
-            terminate_and_reap_child(&mut child, pid).await;
+            terminate_and_reap_child(&mut child, pid).await?;
             return Err(std::io::Error::other("SSH stdout pipe unavailable"));
         }
     };
     let stderr = match child.stderr.take() {
         Some(stderr) => stderr,
         None => {
-            terminate_and_reap_child(&mut child, pid).await;
+            terminate_and_reap_child(&mut child, pid).await?;
             return Err(std::io::Error::other("SSH stderr pipe unavailable"));
         }
     };
@@ -1082,15 +1118,15 @@ async fn output_with_hard_timeout(
     match wait_outcome {
         WaitOutcome::Completed(Ok(output)) => Ok(CommandOutcome::Completed(output)),
         WaitOutcome::Completed(Err(error)) => {
-            terminate_and_reap_child(&mut child, pid).await;
+            terminate_and_reap_child(&mut child, pid).await?;
             Err(error)
         }
         WaitOutcome::TimedOut => {
-            terminate_and_reap_child(&mut child, pid).await;
+            terminate_and_reap_child(&mut child, pid).await?;
             Ok(CommandOutcome::TimedOut)
         }
         WaitOutcome::Cancelled => {
-            terminate_and_reap_child(&mut child, pid).await;
+            terminate_and_reap_child(&mut child, pid).await?;
             Ok(CommandOutcome::Cancelled)
         }
     }
@@ -1123,7 +1159,18 @@ async fn probe_pair(
         &format!("{src_user}@{src_ip}"),
         &inner,
     ]);
+    let probe_cancellation = cancellation.clone();
     let result = output_with_hard_timeout(command, MESH_SSH_PROBE_TIMEOUT, cancellation).await;
+    if probe_cancellation.is_cancelled() {
+        return MeshCell {
+            ping_ok: None,
+            ssh_ok: false,
+            src,
+            dst,
+            status: "failed".into(),
+            last_error: Some(MESH_SCAN_DEADLINE_ERROR.into()),
+        };
+    }
 
     match result {
         Ok(CommandOutcome::Completed(out)) if out.status.success() => MeshCell {
@@ -1276,12 +1323,15 @@ async fn local_reach_check_scoped_inner(
         ));
         if futs.len() >= 8
             && let Some(p) = futs.next().await
+            && let Some(p) = p
         {
             probes.push(p);
         }
     }
     while let Some(p) = futs.next().await {
-        probes.push(p);
+        if let Some(p) = p {
+            probes.push(p);
+        }
     }
     let cells = probes
         .iter()
@@ -1311,7 +1361,7 @@ async fn probe_direct(
     dst_user: String,
     dst_ip: String,
     cancellation: CancellationToken,
-) -> LocalProbe {
+) -> Option<LocalProbe> {
     // macOS ping -W is milliseconds; Linux is seconds.
     let ping_wait: &str = if cfg!(target_os = "macos") {
         "2000"
@@ -1324,6 +1374,9 @@ async fn probe_direct(
         output_with_hard_timeout(ping, Duration::from_secs(4), cancellation.child_token()).await,
         Ok(CommandOutcome::Completed(out)) if out.status.success()
     );
+    if cancellation.is_cancelled() {
+        return None;
+    }
 
     let mut ssh = Command::new("ssh");
     ssh.args(crate::ssh_opts::ssh_bypass_args()).args([
@@ -1336,6 +1389,9 @@ async fn probe_direct(
     ]);
     let ssh_res =
         output_with_hard_timeout(ssh, Duration::from_secs(8), cancellation.child_token()).await;
+    if cancellation.is_cancelled() {
+        return None;
+    }
     let ssh_err = match ssh_res {
         Ok(CommandOutcome::Completed(out)) if out.status.success() => None,
         Ok(CommandOutcome::Completed(out)) => Some(format!(
@@ -1349,11 +1405,14 @@ async fn probe_direct(
         )),
         Err(e) => Some(format!("spawn: {e}")),
         Ok(CommandOutcome::TimedOut) => Some("timeout".into()),
-        Ok(CommandOutcome::Cancelled) => Some("cancelled".into()),
+        // Cancellation is teardown, not a reachability observation. Returning
+        // None prevents a synthetic failed cell from ever reaching the
+        // persistence layer, even if cancellation races the caller's drain.
+        Ok(CommandOutcome::Cancelled) => return None,
     };
     let ssh_ok = ssh_err.is_none();
     let (status, detail) = classify_direct_probe(ping_ok, ssh_err);
-    LocalProbe {
+    Some(LocalProbe {
         src,
         dst,
         ip: dst_ip,
@@ -1361,7 +1420,7 @@ async fn probe_direct(
         ssh_ok,
         status,
         detail,
-    }
+    })
 }
 
 /// Fold a ping result + optional SSH failure into the (status, last_error)
@@ -1662,43 +1721,72 @@ async fn mesh_propagate_inner(
         }
         match propagate_to_peer(peer, user_key, &known_lines, new_user, new_ip, cancellation).await
         {
-            Ok(()) => {
-                ok += 1;
-                cells.push(MeshCell {
-                    src: peer.name.clone(),
-                    dst: new_node.to_string(),
-                    status: "ok".into(),
-                    last_error: None,
-                    ping_ok: None,
-                    ssh_ok: true,
-                });
-                cells.push(MeshCell {
-                    src: new_node.to_string(),
-                    dst: peer.name.clone(),
-                    status: "ok".into(),
-                    last_error: None,
-                    ping_ok: None,
-                    ssh_ok: true,
-                });
+            Ok(observation) => {
+                let (peer_ok, observed_cells) = propagation_cells(
+                    &peer.name,
+                    new_node,
+                    observation.peer_to_new,
+                    observation.new_to_peer,
+                );
+                if peer_ok {
+                    ok += 1;
+                } else {
+                    fail += 1;
+                }
+                cells.extend(observed_cells);
             }
             Err(e) => {
                 if cancellation.is_cancelled() {
                     return Err(MESH_OPERATION_CANCELLED_ERROR.into());
                 }
                 fail += 1;
-                cells.push(MeshCell {
-                    src: peer.name.clone(),
-                    dst: new_node.to_string(),
-                    status: "failed".into(),
-                    last_error: Some(e),
-                    ping_ok: None,
-                    ssh_ok: false,
-                });
+                warn!(peer = %peer.name, %e, "mesh propagation setup failed before directional probes");
             }
         }
     }
     persist_mesh_cells(pool, cells, cancellation).await?;
     Ok((ok, fail))
+}
+
+#[derive(Debug)]
+struct PropagationObservation {
+    peer_to_new: Result<(), String>,
+    new_to_peer: Result<(), String>,
+}
+
+fn observed_propagation_cell(src: &str, dst: &str, result: Result<(), String>) -> MeshCell {
+    match result {
+        Ok(()) => MeshCell {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            status: "ok".into(),
+            last_error: None,
+            ping_ok: None,
+            ssh_ok: true,
+        },
+        Err(error) => MeshCell {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            status: "failed".into(),
+            last_error: Some(error),
+            ping_ok: None,
+            ssh_ok: false,
+        },
+    }
+}
+
+fn propagation_cells(
+    peer: &str,
+    new_node: &str,
+    peer_to_new: Result<(), String>,
+    new_to_peer: Result<(), String>,
+) -> (bool, [MeshCell; 2]) {
+    let peer_to_new = observed_propagation_cell(peer, new_node, peer_to_new);
+    let new_to_peer = observed_propagation_cell(new_node, peer, new_to_peer);
+    (
+        peer_to_new.ssh_ok && new_to_peer.ssh_ok,
+        [peer_to_new, new_to_peer],
+    )
 }
 
 async fn propagate_to_peer(
@@ -1708,7 +1796,7 @@ async fn propagate_to_peer(
     new_user: &str,
     new_ip: &str,
     cancellation: &CancellationToken,
-) -> Result<(), String> {
+) -> Result<PropagationObservation, String> {
     let peer_dest = format!("{}@{}", peer.ssh_user, peer.ip);
     if !user_key.trim().is_empty() {
         let cmd = format!(
@@ -1730,12 +1818,36 @@ async fn propagate_to_peer(
         );
         ssh_exec(&peer_dest, &cmd, cancellation.child_token()).await?;
     }
-    let probe = format!(
+    let peer_to_new_probe = format!(
         "ssh {} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
          {new_user}@{new_ip} true",
         crate::ssh_opts::SSH_AGENT_BYPASS,
     );
-    ssh_exec(&peer_dest, &probe, cancellation.child_token()).await
+    let peer_to_new = ssh_exec(&peer_dest, &peer_to_new_probe, cancellation.child_token()).await;
+    if cancellation.is_cancelled() {
+        return Err(MESH_OPERATION_CANCELLED_ERROR.into());
+    }
+
+    // The first nested SSH proves only peer -> new. Independently enter the
+    // new node and SSH back to the peer before publishing the reverse edge;
+    // directionality cannot be inferred from a successful opposite hop.
+    let new_dest = format!("{new_user}@{new_ip}");
+    let new_to_peer_probe = format!(
+        "ssh {} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+         {}@{} true",
+        crate::ssh_opts::SSH_AGENT_BYPASS,
+        peer.ssh_user,
+        peer.ip,
+    );
+    let new_to_peer = ssh_exec(&new_dest, &new_to_peer_probe, cancellation.child_token()).await;
+    if cancellation.is_cancelled() {
+        return Err(MESH_OPERATION_CANCELLED_ERROR.into());
+    }
+
+    Ok(PropagationObservation {
+        peer_to_new,
+        new_to_peer,
+    })
 }
 
 async fn ssh_exec(dest: &str, cmd: &str, cancellation: CancellationToken) -> Result<(), String> {
@@ -2457,10 +2569,10 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    async fn hard_timeout_kills_and_reaps_child_before_returning() {
+    async fn hard_timeout_kills_and_reaps_process_tree_before_returning() {
         let pid_file = std::env::temp_dir().join(format!("ff-mesh-timeout-{}.pid", Uuid::new_v4()));
         let script = format!(
-            "printf '%s' \"$$\" > {}; exec sleep 30",
+            "sleep 30 & descendant=$!; printf '%s %s' \"$$\" \"$descendant\" > {}; wait \"$descendant\"",
             shell_escape_single(pid_file.to_string_lossy().as_ref())
         );
         let mut command = Command::new("sh");
@@ -2478,14 +2590,13 @@ mod tests {
             "sleeping child must hit the hard timeout"
         );
 
-        let pid = std::fs::read_to_string(&pid_file)
-            .expect("child wrote pid")
-            .trim()
-            .to_string();
-        assert!(
-            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-            "timed-out child {pid} still exists after helper returned"
-        );
+        let pids = std::fs::read_to_string(&pid_file).expect("process tree wrote pids");
+        for pid in pids.split_whitespace() {
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "timed-out process-tree member {pid} still exists after helper returned"
+            );
+        }
         let _ = std::fs::remove_file(pid_file);
     }
 
@@ -2660,18 +2771,10 @@ mod tests {
             .expect("background pipe holder wrote pid")
             .trim()
             .to_string();
-        timeout(Duration::from_secs(2), async {
-            loop {
-                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-                let state = stat.split_whitespace().nth(2);
-                if state.is_none_or(|state| state == "Z") {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("background pipe holder was killed after bounded output collection");
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "background pipe holder {pid} remained in the process table after helper returned"
+        );
         let _ = std::fs::remove_file(pid_file);
     }
 
@@ -2689,6 +2792,30 @@ mod tests {
             Instant::now().duration_since(started)
                 <= FULL_MESH_OPERATION_DEADLINE + MESH_OPERATION_CLEANUP_TIMEOUT
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cleanup_timeout_returns_error_but_does_not_abort_cleanup_owner() {
+        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
+        let started = Instant::now();
+        let error = run_owned_mesh_operation("slow cleanup", move |cancellation| async move {
+            cancellation.cancelled().await;
+            tokio::time::sleep(MESH_OPERATION_CLEANUP_TIMEOUT + Duration::from_secs(1)).await;
+            let _ = cleanup_tx.send(());
+            Ok::<(), String>(())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.contains("cleanup timeout"));
+        assert_eq!(
+            Instant::now().duration_since(started),
+            FULL_MESH_OPERATION_DEADLINE + MESH_OPERATION_CLEANUP_TIMEOUT
+        );
+        timeout(Duration::from_secs(2), cleanup_rx)
+            .await
+            .expect("detached cleanup owner continued after the bounded error")
+            .expect("cleanup owner retained its resources");
     }
 
     #[test]
@@ -2728,6 +2855,42 @@ mod tests {
         let (status, detail) = classify_direct_probe(true, Some("exit 255: refused".into()));
         assert_eq!(status, "failed");
         assert_eq!(detail.as_deref(), Some("ping ok; ssh exit 255: refused"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_direct_probe_is_not_a_persistable_observation() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let probe = probe_direct(
+            "local".into(),
+            "peer".into(),
+            "user".into(),
+            "192.0.2.1".into(),
+            cancellation,
+        )
+        .await;
+        assert!(probe.is_none());
+    }
+
+    #[test]
+    fn propagation_records_each_observed_direction_independently() {
+        let (both_ok, cells) =
+            propagation_cells("peer", "new", Ok(()), Err("reverse probe refused".into()));
+        assert!(!both_ok);
+        assert_eq!(
+            (cells[0].src.as_str(), cells[0].dst.as_str()),
+            ("peer", "new")
+        );
+        assert_eq!(cells[0].status, "ok");
+        assert_eq!(
+            (cells[1].src.as_str(), cells[1].dst.as_str()),
+            ("new", "peer")
+        );
+        assert_eq!(cells[1].status, "failed");
+        assert_eq!(
+            cells[1].last_error.as_deref(),
+            Some("reverse probe refused")
+        );
     }
 
     #[test]
