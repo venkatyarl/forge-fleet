@@ -247,8 +247,9 @@ pub async fn handle_fleet_drain(pool: &sqlx::PgPool, computer: &str, yes: bool) 
     Ok(())
 }
 
-/// `ff fleet undrain <computer>` — explicitly recover an ownerless deploy
-/// drain. Operator-owned reservations and Vinny are deliberately immutable.
+/// `ff fleet undrain <computer>` — explicitly recover an ownerless drain.
+/// Vinny remains immutable except when reversing an explicit operator drain;
+/// deploy drains and operator-owned reservations are never crossed.
 pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool) -> Result<()> {
     if !yes {
         anyhow::bail!("pass --yes to recover the ownerless deploy drain on '{computer}'");
@@ -261,17 +262,19 @@ pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool
                 reserved_reason = NULL,
                 reservation_expires_at = NULL
           WHERE LOWER(name) = LOWER($1)
-            AND LOWER(name) <> 'vinny'
             AND reservation_state = 'drained'
             AND reservation_owner IS NULL
+            AND (LOWER(name) <> 'vinny'
+                 OR reserved_reason = $2)
         RETURNING id",
     )
     .bind(computer)
+    .bind(ff_agent::ha::node_drain::OPERATOR_DRAIN_REASON)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(computer_id) = computer_id else {
         anyhow::bail!(
-            "refusing to undrain '{computer}': node is Vinny, not drained, or has an operator owner"
+            "refusing to undrain '{computer}': node is not an ownerless drain, or Vinny was not explicitly operator-drained"
         );
     };
     let enabled = sqlx::query(
@@ -8107,7 +8110,7 @@ mod route_tests {
     }
 
     #[test]
-    fn undrain_is_limited_to_ownerless_non_vinny_drains() {
+    fn undrain_is_limited_to_ownerless_drains_and_explicit_vinny_operator_drains() {
         let source = include_str!("fleet_cmd.rs");
         let undrain = source
             .split("pub async fn handle_fleet_undrain")
@@ -8116,6 +8119,7 @@ mod route_tests {
         assert!(undrain.contains("reservation_state = 'drained'"));
         assert!(undrain.contains("reservation_owner IS NULL"));
         assert!(undrain.contains("LOWER(name) <> 'vinny'"));
+        assert!(undrain.contains("OPERATOR_DRAIN_REASON"));
         assert!(undrain.contains("status = 'disabled'"));
     }
 
