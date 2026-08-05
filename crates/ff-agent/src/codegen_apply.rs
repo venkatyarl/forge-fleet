@@ -14,15 +14,22 @@ const LARGE_CONTEXT_FILE_CHARS: usize = 16_000;
 const REGION_CONTEXT_LINES: usize = 25;
 const FALLBACK_LINES: usize = 60;
 const CODEGEN_RUN_BUDGET: Duration = Duration::from_secs(420);
-const CODEGEN_FINALIZE_RESERVE: Duration = Duration::from_secs(60);
-const CODEGEN_CORRECTION_RESERVE: Duration = Duration::from_secs(45);
+const CODEGEN_FINALIZE_RESERVE: Duration = Duration::from_secs(30);
+const CODEGEN_CORRECTION_RESERVE: Duration =
+    Duration::from_secs(CODEGEN_REQUEST_STARTUP_SECS + CODEGEN_MIN_GENERATION_SECS);
 const CODEGEN_ROLLBACK_RESERVE: Duration = Duration::from_secs(5);
-const CODEGEN_MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(210);
-const CODEGEN_REQUEST_STARTUP: Duration = Duration::from_secs(15);
+const CODEGEN_MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
+const CODEGEN_REQUEST_STARTUP_SECS: u64 = 15;
+const CODEGEN_REQUEST_STARTUP: Duration = Duration::from_secs(CODEGEN_REQUEST_STARTUP_SECS);
 const CODEGEN_TELEMETRY_TIMEOUT: Duration = Duration::from_secs(2);
 const CODEGEN_OUTPUT_TOKENS_PER_SEC: u64 = 8;
 const CODEGEN_MIN_OUTPUT_TOKENS: u32 = 512;
 const CODEGEN_MAX_OUTPUT_TOKENS: u32 = 2048;
+const CODEGEN_MIN_GENERATION_SECS: u64 =
+    (CODEGEN_MIN_OUTPUT_TOKENS as u64).div_ceil(CODEGEN_OUTPUT_TOKENS_PER_SEC);
+const CODEGEN_CORRECTION_RESPONSE_CHARS: usize = 12_000;
+const CODEGEN_CORRECTION_CONTEXT_CHARS: usize = 24_000;
+const CODEGEN_CORRECTION_FILE_CHARS: usize = 8_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RoundPlan {
@@ -57,6 +64,37 @@ fn plan_round(remaining: Duration, rounds_after_current: u32) -> Option<RoundPla
         request_timeout,
         max_tokens: achievable.min(u64::from(CODEGEN_MAX_OUTPUT_TOKENS)) as u32,
     })
+}
+
+/// The first round must preserve one viable correction. Once a round has
+/// failed, prefer preserving another correction but admit the final viable
+/// round when that is all the absolute deadline can still support.
+fn plan_admitted_round(remaining: Duration, round: u32, max_rounds: u32) -> Option<RoundPlan> {
+    let rounds_after_current = max_rounds.saturating_sub(round);
+    plan_round(remaining, rounds_after_current).or_else(|| {
+        if round > 1 && rounds_after_current > 0 {
+            plan_round(remaining, 0)
+        } else {
+            None
+        }
+    })
+}
+
+fn terminal_round_budget() -> Duration {
+    CODEGEN_FINALIZE_RESERVE + CODEGEN_CORRECTION_RESERVE
+}
+
+/// Verification may use the deadline only after preserving rollback and, if
+/// another round is available, a complete terminal correction request.
+fn verification_timeout(remaining: Duration, has_correction_round: bool) -> Option<Duration> {
+    let correction = if has_correction_round {
+        terminal_round_budget()
+    } else {
+        Duration::ZERO
+    };
+    remaining
+        .checked_sub(CODEGEN_ROLLBACK_RESERVE + correction)
+        .filter(|timeout| !timeout.is_zero())
 }
 
 async fn bounded_best_effort<F>(timeout: Duration, future: F) -> Option<F::Output>
@@ -146,6 +184,7 @@ fn round_interaction(
         request_text: prompt.chars().take(16000).collect(),
         request_meta: serde_json::json!({
             "round": round,
+            "stage": "model_generation",
             "tokens_estimated": tokens_estimated,
             "route_provenance": resp.provenance.as_str(),
         }),
@@ -163,7 +202,7 @@ fn round_interaction(
         tokens_out,
         cost_usd,
         latency_ms: i32::try_from(resp.latency_ms).ok(),
-        outcome: "success".to_string(),
+        outcome: "generated".to_string(),
         worker_name: Some(resp.worker_name.clone()),
         endpoint: Some(resp.endpoint.clone()),
         work_item_id,
@@ -261,7 +300,7 @@ pub async fn codegen_apply_with_target(
         };
 
         let remaining = run_deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Some(plan) = plan_round(remaining, max_rounds.saturating_sub(round)) else {
+        let Some(plan) = plan_admitted_round(remaining, round, max_rounds) else {
             let diagnostic = round_diagnostic(
                 round,
                 "not started",
@@ -427,7 +466,7 @@ pub async fn codegen_apply_with_target(
                 let diagnostic = round_diagnostic(round, "edits rejected", e);
                 warn!(round, error = %diagnostic, "codegen edits failed to apply");
                 diagnostics.push(diagnostic.clone());
-                last_edits = Some(edit_summary);
+                last_edits = Some(correction_context(repo_path, &response.text, &edits));
                 last_error = Some(diagnostic);
                 continue;
             }
@@ -448,7 +487,8 @@ pub async fn codegen_apply_with_target(
                 );
                 warn!(round, error = %diagnostic, "codegen edits were a no-op");
                 diagnostics.push(diagnostic.clone());
-                last_edits = Some(edit_summary);
+                drop(transaction);
+                last_edits = Some(correction_context(repo_path, &response.text, &edits));
                 last_error = Some(diagnostic);
                 continue;
             }
@@ -456,7 +496,8 @@ pub async fn codegen_apply_with_target(
                 let diagnostic = round_diagnostic(round, "edit inspection failed", error);
                 warn!(round, error = %diagnostic, "codegen could not inspect touched files");
                 diagnostics.push(diagnostic.clone());
-                last_edits = Some(edit_summary);
+                drop(transaction);
+                last_edits = Some(correction_context(repo_path, &response.text, &edits));
                 last_error = Some(diagnostic);
                 continue;
             }
@@ -470,7 +511,8 @@ pub async fn codegen_apply_with_target(
             );
             warn!(round, error = %diagnostic, "codegen apply exceeded deadline");
             diagnostics.push(diagnostic.clone());
-            last_edits = Some(edit_summary);
+            drop(transaction);
+            last_edits = Some(correction_context(repo_path, &response.text, &edits));
             last_error = Some(diagnostic);
             continue;
         }
@@ -482,17 +524,19 @@ pub async fn codegen_apply_with_target(
         if let Some((program, args)) = verify {
             let check_name = format_command(&program, &args);
             let remaining = run_deadline.saturating_duration_since(tokio::time::Instant::now());
-            let Some(verify_timeout) = remaining.checked_sub(CODEGEN_ROLLBACK_RESERVE) else {
+            let has_correction_round = round < max_rounds;
+            let Some(verify_timeout) = verification_timeout(remaining, has_correction_round) else {
                 let diagnostic = round_diagnostic(
                     round,
                     "verification not started",
                     format!(
-                        "remaining budget {remaining:?} does not preserve rollback reserve {CODEGEN_ROLLBACK_RESERVE:?}"
+                        "remaining budget {remaining:?} does not preserve rollback and terminal correction reserves"
                     ),
                 );
                 warn!(round, error = %diagnostic, "codegen verification rejected by budget");
                 diagnostics.push(diagnostic.clone());
-                last_edits = Some(edit_summary);
+                drop(transaction);
+                last_edits = Some(correction_context(repo_path, &response.text, &edits));
                 last_error = Some(diagnostic);
                 continue;
             };
@@ -507,7 +551,8 @@ pub async fn codegen_apply_with_target(
                     );
                     warn!(round, error = %diagnostic, "codegen edits failed verification");
                     diagnostics.push(diagnostic.clone());
-                    last_edits = Some(edit_summary);
+                    drop(transaction);
+                    last_edits = Some(correction_context(repo_path, &response.text, &edits));
                     last_error = Some(diagnostic);
                     continue;
                 }
@@ -515,7 +560,8 @@ pub async fn codegen_apply_with_target(
                     let diagnostic = round_diagnostic(round, "verification failed", error);
                     warn!(round, error = %diagnostic, "codegen verification could not complete");
                     diagnostics.push(diagnostic.clone());
-                    last_edits = Some(edit_summary);
+                    drop(transaction);
+                    last_edits = Some(correction_context(repo_path, &response.text, &edits));
                     last_error = Some(diagnostic);
                     continue;
                 }
@@ -767,7 +813,7 @@ fn build_prompt(
     }
 
     if let Some(edits) = previous_edits {
-        prompt.push_str("\n\nPrevious edit blocks that failed:\n");
+        prompt.push_str("\n\nPrevious failed response and exact restored-checkout grounding:\n");
         prompt.push_str(edits.trim());
     }
     if let Some(error) = previous_error {
@@ -1934,6 +1980,97 @@ fn crate_dir_for_rel_path(rel_path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from("crates").join(crate_name))
 }
 
+/// Build the next-round correction context only after the edit transaction has
+/// been dropped. It carries the bounded raw model response plus exact bytes
+/// from the restored checkout for every failed edit target, so the model does
+/// not correct against its rolled-back mutation.
+fn correction_context(repo_path: &Path, response: &str, edits: &[Edit]) -> String {
+    let mut out =
+        String::from("Raw previous model response (failed; do not assume it was applied):\n");
+    push_str_capped(&mut out, response, CODEGEN_CORRECTION_RESPONSE_CHARS);
+    let mut seen = HashSet::new();
+    let unique_edits = edits
+        .iter()
+        .filter_map(|edit| {
+            let rel = normalize_relative_path(&edit.path)?;
+            seen.insert((rel.clone(), edit.search.clone()))
+                .then_some((rel, edit))
+        })
+        .collect::<Vec<_>>();
+
+    for (index, (rel, edit)) in unique_edits.iter().enumerate() {
+        let paths_left = unique_edits.len() - index;
+        let remaining = CODEGEN_CORRECTION_CONTEXT_CHARS.saturating_sub(char_count(&out));
+        let path_budget = remaining / paths_left;
+        let header = format!(
+            "\n\nExact restored checkout grounding for {}:\n",
+            rel.display()
+        );
+        push_str_capped(&mut out, &header, CODEGEN_CORRECTION_CONTEXT_CHARS);
+        let excerpt_budget = path_budget
+            .saturating_sub(char_count(&header))
+            .min(CODEGEN_CORRECTION_FILE_CHARS);
+
+        let abs = repo_path.join(&rel);
+        match fs::read_to_string(&abs) {
+            Ok(content) => {
+                let (excerpt, truncated) =
+                    restored_content_excerpt(&content, &edit.search, excerpt_budget);
+                if truncated {
+                    push_str_capped(
+                        &mut out,
+                        "[exact bounded excerpt; surrounding restored bytes omitted]\n",
+                        CODEGEN_CORRECTION_CONTEXT_CHARS,
+                    );
+                }
+                push_str_capped(&mut out, &excerpt, CODEGEN_CORRECTION_CONTEXT_CHARS);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                push_str_capped(
+                    &mut out,
+                    "[file is absent in the restored checkout]\n",
+                    CODEGEN_CORRECTION_CONTEXT_CHARS,
+                );
+            }
+            Err(error) => {
+                push_str_capped(
+                    &mut out,
+                    &format!("[could not read restored checkout file: {error}]\n"),
+                    CODEGEN_CORRECTION_CONTEXT_CHARS,
+                );
+            }
+        }
+    }
+
+    out
+}
+
+fn restored_content_excerpt(content: &str, search: &str, cap: usize) -> (String, bool) {
+    let total_chars = char_count(content);
+    if total_chars <= cap {
+        return (content.to_string(), false);
+    }
+    if cap == 0 {
+        return (String::new(), true);
+    }
+
+    let anchor = content
+        .find(search)
+        .map(|byte| char_count(&content[..byte]))
+        .unwrap_or(0);
+    let search_chars = char_count(search);
+    let desired_end = anchor
+        .saturating_add(search_chars)
+        .saturating_add(cap / 3)
+        .min(total_chars);
+    let start = desired_end.saturating_sub(cap).min(anchor);
+    let end = start.saturating_add(cap).min(total_chars);
+    (
+        content.chars().skip(start).take(end - start).collect(),
+        true,
+    )
+}
+
 fn package_name_from_manifest(content: &str) -> Option<String> {
     let mut in_package = false;
 
@@ -2037,6 +2174,7 @@ mod tests {
         assert_eq!(rec.work_item_id, Some(work_item_id));
         assert_eq!(rec.purpose.as_deref(), Some("build"));
         assert_eq!(rec.request_meta["round"], 2);
+        assert_eq!(rec.request_meta["stage"], "model_generation");
         assert_eq!(rec.request_meta["route_provenance"], "explicit_catalog");
         assert_eq!(
             rec.route_decision["deployment_id"],
@@ -2047,6 +2185,7 @@ mod tests {
         assert_eq!(rec.endpoint.as_deref(), Some("http://192.168.5.103:55000"));
         assert_eq!(rec.engine.as_deref(), Some("local:glm-4.5-air"));
         assert_eq!(rec.latency_ms, Some(1234));
+        assert_eq!(rec.outcome, "generated");
 
         // No work item in scope (e.g. `ff codegen` from the CLI) → the row
         // still lands, just untagged.
@@ -2445,35 +2584,78 @@ mod tests {
 
     #[test]
     fn codegen_round_plan_preserves_finalize_and_correction_reserves() {
+        assert_eq!(CODEGEN_MIN_GENERATION_SECS, 64);
+        assert_eq!(CODEGEN_CORRECTION_RESERVE, Duration::from_secs(79));
         assert_eq!(
             plan_round(Duration::from_secs(420), 2),
             Some(RoundPlan {
-                request_timeout: Duration::from_secs(210),
-                max_tokens: 1560,
+                request_timeout: Duration::from_secs(180),
+                max_tokens: 1320,
             })
         );
         assert_eq!(
-            plan_round(Duration::from_secs(165), 0),
+            plan_round(Duration::from_secs(114), 0),
             Some(RoundPlan {
-                request_timeout: Duration::from_secs(105),
-                max_tokens: 720,
+                request_timeout: Duration::from_secs(84),
+                max_tokens: 552,
             })
         );
-        assert_eq!(plan_round(Duration::from_secs(105), 0), None);
-        assert_eq!(plan_round(Duration::from_secs(104), 0), None);
+        assert_eq!(
+            plan_round(Duration::from_secs(109), 0),
+            Some(RoundPlan {
+                request_timeout: Duration::from_secs(79),
+                max_tokens: 512,
+            })
+        );
+        assert_eq!(plan_round(Duration::from_secs(108), 0), None);
+        assert_eq!(verification_timeout(CODEGEN_ROLLBACK_RESERVE, false), None);
     }
 
     #[test]
-    fn codegen_two_slow_rounds_do_not_admit_a_third() {
+    fn codegen_verification_preserves_one_terminal_correction() {
         let mut remaining = CODEGEN_RUN_BUDGET;
         let first = plan_round(remaining, 2).expect("first round admitted");
         remaining = remaining.saturating_sub(first.request_timeout);
-        let second = plan_round(remaining, 1).expect("correction round admitted");
+        let verify = verification_timeout(remaining, true).expect("verification admitted");
+        remaining = remaining.saturating_sub(verify);
+        let second = plan_admitted_round(remaining, 2, 3).expect("correction round admitted");
         remaining = remaining.saturating_sub(second.request_timeout);
 
-        assert_eq!(first.request_timeout, Duration::from_secs(210));
-        assert_eq!(second.request_timeout, Duration::from_secs(105));
+        assert_eq!(first.request_timeout, Duration::from_secs(180));
+        assert_eq!(verify, Duration::from_secs(126));
+        assert_eq!(second.request_timeout, Duration::from_secs(84));
+        assert_eq!(remaining, CODEGEN_FINALIZE_RESERVE);
+        assert_eq!(
+            verification_timeout(remaining, false),
+            Some(Duration::from_secs(25))
+        );
         assert_eq!(plan_round(remaining, 0), None);
+    }
+
+    #[test]
+    fn codegen_correction_context_reads_restored_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("src/lib.rs");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "original restored bytes\n").unwrap();
+        let edits = vec![Edit {
+            path: "src/lib.rs".to_string(),
+            search: "original restored bytes\n".to_string(),
+            replace: "failed model bytes\n".to_string(),
+        }];
+
+        let transaction = EditTransaction::new(apply_edits(dir.path(), &edits).unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "failed model bytes\n");
+        drop(transaction);
+        let context = correction_context(dir.path(), "raw failed response", &edits);
+
+        assert!(context.contains("raw failed response"));
+        assert!(context.contains("original restored bytes"));
+        assert!(!context.contains("failed model bytes"));
+        assert_eq!(
+            fs::read_to_string(path).unwrap(),
+            "original restored bytes\n"
+        );
     }
 
     #[tokio::test(start_paused = true)]
