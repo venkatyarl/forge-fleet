@@ -1,0 +1,591 @@
+#!/usr/bin/env bash
+# Reversible source firewall for Docker-published FalkorDB.
+#
+# Policy values are supplied by the systemd EnvironmentFile. This helper owns
+# only three exact comment-tagged rules and never flushes or changes unrelated
+# firewall state (including ForgeFleet PostgreSQL/Redis ports).
+
+set -Eeuo pipefail
+
+readonly ALLOW_V4_TAG="forgefleet:falkor:allow-v4:v1"
+readonly DENY_V4_TAG="forgefleet:falkor:deny-v4:v1"
+readonly DENY_V6_TAG="forgefleet:falkor:deny-v6:v1"
+readonly DENY_V6_FORWARD_TAG="forgefleet:falkor:deny-v6-forward:v1"
+readonly IPTABLES_WAIT_SECONDS=5
+readonly UNIT_NAME="forgefleet-falkordb-source-firewall.service"
+readonly ENVIRONMENT_FILE="/etc/forgefleet/falkordb-source-firewall.env"
+readonly INSTALLED_HELPER="/usr/local/sbin/forgefleet-falkor-source-firewall"
+
+DRY_RUN=0
+JSON_OUTPUT=0
+ACTION=""
+
+usage() {
+    cat <<'EOF'
+Usage: forgefleet-falkor-source-firewall [--dry-run] [--json] apply|status|remove|render
+
+Required environment:
+  FF_FALKOR_INTERFACE             External interface (for example enp3s0)
+  FF_FALKOR_ALLOWED_SOURCE_IPV4   Sole allowed remote IPv4 source
+  FF_FALKOR_DESTINATION_IPV4      Docker host IPv4 original destination
+  FF_FALKOR_PORT                  Published FalkorDB TCP port
+
+render prints the intended rules without inspecting the host. --dry-run runs
+all read-only prerequisites and prints mutations without applying them.
+--json is supported by status and emits the stable provisioning contract.
+Configuration/prerequisite failures exit nonzero on stderr before JSON output.
+EOF
+}
+
+die() {
+    printf 'forgefleet-falkor-firewall: ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+for argument in "$@"; do
+    case "$argument" in
+        --dry-run) DRY_RUN=1 ;;
+        --json) JSON_OUTPUT=1 ;;
+        apply | status | remove | render)
+            [[ -z "$ACTION" ]] || die "only one action may be specified"
+            ACTION="$argument"
+            ;;
+        -h | --help)
+            usage
+            exit 0
+            ;;
+        *) die "unknown argument: $argument" ;;
+    esac
+done
+[[ -n "$ACTION" ]] || {
+    usage >&2
+    exit 2
+}
+if ((JSON_OUTPUT)) && [[ "$ACTION" != "status" ]]; then
+    die "--json is supported only by status"
+fi
+
+INTERFACE="${FF_FALKOR_INTERFACE:-}"
+ALLOWED_SOURCE_IPV4="${FF_FALKOR_ALLOWED_SOURCE_IPV4:-}"
+DESTINATION_IPV4="${FF_FALKOR_DESTINATION_IPV4:-}"
+FALKOR_PORT="${FF_FALKOR_PORT:-}"
+
+validate_ipv4() {
+    local address="$1" label="$2" octet
+    local -a octets=()
+    IFS=. read -r -a octets <<<"$address"
+    [[ ${#octets[@]} -eq 4 ]] || die "$label is not an IPv4 address: $address"
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || die "$label is not an IPv4 address: $address"
+        ((10#$octet <= 255)) || die "$label is not an IPv4 address: $address"
+    done
+    [[ "$address" != "0.0.0.0" && "$address" != "255.255.255.255" ]] ||
+        die "$label must be a concrete unicast address"
+    ((10#${octets[0]} >= 1 && 10#${octets[0]} < 224 && 10#${octets[0]} != 127)) ||
+        die "$label must be non-loopback unicast"
+}
+
+validate_config() {
+    [[ "$INTERFACE" =~ ^[[:alnum:]_.:-]{1,15}$ ]] ||
+        die "FF_FALKOR_INTERFACE is missing or invalid"
+    validate_ipv4 "$ALLOWED_SOURCE_IPV4" "FF_FALKOR_ALLOWED_SOURCE_IPV4"
+    validate_ipv4 "$DESTINATION_IPV4" "FF_FALKOR_DESTINATION_IPV4"
+    [[ "$ALLOWED_SOURCE_IPV4" != "$DESTINATION_IPV4" ]] ||
+        die "allowed source and destination must differ"
+    [[ "$FALKOR_PORT" =~ ^[0-9]{1,5}$ ]] || die "FF_FALKOR_PORT is invalid"
+    ((10#$FALKOR_PORT >= 1 && 10#$FALKOR_PORT <= 65535)) ||
+        die "FF_FALKOR_PORT must be between 1 and 65535"
+    case "$FALKOR_PORT" in
+        55432 | 56379)
+            die "refusing to apply Falkor policy to the reserved PostgreSQL/Redis port $FALKOR_PORT"
+            ;;
+    esac
+    # Canonical decimal representation keeps status JSON valid for inputs such
+    # as 06379 and makes rule comparisons stable across restarts.
+    FALKOR_PORT="$((10#$FALKOR_PORT))"
+}
+
+build_rules() {
+    ALLOW_V4_RULE=(
+        -i "$INTERFACE" -p tcp -s "$ALLOWED_SOURCE_IPV4/32"
+        -m conntrack --ctdir ORIGINAL
+        --ctorigdst "$DESTINATION_IPV4/32" --ctorigdstport "$FALKOR_PORT"
+        -m comment --comment "$ALLOW_V4_TAG" -j ACCEPT
+    )
+    DENY_V4_RULE=(
+        -i "$INTERFACE" -p tcp
+        -m conntrack --ctdir ORIGINAL
+        --ctorigdst "$DESTINATION_IPV4/32" --ctorigdstport "$FALKOR_PORT"
+        -m comment --comment "$DENY_V4_TAG" -j DROP
+    )
+    DENY_V6_RULE=(
+        -i "$INTERFACE" -p tcp --dport "$FALKOR_PORT"
+        -m comment --comment "$DENY_V6_TAG" -j DROP
+    )
+    DENY_V6_FORWARD_RULE=(
+        -i "$INTERFACE" -p tcp
+        -m conntrack --ctdir ORIGINAL --ctorigdstport "$FALKOR_PORT"
+        -m comment --comment "$DENY_V6_FORWARD_TAG" -j DROP
+    )
+}
+
+print_command() {
+    printf '  '
+    printf '%q ' "$@"
+    printf '\n'
+}
+
+render_plan() {
+    cat <<EOF
+# ForgeFleet FalkorDB source firewall v1
+# Effective IPv4 DOCKER-USER order: allow source, then deny every other source.
+# IPv6 is denied only on interface $INTERFACE and TCP port $FALKOR_PORT.
+# Both local docker-proxy INPUT and native-DNAT FORWARD paths are covered.
+# PostgreSQL 55432 and Redis 56379 are not matched.
+EOF
+    print_command ip6tables -w "$IPTABLES_WAIT_SECONDS" -t filter -I INPUT 1 "${DENY_V6_RULE[@]}"
+    print_command ip6tables -w "$IPTABLES_WAIT_SECONDS" -t filter -I FORWARD 1 "${DENY_V6_FORWARD_RULE[@]}"
+    # Insert deny first, then allow at position 1, producing allow-before-deny.
+    print_command iptables -w "$IPTABLES_WAIT_SECONDS" -t filter -I DOCKER-USER 1 "${DENY_V4_RULE[@]}"
+    print_command iptables -w "$IPTABLES_WAIT_SECONDS" -t filter -I DOCKER-USER 1 "${ALLOW_V4_RULE[@]}"
+}
+
+if [[ "$ACTION" == "render" ]]; then
+    validate_config
+    build_rules
+    render_plan
+    exit 0
+fi
+
+if ((DRY_RUN == 0 && EUID != 0)); then
+    die "$ACTION must run as root (use --dry-run for a read-only preflight)"
+fi
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "required command is unavailable: $1"
+}
+
+if [[ "$ACTION" != remove ]]; then
+    validate_config
+    build_rules
+fi
+require_command ip
+require_command iptables
+require_command ip6tables
+IP_COMMAND="$(command -v ip)"
+IPTABLES_COMMAND="$(command -v iptables)"
+IP6TABLES_COMMAND="$(command -v ip6tables)"
+
+v4_filter() {
+    "$IPTABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter "$@"
+}
+
+v6_filter() {
+    "$IP6TABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter "$@"
+}
+
+validate_runtime_prerequisites() {
+    "$IP_COMMAND" link show dev "$INTERFACE" >/dev/null 2>&1 ||
+        die "configured interface does not exist: $INTERFACE"
+
+    local interface_addresses
+    interface_addresses="$($IP_COMMAND -4 -o addr show dev "$INTERFACE" scope global)" ||
+        die "cannot read IPv4 addresses for $INTERFACE"
+    awk -v expected="$DESTINATION_IPV4" '
+        { split($4, address, "/"); if (address[1] == expected) found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' <<<"$interface_addresses" ||
+        die "destination $DESTINATION_IPV4 is not assigned to $INTERFACE"
+
+    local all_addresses
+    all_addresses="$($IP_COMMAND -4 -o addr show)" || die "cannot inspect local IPv4 addresses"
+    if awk -v forbidden="$ALLOWED_SOURCE_IPV4" '
+        { split($4, address, "/"); if (address[1] == forbidden) found = 1 }
+        END { exit(found ? 0 : 1) }
+    ' <<<"$all_addresses"; then
+        die "allowed source $ALLOWED_SOURCE_IPV4 is local; refusing self-allow policy"
+    fi
+
+    local route
+    route="$($IP_COMMAND -4 route get "$ALLOWED_SOURCE_IPV4" from "$DESTINATION_IPV4")" ||
+        die "no IPv4 route from $DESTINATION_IPV4 to allowed source $ALLOWED_SOURCE_IPV4"
+    [[ " $route " == *" dev $INTERFACE "* ]] ||
+        die "route to allowed source does not use configured interface $INTERFACE: $route"
+
+    v4_filter -n -L DOCKER-USER >/dev/null 2>&1 ||
+        die "Docker DOCKER-USER chain is absent; refusing unguarded apply"
+    v6_filter -n -L INPUT >/dev/null 2>&1 || die "IPv6 INPUT chain is unavailable"
+    v6_filter -n -L FORWARD >/dev/null 2>&1 || die "IPv6 FORWARD chain is unavailable"
+
+    local docker_user_rules
+    docker_user_rules="$(v4_filter -S DOCKER-USER)" ||
+        die "cannot inspect Docker DOCKER-USER chain"
+    grep -Eq -- '^-A DOCKER-USER( .*)? -j RETURN$' <<<"$docker_user_rules" ||
+        die "DOCKER-USER lacks Docker's terminal RETURN rule; refusing a possibly wrong iptables backend"
+
+    local conntrack_help conntrack_v6_help
+    conntrack_help="$($IPTABLES_COMMAND -m conntrack --help 2>&1)" ||
+        die "iptables conntrack matcher is unavailable"
+    conntrack_v6_help="$($IP6TABLES_COMMAND -m conntrack --help 2>&1)" ||
+        die "ip6tables conntrack matcher is unavailable"
+    for option in --ctdir --ctorigdst --ctorigdstport; do
+        grep -Fq -- "$option" <<<"$conntrack_help" ||
+            die "iptables conntrack matcher lacks $option"
+    done
+    for option in --ctdir --ctorigdstport; do
+        grep -Fq -- "$option" <<<"$conntrack_v6_help" ||
+            die "ip6tables conntrack matcher lacks $option"
+    done
+}
+
+rule_exists_v4() {
+    local -n rule="$1"
+    v4_filter -C DOCKER-USER "${rule[@]}" >/dev/null 2>&1
+}
+
+rule_exists_v6() {
+    v6_filter -C INPUT "${DENY_V6_RULE[@]}" >/dev/null 2>&1
+}
+
+rule_exists_v6_forward() {
+    v6_filter -C FORWARD "${DENY_V6_FORWARD_RULE[@]}" >/dev/null 2>&1
+}
+
+tag_count() {
+    local family="$1" chain="$2" tag="$3" output
+    if [[ "$family" == v4 ]]; then
+        output="$(v4_filter -S "$chain")"
+    else
+        output="$(v6_filter -S "$chain")"
+    fi
+    awk -v expected="$tag" '
+        $1 == "-A" {
+            for (field = 1; field < NF; field++) {
+                if ($field == "--comment") {
+                    value = $(field + 1)
+                    gsub(/^"|"$/, "", value)
+                    if (value == expected) count++
+                }
+            }
+        }
+        END { print count + 0 }
+    ' <<<"$output"
+}
+
+tag_position() {
+    local family="$1" chain="$2" tag="$3" output
+    if [[ "$family" == v4 ]]; then
+        output="$(v4_filter -S "$chain")"
+    else
+        output="$(v6_filter -S "$chain")"
+    fi
+    awk -v expected="$tag" '
+        $1 == "-A" {
+            position++
+            for (field = 1; field < NF; field++) {
+                if ($field == "--comment") {
+                    value = $(field + 1)
+                    gsub(/^"|"$/, "", value)
+                    if (value == expected) { print position; exit }
+                }
+            }
+        }
+    ' <<<"$output"
+}
+
+validate_tag_integrity() {
+    local family="$1" chain="$2" tag="$3" exists="$4" count
+    count="$(tag_count "$family" "$chain" "$tag")"
+    ((count <= 1)) || die "duplicate reserved firewall tag detected: $tag"
+    if [[ "$exists" == 1 ]]; then
+        ((count == 1)) || die "exact rule exists but reserved tag is not uniquely visible: $tag"
+    else
+        ((count == 0)) || die "reserved tag is attached to a non-owned rule: $tag"
+    fi
+}
+
+inspect_rules() {
+    ALLOW_EXISTS=0
+    DENY_EXISTS=0
+    DENY_V6_EXISTS=0
+    DENY_V6_FORWARD_EXISTS=0
+    rule_exists_v4 ALLOW_V4_RULE && ALLOW_EXISTS=1
+    rule_exists_v4 DENY_V4_RULE && DENY_EXISTS=1
+    rule_exists_v6 && DENY_V6_EXISTS=1
+    rule_exists_v6_forward && DENY_V6_FORWARD_EXISTS=1
+    validate_tag_integrity v4 DOCKER-USER "$ALLOW_V4_TAG" "$ALLOW_EXISTS"
+    validate_tag_integrity v4 DOCKER-USER "$DENY_V4_TAG" "$DENY_EXISTS"
+    validate_tag_integrity v6 INPUT "$DENY_V6_TAG" "$DENY_V6_EXISTS"
+    validate_tag_integrity v6 FORWARD "$DENY_V6_FORWARD_TAG" "$DENY_V6_FORWARD_EXISTS"
+    ALLOW_POSITION="$(tag_position v4 DOCKER-USER "$ALLOW_V4_TAG")"
+    DENY_POSITION="$(tag_position v4 DOCKER-USER "$DENY_V4_TAG")"
+    DENY_V6_POSITION="$(tag_position v6 INPUT "$DENY_V6_TAG")"
+    DENY_V6_FORWARD_POSITION="$(tag_position v6 FORWARD "$DENY_V6_FORWARD_TAG")"
+}
+
+rules_are_applied() {
+    [[ "$ALLOW_EXISTS" == 1 && "$DENY_EXISTS" == 1 && "$DENY_V6_EXISTS" == 1 &&
+        "$DENY_V6_FORWARD_EXISTS" == 1 && "$ALLOW_POSITION" == 1 &&
+        "$DENY_POSITION" == 2 && "$DENY_V6_POSITION" == 1 &&
+        "$DENY_V6_FORWARD_POSITION" == 1 ]]
+}
+
+run_mutation() {
+    if ((DRY_RUN)); then
+        print_command "$@"
+    else
+        "$@"
+    fi
+}
+
+apply_action() {
+    inspect_rules
+    if rules_are_applied; then
+        printf 'forgefleet-falkor-firewall: applied (already converged)\n'
+        return
+    fi
+
+    # Only safe partial states are repaired automatically. Misordered rules
+    # could sit behind an ACCEPT/RETURN, so they require explicit remove/apply.
+    if [[ "$DENY_V6_EXISTS" == 1 && "$DENY_V6_POSITION" != 1 ]]; then
+        die "IPv6 rule is not first in INPUT; run remove, inspect policy, then apply"
+    fi
+    if [[ "$DENY_V6_FORWARD_EXISTS" == 1 && "$DENY_V6_FORWARD_POSITION" != 1 ]]; then
+        die "IPv6 rule is not first in FORWARD; run remove, inspect policy, then apply"
+    fi
+    if [[ "$ALLOW_EXISTS" == 1 && "$DENY_EXISTS" == 1 ]] &&
+        [[ "$ALLOW_POSITION" != 1 || "$DENY_POSITION" != 2 ]]; then
+        die "IPv4 rules are misordered; run remove, inspect policy, then apply"
+    fi
+    if [[ "$ALLOW_EXISTS" == 1 && "$DENY_EXISTS" == 0 && "$ALLOW_POSITION" != 1 ]]; then
+        die "partial IPv4 allow rule is not first in DOCKER-USER"
+    fi
+    if [[ "$DENY_EXISTS" == 1 && "$ALLOW_EXISTS" == 0 && "$DENY_POSITION" != 1 ]]; then
+        die "partial IPv4 deny rule is not first in DOCKER-USER"
+    fi
+
+    if [[ "$DENY_V6_EXISTS" == 0 ]]; then
+        run_mutation "$IP6TABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter \
+            -I INPUT 1 "${DENY_V6_RULE[@]}"
+    fi
+    if [[ "$DENY_V6_FORWARD_EXISTS" == 0 ]]; then
+        run_mutation "$IP6TABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter \
+            -I FORWARD 1 "${DENY_V6_FORWARD_RULE[@]}"
+    fi
+    if [[ "$ALLOW_EXISTS" == 0 && "$DENY_EXISTS" == 0 ]]; then
+        # Deny first is fail-closed; the following position-1 allow produces
+        # the required effective allow-before-deny order.
+        run_mutation "$IPTABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter \
+            -I DOCKER-USER 1 "${DENY_V4_RULE[@]}"
+        run_mutation "$IPTABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter \
+            -I DOCKER-USER 1 "${ALLOW_V4_RULE[@]}"
+    elif [[ "$DENY_EXISTS" == 1 && "$ALLOW_EXISTS" == 0 ]]; then
+        run_mutation "$IPTABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter \
+            -I DOCKER-USER 1 "${ALLOW_V4_RULE[@]}"
+    elif [[ "$ALLOW_EXISTS" == 1 && "$DENY_EXISTS" == 0 ]]; then
+        run_mutation "$IPTABLES_COMMAND" -w "$IPTABLES_WAIT_SECONDS" -t filter \
+            -I DOCKER-USER 2 "${DENY_V4_RULE[@]}"
+    fi
+
+    if ((DRY_RUN)); then
+        printf 'forgefleet-falkor-firewall: dry-run apply complete (no mutation)\n'
+        return
+    fi
+    inspect_rules
+    rules_are_applied || die "post-apply verification failed; deny rules were installed first"
+    printf 'forgefleet-falkor-firewall: applied\n'
+}
+
+status_action() {
+    inspect_rules
+    if ((JSON_OUTPUT)); then
+        local ok=false allow=false deny=false deny_v6=false
+        local unit_active=null unit_enabled=null environment_file_present=false helper_present=false
+        [[ "$ALLOW_EXISTS" == 1 ]] && allow=true
+        [[ "$DENY_EXISTS" == 1 ]] && deny=true
+        [[ "$DENY_V6_EXISTS" == 1 && "$DENY_V6_FORWARD_EXISTS" == 1 ]] && deny_v6=true
+        rules_are_applied && ok=true
+        if command -v systemctl >/dev/null 2>&1; then
+            unit_active=false
+            unit_enabled=false
+            systemctl is-active --quiet "$UNIT_NAME" >/dev/null 2>&1 && unit_active=true
+            systemctl is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1 && unit_enabled=true
+        fi
+        [[ -f "$ENVIRONMENT_FILE" ]] && environment_file_present=true
+        [[ -x "$INSTALLED_HELPER" ]] && helper_present=true
+        printf '{"ok":%s,"interface":"%s","source_ipv4":"%s","destination_ipv4":"%s","port":%s,"allow_v4":%s,"deny_v4":%s,"deny_v6":%s,"allow_v4_position":%s,"deny_v4_position":%s,"deny_v6_position":%s,"deny_v6_forward_position":%s,"persistence":{"unit":"%s","unit_active":%s,"unit_enabled":%s,"environment_file":"%s","environment_file_present":%s,"helper":"%s","helper_present":%s}}\n' \
+            "$ok" "$INTERFACE" "$ALLOWED_SOURCE_IPV4" "$DESTINATION_IPV4" "$FALKOR_PORT" \
+            "$allow" "$deny" "$deny_v6" "${ALLOW_POSITION:-null}" "${DENY_POSITION:-null}" \
+            "${DENY_V6_POSITION:-null}" "${DENY_V6_FORWARD_POSITION:-null}" \
+            "$UNIT_NAME" "$unit_active" "$unit_enabled" \
+            "$ENVIRONMENT_FILE" "$environment_file_present" "$INSTALLED_HELPER" "$helper_present"
+        [[ "$ok" == true ]]
+        return
+    fi
+    printf 'ipv4_allow=%s position=%s tag=%s\n' "$ALLOW_EXISTS" "${ALLOW_POSITION:-none}" "$ALLOW_V4_TAG"
+    printf 'ipv4_deny=%s position=%s tag=%s\n' "$DENY_EXISTS" "${DENY_POSITION:-none}" "$DENY_V4_TAG"
+    printf 'ipv6_deny=%s position=%s tag=%s\n' "$DENY_V6_EXISTS" "${DENY_V6_POSITION:-none}" "$DENY_V6_TAG"
+    printf 'ipv6_forward_deny=%s position=%s tag=%s\n' "$DENY_V6_FORWARD_EXISTS" \
+        "${DENY_V6_FORWARD_POSITION:-none}" "$DENY_V6_FORWARD_TAG"
+    if rules_are_applied; then
+        printf 'status=applied\n'
+    else
+        printf 'status=not-applied\n'
+        return 1
+    fi
+}
+
+load_discovered_tagged_rule() {
+    local family="$1" chain="$2" tag="$3" output
+    DISCOVERED_RULE_LINE=""
+    if [[ "$family" == v4 ]]; then
+        output="$(v4_filter -S "$chain" 2>/dev/null)" || return 0
+    else
+        output="$(v6_filter -S "$chain" 2>/dev/null)" || return 0
+    fi
+    local -a matches=()
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && matches+=("$line")
+    done < <(awk -v expected="$tag" '
+        $1 == "-A" {
+            for (field = 1; field < NF; field++) {
+                if ($field == "--comment") {
+                    value = $(field + 1)
+                    gsub(/^"|"$/, "", value)
+                    if (value == expected) print
+                }
+            }
+        }
+    ' <<<"$output")
+    ((${#matches[@]} <= 1)) || die "duplicate reserved firewall tag detected during remove: $tag"
+    if ((${#matches[@]} == 1)); then
+        DISCOVERED_RULE_LINE="${matches[0]}"
+    fi
+}
+
+validate_discovered_owned_rule() {
+    local kind="$1" expected_tag="$2" token port
+    read -r -a DISCOVERED_RULE_TOKENS <<<"$DISCOVERED_RULE_LINE"
+    for token in "${!DISCOVERED_RULE_TOKENS[@]}"; do
+        DISCOVERED_RULE_TOKENS[$token]="${DISCOVERED_RULE_TOKENS[$token]#\"}"
+        DISCOVERED_RULE_TOKENS[$token]="${DISCOVERED_RULE_TOKENS[$token]%\"}"
+    done
+    case "$kind" in
+        allow_v4)
+            [[ ${#DISCOVERED_RULE_TOKENS[@]} -eq 22 &&
+                "${DISCOVERED_RULE_TOKENS[0]}" == -A &&
+                "${DISCOVERED_RULE_TOKENS[1]}" == DOCKER-USER &&
+                "${DISCOVERED_RULE_TOKENS[2]}" == -i &&
+                "${DISCOVERED_RULE_TOKENS[3]}" =~ ^[[:alnum:]_.:-]{1,15}$ &&
+                "${DISCOVERED_RULE_TOKENS[4]}" == -p && "${DISCOVERED_RULE_TOKENS[5]}" == tcp &&
+                "${DISCOVERED_RULE_TOKENS[6]}" == -s && "${DISCOVERED_RULE_TOKENS[7]}" == */32 &&
+                "${DISCOVERED_RULE_TOKENS[8]}" == -m && "${DISCOVERED_RULE_TOKENS[9]}" == conntrack &&
+                "${DISCOVERED_RULE_TOKENS[10]}" == --ctdir && "${DISCOVERED_RULE_TOKENS[11]}" == ORIGINAL &&
+                "${DISCOVERED_RULE_TOKENS[12]}" == --ctorigdst && "${DISCOVERED_RULE_TOKENS[13]}" == */32 &&
+                "${DISCOVERED_RULE_TOKENS[14]}" == --ctorigdstport &&
+                "${DISCOVERED_RULE_TOKENS[16]}" == -m && "${DISCOVERED_RULE_TOKENS[17]}" == comment &&
+                "${DISCOVERED_RULE_TOKENS[18]}" == --comment && "${DISCOVERED_RULE_TOKENS[19]}" == "$expected_tag" &&
+                "${DISCOVERED_RULE_TOKENS[20]}" == -j && "${DISCOVERED_RULE_TOKENS[21]}" == ACCEPT ]] ||
+                die "reserved allow tag is attached to a non-owned rule; refusing removal"
+            port="${DISCOVERED_RULE_TOKENS[15]}"
+            ;;
+        deny_v4)
+            [[ ${#DISCOVERED_RULE_TOKENS[@]} -eq 20 &&
+                "${DISCOVERED_RULE_TOKENS[0]}" == -A &&
+                "${DISCOVERED_RULE_TOKENS[1]}" == DOCKER-USER &&
+                "${DISCOVERED_RULE_TOKENS[2]}" == -i &&
+                "${DISCOVERED_RULE_TOKENS[3]}" =~ ^[[:alnum:]_.:-]{1,15}$ &&
+                "${DISCOVERED_RULE_TOKENS[4]}" == -p && "${DISCOVERED_RULE_TOKENS[5]}" == tcp &&
+                "${DISCOVERED_RULE_TOKENS[6]}" == -m && "${DISCOVERED_RULE_TOKENS[7]}" == conntrack &&
+                "${DISCOVERED_RULE_TOKENS[8]}" == --ctdir && "${DISCOVERED_RULE_TOKENS[9]}" == ORIGINAL &&
+                "${DISCOVERED_RULE_TOKENS[10]}" == --ctorigdst && "${DISCOVERED_RULE_TOKENS[11]}" == */32 &&
+                "${DISCOVERED_RULE_TOKENS[12]}" == --ctorigdstport &&
+                "${DISCOVERED_RULE_TOKENS[14]}" == -m && "${DISCOVERED_RULE_TOKENS[15]}" == comment &&
+                "${DISCOVERED_RULE_TOKENS[16]}" == --comment && "${DISCOVERED_RULE_TOKENS[17]}" == "$expected_tag" &&
+                "${DISCOVERED_RULE_TOKENS[18]}" == -j && "${DISCOVERED_RULE_TOKENS[19]}" == DROP ]] ||
+                die "reserved deny tag is attached to a non-owned IPv4 rule; refusing removal"
+            port="${DISCOVERED_RULE_TOKENS[13]}"
+            ;;
+        deny_v6_input)
+            [[ ${#DISCOVERED_RULE_TOKENS[@]} -eq 14 &&
+                "${DISCOVERED_RULE_TOKENS[0]}" == -A && "${DISCOVERED_RULE_TOKENS[1]}" == INPUT &&
+                "${DISCOVERED_RULE_TOKENS[2]}" == -i &&
+                "${DISCOVERED_RULE_TOKENS[3]}" =~ ^[[:alnum:]_.:-]{1,15}$ &&
+                "${DISCOVERED_RULE_TOKENS[4]}" == -p && "${DISCOVERED_RULE_TOKENS[5]}" == tcp &&
+                "${DISCOVERED_RULE_TOKENS[6]}" == --dport &&
+                "${DISCOVERED_RULE_TOKENS[8]}" == -m && "${DISCOVERED_RULE_TOKENS[9]}" == comment &&
+                "${DISCOVERED_RULE_TOKENS[10]}" == --comment && "${DISCOVERED_RULE_TOKENS[11]}" == "$expected_tag" &&
+                "${DISCOVERED_RULE_TOKENS[12]}" == -j && "${DISCOVERED_RULE_TOKENS[13]}" == DROP ]] ||
+                die "reserved deny tag is attached to a non-owned IPv6 INPUT rule; refusing removal"
+            port="${DISCOVERED_RULE_TOKENS[7]}"
+            ;;
+        deny_v6_forward)
+            [[ ${#DISCOVERED_RULE_TOKENS[@]} -eq 18 &&
+                "${DISCOVERED_RULE_TOKENS[0]}" == -A && "${DISCOVERED_RULE_TOKENS[1]}" == FORWARD &&
+                "${DISCOVERED_RULE_TOKENS[2]}" == -i &&
+                "${DISCOVERED_RULE_TOKENS[3]}" =~ ^[[:alnum:]_.:-]{1,15}$ &&
+                "${DISCOVERED_RULE_TOKENS[4]}" == -p && "${DISCOVERED_RULE_TOKENS[5]}" == tcp &&
+                "${DISCOVERED_RULE_TOKENS[6]}" == -m && "${DISCOVERED_RULE_TOKENS[7]}" == conntrack &&
+                "${DISCOVERED_RULE_TOKENS[8]}" == --ctdir && "${DISCOVERED_RULE_TOKENS[9]}" == ORIGINAL &&
+                "${DISCOVERED_RULE_TOKENS[10]}" == --ctorigdstport &&
+                "${DISCOVERED_RULE_TOKENS[12]}" == -m && "${DISCOVERED_RULE_TOKENS[13]}" == comment &&
+                "${DISCOVERED_RULE_TOKENS[14]}" == --comment && "${DISCOVERED_RULE_TOKENS[15]}" == "$expected_tag" &&
+                "${DISCOVERED_RULE_TOKENS[16]}" == -j && "${DISCOVERED_RULE_TOKENS[17]}" == DROP ]] ||
+                die "reserved deny tag is attached to a non-owned IPv6 FORWARD rule; refusing removal"
+            port="${DISCOVERED_RULE_TOKENS[11]}"
+            ;;
+        *) die "internal unknown discovered-rule kind: $kind" ;;
+    esac
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || die "owned tagged rule has an invalid port"
+    ((10#$port >= 1 && 10#$port <= 65535)) || die "owned tagged rule port is out of range"
+    [[ "$port" != 55432 && "$port" != 56379 ]] ||
+        die "refusing to remove a reserved PostgreSQL/Redis tagged rule"
+    DISCOVERED_RULE_TOKENS[0]=-D
+}
+
+remove_discovered_rule() {
+    local family="$1" chain="$2" tag="$3" kind="$4" command
+    load_discovered_tagged_rule "$family" "$chain" "$tag"
+    [[ -n "$DISCOVERED_RULE_LINE" ]] || return 0
+    validate_discovered_owned_rule "$kind" "$tag"
+    if [[ "$family" == v4 ]]; then
+        command="$IPTABLES_COMMAND"
+    else
+        command="$IP6TABLES_COMMAND"
+    fi
+    run_mutation "$command" -w "$IPTABLES_WAIT_SECONDS" -t filter "${DISCOVERED_RULE_TOKENS[@]}"
+}
+
+remove_action() {
+    # Remove allow before deny so a partial failure remains fail-closed.
+    remove_discovered_rule v4 DOCKER-USER "$ALLOW_V4_TAG" allow_v4
+    remove_discovered_rule v4 DOCKER-USER "$DENY_V4_TAG" deny_v4
+    remove_discovered_rule v6 FORWARD "$DENY_V6_FORWARD_TAG" deny_v6_forward
+    remove_discovered_rule v6 INPUT "$DENY_V6_TAG" deny_v6_input
+    if ((DRY_RUN)); then
+        printf 'forgefleet-falkor-firewall: dry-run remove complete (no mutation)\n'
+        return
+    fi
+    for owned in \
+        "v4 DOCKER-USER $ALLOW_V4_TAG" \
+        "v4 DOCKER-USER $DENY_V4_TAG" \
+        "v6 FORWARD $DENY_V6_FORWARD_TAG" \
+        "v6 INPUT $DENY_V6_TAG"; do
+        read -r family chain tag <<<"$owned"
+        load_discovered_tagged_rule "$family" "$chain" "$tag"
+        [[ -z "$DISCOVERED_RULE_LINE" ]] || die "post-remove verification failed for $tag"
+    done
+    printf 'forgefleet-falkor-firewall: removed\n'
+}
+
+case "$ACTION" in
+    apply)
+        validate_runtime_prerequisites
+        apply_action
+        ;;
+    status)
+        validate_runtime_prerequisites
+        status_action
+        ;;
+    remove) remove_action ;;
+esac
