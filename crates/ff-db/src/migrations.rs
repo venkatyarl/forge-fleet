@@ -1314,6 +1314,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "james_qwen_served_model_alias",
         sql: schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS,
     },
+    PgMigration {
+        version: 293,
+        name: "smolvlm_exact_variant_authority",
+        sql: schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY,
+    },
 ];
 
 /// Fail closed unless the enrollment authority table is exactly the reviewed
@@ -1852,12 +1857,63 @@ mod tests {
                 "v292 must not use fuzzy identity matching through {forbidden}"
             );
         }
+        let v292_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 292)
+            .expect("v292 position");
+        let v293_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 293)
+            .expect("v293 position");
+        assert_eq!(v293_position, v292_position + 1, "v293 must follow v292");
+    }
+
+    #[test]
+    fn v293_is_exact_fail_closed_smolvlm_variant_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 293)
+            .expect("v293 must be appended after v292");
+        assert_eq!(migration.name, "smolvlm_exact_variant_authority");
+        for required in [
+            "FOR UPDATE",
+            "catalog_row_count > 1",
+            "catalog_row_count = 0",
+            "INSERT INTO fleet_model_catalog",
+            "exact_nonvariant_state",
+            "nonvariant_state IS DISTINCT FROM exact_nonvariant_state",
+            "jsonb_typeof(original_variants) IS DISTINCT FROM 'array'",
+            "original_variants = '[]'::jsonb",
+            "original_variants IS DISTINCT FROM exact_variants",
+            "variants = original_variants",
+            "final_variants IS DISTINCT FROM exact_variants",
+            "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+            "ccd7aae53bcb1997355c2f094959e72b3642ce17",
+            "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+            "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+            "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        ] {
+            assert!(migration.sql.contains(required), "v293 missing {required}");
+        }
+        for forbidden in [
+            "ILIKE",
+            "LOWER(",
+            "regexp_replace",
+            "translate(",
+            "ON CONFLICT",
+            "DO UPDATE",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v293 must not repair or fuzz authority through {forbidden}"
+            );
+        }
         assert_eq!(
             PG_MIGRATIONS
                 .iter()
-                .position(|migration| migration.version == 292),
+                .position(|migration| migration.version == 293),
             PG_MIGRATIONS.len().checked_sub(1),
-            "v292 must remain the final forward migration"
+            "v293 must remain the final forward migration"
         );
     }
 
@@ -2195,7 +2251,7 @@ mod tests {
         let final_version = run_postgres_migrations(&pool)
             .await
             .expect("fresh V161 bootstrap plus forward migrations must converge");
-        assert_eq!(final_version, 292);
+        assert_eq!(final_version, 293);
         let migration_name: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 292")
                 .fetch_one(&pool)
@@ -2382,6 +2438,340 @@ mod tests {
             );
             assert_eq!(v292_catalog_variants(&pool).await, variants);
         }
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    fn v293_expected_variants() -> serde_json::Value {
+        serde_json::json!([{
+            "runtime": "llama.cpp",
+            "quant": "Q8_0",
+            "hf_repo": "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+            "source_revision": "ccd7aae53bcb1997355c2f094959e72b3642ce17",
+            "size_gb": 0.545593888,
+            "model_file": "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+            "model_size_bytes": 436808704_i64,
+            "model_sha256": "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+            "mmproj_file": "mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+            "mmproj_size_bytes": 108785184_i64,
+            "mmproj_sha256": "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+            "served_model_aliases": ["SmolVLM2-500M-Video-Instruct-Q8_0.gguf"]
+        }])
+    }
+
+    fn v293_expected_row() -> serde_json::Value {
+        serde_json::json!({
+            "id": "smolvlm2-500m-video",
+            "name": "SmolVLM2 500M Video",
+            "family": "smolvlm",
+            "parameters": "500M",
+            "tier": 1,
+            "description": "SmolVLM2 500M - tiny video/vision understanding SLM (research lane)",
+            "gated": false,
+            "preferred_workloads": ["vision", "video", "multimodal", "slm"],
+            "variants": v293_expected_variants(),
+            "tool_calling": false,
+            "display_name": null,
+            "tasks": null,
+            "modalities": null,
+            "benchmarks": null,
+            "license": null,
+            "lifecycle": null
+        })
+    }
+
+    async fn prepare_v293_catalog_table(pool: &PgPool) {
+        let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+            .fetch_one(pool)
+            .await
+            .expect("read disposable postgres version");
+        let server_major = server_version_num
+            .parse::<u32>()
+            .expect("server_version_num must be numeric")
+            / 10_000;
+        assert_eq!(server_major, 16, "V293 must be proven on PostgreSQL 16");
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_model_catalog (\
+                 id TEXT NOT NULL,\
+                 name TEXT NOT NULL,\
+                 family TEXT NOT NULL,\
+                 parameters TEXT NOT NULL,\
+                 tier INTEGER NOT NULL,\
+                 description TEXT,\
+                 gated BOOLEAN NOT NULL,\
+                 preferred_workloads JSONB NOT NULL,\
+                 variants JSONB,\
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
+                 tool_calling BOOLEAN NOT NULL,\
+                 display_name TEXT,\
+                 tasks JSONB,\
+                 modalities JSONB,\
+                 benchmarks JSONB,\
+                 license TEXT,\
+                 lifecycle TEXT,\
+                 sentinel JSONB NOT NULL DEFAULT '{}'::jsonb\
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create minimal V293 catalog authority");
+    }
+
+    async fn seed_v293_catalog_row(
+        pool: &PgPool,
+        variants: &serde_json::Value,
+        sentinel: &serde_json::Value,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO fleet_model_catalog (
+                id, name, family, parameters, tier, description, gated,
+                preferred_workloads, variants, tool_calling, display_name,
+                tasks, modalities, benchmarks, license, lifecycle, sentinel
+            ) VALUES (
+                'smolvlm2-500m-video',
+                'SmolVLM2 500M Video',
+                'smolvlm',
+                '500M',
+                1,
+                'SmolVLM2 500M - tiny video/vision understanding SLM (research lane)',
+                false,
+                '["vision", "video", "multimodal", "slm"]',
+                $1,
+                false,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                $2
+            )
+            "#,
+        )
+        .bind(variants)
+        .bind(sentinel)
+        .execute(pool)
+        .await
+        .expect("seed exact V293 catalog metadata");
+    }
+
+    async fn v293_rejection(pool: &PgPool) -> String {
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(pool)
+            .await
+            .expect_err("V293 fixture drift must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v293_adds_exact_authority_is_idempotent_and_preserves_other_data_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        seed_v293_catalog_row(
+            &pool,
+            &serde_json::json!([]),
+            &serde_json::json!({"keep": "target"}),
+        )
+        .await;
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO fleet_model_catalog (
+                id, name, family, parameters, tier, description, gated,
+                preferred_workloads, variants, tool_calling, sentinel
+            ) VALUES (
+                'unrelated', 'Unrelated', 'test', '1B', 1, NULL, false,
+                '[]', '[{"leave":true}]', false, '{"keep":"other"}'
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated V293 row");
+        let target_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'variants' FROM fleet_model_catalog catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot target non-variant columns");
+        let unrelated_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot unrelated row");
+
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V293 must add exact reviewed authority");
+        let after_first: serde_json::Value = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read V293 authority");
+        assert_eq!(after_first, v293_expected_variants());
+
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("exact reviewed V293 state must be idempotent");
+        let target_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'variants' FROM fleet_model_catalog catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read target non-variant columns");
+        let unrelated_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read unrelated row");
+        assert_eq!(target_after, target_before);
+        assert_eq!(unrelated_after, unrelated_before);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v293_fresh_v161_bootstrap_converges_to_exact_authority_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh V161 bootstrap plus forward migrations must converge");
+        assert_eq!(final_version, 293);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 293")
+                .fetch_one(&pool)
+                .await
+                .expect("V293 must be durably recorded");
+        assert_eq!(migration_name, "smolvlm_exact_variant_authority");
+        let row: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' FROM fleet_model_catalog catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bootstrapped V293 authority");
+        assert_eq!(row, v293_expected_row());
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v293_seeds_missing_row_and_rejects_duplicate_catalog_rows_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V293 must seed the exact source-controlled row on fresh bootstrap");
+        let seeded: serde_json::Value = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read freshly seeded V293 row");
+        assert_eq!(seeded, v293_expected_variants());
+
+        sqlx::query("DELETE FROM fleet_model_catalog")
+            .execute(&pool)
+            .await
+            .expect("reset V293 duplicate fixture");
+        seed_v293_catalog_row(&pool, &serde_json::json!([]), &serde_json::json!({})).await;
+        seed_v293_catalog_row(&pool, &serde_json::json!([]), &serde_json::json!({})).await;
+        let duplicate_error = v293_rejection(&pool).await;
+        assert!(
+            duplicate_error.contains("found duplicate smolvlm2-500m-video catalog rows"),
+            "unexpected duplicate-row error: {duplicate_error}"
+        );
+        let variants: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read duplicate V293 rows");
+        assert_eq!(variants, vec![serde_json::json!([]), serde_json::json!([])]);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v293_rejects_malformed_duplicate_or_drifted_variants_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        let exact = v293_expected_variants()[0].clone();
+        let drift_cases = [
+            serde_json::json!(null),
+            serde_json::json!({"not": "an array"}),
+            serde_json::json!([42]),
+            serde_json::json!([exact.clone(), exact]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q8_0",
+                "hf_repo": "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+                "source_revision": "wrong",
+                "served_model_aliases": ["SmolVLM2-500M-Video-Instruct-Q8_0.gguf"]
+            }]),
+        ];
+        for variants in drift_cases {
+            sqlx::query("DELETE FROM fleet_model_catalog")
+                .execute(&pool)
+                .await
+                .expect("reset V293 drift fixture");
+            seed_v293_catalog_row(&pool, &variants, &serde_json::json!({"keep": true})).await;
+            let error = v293_rejection(&pool).await;
+            assert!(
+                error.contains("variants must be a JSON array")
+                    || error.contains("unreviewed SmolVLM variant authority"),
+                "unexpected V293 drift error: {error}"
+            );
+            let after: serde_json::Value = sqlx::query_scalar(
+                "SELECT variants FROM fleet_model_catalog WHERE id = 'smolvlm2-500m-video'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read rejected V293 fixture");
+            assert_eq!(after, variants);
+        }
+
+        sqlx::query("DELETE FROM fleet_model_catalog")
+            .execute(&pool)
+            .await
+            .expect("reset V293 metadata drift fixture");
+        seed_v293_catalog_row(&pool, &serde_json::json!([]), &serde_json::json!({})).await;
+        sqlx::query(
+            "UPDATE fleet_model_catalog SET name = 'Drifted SmolVLM' \
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .execute(&pool)
+        .await
+        .expect("drift V293 metadata fixture");
+        let metadata_error = v293_rejection(&pool).await;
+        assert!(
+            metadata_error.contains("found unreviewed SmolVLM catalog metadata"),
+            "unexpected V293 metadata error: {metadata_error}"
+        );
+        let after_metadata_rejection: (String, serde_json::Value) = sqlx::query_as(
+            "SELECT name, variants FROM fleet_model_catalog \
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rejected V293 metadata fixture");
+        assert_eq!(after_metadata_rejection.0, "Drifted SmolVLM");
+        assert_eq!(after_metadata_rejection.1, serde_json::json!([]));
 
         drop_temp_db(admin, pool, &db_name).await;
     }

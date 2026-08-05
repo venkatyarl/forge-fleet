@@ -19,7 +19,7 @@ use crate::beat_v2::{AvailableModel, ClusterInfo, LlmMemoryUsage, LlmServer, Llm
 /// plus the well-known Ollama port.
 const LLM_SCAN_PORTS: &[u16] = &[
     51001, 51003, 51004, 51005, 51006, 51007, 51008, 51009, 51010, 55000, 55001, 55002, 55003,
-    55004, 55005, 55006, 55007, 55008, 55009, 55010, 11434, // ollama
+    55004, 55005, 55006, 55007, 55008, 55009, 55010, 55020, 11434, // ollama
 ];
 
 /// Ports that belong to ForgeFleet infrastructure, NOT LLM servers.
@@ -455,6 +455,21 @@ fn model_id_from_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_ports_include_sia_coder_and_exclude_infrastructure() {
+        assert_eq!(
+            LLM_SCAN_PORTS.iter().filter(|&&port| port == 55020).count(),
+            1,
+            "Sia's dedicated coder endpoint must be scanned exactly once"
+        );
+        for port in EXCLUDED_PORTS {
+            assert!(
+                !LLM_SCAN_PORTS.contains(port),
+                "infrastructure port {port} must not enter the LLM scan set"
+            );
+        }
+    }
 
     #[test]
     fn runtime_identification_fallbacks() {

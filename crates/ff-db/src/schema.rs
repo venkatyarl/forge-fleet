@@ -13516,6 +13516,171 @@ END
 $v292_james_qwen_served_alias$;
 "#;
 
+/// v293: authorize the exact SmolVLM2 Q8_0 llama.cpp artifact identity.
+///
+/// The live catalog row predates source-controlled authority and therefore has
+/// an empty `variants` array; a fresh bootstrap has no row at all. The
+/// downloaded model and projector were independently hashed on every fleet
+/// holder and matched to the pinned upstream revision. This migration seeds an
+/// absent row exactly, upgrades only the exact reviewed live row, accepts the
+/// exact final state idempotently, and fails closed on every partial or drifted
+/// state.
+pub const SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY: &str = r#"
+DO $v293_smolvlm_exact_variant_authority$
+DECLARE
+    target_catalog_id CONSTANT TEXT := 'smolvlm2-500m-video';
+    exact_nonvariant_state CONSTANT JSONB := '{
+        "id": "smolvlm2-500m-video",
+        "name": "SmolVLM2 500M Video",
+        "family": "smolvlm",
+        "parameters": "500M",
+        "tier": 1,
+        "description": "SmolVLM2 500M - tiny video/vision understanding SLM (research lane)",
+        "gated": false,
+        "preferred_workloads": ["vision", "video", "multimodal", "slm"],
+        "tool_calling": false,
+        "display_name": null,
+        "tasks": null,
+        "modalities": null,
+        "benchmarks": null,
+        "license": null,
+        "lifecycle": null
+    }'::jsonb;
+    exact_variants CONSTANT JSONB := '[{
+        "runtime": "llama.cpp",
+        "quant": "Q8_0",
+        "hf_repo": "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+        "source_revision": "ccd7aae53bcb1997355c2f094959e72b3642ce17",
+        "size_gb": 0.545593888,
+        "model_file": "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        "model_size_bytes": 436808704,
+        "model_sha256": "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+        "mmproj_file": "mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        "mmproj_size_bytes": 108785184,
+        "mmproj_sha256": "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+        "served_model_aliases": ["SmolVLM2-500M-Video-Instruct-Q8_0.gguf"]
+    }]'::jsonb;
+    catalog_row_count BIGINT;
+    original_variants JSONB;
+    nonvariant_state JSONB;
+    final_variants JSONB;
+    updated_rows BIGINT;
+BEGIN
+    SELECT count(*)
+      INTO catalog_row_count
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF catalog_row_count > 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v293 found duplicate smolvlm2-500m-video catalog rows',
+            DETAIL = format('found %s rows', catalog_row_count);
+    END IF;
+
+    IF catalog_row_count = 0 THEN
+        INSERT INTO fleet_model_catalog (
+            id, name, family, parameters, tier, description, gated,
+            preferred_workloads, variants, tool_calling, display_name,
+            tasks, modalities, benchmarks, license, lifecycle
+        ) VALUES (
+            target_catalog_id,
+            'SmolVLM2 500M Video',
+            'smolvlm',
+            '500M',
+            1,
+            'SmolVLM2 500M - tiny video/vision understanding SLM (research lane)',
+            false,
+            '["vision", "video", "multimodal", "slm"]'::jsonb,
+            exact_variants,
+            false,
+            NULL, NULL, NULL, NULL, NULL, NULL
+        );
+        GET DIAGNOSTICS updated_rows = ROW_COUNT;
+        IF updated_rows <> 1 THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v293 failed to seed exactly one canonical catalog row',
+                DETAIL = format('inserted %s rows', updated_rows);
+        END IF;
+    ELSE
+        SELECT variants,
+               jsonb_build_object(
+                   'id', id,
+                   'name', name,
+                   'family', family,
+                   'parameters', parameters,
+                   'tier', tier,
+                   'description', description,
+                   'gated', gated,
+                   'preferred_workloads', preferred_workloads,
+                   'tool_calling', tool_calling,
+                   'display_name', display_name,
+                   'tasks', tasks,
+                   'modalities', modalities,
+                   'benchmarks', benchmarks,
+                   'license', license,
+                   'lifecycle', lifecycle
+               )
+          INTO original_variants, nonvariant_state
+          FROM fleet_model_catalog
+         WHERE id = target_catalog_id
+           FOR UPDATE;
+
+        IF nonvariant_state IS DISTINCT FROM exact_nonvariant_state THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v293 found unreviewed SmolVLM catalog metadata',
+                DETAIL = format('metadata=%s', nonvariant_state::text);
+        END IF;
+        IF jsonb_typeof(original_variants) IS DISTINCT FROM 'array' THEN
+            RAISE EXCEPTION 'v293 smolvlm2-500m-video variants must be a JSON array';
+        END IF;
+
+        IF original_variants = '[]'::jsonb THEN
+            UPDATE fleet_model_catalog
+               SET variants = exact_variants
+             WHERE id = target_catalog_id
+               AND variants = original_variants;
+            GET DIAGNOSTICS updated_rows = ROW_COUNT;
+            IF updated_rows <> 1 THEN
+                RAISE EXCEPTION USING
+                    MESSAGE = 'v293 failed to update exactly one locked catalog row',
+                    DETAIL = format('updated %s rows', updated_rows);
+            END IF;
+        ELSIF original_variants IS DISTINCT FROM exact_variants THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v293 found unreviewed SmolVLM variant authority',
+                DETAIL = format('variants=%s', original_variants::text);
+        END IF;
+    END IF;
+
+    SELECT variants,
+           jsonb_build_object(
+               'id', id,
+               'name', name,
+               'family', family,
+               'parameters', parameters,
+               'tier', tier,
+               'description', description,
+               'gated', gated,
+               'preferred_workloads', preferred_workloads,
+               'tool_calling', tool_calling,
+               'display_name', display_name,
+               'tasks', tasks,
+               'modalities', modalities,
+               'benchmarks', benchmarks,
+               'license', license,
+               'lifecycle', lifecycle
+           )
+      INTO final_variants, nonvariant_state
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF final_variants IS DISTINCT FROM exact_variants
+       OR nonvariant_state IS DISTINCT FROM exact_nonvariant_state
+    THEN
+        RAISE EXCEPTION 'v293 postcondition failed: catalog row differs from reviewed authority';
+    END IF;
+END
+$v293_smolvlm_exact_variant_authority$;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty
