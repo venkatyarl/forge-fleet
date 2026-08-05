@@ -8,11 +8,13 @@
 //! filesystem scan and PostgreSQL commit one atomic snapshot. Directory
 //! manifests fail closed until the live schema records algorithm and kind.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use chrono::{DateTime, Utc};
 use ff_core::model_integrity::{
     ModelArtifactKind, constant_time_sha256_eq, model_integrity_worker_allowed, parse_sha256_hex,
 };
-use sqlx::Row;
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::PgPool;
@@ -144,6 +146,25 @@ pub struct ReleaseArtifactRegistration {
     pub outcome: ReleaseArtifactRegistrationOutcome,
 }
 
+/// One logical immutable bundle represented entirely by V291 file artifacts.
+///
+/// The manifest is itself one artifact and must appear exactly once in
+/// `artifacts`. Every entry shares one release identity and custody holder.
+#[derive(Debug, Clone)]
+pub struct ReleaseArtifactBatchAssertion {
+    pub manifest_artifact_name: String,
+    pub artifacts: Vec<ReleaseArtifactAssertion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseArtifactBatchRegistration {
+    pub manifest_artifact_name: String,
+    pub registrations: Vec<ReleaseArtifactRegistration>,
+    pub origin_computer_id: Uuid,
+    pub origin_holder: String,
+    pub outcome: ReleaseArtifactRegistrationOutcome,
+}
+
 /// Pure comparison policy: a known digest is never rewritten.
 pub fn decide_hash_write(existing: Option<&str>, computed: &str) -> HashWriteDecision {
     match existing {
@@ -224,9 +245,91 @@ pub async fn pg_register_release_artifact(
     validate_release_artifact_assertion(assertion)?;
 
     let mut transaction = pool.begin().await?;
+    lock_release_identity(&mut transaction, assertion).await?;
+    validate_release_holder(&mut transaction, assertion).await?;
+    let registration =
+        register_release_artifact_in_transaction(&mut transaction, assertion).await?;
+    transaction.commit().await?;
+    Ok(registration)
+}
+
+/// Atomically register or verify every file in one immutable runtime bundle.
+///
+/// V291 remains the authority: the canonical JSON manifest and each executable
+/// or shared library are ordinary file artifacts. The batch API adds no
+/// synthetic directory artifact or digest. It serializes all users of the
+/// release identity, requires an exact artifact set, requires every custodian
+/// to hold that complete set, and proves that every file has the same first
+/// custodian before refreshing any verification timestamp.
+pub async fn pg_register_release_artifact_batch(
+    pool: &PgPool,
+    batch: &ReleaseArtifactBatchAssertion,
+) -> Result<ReleaseArtifactBatchRegistration> {
+    let assertions = validate_release_artifact_batch(batch)?;
+    let anchor = assertions
+        .first()
+        .expect("validated release artifact batch is non-empty");
+    let expected_names: BTreeSet<_> = assertions
+        .iter()
+        .map(|assertion| assertion.artifact_name.clone())
+        .collect();
+
+    let mut transaction = pool.begin().await?;
+    lock_release_identity(&mut transaction, anchor).await?;
+    validate_release_holder(&mut transaction, anchor).await?;
+    preflight_release_bundle_identity(&mut transaction, &assertions, &expected_names).await?;
+    preflight_release_bundle_custody(&mut transaction, &assertions, &expected_names).await?;
+    let existing_origin =
+        preflight_release_bundle_origin(&mut transaction, anchor, &expected_names).await?;
+
+    let mut registrations = Vec::with_capacity(assertions.len());
+    for assertion in &assertions {
+        registrations
+            .push(register_release_artifact_in_transaction(&mut transaction, assertion).await?);
+    }
+    let outcome = if registrations
+        .iter()
+        .any(|registration| registration.outcome == ReleaseArtifactRegistrationOutcome::Registered)
+    {
+        ReleaseArtifactRegistrationOutcome::Registered
+    } else {
+        ReleaseArtifactRegistrationOutcome::Verified
+    };
+    let (origin_computer_id, origin_holder) =
+        existing_origin.unwrap_or_else(|| (anchor.computer_id, anchor.holder_name.clone()));
+
+    transaction.commit().await?;
+    Ok(ReleaseArtifactBatchRegistration {
+        manifest_artifact_name: batch.manifest_artifact_name.clone(),
+        registrations,
+        origin_computer_id,
+        origin_holder,
+        outcome,
+    })
+}
+
+async fn lock_release_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    assertion: &ReleaseArtifactAssertion,
+) -> Result<()> {
+    let identity = format!(
+        "{}\n{}\n{}",
+        assertion.artifact_version, assertion.source_commit, assertion.target_triple
+    );
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('ff.release-bundle'), hashtext($1))")
+        .bind(identity)
+        .execute(&mut **transaction)
+        .await?;
+    Ok(())
+}
+
+async fn validate_release_holder(
+    transaction: &mut Transaction<'_, Postgres>,
+    assertion: &ReleaseArtifactAssertion,
+) -> Result<()> {
     let canonical_holder: Option<String> = sqlx::query_scalar(RELEASE_HOLDER_SELECT_FOR_UPDATE_SQL)
         .bind(assertion.computer_id)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
     let canonical_holder = canonical_holder.ok_or_else(|| {
         DbError::ArtifactIntegrity(format!(
@@ -245,7 +348,13 @@ pub async fn pg_register_release_artifact(
             "release artifact operations are forbidden on Vinny".to_string(),
         ));
     }
+    Ok(())
+}
 
+async fn register_release_artifact_in_transaction(
+    transaction: &mut Transaction<'_, Postgres>,
+    assertion: &ReleaseArtifactAssertion,
+) -> Result<ReleaseArtifactRegistration> {
     let inserted_artifact = sqlx::query(RELEASE_ARTIFACT_INSERT_SQL)
         .bind(&assertion.artifact_name)
         .bind(&assertion.artifact_version)
@@ -253,7 +362,7 @@ pub async fn pg_register_release_artifact(
         .bind(&assertion.target_triple)
         .bind(&assertion.sha256)
         .bind(assertion.size_bytes)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
     let artifact_was_inserted = inserted_artifact.is_some();
     let artifact = match inserted_artifact {
@@ -264,7 +373,7 @@ pub async fn pg_register_release_artifact(
                 .bind(&assertion.artifact_version)
                 .bind(&assertion.source_commit)
                 .bind(&assertion.target_triple)
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await?
                 .ok_or_else(|| {
                     DbError::ArtifactIntegrity(
@@ -287,7 +396,7 @@ pub async fn pg_register_release_artifact(
         .bind(assertion.computer_id)
         .bind(&assertion.holder_name)
         .bind(&assertion.relative_path)
-        .fetch_optional(&mut *transaction)
+        .fetch_optional(&mut **transaction)
         .await?;
     let custody_was_inserted = inserted_custody.is_some();
     let custody = match inserted_custody {
@@ -296,7 +405,7 @@ pub async fn pg_register_release_artifact(
             let row = sqlx::query(RELEASE_CUSTODY_SELECT_FOR_UPDATE_SQL)
                 .bind(artifact.id)
                 .bind(assertion.computer_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await?
                 .ok_or_else(|| {
                     DbError::ArtifactIntegrity(
@@ -319,13 +428,12 @@ pub async fn pg_register_release_artifact(
             )
             .bind(artifact.id)
             .bind(assertion.computer_id)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await?;
             release_custody_from_row(&row)
         }
     };
 
-    transaction.commit().await?;
     Ok(ReleaseArtifactRegistration {
         artifact,
         custody,
@@ -335,6 +443,234 @@ pub async fn pg_register_release_artifact(
             ReleaseArtifactRegistrationOutcome::Verified
         },
     })
+}
+
+fn validate_release_artifact_batch(
+    batch: &ReleaseArtifactBatchAssertion,
+) -> Result<Vec<&ReleaseArtifactAssertion>> {
+    if batch.artifacts.is_empty() {
+        return Err(DbError::ArtifactIntegrity(
+            "release artifact batch must not be empty".to_string(),
+        ));
+    }
+    if batch.manifest_artifact_name.is_empty() {
+        return Err(DbError::ArtifactIntegrity(
+            "release artifact batch must name its manifest artifact".to_string(),
+        ));
+    }
+
+    let anchor = &batch.artifacts[0];
+    let mut names = BTreeSet::new();
+    let mut paths = BTreeSet::new();
+    let mut manifest_count = 0;
+    for assertion in &batch.artifacts {
+        validate_release_artifact_assertion(assertion)?;
+        if assertion.artifact_version != anchor.artifact_version
+            || assertion.source_commit != anchor.source_commit
+            || assertion.target_triple != anchor.target_triple
+            || assertion.computer_id != anchor.computer_id
+            || assertion.holder_name != anchor.holder_name
+        {
+            return Err(DbError::ArtifactIntegrity(
+                "every release bundle artifact must share version, source commit, target triple, computer, and holder"
+                    .to_string(),
+            ));
+        }
+        if !names.insert(assertion.artifact_name.clone()) {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "duplicate release bundle artifact name {}",
+                assertion.artifact_name
+            )));
+        }
+        if !paths.insert(assertion.relative_path.clone()) {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "duplicate release bundle relative path {}",
+                assertion.relative_path
+            )));
+        }
+        manifest_count += usize::from(assertion.artifact_name == batch.manifest_artifact_name);
+    }
+    if manifest_count != 1 {
+        return Err(DbError::ArtifactIntegrity(format!(
+            "release bundle manifest artifact {} must appear exactly once",
+            batch.manifest_artifact_name
+        )));
+    }
+
+    let mut assertions: Vec<_> = batch.artifacts.iter().collect();
+    assertions.sort_by(|left, right| left.artifact_name.cmp(&right.artifact_name));
+    Ok(assertions)
+}
+
+async fn preflight_release_bundle_identity(
+    transaction: &mut Transaction<'_, Postgres>,
+    assertions: &[&ReleaseArtifactAssertion],
+    expected_names: &BTreeSet<String>,
+) -> Result<()> {
+    let anchor = assertions[0];
+    let rows = sqlx::query(
+        "SELECT id, artifact_name, artifact_version, source_commit, target_triple,
+                sha256, size_bytes, created_at
+           FROM release_artifacts
+          WHERE artifact_version = $1 AND source_commit = $2 AND target_triple = $3
+          ORDER BY artifact_name
+          FOR UPDATE",
+    )
+    .bind(&anchor.artifact_version)
+    .bind(&anchor.source_commit)
+    .bind(&anchor.target_triple)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let stored: BTreeMap<_, _> = rows
+        .iter()
+        .map(|row| {
+            let artifact = release_artifact_from_row(row);
+            (artifact.artifact_name.clone(), artifact)
+        })
+        .collect();
+    let stored_names: BTreeSet<_> = stored.keys().cloned().collect();
+    if &stored_names != expected_names {
+        return Err(DbError::ArtifactIntegrity(format!(
+            "release bundle artifact set is partial or drifted: expected {expected_names:?}, stored {stored_names:?}"
+        )));
+    }
+    for assertion in assertions {
+        let existing = &stored[&assertion.artifact_name];
+        if !release_content_matches(existing, assertion) {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "release bundle artifact {} has different stored content",
+                assertion.artifact_name
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn preflight_release_bundle_custody(
+    transaction: &mut Transaction<'_, Postgres>,
+    assertions: &[&ReleaseArtifactAssertion],
+    expected_names: &BTreeSet<String>,
+) -> Result<()> {
+    let anchor = assertions[0];
+    let rows = sqlx::query(
+        "SELECT a.artifact_name, c.artifact_id, c.computer_id,
+                c.holder_name_at_registration, c.relative_path,
+                c.first_verified_at, c.last_verified_at
+           FROM release_artifacts a
+           JOIN release_artifact_custody c ON c.artifact_id = a.id
+          WHERE a.artifact_version = $1 AND a.source_commit = $2 AND a.target_triple = $3
+          ORDER BY c.computer_id, a.artifact_name
+          FOR UPDATE OF c",
+    )
+    .bind(&anchor.artifact_version)
+    .bind(&anchor.source_commit)
+    .bind(&anchor.target_triple)
+    .fetch_all(&mut **transaction)
+    .await?;
+
+    let expected_by_name: BTreeMap<_, _> = assertions
+        .iter()
+        .map(|assertion| (assertion.artifact_name.as_str(), *assertion))
+        .collect();
+    let mut names_by_computer: BTreeMap<Uuid, BTreeSet<String>> = BTreeMap::new();
+    for row in &rows {
+        names_by_computer
+            .entry(row.get("computer_id"))
+            .or_default()
+            .insert(row.get("artifact_name"));
+    }
+    for (computer_id, names) in &names_by_computer {
+        if names != expected_names {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "release bundle custody is partial for computer {computer_id}: expected {expected_names:?}, stored {names:?}"
+            )));
+        }
+    }
+
+    for row in rows
+        .iter()
+        .filter(|row| row.get::<Uuid, _>("computer_id") == anchor.computer_id)
+    {
+        let artifact_name: String = row.get("artifact_name");
+        let assertion = expected_by_name[artifact_name.as_str()];
+        let custody = release_custody_from_row(row);
+        if !release_custody_matches(&custody, assertion) {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "release bundle custody for {artifact_name} has different stored holder/path"
+            )));
+        }
+    }
+    Ok(())
+}
+
+async fn preflight_release_bundle_origin(
+    transaction: &mut Transaction<'_, Postgres>,
+    anchor: &ReleaseArtifactAssertion,
+    expected_names: &BTreeSet<String>,
+) -> Result<Option<(Uuid, String)>> {
+    let rows = sqlx::query(
+        "SELECT a.artifact_name, c.computer_id, c.holder_name_at_registration,
+                c.first_verified_at
+           FROM release_artifacts a
+           JOIN release_artifact_custody c ON c.artifact_id = a.id
+          WHERE a.artifact_version = $1 AND a.source_commit = $2 AND a.target_triple = $3
+          ORDER BY a.artifact_name, c.first_verified_at, c.computer_id",
+    )
+    .bind(&anchor.artifact_version)
+    .bind(&anchor.source_commit)
+    .bind(&anchor.target_triple)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+
+    let mut by_artifact: BTreeMap<String, Vec<(Uuid, String, DateTime<Utc>)>> = BTreeMap::new();
+    for row in rows {
+        by_artifact
+            .entry(row.get("artifact_name"))
+            .or_default()
+            .push((
+                row.get("computer_id"),
+                row.get("holder_name_at_registration"),
+                row.get("first_verified_at"),
+            ));
+    }
+    let stored_names: BTreeSet<_> = by_artifact.keys().cloned().collect();
+    if &stored_names != expected_names {
+        return Err(DbError::ArtifactIntegrity(
+            "release bundle origin cannot be proven for every exact artifact".to_string(),
+        ));
+    }
+
+    let mut common_origin: Option<(Uuid, String)> = None;
+    for (artifact_name, custodians) in by_artifact {
+        let earliest = custodians[0].2;
+        let earliest_rows: Vec<_> = custodians
+            .iter()
+            .filter(|(_, _, first_verified_at)| *first_verified_at == earliest)
+            .collect();
+        if earliest_rows.len() != 1 {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "release bundle artifact {artifact_name} has ambiguous first custody"
+            )));
+        }
+        let candidate = (earliest_rows[0].0, earliest_rows[0].1.clone());
+        match &common_origin {
+            None => common_origin = Some(candidate),
+            Some(origin) if origin == &candidate => {}
+            Some(_) => {
+                return Err(DbError::ArtifactIntegrity(
+                    "release bundle artifacts do not share one custody origin".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(common_origin)
 }
 
 pub async fn pg_get_release_artifact(
@@ -618,6 +954,24 @@ mod tests {
         }
     }
 
+    fn release_batch(computer_id: Uuid, holder: &str) -> ReleaseArtifactBatchAssertion {
+        let mut manifest = release_assertion(computer_id, holder);
+        manifest.artifact_name = "llama-runtime-manifest".to_string();
+        manifest.relative_path = "logan-runtime/runtime-manifest.json".to_string();
+        let mut library = release_assertion(computer_id, holder);
+        library.artifact_name = "libllama".to_string();
+        library.relative_path = "logan-runtime/libllama.so".to_string();
+        library.sha256 = "0".repeat(64);
+        let mut server = release_assertion(computer_id, holder);
+        server.artifact_name = "llama-server".to_string();
+        server.relative_path = "logan-runtime/llama-server".to_string();
+        server.sha256 = "1".repeat(64);
+        ReleaseArtifactBatchAssertion {
+            manifest_artifact_name: manifest.artifact_name.clone(),
+            artifacts: vec![manifest, library, server],
+        }
+    }
+
     fn artifact_test_db_url() -> Option<String> {
         env::var("FORGEFLEET_POSTGRES_URL")
             .or_else(|_| env::var("FORGEFLEET_DATABASE_URL"))
@@ -819,6 +1173,35 @@ mod tests {
     }
 
     #[test]
+    fn release_batch_requires_one_complete_shared_identity() {
+        let computer_id = Uuid::new_v4();
+        let valid = release_batch(computer_id, "logan");
+        let sorted = validate_release_artifact_batch(&valid).unwrap();
+        assert_eq!(sorted.len(), 3);
+        assert_eq!(sorted[0].artifact_name, "libllama");
+
+        let mut invalid = valid.clone();
+        invalid.artifacts.clear();
+        assert!(validate_release_artifact_batch(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.manifest_artifact_name = "missing-manifest".to_string();
+        assert!(validate_release_artifact_batch(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.artifacts[2].artifact_name = invalid.artifacts[1].artifact_name.clone();
+        assert!(validate_release_artifact_batch(&invalid).is_err());
+
+        let mut invalid = valid.clone();
+        invalid.artifacts[2].relative_path = invalid.artifacts[1].relative_path.clone();
+        assert!(validate_release_artifact_batch(&invalid).is_err());
+
+        let mut invalid = valid;
+        invalid.artifacts[2].source_commit = "2".repeat(40);
+        assert!(validate_release_artifact_batch(&invalid).is_err());
+    }
+
+    #[test]
     fn release_sql_has_no_content_rewrite_or_delete_surface() {
         assert!(RELEASE_ARTIFACT_INSERT_SQL.contains("ON CONFLICT"));
         assert!(RELEASE_ARTIFACT_INSERT_SQL.contains("DO NOTHING"));
@@ -868,11 +1251,14 @@ mod tests {
         let suffix = Uuid::new_v4().simple().to_string();
         let holder_a = format!("a{}", &suffix[..10]);
         let holder_b = format!("b{}", &suffix[..10]);
+        let holder_c = format!("c{}", &suffix[..10]);
         let computer_a = Uuid::new_v4();
         let computer_b = Uuid::new_v4();
+        let computer_c = Uuid::new_v4();
         for (id, name, ip) in [
             (computer_a, holder_a.as_str(), "192.0.2.10"),
             (computer_b, holder_b.as_str(), "192.0.2.11"),
+            (computer_c, holder_c.as_str(), "192.0.2.12"),
         ] {
             sqlx::query(
                 "INSERT INTO computers (id, name, primary_ip, all_ips, os_family, ssh_user)
@@ -960,6 +1346,166 @@ mod tests {
                 .await
                 .is_err(),
             "database trigger must reject custody deletion"
+        );
+
+        let set_batch_version = |batch: &mut ReleaseArtifactBatchAssertion, version: &str| {
+            for artifact in &mut batch.artifacts {
+                artifact.artifact_version = version.to_string();
+            }
+        };
+
+        let mut bundle_a = release_batch(computer_a, &holder_a);
+        let bundle_version = format!("{suffix}_bundle");
+        set_batch_version(&mut bundle_a, &bundle_version);
+        let registered = pg_register_release_artifact_batch(&pool, &bundle_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            registered.outcome,
+            ReleaseArtifactRegistrationOutcome::Registered
+        );
+        assert_eq!(registered.origin_computer_id, computer_a);
+        assert_eq!(registered.origin_holder, holder_a);
+        assert_eq!(registered.registrations.len(), 3);
+
+        let replay = pg_register_release_artifact_batch(&pool, &bundle_a)
+            .await
+            .unwrap();
+        assert_eq!(replay.outcome, ReleaseArtifactRegistrationOutcome::Verified);
+        assert_eq!(replay.origin_computer_id, computer_a);
+
+        let mut bundle_b = release_batch(computer_b, &holder_b);
+        set_batch_version(&mut bundle_b, &bundle_version);
+        let replicated = pg_register_release_artifact_batch(&pool, &bundle_b)
+            .await
+            .unwrap();
+        assert_eq!(
+            replicated.outcome,
+            ReleaseArtifactRegistrationOutcome::Registered
+        );
+        assert_eq!(replicated.origin_computer_id, computer_a);
+        assert_eq!(replicated.origin_holder, holder_a);
+
+        let mut drifted = bundle_a.clone();
+        drifted.artifacts[1].sha256 = "f".repeat(64);
+        assert!(
+            pg_register_release_artifact_batch(&pool, &drifted)
+                .await
+                .is_err()
+        );
+        let mut drifted = bundle_a.clone();
+        drifted.artifacts[1].relative_path = "logan-runtime/other.so".to_string();
+        assert!(
+            pg_register_release_artifact_batch(&pool, &drifted)
+                .await
+                .is_err()
+        );
+
+        let mut partial_identity = release_batch(computer_a, &holder_a);
+        let partial_identity_version = format!("{suffix}_partial_identity");
+        set_batch_version(&mut partial_identity, &partial_identity_version);
+        pg_register_release_artifact(&pool, &partial_identity.artifacts[0])
+            .await
+            .unwrap();
+        assert!(
+            pg_register_release_artifact_batch(&pool, &partial_identity)
+                .await
+                .is_err()
+        );
+        let partial_identity_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM release_artifacts WHERE artifact_version = $1",
+        )
+        .bind(&partial_identity_version)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(partial_identity_count, 1);
+
+        let mut complete_a = release_batch(computer_a, &holder_a);
+        let partial_custody_version = format!("{suffix}_partial_custody");
+        set_batch_version(&mut complete_a, &partial_custody_version);
+        pg_register_release_artifact_batch(&pool, &complete_a)
+            .await
+            .unwrap();
+        let mut partial_b = release_batch(computer_b, &holder_b);
+        set_batch_version(&mut partial_b, &partial_custody_version);
+        pg_register_release_artifact(&pool, &partial_b.artifacts[0])
+            .await
+            .unwrap();
+        assert!(
+            pg_register_release_artifact_batch(&pool, &partial_b)
+                .await
+                .is_err()
+        );
+
+        let mixed_origin_version = format!("{suffix}_mixed_origin");
+        let mut origin_a = release_batch(computer_a, &holder_a);
+        let mut origin_b = release_batch(computer_b, &holder_b);
+        set_batch_version(&mut origin_a, &mixed_origin_version);
+        set_batch_version(&mut origin_b, &mixed_origin_version);
+        for (index, assertion) in origin_a.artifacts.iter().enumerate() {
+            let first = if index == 1 {
+                &origin_b.artifacts[index]
+            } else {
+                assertion
+            };
+            pg_register_release_artifact(&pool, first).await.unwrap();
+        }
+        for assertion in &origin_a.artifacts {
+            if assertion.artifact_name == origin_a.artifacts[1].artifact_name {
+                pg_register_release_artifact(&pool, assertion)
+                    .await
+                    .unwrap();
+            }
+        }
+        for (index, assertion) in origin_b.artifacts.iter().enumerate() {
+            if index != 1 {
+                pg_register_release_artifact(&pool, assertion)
+                    .await
+                    .unwrap();
+            }
+        }
+        assert!(
+            pg_register_release_artifact_batch(&pool, &origin_a)
+                .await
+                .is_err()
+        );
+
+        let mut atomic = release_batch(computer_c, &holder_c);
+        let atomic_version = format!("{suffix}_atomic");
+        set_batch_version(&mut atomic, &atomic_version);
+        for artifact in &mut atomic.artifacts {
+            artifact.relative_path = format!("atomic/{}", artifact.artifact_name);
+        }
+        let collision_path = atomic
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.artifact_name == "llama-server")
+            .unwrap()
+            .relative_path
+            .clone();
+        let mut collision = release_assertion(computer_c, &holder_c);
+        collision.artifact_name = "unrelated-collision".to_string();
+        collision.artifact_version = format!("{suffix}_unrelated");
+        collision.relative_path = collision_path;
+        pg_register_release_artifact(&pool, &collision)
+            .await
+            .unwrap();
+        assert!(
+            pg_register_release_artifact_batch(&pool, &atomic)
+                .await
+                .is_err()
+        );
+        let atomic_count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM release_artifacts WHERE artifact_version = $1",
+        )
+        .bind(&atomic_version)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            atomic_count, 0,
+            "late failure must roll back the whole batch"
         );
 
         drop_artifact_temp_db(admin, pool, &db_name).await;

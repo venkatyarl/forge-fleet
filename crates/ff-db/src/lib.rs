@@ -38,10 +38,11 @@ pub use migrations::{
 };
 pub use model_integrity::{
     HashWriteDecision, ModelLibraryHashAssertion, ModelLibraryHashCasOutcome,
-    ReleaseArtifactAssertion, ReleaseArtifactCustodyRow, ReleaseArtifactRegistration,
-    ReleaseArtifactRegistrationOutcome, ReleaseArtifactRow, pg_compare_or_cas_model_library_sha256,
-    pg_get_release_artifact, pg_list_release_artifact_custody, pg_list_release_artifacts,
-    pg_register_release_artifact,
+    ReleaseArtifactAssertion, ReleaseArtifactBatchAssertion, ReleaseArtifactBatchRegistration,
+    ReleaseArtifactCustodyRow, ReleaseArtifactRegistration, ReleaseArtifactRegistrationOutcome,
+    ReleaseArtifactRow, pg_compare_or_cas_model_library_sha256, pg_get_release_artifact,
+    pg_list_release_artifact_custody, pg_list_release_artifacts, pg_register_release_artifact,
+    pg_register_release_artifact_batch,
 };
 pub use models::WorkItem;
 pub use operational_store::OperationalStore;
