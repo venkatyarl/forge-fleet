@@ -20,8 +20,8 @@ use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
 use ff_core::config::{self, FleetConfig};
 use ff_core::llm_completion_policy::{
-    apply_completion_policy, redacted_for_logging, validate_completion_response, CompletionBudget,
-    WorkloadClass, LEGACY_DEFAULT_COMPLETION_TOKENS,
+    CompletionBudget, LEGACY_DEFAULT_COMPLETION_TOKENS, WorkloadClass, apply_completion_policy,
+    redacted_for_logging, validate_completion_response,
 };
 use ff_db::{ModelDeploymentRow, OperationalStore};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
@@ -571,7 +571,9 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .ok_or_else(|| "fleet_run requires 'prompt'".to_string())?;
 
     let workload = match params.as_ref().and_then(|p| p.get("workload")) {
-        Some(Value::String(value)) if matches!(value.as_str(), "code_oneshot" | "code_one_shot") => {
+        Some(Value::String(value))
+            if matches!(value.as_str(), "code_oneshot" | "code_one_shot") =>
+        {
             WorkloadClass::CodeOneShot
         }
         Some(Value::String(value)) if value == "reasoning" => WorkloadClass::Reasoning,
@@ -702,17 +704,22 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     // are explicitly trusting the cascade's auto-routing.
     if strategy_str != "tier" {
         let (cfg, _) = load_config_auto()?;
-        let exec = match get_pg_pool(&cfg).await {
-            Ok(pool) => crate::llm_exec::GatewayLlmExec::new().with_pool(pool),
-            Err(e) => {
-                tracing::warn!(
-                    "fleet_run strategy='{strategy_str}': pool unavailable, falling back to hardcoded endpoints: {e}"
-                );
-                crate::llm_exec::GatewayLlmExec::new()
-            }
-        }
-        .with_workload(workload)
-        .with_completion_ceiling(requested_max_tokens.map(|_| completion_budget));
+        let pool = get_pg_pool(&cfg).await.map_err(|error| {
+            format!(
+                "fleet_run strategy='{strategy_str}' unavailable: canonical Postgres router is required: {error}"
+            )
+        })?;
+        let stored_policy = config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await;
+        let route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
+            &cfg.llm.timeouts,
+            stored_policy.as_deref(),
+        )?;
+        let exec = crate::llm_exec::GatewayLlmExec::new(
+            pool.clone(),
+            workload,
+            requested_max_tokens.map(|_| completion_budget),
+            route_policy.clone(),
+        );
 
         let tier_hint = params
             .as_ref()
@@ -726,7 +733,6 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 .and_then(|v| v.as_str()),
         );
 
-        let started = std::time::Instant::now();
         let result = crate::strategy_dispatch::dispatch_strategy(
             &exec,
             prompt,
@@ -735,78 +741,16 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             validator_override,
         )
         .await;
-
-        // Interaction-log capture for Path 3 (strategy=auto/single/cascade/
-        // judge_escalate). The legacy tier path captures below; this branch
-        // returns early and used to skip it entirely, so the recommended
-        // `strategy=auto` default never reached the SLM corpus.
-        if let Ok(value) = &result {
-            let prompt_owned = prompt.to_string();
-            let response_owned = value
-                .get("output")
-                .or_else(|| value.get("response"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_default();
-            let route_decision = value.get("strategy").cloned().unwrap_or(json!({}));
-            // Strategy dispatch runs on the local tier cascade; its result JSON
-            // carries no model/usage today, so without a fallback these rows
-            // landed as engine=NULL with 0 tokens. Label the engine
-            // (`local:<catalog_id>` when the strategy names a model, plain
-            // `local` otherwise) and degrade to a flagged chars/4 estimate.
-            let engine_owned = value
-                .get("strategy")
-                .and_then(|s| s.get("model").or_else(|| s.get("engine")))
-                .and_then(|v| v.as_str())
-                .map(ff_agent::llm_attribution::engine_label)
-                .unwrap_or_else(|| "local".to_string());
-            let tokens_out = value
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            let tokens_in = value
-                .get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            let (tokens_in, tokens_out, tokens_estimated) =
-                ff_agent::llm_attribution::tokens_or_estimate(
-                    tokens_in,
-                    tokens_out,
-                    prompt,
-                    &response_owned,
-                );
-            let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
-            let strategy_label = strategy_str.to_string();
-            if let Ok((cfg2, _)) = load_config_auto() {
-                tokio::spawn(async move {
-                    if let Ok(pool) = get_pg_pool(&cfg2).await {
-                        let rec = ff_db::InteractionRecord {
-                            channel: "mcp".to_string(),
-                            request_text: prompt_owned,
-                            request_meta: json!({
-                                "strategy": strategy_label,
-                                "tokens_estimated": tokens_estimated,
-                            }),
-                            route_decision,
-                            engine: Some(engine_owned),
-                            response_text: response_owned,
-                            tokens_in,
-                            tokens_out,
-                            latency_ms: Some(latency_ms),
-                            outcome: "ok".to_string(),
-                            ..Default::default()
-                        };
-                        if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
-                            tracing::debug!("fleet_run Path-3 interaction capture failed: {e}");
-                        }
-                    }
-                });
-            }
+        let interaction =
+            path3_interaction_record("fleet_run", prompt, strategy_str, &route_policy, &result);
+        if let Err(error) = ff_db::pg_record_interaction(&pool, &interaction).await {
+            tracing::warn!(%error, "fleet_run Path-3 interaction capture failed");
         }
-
-        return result;
+        return match result {
+            Ok(success) => serde_json::to_value(success)
+                .map_err(|error| format!("serialize local strategy result: {error}")),
+            Err(failure) => Err(failure.error_text()),
+        };
     }
 
     let (config, _config_path) = load_config_auto()?;
@@ -1085,6 +1029,106 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     } else {
         last_error
     })
+}
+
+fn path3_interaction_record(
+    tool: &str,
+    prompt: &str,
+    strategy: &str,
+    policy: &crate::llm_exec::LocalRoutePolicy,
+    result: &crate::strategy_dispatch::StrategyDispatchResult,
+) -> ff_db::InteractionRecord {
+    let (execution, route_decision, response_text, outcome, error_text, engine, worker, endpoint) =
+        match result {
+            Ok(success) if !success.output.trim().is_empty() => {
+                let winner = success.winner();
+                (
+                    &success.execution,
+                    success.route_decision(),
+                    success.output.clone(),
+                    "ok".to_string(),
+                    None,
+                    winner.map(|route| route.engine.clone()),
+                    winner.map(|route| route.worker_name.clone()),
+                    winner.map(|route| route.endpoint.clone()),
+                )
+            }
+            Ok(success) => {
+                // Defense in depth: even a future caller that accidentally
+                // constructs a success object with blank output is recorded as
+                // an error, never as training-corpus success.
+                let last = success.execution.attempts.last();
+                (
+                    &success.execution,
+                    success.route_decision(),
+                    String::new(),
+                    "error".to_string(),
+                    Some("invalid_response: strategy success contained blank output".to_string()),
+                    last.and_then(|attempt| {
+                        attempt
+                            .catalog_id
+                            .as_deref()
+                            .map(ff_agent::llm_attribution::engine_label)
+                    }),
+                    last.map(|attempt| attempt.worker_name.clone()),
+                    last.map(|attempt| attempt.endpoint.clone()),
+                )
+            }
+            Err(failure) => {
+                let last = failure.execution.attempts.last();
+                let error = failure.error_text();
+                (
+                    &failure.execution,
+                    failure.route_decision(),
+                    String::new(),
+                    "error".to_string(),
+                    Some(error),
+                    last.and_then(|attempt| {
+                        attempt
+                            .catalog_id
+                            .as_deref()
+                            .map(ff_agent::llm_attribution::engine_label)
+                    }),
+                    last.map(|attempt| attempt.worker_name.clone()),
+                    last.map(|attempt| attempt.endpoint.clone()),
+                )
+            }
+        };
+    let tokens_in = execution
+        .attempts
+        .iter()
+        .map(|attempt| attempt.tokens_in)
+        .sum();
+    let tokens_out = execution
+        .attempts
+        .iter()
+        .map(|attempt| attempt.tokens_out)
+        .sum();
+    let error_signature = error_text
+        .as_deref()
+        .map(|error| ff_agent::log_signature::global_tracker().signature_for(error));
+    ff_db::InteractionRecord {
+        channel: "mcp".to_string(),
+        request_text: prompt.chars().take(16_000).collect(),
+        request_meta: json!({
+            "tool": tool,
+            "strategy": strategy,
+            "local_route_policy": policy,
+        }),
+        route_decision,
+        engine,
+        steps: serde_json::to_value(&execution.attempts).unwrap_or_else(|_| json!([])),
+        response_text: response_text.chars().take(16_000).collect(),
+        tokens_in,
+        tokens_out,
+        latency_ms: Some(execution.latency_ms.min(i32::MAX as u64) as i32),
+        outcome,
+        error_text,
+        error_signature,
+        worker_name: worker,
+        endpoint,
+        ..Default::default()
+    }
 }
 
 // ─── Fleet Offload ─────────────────────────────────────────────────────────
@@ -1506,35 +1550,45 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
             .and_then(|v| v.as_str()),
     );
 
-    // Wire a Postgres pool into the exec so endpoint resolution queries
-    // fleet_model_deployments at dispatch time. Pool failure degrades to
-    // the hardcoded preferred-endpoint map.
-    let exec = match config::load_config_auto() {
-        Ok((cfg, _)) => match get_pg_pool(&cfg).await {
-            Ok(pool) => crate::llm_exec::GatewayLlmExec::new().with_pool(pool),
-            Err(e) => {
-                tracing::warn!(
-                    "fleet_cascade: pool unavailable, falling back to hardcoded endpoints: {e}"
-                );
-                crate::llm_exec::GatewayLlmExec::new()
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                "fleet_cascade: config load failed, falling back to hardcoded endpoints: {e}"
-            );
-            crate::llm_exec::GatewayLlmExec::new()
-        }
-    };
+    let (cfg, _) = config::load_config_auto().map_err(|error| format!("config: {error}"))?;
+    let pool = get_pg_pool(&cfg).await.map_err(|error| {
+        format!("fleet_cascade unavailable: canonical Postgres router is required: {error}")
+    })?;
+    let stored_policy = config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await;
+    let route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
+        &cfg.llm.timeouts,
+        stored_policy.as_deref(),
+    )?;
+    let exec = crate::llm_exec::GatewayLlmExec::new(
+        pool.clone(),
+        WorkloadClass::CodeOneShot,
+        None,
+        route_policy.clone(),
+    );
 
-    crate::strategy_dispatch::dispatch_strategy(
+    let result = crate::strategy_dispatch::dispatch_strategy(
         &exec,
         prompt,
         strategy_str,
         tier_hint,
         validator_override,
     )
-    .await
+    .await;
+    let interaction = path3_interaction_record(
+        "fleet_cascade",
+        prompt,
+        strategy_str,
+        &route_policy,
+        &result,
+    );
+    if let Err(error) = ff_db::pg_record_interaction(&pool, &interaction).await {
+        tracing::warn!(%error, "fleet_cascade Path-3 interaction capture failed");
+    }
+    match result {
+        Ok(success) => serde_json::to_value(success)
+            .map_err(|error| format!("serialize local cascade result: {error}")),
+        Err(failure) => Err(failure.error_text()),
+    }
 }
 
 // ─── Fleet Route ─────────────────────────────────────────────────────────────
@@ -4428,6 +4482,133 @@ mod tests {
             .await
             .unwrap_err();
         assert!(token_error.contains("max_tokens must be a positive integer"));
+    }
+
+    fn path3_test_policy() -> crate::llm_exec::LocalRoutePolicy {
+        crate::llm_exec::LocalRoutePolicy::from_config(
+            &ff_core::config::LlmTimeouts::default(),
+            Some(r#"{"total_timeout_ms":10000,"min_start_budget_ms":100,"cooldown_ms":10}"#),
+        )
+        .unwrap()
+    }
+
+    fn path3_test_attempt(
+        outcome: &str,
+        reason_code: Option<crate::llm_exec::FailureReasonCode>,
+    ) -> crate::llm_exec::AttemptLedgerEntry {
+        crate::llm_exec::AttemptLedgerEntry {
+            sequence: 1,
+            role: crate::llm_exec::AttemptRole::Completion,
+            tier: 2,
+            catalog_tier: 2,
+            deployment_id: uuid::Uuid::from_u128(91),
+            endpoint: "http://192.0.2.91:55000".into(),
+            worker_name: "rihanna".into(),
+            catalog_id: Some("glm-4.5-air".into()),
+            attempt_timeout_ms: 1_000,
+            started_offset_ms: 0,
+            latency_ms: 25,
+            outcome: outcome.into(),
+            reason_code,
+            error: reason_code.map(|code| code.as_str().to_string()),
+            tokens_in: 3,
+            tokens_out: 5,
+        }
+    }
+
+    fn path3_test_evidence(
+        attempt: crate::llm_exec::AttemptLedgerEntry,
+        winner: bool,
+    ) -> crate::llm_exec::ExecutionEvidence {
+        crate::llm_exec::ExecutionEvidence {
+            attempts: vec![attempt],
+            candidate_snapshot: vec![crate::llm_exec::CandidateSnapshotEntry {
+                ordinal: 0,
+                deployment_id: uuid::Uuid::from_u128(91),
+                endpoint: "http://192.0.2.91:55000".into(),
+                worker_name: "rihanna".into(),
+                catalog_id: Some("glm-4.5-air".into()),
+                catalog_tier: 2,
+            }],
+            winner: winner.then(|| crate::llm_exec::WinningRoute {
+                deployment_id: uuid::Uuid::from_u128(91),
+                endpoint: "http://192.0.2.91:55000".into(),
+                worker_name: "rihanna".into(),
+                catalog_id: "glm-4.5-air".into(),
+                served_model_id: Some("GLM-4.5-Air".into()),
+                engine: "local:GLM-4.5-Air".into(),
+                route_decision: json!({"deployment_id": uuid::Uuid::from_u128(91)}),
+            }),
+            last_failure: None,
+            latency_ms: 25,
+            local_authority: "process_local_hint_only",
+            cloud_fallback: false,
+        }
+    }
+
+    #[test]
+    fn path3_blank_success_is_recorded_as_error() {
+        let success = crate::strategy_dispatch::StrategyDispatchSuccess {
+            output: "   ".into(),
+            strategy: ff_orchestrator::cascade_strategy::RouteStrategy::SingleTier { tier: 2 },
+            trace: json!([]),
+            early_exit_at_tier: None,
+            execution: path3_test_evidence(path3_test_attempt("ok", None), true),
+        };
+        let record = path3_interaction_record(
+            "fleet_run",
+            "generate code",
+            "single",
+            &path3_test_policy(),
+            &Ok(success),
+        );
+        assert_eq!(record.outcome, "error");
+        assert_eq!(record.request_meta["tool"], "fleet_run");
+        assert_eq!(record.response_text, "");
+        assert!(
+            record
+                .error_text
+                .as_deref()
+                .unwrap()
+                .contains("blank output")
+        );
+        assert!(record.error_signature.is_some());
+        assert_eq!(record.worker_name.as_deref(), Some("rihanna"));
+        assert_eq!(record.endpoint.as_deref(), Some("http://192.0.2.91:55000"));
+    }
+
+    #[test]
+    fn path3_failure_records_last_attempt_and_full_steps() {
+        let mut evidence = path3_test_evidence(
+            path3_test_attempt(
+                "error",
+                Some(crate::llm_exec::FailureReasonCode::InvalidResponse),
+            ),
+            false,
+        );
+        evidence.last_failure = Some(crate::llm_exec::FailureReasonCode::InvalidResponse);
+        let failure = crate::strategy_dispatch::StrategyDispatchFailure {
+            reason_code: crate::llm_exec::FailureReasonCode::InvalidResponse,
+            message: "empty 200".into(),
+            strategy: Some(
+                ff_orchestrator::cascade_strategy::RouteStrategy::SingleTier { tier: 2 },
+            ),
+            execution: evidence,
+        };
+        let record = path3_interaction_record(
+            "fleet_cascade",
+            "generate code",
+            "single",
+            &path3_test_policy(),
+            &Err(failure),
+        );
+        assert_eq!(record.outcome, "error");
+        assert_eq!(record.request_meta["tool"], "fleet_cascade");
+        assert_eq!(record.worker_name.as_deref(), Some("rihanna"));
+        assert_eq!(record.endpoint.as_deref(), Some("http://192.0.2.91:55000"));
+        assert_eq!(record.steps.as_array().unwrap().len(), 1);
+        assert_eq!(record.steps[0]["reason_code"], "invalid_response");
+        assert!(record.error_signature.is_some());
     }
 
     fn setup_test_db() -> (String, Option<String>) {
