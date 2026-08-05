@@ -639,9 +639,13 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
-        // Re-running the forward migration is allowed only when the existing
-        // authority objects still match the exact reviewed definitions.
-        sqlx::raw_sql(ff_db::schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS)
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING)
+            .execute(pool)
+            .await
+            .unwrap();
+        // Re-running V290 is allowed only when the existing authority objects
+        // still match the exact reviewed definitions.
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING)
             .execute(pool)
             .await
             .unwrap();

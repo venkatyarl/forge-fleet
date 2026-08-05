@@ -7,10 +7,9 @@
 //!   GET  /api/fleet/check-ip                — server-side ping probe (for verify actions)
 //!   GET  /api/fleet/check-tcp               — server-side TCP probe
 //!
-//! These endpoints are *complementary* to the existing `/api/fleet/enroll` (which
-//! only upserts `fleet_worker_runtime`). Self-enroll handles first-join flow: it
-//! creates the `fleet_workers` row, stashes the SSH identity, records hardware/
-//! tooling metadata, and kicks off mesh-propagation via the deferred queue.
+//! The legacy `/api/fleet/enroll` compatibility route is also quarantined on
+//! the ordinary HTTP listener. New-node admission is owned exclusively by the
+//! dedicated server-verified TLS enrollment listener.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,34 +24,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::server::GatewayState;
-
-/// Resolve the enrollment policy, falling back to the canonical
-/// `enrollment.shared_secret` in the fleet vault (`fleet_secrets`) when the
-/// local fleet.toml/env has none. Without this, only nodes with a hand-wired
-/// `FORGEFLEET_ENROLLMENT_TOKEN` could serve onboarding — every other
-/// gateway 503'd `/onboard/bootstrap.sh` (found live 2026-08-03: zero of 17
-/// nodes could onboard vinny until adele was hand-configured).
-pub async fn resolve_enrollment_policy(
-    state: &GatewayState,
-) -> ff_core::config::EnrollmentEnforcement {
-    let policy = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock.read().await.enrollment.enforcement_policy(),
-        None => ff_core::config::EnrollmentEnforcement::MisconfiguredRequired,
-    };
-    if !matches!(
-        policy,
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired
-    ) {
-        return policy;
-    }
-    if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool())
-        && let Ok(Some(secret)) = ff_db::pg_get_secret(pool, "enrollment.shared_secret").await
-        && !secret.trim().is_empty()
-    {
-        return ff_core::config::EnrollmentEnforcement::Required(secret);
-    }
-    policy
-}
 
 // ─── Bootstrap script rendering ──────────────────────────────────────────
 

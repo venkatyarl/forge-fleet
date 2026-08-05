@@ -1348,6 +1348,10 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING)
+            .execute(pool)
+            .await
+            .unwrap();
     }
 
     async fn install_test_leader(pool: &sqlx::PgPool, leader_name: &str) {
@@ -1702,7 +1706,7 @@ mod tests {
                 .is_err()
         );
         assert!(
-            sqlx::raw_sql(ff_db::schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS)
+            sqlx::raw_sql(ff_db::schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING)
                 .execute(&pool)
                 .await
                 .is_err(),

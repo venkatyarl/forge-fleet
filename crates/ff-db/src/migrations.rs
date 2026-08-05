@@ -1299,10 +1299,15 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "secure_enrollment_tokens",
         sql: schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS,
     },
+    PgMigration {
+        version: 290,
+        name: "secure_enrollment_hardening",
+        sql: schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING,
+    },
 ];
 
 /// Fail closed unless the enrollment authority table is exactly the reviewed
-/// v289 shape. This is intentionally validation-only: callers such as
+/// v290 shape. This is intentionally validation-only: callers such as
 /// `ff onboard` and the TLS supervisor must never repair or create authority
 /// schema as an ordinary request side effect. Only the forward migration runner
 /// owns that lifecycle.
@@ -1363,24 +1368,89 @@ pub async fn validate_secure_enrollment_schema(pool: &PgPool) -> Result<()> {
               FROM relation r
               JOIN pg_constraint c ON c.conrelid = r.oid
         ),
-        expected_indexes(indexname, indexdef) AS (
+        roster_layout(layout) AS (
+            SELECT 'legacy'::text
+             WHERE (SELECT c.relkind = 'r'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.computers'::regclass)
+               AND (SELECT c.relkind = 'r'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.fleet_workers'::regclass)
+            UNION ALL
+            SELECT 'unified'::text
+             WHERE to_regclass('public.fleet_nodes') IS NOT NULL
+               AND (SELECT c.relkind = 'r'
+                      FROM pg_class c
+                     WHERE c.oid = to_regclass('public.fleet_nodes'))
+               AND (SELECT c.relkind = 'v'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.computers'::regclass)
+               AND (SELECT c.relkind = 'v'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.fleet_workers'::regclass)
+               AND btrim(regexp_replace(
+                       pg_get_viewdef('public.computers'::regclass, true),
+                       E'\\s+', ' ', 'g'
+                   )) = 'SELECT id, name, primary_ip, all_ips, hostname, mac_addresses, os_family, os_distribution, os_version, os_version_latest, os_upgrade_available, os_version_checked_at, cpu_cores, total_ram_gb, total_disk_gb, has_gpu, gpu_kind, gpu_count, gpu_model, gpu_vram_gb, gpu_total_vram_gb, cuda_version, metal_version, rocm_version, gpu_driver_version, ssh_user, ssh_port, ssh_public_key, enrolled_at, last_seen_at, offline_since, status_changed_at, status, metadata, network_scope, source_tree_path, build_archs, connectivity_mode, election_eligibility, reservation_state, reserved_reason, reserved_at, reservation_owner, reservation_expires_at, dispatch_tick_at FROM fleet_nodes;'
+               AND btrim(regexp_replace(
+                       pg_get_viewdef('public.fleet_workers'::regclass, true),
+                       E'\\s+', ' ', 'g'
+                   )) = 'SELECT name, ip, ssh_user, ram_gb, worker_cpu_cores AS cpu_cores, os, role, election_priority, hardware, alt_ips, capabilities, preferences, resources, worker_status AS status, registered_at, updated_at, runtime, models_dir, disk_quota_pct, sub_agent_count, gh_account, tooling FROM fleet_nodes;'
+        ),
+        token_expected_indexes(indexname, indexdef) AS (
             VALUES
                 ('fleet_enrollment_tokens_pkey', 'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)'),
-                ('idx_computers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))'),
-                ('idx_computers_enrollment_primary_ip', 'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)'),
                 ('idx_fleet_enrollment_tokens_expiry', 'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
                 ('idx_fleet_enrollment_tokens_node', 'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)'),
                 ('idx_fleet_enrollment_tokens_pending_ip', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
-                ('idx_fleet_enrollment_tokens_pending_name', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
+                ('idx_fleet_enrollment_tokens_pending_name', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))')
+        ),
+        legacy_expected_indexes(indexname, indexdef) AS (
+            VALUES
+                ('idx_computers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))'),
+                ('idx_computers_enrollment_primary_ip', 'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)'),
                 ('idx_fleet_workers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name ON public.fleet_workers USING btree (lower(name))'),
                 ('idx_fleet_workers_enrollment_ip', 'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip ON public.fleet_workers USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)')
+        ),
+        unified_expected_indexes(indexname, indexdef) AS (
+            VALUES
+                ('idx_fleet_nodes_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_canonical_name ON public.fleet_nodes USING btree (lower(name))'),
+                ('idx_fleet_nodes_enrollment_primary_ip', 'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_primary_ip ON public.fleet_nodes USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)'),
+                ('idx_fleet_nodes_enrollment_worker_ip', 'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_worker_ip ON public.fleet_nodes USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)')
+        ),
+        expected_indexes AS (
+            SELECT * FROM token_expected_indexes
+            UNION ALL
+            SELECT l.*
+              FROM legacy_expected_indexes l
+             WHERE (SELECT layout FROM roster_layout) = 'legacy'
+            UNION ALL
+            SELECT u.*
+              FROM unified_expected_indexes u
+             WHERE (SELECT layout FROM roster_layout) = 'unified'
         ),
         actual_indexes AS (
             SELECT i.relname AS indexname, x.indisvalid, x.indisready,
                    pg_get_indexdef(x.indexrelid) AS indexdef
               FROM pg_index x
               JOIN pg_class i ON i.oid = x.indexrelid
-             WHERE i.relname IN (SELECT indexname FROM expected_indexes)
+             WHERE x.indrelid = (SELECT oid FROM relation)
+                OR (x.indrelid = 'public.computers'::regclass
+                    AND i.relname IN (
+                        'idx_computers_enrollment_canonical_name',
+                        'idx_computers_enrollment_primary_ip'
+                    ))
+                OR (x.indrelid = 'public.fleet_workers'::regclass
+                    AND i.relname IN (
+                        'idx_fleet_workers_enrollment_canonical_name',
+                        'idx_fleet_workers_enrollment_ip'
+                    ))
+                OR (x.indrelid = to_regclass('public.fleet_nodes')
+                    AND i.relname IN (
+                        'idx_fleet_nodes_enrollment_canonical_name',
+                        'idx_fleet_nodes_enrollment_primary_ip',
+                        'idx_fleet_nodes_enrollment_worker_ip'
+                    ))
         ),
         token_index_count AS (
             SELECT count(*) AS count
@@ -1410,8 +1480,10 @@ pub async fn validate_secure_enrollment_schema(pool: &PgPool) -> Result<()> {
                 EXCEPT SELECT conname, condef FROM expected_constraints
             )
             AND NOT EXISTS (SELECT 1 FROM actual_constraints WHERE NOT convalidated)
+            AND (SELECT count(*) FROM roster_layout) = 1
             AND (SELECT count FROM token_index_count) = 5
-            AND (SELECT count(*) FROM actual_indexes) = 9
+            AND (SELECT count(*) FROM actual_indexes) =
+                (SELECT count(*) FROM expected_indexes)
             AND NOT EXISTS (
                 SELECT indexname, indexdef FROM expected_indexes
                 EXCEPT SELECT indexname, indexdef FROM actual_indexes
@@ -1425,7 +1497,7 @@ pub async fn validate_secure_enrollment_schema(pool: &PgPool) -> Result<()> {
             )
             AND obj_description(
                     (SELECT oid FROM relation), 'pg_class'
-                ) = 'forgefleet secure enrollment authority schema v289; forward-only migrations only'
+                ) = 'forgefleet secure enrollment authority schema v290; forward-only migrations only'
         "#,
     )
     .fetch_one(pool)
@@ -1435,7 +1507,7 @@ pub async fn validate_secure_enrollment_schema(pool: &PgPool) -> Result<()> {
         Ok(())
     } else {
         Err(DbError::Migration(
-            "fleet_enrollment_tokens is missing or not the exact reviewed v289 shape; run the controlled forward migration before enrollment".to_string(),
+            "fleet_enrollment_tokens is missing or not the exact reviewed v290 shape; run the controlled forward migration before enrollment".to_string(),
         ))
     }
 }
@@ -1917,6 +1989,55 @@ mod tests {
             .await
             .expect("drop temp db");
         admin.close().await;
+    }
+
+    async fn reset_enrollment_authority_to_original_v289(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            DROP TABLE public.fleet_enrollment_tokens CASCADE;
+            DROP INDEX IF EXISTS public.idx_computers_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_computers_enrollment_primary_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_workers_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_fleet_workers_enrollment_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_primary_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_worker_ip;
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("remove hardened enrollment authority");
+        sqlx::raw_sql(schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS)
+            .execute(pool)
+            .await
+            .expect("recreate immutable V289 enrollment authority");
+        sqlx::query("DELETE FROM _migrations WHERE version = 290")
+            .execute(pool)
+            .await
+            .expect("rewind only the V290 test marker");
+    }
+
+    async fn switch_test_roster_to_legacy_tables(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_primary_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_worker_ip;
+            ALTER VIEW public.computers RENAME TO computers_unified_test;
+            ALTER VIEW public.fleet_workers RENAME TO fleet_workers_unified_test;
+            CREATE TABLE public.computers (
+                name TEXT NOT NULL,
+                primary_ip TEXT
+            );
+            CREATE TABLE public.fleet_workers (
+                name TEXT NOT NULL,
+                ip TEXT
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("replace unified test projections with legacy roster tables");
     }
 
     #[tokio::test]
@@ -3285,8 +3406,133 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn v290_runner_repairs_database_already_recorded_at_original_v289() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("prepare a current schema");
+        switch_test_roster_to_legacy_tables(&pool).await;
+        reset_enrollment_authority_to_original_v289(&pool).await;
+
+        let prior_version: i32 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _migrations")
+                .fetch_one(&pool)
+                .await
+                .expect("read rewound migration version");
+        assert_eq!(prior_version, 289);
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("V290 runner repair should apply");
+        assert_eq!(final_version, 290);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 290")
+                .fetch_one(&pool)
+                .await
+                .expect("V290 should be durably recorded");
+        assert_eq!(migration_name, "secure_enrollment_hardening");
+        validate_secure_enrollment_schema(&pool)
+            .await
+            .expect("V290 repair must produce the exact reviewed authority");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v290_accepts_already_hardened_v289_shape_idempotently() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("prepare a current schema");
+        switch_test_roster_to_legacy_tables(&pool).await;
+        sqlx::raw_sql(
+            r#"
+            CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name
+                ON computers (lower(name));
+            CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip
+                ON computers (primary_ip)
+                WHERE NULLIF(primary_ip, '') IS NOT NULL;
+            CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name
+                ON fleet_workers (lower(name));
+            CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip
+                ON fleet_workers (ip)
+                WHERE NULLIF(ip, '') IS NOT NULL;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("simulate the already-hardened legacy roster indexes");
+        sqlx::query(
+            "COMMENT ON TABLE fleet_enrollment_tokens IS \
+             'forgefleet secure enrollment authority schema v289; forward-only migrations only'",
+        )
+        .execute(&pool)
+        .await
+        .expect("simulate the already-hardened V289 deployment");
+        sqlx::query("DELETE FROM _migrations WHERE version = 290")
+            .execute(&pool)
+            .await
+            .expect("rewind only the V290 test marker");
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("V290 should accept the reviewed hardened V289 shape");
+        assert_eq!(final_version, 290);
+        validate_secure_enrollment_schema(&pool)
+            .await
+            .expect("idempotent V290 must preserve the exact authority");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v290_rejects_familiar_named_but_weakened_index_drift() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("prepare a current schema");
+        sqlx::raw_sql(
+            r#"
+            DROP INDEX public.idx_fleet_enrollment_tokens_pending_ip;
+            CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip
+                ON fleet_enrollment_tokens (intended_ip)
+                WHERE consumed_at IS NULL;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install familiar-named weak test index");
+
+        let error = sqlx::raw_sql(schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING)
+            .execute(&pool)
+            .await
+            .expect_err("V290 must reject drift instead of guessing a repair");
+        assert!(
+            error
+                .to_string()
+                .contains("neither immutable v289 nor reviewed hardened authority"),
+            "unexpected V290 drift error: {error}"
+        );
+        assert!(
+            validate_secure_enrollment_schema(&pool).await.is_err(),
+            "the validator must also reject the weakened familiar-named index"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
     #[test]
-    fn v289_is_controlled_exact_shape_enrollment_authority() {
+    fn v289_remains_the_immutable_original_enrollment_authority() {
         let migration = PG_MIGRATIONS
             .iter()
             .find(|migration| migration.version == 289)
@@ -3295,22 +3541,54 @@ mod tests {
         for required in [
             "token_hash       BYTEA PRIMARY KEY",
             "octet_length(token_hash) = 32",
-            "to_regclass('public.fleet_enrollment_tokens') IS NULL",
-            "preexisting fleet_enrollment_tokens has an unsafe shape",
-            "expected_columns",
-            "expected_constraints",
-            "revoked_at",
-            "idx_fleet_enrollment_tokens_pending_name",
-            "idx_fleet_enrollment_tokens_pending_ip",
-            "forward-only enrollment schema repair migration",
+            "CREATE TABLE IF NOT EXISTS fleet_enrollment_tokens",
+            "WHERE consumed_at IS NULL",
         ] {
             assert!(
                 migration.sql.contains(required),
-                "V289 lacks controlled schema contract: {required}"
+                "immutable V289 lacks original schema contract: {required}"
             );
         }
-        assert!(!migration.sql.contains("CREATE TABLE IF NOT EXISTS"));
+        for hardened_only in [
+            "revoked_at",
+            "idx_fleet_enrollment_tokens_pending_name",
+            "idx_fleet_enrollment_tokens_pending_ip",
+            "fleet_enrollment_tokens_canonical_leader",
+            "fleet_enrollment_tokens_revocation",
+        ] {
+            assert!(
+                !migration.sql.contains(hardened_only),
+                "immutable V289 was rewritten with V290 artifact: {hardened_only}"
+            );
+        }
         assert!(!migration.sql.contains("plaintext"));
+        assert!(!migration.sql.contains("token_value"));
+    }
+
+    #[test]
+    fn v290_is_exact_shape_forward_enrollment_repair() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 290)
+            .expect("V290 must be registered");
+        assert_eq!(migration.name, "secure_enrollment_hardening");
+        for required in [
+            "is_old_v289",
+            "is_hardened",
+            "neither immutable v289 nor reviewed hardened authority",
+            "ADD COLUMN revoked_at",
+            "fleet_enrollment_tokens_canonical_leader",
+            "fleet_enrollment_tokens_revocation",
+            "DROP INDEX public.idx_fleet_enrollment_tokens_expiry",
+            "idx_fleet_enrollment_tokens_pending_name",
+            "idx_fleet_enrollment_tokens_pending_ip",
+            "schema v290; forward-only migrations only",
+        ] {
+            assert!(
+                migration.sql.contains(required),
+                "V290 lacks controlled repair contract: {required}"
+            );
+        }
         assert!(!migration.sql.contains("token_value"));
     }
 }
