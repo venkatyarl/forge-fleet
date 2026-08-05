@@ -13,8 +13,9 @@
 //! After [`MAX_HANDOFFS`] re-tries the row is marked permanently
 //! `failed` so we don't loop forever on a poison task.
 //!
-//! `task_type = "shell"` and `task_type = "code_review"` are both
-//! dispatched. Shell payload shape:
+//! `task_type = "shell"`, `task_type = "code_review"`, and the dedicated
+//! `task_type = "oauth_credential_install"` are dispatched. Shell payload
+//! shape:
 //!
 //! ```json
 //! { "command": "echo hi", "shell": "/bin/bash" }
@@ -159,6 +160,8 @@ pub enum TaskRunnerError {
     BadPayload(String),
     #[error("unsupported task_type: {0}")]
     UnsupportedType(String),
+    #[error("secure task failed: {0}")]
+    SecureOperation(String),
     #[error("task exceeded max duration of {0}s")]
     Timeout(u64),
 }
@@ -364,8 +367,10 @@ impl TaskRunner {
              WHERE id = (
                SELECT id FROM fleet_tasks t
                 WHERE t.status = 'pending'
-                  AND t.task_type = 'shell'
+                  AND t.task_type IN ('shell', 'oauth_credential_install')
                   AND (t.preferred_computer_id IS NULL
+                       OR t.preferred_computer_id = $1)
+                  AND (t.task_type != 'oauth_credential_install'
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
                   AND NOT (t.excludes_computer_ids @> to_jsonb(ARRAY[$1::uuid]))
@@ -484,7 +489,7 @@ impl TaskRunner {
                     OR NOT EXISTS (
                       SELECT 1 FROM fleet_tasks other
                        WHERE other.status = 'pending'
-                         AND other.task_type = 'shell'
+                         AND other.task_type IN ('shell', 'oauth_credential_install')
                          AND COALESCE(other.parent_task_id, other.id)
                              != COALESCE(t.parent_task_id, t.id)
                     )
@@ -601,6 +606,14 @@ impl TaskRunner {
         // `git fetch` processes) until every subsequent task hit the cap.
         let outcome = match task_type.as_str() {
             "shell" => run_shell_payload(&payload, &self.env, max_duration).await,
+            "oauth_credential_install" => crate::oauth_distributor::run_oauth_credential_install(
+                &self.pg,
+                task_id,
+                self.my_computer_id,
+                &payload,
+            )
+            .await
+            .map_err(|error| TaskRunnerError::SecureOperation(error.to_string())),
             "code_review" => run_review_payload(&payload, max_duration).await,
             other => Err(TaskRunnerError::UnsupportedType(other.to_string())),
         };
@@ -1046,6 +1059,76 @@ pub async fn pg_enqueue_shell_task_once(
 
     // Transactional helper deliberately publishes only after commit so a
     // consumer can never observe a row that later rolls back.
+    crate::nats_jetstream::publish_task_inserted(id).await;
+    Ok(EnqueueOnceOutcome::Enqueued(id))
+}
+
+/// Enqueue one exact-target OAuth credential-install operation without ever
+/// materializing the credential document in `fleet_tasks`.
+///
+/// This intentionally does not accept a task type, shell command, capability,
+/// or target name from its caller. The row shape is a closed contract: a typed
+/// payload, the dedicated runner task type, and one FK-validated target UUID.
+/// The same advisory-lock + unique-signature protocol used by shell enqueue-once
+/// protects concurrent refresh/watch producers.
+pub(crate) async fn pg_enqueue_oauth_credential_install_once(
+    pg: &PgPool,
+    enqueue_once_key: &str,
+    summary: &str,
+    payload: &Value,
+    preferred_computer_id: uuid::Uuid,
+    priority: i32,
+) -> Result<EnqueueOnceOutcome, sqlx::Error> {
+    let mut tx = pg.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0::bigint))")
+        .bind(enqueue_once_key)
+        .execute(&mut *tx)
+        .await?;
+
+    let existing: Option<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, status
+           FROM fleet_tasks
+          WHERE dedup_signature = $1
+          FOR UPDATE",
+    )
+    .bind(enqueue_once_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((id, status)) = existing {
+        if !is_terminal_enqueue_once_status(&status) {
+            tx.commit().await?;
+            return Ok(EnqueueOnceOutcome::AlreadyActive(id));
+        }
+        sqlx::query(
+            "UPDATE fleet_tasks
+                SET dedup_signature = NULL
+              WHERE id = $1 AND dedup_signature = $2",
+        )
+        .bind(id)
+        .bind(enqueue_once_key)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    let id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO fleet_tasks (
+             task_type, summary, payload, priority, requires_capability,
+             preferred_computer_id, dedup_signature
+         ) VALUES (
+             'oauth_credential_install', $1, $2, $3, '[]'::jsonb, $4, $5
+         )
+         RETURNING id",
+    )
+    .bind(summary)
+    .bind(payload)
+    .bind(priority)
+    .bind(preferred_computer_id)
+    .bind(enqueue_once_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
     crate::nats_jetstream::publish_task_inserted(id).await;
     Ok(EnqueueOnceOutcome::Enqueued(id))
 }
@@ -2693,6 +2776,32 @@ mod claim_query_tests {
         .fetch_all(&pool)
         .await
         .expect("restart executor-guard clause must parse + type-check");
+    }
+}
+
+#[cfg(test)]
+mod oauth_typed_task_tests {
+    #[test]
+    fn typed_oauth_claim_and_dispatch_are_exact_target_and_non_shell() {
+        let source = include_str!("task_runner.rs");
+        assert!(source.contains("t.task_type IN ('shell', 'oauth_credential_install')"));
+        assert!(source.contains(
+            "t.task_type != 'oauth_credential_install'\n                       OR t.preferred_computer_id = $1"
+        ));
+        assert!(source.contains("\"oauth_credential_install\" =>"));
+        assert!(source.contains("run_oauth_credential_install"));
+
+        let enqueue = source
+            .split("pub(crate) async fn pg_enqueue_oauth_credential_install_once")
+            .nth(1)
+            .unwrap()
+            .split("fn is_terminal_enqueue_once_status")
+            .next()
+            .unwrap();
+        assert!(enqueue.contains("'oauth_credential_install'"));
+        assert!(enqueue.contains("preferred_computer_id"));
+        assert!(!enqueue.contains("command:"));
+        assert!(!enqueue.contains("pg_enqueue_shell_task"));
     }
 }
 

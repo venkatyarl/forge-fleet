@@ -7,9 +7,9 @@
 //! 1. **Imports** (on the leader): reads the local file for one provider,
 //!    extracts the access token, stores it in `fleet_secrets` keyed by the
 //!    provider's `secret_key` (e.g. `anthropic.oauth_token`).
-//! 2. **Distributes**: pushes the entire credential file to every other
-//!    fleet member's matching path via the existing `fleet_tasks` shell
-//!    dispatcher (`pg_enqueue_shell_task` + base64 of the file payload).
+//! 2. **Distributes**: queues a typed, non-secret reference for every target.
+//!    The target resolves the complete credential document from
+//!    `fleet_secrets` just in time and installs it without a shell.
 //! 3. **Status**: reports per-provider whether the token is present,
 //!    decoded expiry, and last refresh time.
 //! 4. **RefreshWatch**: long-lived loop that polls the leader's cred files
@@ -24,16 +24,44 @@
 //! roadmap context.
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::PgPool;
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 use std::time::{Duration, SystemTime};
+#[cfg(unix)]
+use std::{
+    ffi::CString,
+    fs::File,
+    io::Write,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    },
+};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::task_runner::{EnqueueOnceOutcome, pg_enqueue_shell_task_once};
+use crate::task_runner::{
+    EnqueueOnceOutcome, pg_enqueue_oauth_credential_install_once, pg_enqueue_shell_task_once,
+};
+
+const OAUTH_CREDENTIAL_INSTALL_OPERATION: &str = "install_oauth_credentials";
+const OAUTH_CREDENTIAL_INSTALL_VERSION: u8 = 1;
+const MAX_CREDENTIAL_DOCUMENT_BYTES: usize = 1024 * 1024;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct OauthCredentialInstallPayload {
+    operation: String,
+    version: u8,
+    provider: String,
+    secret_ref: String,
+    secret_version: String,
+    target_computer_id: uuid::Uuid,
+}
 
 /// One row in the OAuth provider catalog. Drives the import + distribute
 /// + status logic — provider-agnostic from a single source of truth.
@@ -114,24 +142,91 @@ pub const OAUTH_DISTRIBUTION_ENABLED_KEY: &str = "oauth_distribution_enabled";
 const OAUTH_DISTRIBUTION_DEFAULT: bool = true;
 const OAUTH_DISTRIBUTION_RESTORE_ON_EXPIRY: bool = true;
 
-const OAUTH_BACKLOG_CANCEL_SQL: &str = "UPDATE fleet_tasks
+#[cfg(test)]
+const LEGACY_OAUTH_PAYLOAD_PREDICATE: &str = "task_type = 'shell'
+        AND summary LIKE 'oauth-distribute/%'
+        AND jsonb_typeof(payload) = 'object'
+        AND jsonb_typeof(payload->'command') = 'string'
+        AND payload->>'command' LIKE '%FF_OAUTH_EOF%'
+        AND payload->>'command' LIKE '%base64 -d%'";
+
+const OAUTH_BACKLOG_COUNT_SQL: &str = "SELECT
+        COUNT(*) FILTER (WHERE task_type = 'shell'
+            AND summary LIKE 'oauth-distribute/%'
+            AND jsonb_typeof(payload) = 'object'
+            AND jsonb_typeof(payload->'command') = 'string'
+            AND payload->>'command' LIKE '%FF_OAUTH_EOF%'
+            AND payload->>'command' LIKE '%base64 -d%')::bigint AS legacy_matched,
+        COUNT(*) FILTER (WHERE task_type = 'shell'
+            AND summary LIKE 'oauth-distribute/%'
+            AND jsonb_typeof(payload) = 'object'
+            AND jsonb_typeof(payload->'command') = 'string'
+            AND payload->>'command' LIKE '%FF_OAUTH_EOF%'
+            AND payload->>'command' LIKE '%base64 -d%'
+            AND status = 'running')::bigint AS running_blocked,
+        COUNT(*) FILTER (WHERE task_type = 'shell'
+            AND status IN ('pending', 'dispatchable')
+            AND (summary LIKE 'oauth-repush/%' OR (
+                summary LIKE 'oauth-distribute/%'
+                AND jsonb_typeof(payload) = 'object'
+                AND jsonb_typeof(payload->'command') = 'string'
+                AND payload->>'command' LIKE '%FF_OAUTH_EOF%'
+                AND payload->>'command' LIKE '%base64 -d%')))::bigint AS cancel_eligible
+      FROM fleet_tasks";
+
+const LEGACY_OAUTH_SCRUB_SQL: &str = "WITH legacy AS MATERIALIZED (
+        SELECT id, status
+          FROM fleet_tasks
+         WHERE task_type = 'shell'
+           AND summary LIKE 'oauth-distribute/%'
+           AND jsonb_typeof(payload) = 'object'
+           AND jsonb_typeof(payload->'command') = 'string'
+           AND payload->>'command' LIKE '%FF_OAUTH_EOF%'
+           AND payload->>'command' LIKE '%base64 -d%'
+         FOR UPDATE
+    ), scrubbed AS (
+        UPDATE fleet_tasks task
+           SET payload = jsonb_build_object(
+                   'operation', 'legacy_oauth_payload_redacted',
+                   'version', 1,
+                   'redacted', true),
+               status = CASE
+                   WHEN legacy.status IN ('pending', 'dispatchable') THEN 'cancelled'
+                   ELSE task.status
+               END,
+               completed_at = CASE
+                   WHEN legacy.status IN ('pending', 'dispatchable')
+                       THEN COALESCE(task.completed_at, NOW())
+                   ELSE task.completed_at
+               END,
+               progress_message = CASE
+                   WHEN legacy.status IN ('pending', 'dispatchable')
+                       THEN 'cancelled and credential payload redacted by ff oauth cancel-backlog'
+                   ELSE task.progress_message
+               END
+          FROM legacy
+         WHERE task.id = legacy.id
+           AND NOT EXISTS (SELECT 1 FROM legacy WHERE status = 'running')
+        RETURNING legacy.status AS previous_status
+    )
+    SELECT
+        (SELECT COUNT(*) FROM legacy)::bigint AS legacy_matched,
+        (SELECT COUNT(*) FROM legacy WHERE status = 'running')::bigint AS running_blocked,
+        (SELECT COUNT(*) FROM scrubbed)::bigint AS scrubbed,
+        (SELECT COUNT(*) FROM scrubbed
+          WHERE previous_status IN ('pending', 'dispatchable'))::bigint AS cancelled";
+
+const OAUTH_REPUSH_CANCEL_SQL: &str = "UPDATE fleet_tasks
         SET status = 'cancelled',
             completed_at = COALESCE(completed_at, NOW()),
-            progress_message = 'cancelled by ff oauth cancel-backlog'
+            progress_message = 'cancelled by ff oauth cancel-backlog',
+            payload = jsonb_build_object(
+                'operation', 'oauth_repush_cancelled',
+                'version', 1,
+                'redacted', true)
       WHERE task_type = 'shell'
         AND status IN ('pending', 'dispatchable')
-        AND (
-            summary LIKE 'oauth-repush/%'
-            OR summary LIKE 'oauth-distribute/%'
-        )";
-const OAUTH_BACKLOG_COUNT_SQL: &str = "SELECT COUNT(*)::bigint
-       FROM fleet_tasks
-      WHERE task_type = 'shell'
-        AND status IN ('pending', 'dispatchable')
-        AND (
-            summary LIKE 'oauth-repush/%'
-            OR summary LIKE 'oauth-distribute/%'
-        )";
+        AND summary LIKE 'oauth-repush/%'";
 
 fn resolve_oauth_distribution_gate<E>(result: std::result::Result<bool, E>) -> bool
 where
@@ -162,8 +257,12 @@ pub async fn oauth_distribution_enabled(pool: &PgPool) -> bool {
     )
 }
 
-fn oauth_distribute_enqueue_key(provider: &str, target_id: uuid::Uuid) -> String {
-    format!("oauth-distribute:{provider}:{target_id}")
+fn oauth_distribute_enqueue_key(
+    provider: &str,
+    target_id: uuid::Uuid,
+    secret_version: &str,
+) -> String {
+    format!("oauth-distribute:{provider}:{target_id}:{secret_version}")
 }
 
 fn oauth_repush_enqueue_key(provider: &str, leader_id: uuid::Uuid) -> String {
@@ -235,7 +334,6 @@ pub struct ProviderStatus {
     pub cred_file_present: bool,
     pub cred_file_mtime_secs_ago: Option<u64>,
     pub token_in_secrets: bool,
-    pub token_preview: Option<String>,
 }
 
 /// Read the leader's raw credential bytes for one provider.
@@ -283,6 +381,56 @@ async fn read_leader_cred_bytes(provider: &OauthProvider) -> Result<Vec<u8>> {
     })
 }
 
+fn credentials_secret_ref(provider: &OauthProvider) -> String {
+    format!("{}.credentials", provider.secret_key)
+}
+
+fn credential_access_token<'a>(document: &'a Value, provider: &OauthProvider) -> Option<&'a str> {
+    provider
+        .token_fields
+        .iter()
+        .find_map(|field| document.get(field).and_then(Value::as_str))
+        .or_else(|| {
+            provider.token_fields.iter().find_map(|field| {
+                document
+                    .get("tokens")
+                    .and_then(|tokens| tokens.get(field))
+                    .and_then(Value::as_str)
+            })
+        })
+        .or_else(|| {
+            provider.token_fields.iter().find_map(|field| {
+                document
+                    .get("claudeAiOauth")
+                    .and_then(|oauth| oauth.get(field))
+                    .and_then(Value::as_str)
+            })
+        })
+        .filter(|token| !token.trim().is_empty())
+}
+
+fn validate_credential_document(document: &str, provider: &OauthProvider) -> Result<()> {
+    if document.is_empty() || document.len() > MAX_CREDENTIAL_DOCUMENT_BYTES {
+        anyhow::bail!(
+            "credential document for provider {} is empty or exceeds the safe size limit",
+            provider.name
+        );
+    }
+    let parsed: Value = serde_json::from_str(document).map_err(|_| {
+        anyhow!(
+            "credential document for provider {} is malformed JSON",
+            provider.name
+        )
+    })?;
+    if !parsed.is_object() || credential_access_token(&parsed, provider).is_none() {
+        anyhow::bail!(
+            "credential document for provider {} lacks a non-empty canonical token field",
+            provider.name
+        );
+    }
+    Ok(())
+}
+
 /// Read the leader's credential file for one provider, extract the
 /// access token, write to `fleet_secrets[<provider>.oauth_token]`.
 ///
@@ -302,29 +450,11 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     //   • flat top-level (most CLIs)
     //   • `tokens.<field>` (OpenAI codex CLI, ~/.codex/auth.json)
     //   • `claudeAiOauth.<field>` (Claude Code on macOS, Keychain blob)
-    let token = provider
-        .token_fields
-        .iter()
-        .find_map(|field| json.get(field).and_then(Value::as_str))
-        .or_else(|| {
-            provider.token_fields.iter().find_map(|field| {
-                json.get("tokens")
-                    .and_then(|t| t.get(field))
-                    .and_then(Value::as_str)
-            })
-        })
-        .or_else(|| {
-            provider.token_fields.iter().find_map(|field| {
-                json.get("claudeAiOauth")
-                    .and_then(|t| t.get(field))
-                    .and_then(Value::as_str)
-            })
-        })
+    let token = credential_access_token(&json, provider)
         .ok_or_else(|| {
             anyhow!(
-                "no token field found for provider {} (tried {:?} flat, under `tokens.*`, and under `claudeAiOauth.*`); cred shape may have changed",
-                provider.name,
-                provider.token_fields
+                "no non-empty canonical token field found for provider {}; credential shape may have changed",
+                provider.name
             )
         })?;
 
@@ -346,9 +476,10 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     // expiry, account metadata, etc.), not a guessed token-only JSON shape.
     // Keep it beside the extracted bearer token so bootstrap can pull it via
     // the enrollment-token allowlist without an ad-hoc file copy.
-    let credentials_key = format!("{}.credentials", provider.secret_key);
+    let credentials_key = credentials_secret_ref(provider);
     let credentials = std::str::from_utf8(&bytes)
         .with_context(|| format!("credential document for {} is not UTF-8", provider.name))?;
+    validate_credential_document(credentials, provider)?;
     ff_db::pg_set_secret(
         pool,
         &credentials_key,
@@ -369,13 +500,11 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     Ok(())
 }
 
-/// Push the full credential file to every fleet member's matching path.
+/// Enqueue a non-secret credential reference for every eligible fleet member.
 ///
-/// Uses base64 of the file contents and `pg_enqueue_shell_task_once` to fan
-/// out via the existing wave dispatcher. Each per-target task writes the
-/// decoded payload to the target's `<cred_path>` (with `mode 0600`) so
-/// the local CLI sees the same login the leader did. Members without
-/// the directory get it created (`mkdir -p`) before write.
+/// The queue never receives the token, credential document, an encoded form of
+/// either, or a shell command. The target resolves the exact referenced secret
+/// version just in time in [`run_oauth_credential_install`].
 pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
     if !oauth_distribution_enabled(pool).await {
         warn!(
@@ -386,27 +515,43 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
         return Ok(0);
     }
 
-    // Keychain-first (macOS claude) / file source — same resolver as
-    // `import_token`, so a macOS leader can fan out its Keychain-held claude
-    // creds instead of failing on a nonexistent `~/.claude/.credentials.json`.
-    let bytes = read_leader_cred_bytes(provider).await?;
-    let b64 = BASE64.encode(&bytes);
+    let secret_ref = credentials_secret_ref(provider);
+    let authority: Option<(String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT value, updated_at
+           FROM fleet_secrets
+          WHERE key = $1
+            AND disabled_reason IS NULL
+            AND (expires_at IS NULL OR expires_at > NOW())",
+    )
+    .bind(&secret_ref)
+    .fetch_optional(pool)
+    .await
+    .context("resolve OAuth credential authority")?;
+    let Some((credential_document, updated_at)) = authority else {
+        anyhow::bail!(
+            "current credential authority for provider {} is missing, disabled, or expired; run `ff oauth import {}` first",
+            provider.name,
+            provider.name
+        );
+    };
+    validate_credential_document(&credential_document, provider)?;
+    drop(credential_document);
+    let secret_version = updated_at.to_rfc3339_opts(SecondsFormat::Micros, true);
 
-    // Target list = every fleet member EXCEPT the leader (the leader's
-    // local copy is already authoritative). Members are looked up by
-    // primary_ip + ssh_user from the `computers` table.
+    // Target list = every fleet member EXCEPT the leader (the leader's local
+    // copy is already authoritative). The typed row is bound directly to the
+    // target UUID; no target-controlled string enters an executable surface.
     let leader_id = ff_db::pg_get_current_leader(pool)
         .await
-        .ok()
-        .flatten()
-        .map(|l| l.computer_id);
+        .context("resolve current leader for OAuth distribution")?
+        .map(|leader| leader.computer_id);
 
     let rows = sqlx::query(
         // 'online' is the live status the heartbeat materializer writes;
         // ('ok','pending','maintenance') are legacy/transitional vocab kept
         // for compat. Omitting 'online' made distribute resolve ZERO targets
         // on a fleet whose members are all 'online' (silent enqueued=0).
-        "SELECT id, name, ssh_user, primary_ip
+        "SELECT id, name
            FROM computers
           WHERE status IN ('online', 'ok', 'pending', 'maintenance')",
     )
@@ -423,84 +568,26 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
             continue;
         }
         let name: String = row.get("name");
-        let ssh_user: String = row.get("ssh_user");
-        let primary_ip: String = row.get("primary_ip");
-        // Bind the DB-sourced target IP + the (const) cred path to shell vars
-        // ONCE, then reference them QUOTED. This branch gates a local secret
-        // WRITE on an identity check, so `primary_ip` must not be able to
-        // misparse as grep options/pattern (hence `-- "$IP"`), and the path
-        // must survive spaces/metachars. `~` is pre-expanded to `$HOME` here so
-        // the quoted var still resolves (a quoted `~` would stay literal).
-        let cred_path_sh = provider
-            .cred_path
-            .strip_prefix("~/")
-            .map(|rest| format!("$HOME/{rest}"))
-            .unwrap_or_else(|| provider.cred_path.to_string());
-        // Escape single quotes so the `IP='…'` assignment is injection-proof
-        // even if the DB value ever contained one (POSIX: close-quote, escaped
-        // literal quote, reopen-quote). primary_ip is validated IP data today,
-        // but this write path handles a secret — belt and suspenders.
-        // Every DB-sourced value that reaches the shell is bound to a var via a
-        // single-quote-escaped assignment (POSIX close/escaped-quote/reopen) and
-        // referenced QUOTED — so no metacharacter in primary_ip / ssh_user /
-        // name can inject into this secret-write command. Const/base64 values
-        // (provider, cred_path, b64) are not attacker-influenced.
-        let sh_squote = |s: &str| s.replace('\'', "'\\''");
-        let primary_ip_sh = sh_squote(&primary_ip);
-        let ssh_user_sh = sh_squote(&ssh_user);
-        let target_sh = sh_squote(&name);
-        // The remote payload: write the cred file with a heredoc (no
-        // shell expansion of `$` inside the b64 blob), chmod 0600.
-        let cmd = format!(
-            "set -e\n\
-             IP='{primary_ip_sh}'\n\
-             SSH_USER='{ssh_user_sh}'\n\
-             TARGET='{target_sh}'\n\
-             CRED_PATH=\"{cred_path_sh}\"\n\
-             echo \"== distributing {provider} cred file to $TARGET ==\"\n\
-             __ff_local_ips() {{ (hostname -I 2>/dev/null; \
-                 ifconfig 2>/dev/null | awk '/inet /{{print $2}}') | tr ' ' '\\n'; }}\n\
-             if __ff_local_ips | grep -Fxq -- \"$IP\"; then\n\
-             echo '(on target — local write, no SSH)'\n\
-             mkdir -p \"$(dirname \"$CRED_PATH\")\"\n\
-             umask 077\n\
-             printf '%s' '{b64}' | base64 -d > \"$CRED_PATH\"\n\
-             chmod 600 \"$CRED_PATH\"\n\
-             echo distributed: $(stat -c %y \"$CRED_PATH\" 2>/dev/null || stat -f %Sm \"$CRED_PATH\")\n\
-             else\n\
-             ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
-                 \"$SSH_USER@$IP\" bash -l <<'FF_OAUTH_EOF'\n\
-             mkdir -p \"$(dirname {cred_path})\"\n\
-             umask 077\n\
-             printf '%s' '{b64}' | base64 -d > {cred_path}\n\
-             chmod 600 {cred_path}\n\
-             echo distributed: $(stat -c %y {cred_path} 2>/dev/null || stat -f %Sm {cred_path})\n\
-             FF_OAUTH_EOF\n\
-             fi\n",
-            provider = provider.name,
-            primary_ip_sh = primary_ip_sh,
-            ssh_user_sh = ssh_user_sh,
-            target_sh = target_sh,
-            cred_path = provider.cred_path,
-            cred_path_sh = cred_path_sh,
-            b64 = b64,
-            ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
-        );
-
-        let enqueue_once_key = oauth_distribute_enqueue_key(provider.name, id);
-        let outcome = pg_enqueue_shell_task_once(
+        let payload = serde_json::to_value(OauthCredentialInstallPayload {
+            operation: OAUTH_CREDENTIAL_INSTALL_OPERATION.to_string(),
+            version: OAUTH_CREDENTIAL_INSTALL_VERSION,
+            provider: provider.name.to_string(),
+            secret_ref: secret_ref.clone(),
+            secret_version: secret_version.clone(),
+            target_computer_id: id,
+        })
+        .context("serialize typed OAuth credential install payload")?;
+        let enqueue_once_key = oauth_distribute_enqueue_key(provider.name, id, &secret_version);
+        let outcome = pg_enqueue_oauth_credential_install_once(
             pool,
             &enqueue_once_key,
             &format!(
                 "oauth-distribute/{}: {} → {}",
                 provider.name, provider.name, name
             ),
-            &cmd,
-            &[],
-            Some(&name),
-            None,
+            &payload,
+            id,
             70,
-            None,
         )
         .await
         .with_context(|| format!("enqueue distribute task for {name}"))?;
@@ -523,22 +610,332 @@ pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result
     Ok(enqueued)
 }
 
+fn validate_install_payload(
+    payload: &Value,
+    my_computer_id: uuid::Uuid,
+) -> Result<(
+    OauthCredentialInstallPayload,
+    &'static OauthProvider,
+    DateTime<Utc>,
+)> {
+    let parsed: OauthCredentialInstallPayload = serde_json::from_value(payload.clone())
+        .map_err(|_| anyhow!("OAuth credential install payload has an invalid shape"))?;
+    if parsed.operation != OAUTH_CREDENTIAL_INSTALL_OPERATION
+        || parsed.version != OAUTH_CREDENTIAL_INSTALL_VERSION
+    {
+        anyhow::bail!("OAuth credential install operation or version is unsupported");
+    }
+    if parsed.target_computer_id != my_computer_id {
+        anyhow::bail!("OAuth credential install target does not match this computer");
+    }
+    let provider = provider_by_name(&parsed.provider)
+        .filter(|provider| provider.name == parsed.provider)
+        .ok_or_else(|| anyhow!("OAuth credential install provider is not canonical"))?;
+    if provider.cred_path.is_empty() || parsed.secret_ref != credentials_secret_ref(provider) {
+        anyhow::bail!("OAuth credential install secret reference is not canonical");
+    }
+    let secret_version = DateTime::parse_from_rfc3339(&parsed.secret_version)
+        .map_err(|_| anyhow!("OAuth credential install secret version is invalid"))?
+        .with_timezone(&Utc);
+    if secret_version.to_rfc3339_opts(SecondsFormat::Micros, true) != parsed.secret_version {
+        anyhow::bail!("OAuth credential install secret version is not canonical");
+    }
+    Ok((parsed, provider, secret_version))
+}
+
+fn credential_relative_path(provider: &OauthProvider) -> Result<PathBuf> {
+    let relative = provider.cred_path.strip_prefix("~/").ok_or_else(|| {
+        anyhow!(
+            "provider {} credential path is not home-relative",
+            provider.name
+        )
+    })?;
+    let relative = PathBuf::from(relative);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        anyhow::bail!("provider {} credential path is unsafe", provider.name);
+    }
+    Ok(relative)
+}
+
+#[cfg(unix)]
+fn cstring_component(component: &std::ffi::OsStr) -> Result<CString> {
+    CString::new(component.as_bytes())
+        .map_err(|_| anyhow!("OAuth credential path contains an invalid NUL byte"))
+}
+
+#[cfg(unix)]
+fn verify_private_directory(directory: &File) -> Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    if unsafe { libc::fstat(directory.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("inspect OAuth credential directory");
+    }
+    let stat = unsafe { stat.assume_init() };
+    let effective_uid = unsafe { libc::geteuid() };
+    if stat.st_uid != effective_uid || stat.st_mode & 0o022 != 0 {
+        anyhow::bail!(
+            "OAuth credential directory is not privately owned (owner={}, expected={}, mode={:o})",
+            stat.st_uid,
+            effective_uid,
+            stat.st_mode & 0o777
+        );
+    }
+    Ok(())
+}
+
+/// Install through descriptor-relative, no-follow operations. Each directory
+/// component is opened with `O_NOFOLLOW`; the final document is a new 0600 inode
+/// in the destination directory and is renamed into place only after fsync.
+#[cfg(unix)]
+fn install_credential_document_under(
+    home: &std::path::Path,
+    relative_path: &std::path::Path,
+    document: &str,
+) -> Result<()> {
+    let canonical_home = home
+        .canonicalize()
+        .context("resolve local home for OAuth credential install")?;
+    let mut components: Vec<_> = relative_path
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_os_string()),
+            _ => Err(anyhow!("OAuth credential path escaped the local home")),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let file_name = components
+        .pop()
+        .ok_or_else(|| anyhow!("OAuth credential path has no file name"))?;
+
+    let mut directory =
+        File::open(&canonical_home).context("open local home for OAuth credential install")?;
+    verify_private_directory(&directory)?;
+    for component in components {
+        let component = cstring_component(&component)?;
+        let created = unsafe { libc::mkdirat(directory.as_raw_fd(), component.as_ptr(), 0o700) };
+        if created != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(error).context("create OAuth credential directory");
+            }
+        }
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                component.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("open OAuth credential directory without following links");
+        }
+        directory = unsafe { File::from_raw_fd(fd) };
+        verify_private_directory(&directory)?;
+    }
+
+    let file_name = cstring_component(&file_name)?;
+    let mut existing = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    let existing_result = unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            file_name.as_ptr(),
+            existing.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if existing_result == 0 {
+        let existing = unsafe { existing.assume_init() };
+        if existing.st_mode & libc::S_IFMT != libc::S_IFREG {
+            anyhow::bail!("OAuth credential destination is not a regular file");
+        }
+    } else {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ENOENT) {
+            return Err(error).context("inspect OAuth credential destination");
+        }
+    }
+
+    let temporary_name = CString::new(format!(".ff-oauth-{}.tmp", uuid::Uuid::new_v4()))
+        .expect("UUID temporary name contains no NUL");
+    let temporary_fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary_name.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if temporary_fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("create private OAuth credential temporary file");
+    }
+    let mut temporary = unsafe { File::from_raw_fd(temporary_fd) };
+    let install_result = (|| -> std::io::Result<()> {
+        temporary.write_all(document.as_bytes())?;
+        temporary.sync_all()?;
+        if unsafe { libc::fchmod(temporary.as_raw_fd(), 0o600) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                temporary_name.as_ptr(),
+                directory.as_raw_fd(),
+                file_name.as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    })();
+    if install_result.is_err() {
+        unsafe {
+            libc::unlinkat(directory.as_raw_fd(), temporary_name.as_ptr(), 0);
+        }
+    }
+    install_result.context("atomically install OAuth credential document")?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn install_credential_document_under(
+    _home: &std::path::Path,
+    _relative_path: &std::path::Path,
+    _document: &str,
+) -> Result<()> {
+    anyhow::bail!("secure OAuth credential install is unsupported on this operating system")
+}
+
+async fn install_credential_document(provider: &OauthProvider, document: String) -> Result<()> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow!("local home directory is unavailable"))?;
+    let relative_path = credential_relative_path(provider)?;
+    tokio::task::spawn_blocking(move || {
+        install_credential_document_under(&home, &relative_path, &document)
+    })
+    .await
+    .map_err(|_| anyhow!("OAuth credential install worker stopped unexpectedly"))??;
+    Ok(())
+}
+
+async fn resolve_install_document(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    task_id: uuid::Uuid,
+    my_computer_id: uuid::Uuid,
+    secret_ref: &str,
+    secret_version: DateTime<Utc>,
+) -> Result<String> {
+    let target_fence: Option<bool> = sqlx::query_scalar(
+        "SELECT TRUE
+           FROM fleet_tasks
+          WHERE id = $1
+            AND task_type = 'oauth_credential_install'
+            AND status = 'running'
+            AND claimed_by_computer_id = $2
+            AND preferred_computer_id = $2
+          FOR SHARE",
+    )
+    .bind(task_id)
+    .bind(my_computer_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("verify OAuth credential task target fence")?;
+    if target_fence.is_none() {
+        anyhow::bail!("OAuth credential install task target fence is not authoritative");
+    }
+    sqlx::query_scalar(
+        "SELECT value
+           FROM fleet_secrets
+          WHERE key = $1
+            AND updated_at = $2
+            AND disabled_reason IS NULL
+            AND (expires_at IS NULL OR expires_at > NOW())
+          FOR SHARE",
+    )
+    .bind(secret_ref)
+    .bind(secret_version)
+    .fetch_optional(&mut **tx)
+    .await
+    .context("resolve exact OAuth credential secret reference")?
+    .ok_or_else(|| anyhow!("OAuth credential authority is unavailable or rotated"))
+}
+
+/// Execute the dedicated exact-target credential operation. The row lock keeps
+/// the referenced secret version stable until the atomically replaced file is
+/// durable. Errors and the returned result contain identifiers only.
+pub(crate) async fn run_oauth_credential_install(
+    pool: &PgPool,
+    task_id: uuid::Uuid,
+    my_computer_id: uuid::Uuid,
+    payload: &Value,
+) -> Result<Value> {
+    let (payload, provider, secret_version) = validate_install_payload(payload, my_computer_id)?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin OAuth credential install transaction")?;
+    let document = resolve_install_document(
+        &mut tx,
+        task_id,
+        my_computer_id,
+        &payload.secret_ref,
+        secret_version,
+    )
+    .await?;
+    validate_credential_document(&document, provider)?;
+    install_credential_document(provider, document).await?;
+    tx.commit()
+        .await
+        .context("commit OAuth credential install authority read")?;
+    info!(
+        provider = provider.name,
+        target_computer_id = %my_computer_id,
+        "OAuth credential document installed from canonical reference"
+    );
+    Ok(serde_json::json!({
+        "exit": 0,
+        "operation": OAUTH_CREDENTIAL_INSTALL_OPERATION,
+        "provider": provider.name,
+        "secret_ref": payload.secret_ref,
+        "target_computer_id": my_computer_id,
+        "installed": true
+    }))
+}
+
 /// Result of the narrowly-scoped OAuth queue cleanup verb.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub struct OauthBacklogCancellation {
-    /// Number of pending/dispatchable OAuth tasks matched by the operation.
-    pub eligible: u64,
+    /// Historical and unstarted legacy distribute rows whose payload has the
+    /// exact old credential-bearing shell fingerprint.
+    pub legacy_matched: u64,
+    /// Number whose legacy payload was replaced (`0` for a dry run).
+    pub scrubbed: u64,
+    /// Pending/dispatchable legacy-distribute plus repush rows eligible for
+    /// cancellation.
+    pub cancel_eligible: u64,
     /// Number actually moved to `cancelled` (`0` for a dry run).
     pub cancelled: u64,
+    /// Matching rows currently running. Apply fails without changing any row
+    /// when this is non-zero.
+    pub running_blocked: u64,
     pub applied: bool,
 }
 
-/// Preview or cancel only the unstarted OAuth repush/distribute backlog.
+/// Preview or repair the retained legacy OAuth task payloads and backlog.
 ///
-/// Both paths use one transaction. Apply mode uses a single guarded `UPDATE`,
-/// so a row that races to `running` before its lock is acquired is re-checked
-/// and left untouched. Running, completed, failed, and already-cancelled rows
-/// are never eligible.
+/// Apply locks every exact-fingerprint legacy row. If any is running, one SQL
+/// guard updates nothing and the transaction rolls back. Otherwise all legacy
+/// payloads are replaced with a constant marker; terminal statuses and audit
+/// columns remain unchanged, while pending/dispatchable rows are cancelled in
+/// that same update. Short, non-secret repush commands are cancelled and
+/// replaced separately inside the same transaction. Re-running is idempotent
+/// because redacted rows no longer match the legacy fingerprint.
 pub async fn cancel_oauth_task_backlog(
     pool: &PgPool,
     apply: bool,
@@ -548,28 +945,49 @@ pub async fn cancel_oauth_task_backlog(
         .await
         .context("begin OAuth backlog transaction")?;
     if apply {
-        let result = sqlx::query(OAUTH_BACKLOG_CANCEL_SQL)
+        let (legacy_matched, running_blocked, scrubbed, legacy_cancelled): (i64, i64, i64, i64) =
+            sqlx::query_as(LEGACY_OAUTH_SCRUB_SQL)
+                .fetch_one(&mut *tx)
+                .await
+                .context("lock and scrub legacy OAuth task payloads")?;
+        if running_blocked > 0 {
+            tx.rollback()
+                .await
+                .context("roll back blocked OAuth payload scrub")?;
+            anyhow::bail!(
+                "refusing OAuth payload scrub while {running_blocked} matching task(s) are running"
+            );
+        }
+        let repush_cancelled = sqlx::query(OAUTH_REPUSH_CANCEL_SQL)
             .execute(&mut *tx)
             .await
-            .context("cancel pending OAuth task backlog")?;
-        let cancelled = result.rows_affected();
+            .context("cancel pending OAuth repush backlog")?
+            .rows_affected();
         tx.commit()
             .await
-            .context("commit OAuth backlog cancellation")?;
+            .context("commit OAuth payload scrub and backlog cancellation")?;
+        let cancelled = u64::try_from(legacy_cancelled).unwrap_or(0) + repush_cancelled;
         Ok(OauthBacklogCancellation {
-            eligible: cancelled,
+            legacy_matched: u64::try_from(legacy_matched).unwrap_or(0),
+            scrubbed: u64::try_from(scrubbed).unwrap_or(0),
+            cancel_eligible: cancelled,
             cancelled,
+            running_blocked: 0,
             applied: true,
         })
     } else {
-        let eligible: i64 = sqlx::query_scalar(OAUTH_BACKLOG_COUNT_SQL)
-            .fetch_one(&mut *tx)
-            .await
-            .context("count pending OAuth task backlog")?;
+        let (legacy_matched, running_blocked, cancel_eligible): (i64, i64, i64) =
+            sqlx::query_as(OAUTH_BACKLOG_COUNT_SQL)
+                .fetch_one(&mut *tx)
+                .await
+                .context("count retained OAuth payloads and pending backlog")?;
         tx.commit().await.context("finish OAuth backlog dry run")?;
         Ok(OauthBacklogCancellation {
-            eligible: u64::try_from(eligible).unwrap_or(0),
+            legacy_matched: u64::try_from(legacy_matched).unwrap_or(0),
+            scrubbed: 0,
+            cancel_eligible: u64::try_from(cancel_eligible).unwrap_or(0),
             cancelled: 0,
+            running_blocked: u64::try_from(running_blocked).unwrap_or(0),
             applied: false,
         })
     }
@@ -594,21 +1012,20 @@ pub async fn status(pool: &PgPool) -> Result<Vec<ProviderStatus>> {
             None => (false, None),
         };
 
-        let token = ff_db::pg_get_secret(pool, p.secret_key)
-            .await
-            .ok()
-            .flatten();
-        let preview = token.as_deref().map(|t| {
-            let head: String = t.chars().take(8).collect();
-            format!("{head}…({} chars)", t.chars().count())
-        });
-
+        let token_in_secrets: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                SELECT 1 FROM fleet_secrets WHERE key = $1 AND value <> ''
+            )",
+        )
+        .bind(p.secret_key)
+        .fetch_one(pool)
+        .await
+        .with_context(|| format!("check OAuth secret presence for provider {}", p.name))?;
         out.push(ProviderStatus {
             name: p.name.to_string(),
             cred_file_present: cred_present,
             cred_file_mtime_secs_ago: mtime_ago,
-            token_in_secrets: token.is_some(),
-            token_preview: preview,
+            token_in_secrets,
         });
     }
     Ok(out)
@@ -925,30 +1342,441 @@ mod tests {
     fn enqueue_once_keys_scope_repush_and_distribution_independently() {
         let leader = uuid::Uuid::nil();
         let target = uuid::Uuid::from_u128(1);
+        let version = "2026-08-05T10:00:00.000000Z";
         assert_eq!(
             oauth_repush_enqueue_key("codex", leader),
             format!("oauth-repush:codex:{leader}")
         );
         assert_eq!(
-            oauth_distribute_enqueue_key("codex", target),
-            format!("oauth-distribute:codex:{target}")
+            oauth_distribute_enqueue_key("codex", target, version),
+            format!("oauth-distribute:codex:{target}:{version}")
         );
         assert_ne!(
-            oauth_distribute_enqueue_key("codex", target),
-            oauth_distribute_enqueue_key("kimi", target)
+            oauth_distribute_enqueue_key("codex", target, version),
+            oauth_distribute_enqueue_key("kimi", target, version)
+        );
+        assert_ne!(
+            oauth_distribute_enqueue_key("codex", target, version),
+            oauth_distribute_enqueue_key("codex", target, "2026-08-05T10:00:01.000000Z")
         );
     }
 
     #[test]
-    fn backlog_cleanup_sql_is_narrow_and_never_names_running_or_terminal_statuses() {
-        for sql in [OAUTH_BACKLOG_COUNT_SQL, OAUTH_BACKLOG_CANCEL_SQL] {
-            assert!(sql.contains("task_type = 'shell'"));
-            assert!(sql.contains("status IN ('pending', 'dispatchable')"));
-            assert!(sql.contains("summary LIKE 'oauth-repush/%'"));
-            assert!(sql.contains("summary LIKE 'oauth-distribute/%'"));
-            assert!(!sql.contains("status IN ('running'"));
-            assert!(!sql.contains("status IN ('completed'"));
+    fn backlog_cleanup_fingerprint_and_atomic_guard_are_exact() {
+        for marker in [
+            "task_type = 'shell'",
+            "summary LIKE 'oauth-distribute/%'",
+            "jsonb_typeof(payload) = 'object'",
+            "jsonb_typeof(payload->'command') = 'string'",
+            "FF_OAUTH_EOF",
+            "base64 -d",
+        ] {
+            assert!(LEGACY_OAUTH_PAYLOAD_PREDICATE.contains(marker));
+            assert!(OAUTH_BACKLOG_COUNT_SQL.contains(marker));
+            assert!(LEGACY_OAUTH_SCRUB_SQL.contains(marker));
         }
+        assert!(LEGACY_OAUTH_SCRUB_SQL.contains("FOR UPDATE"));
+        assert!(
+            LEGACY_OAUTH_SCRUB_SQL
+                .contains("NOT EXISTS (SELECT 1 FROM legacy WHERE status = 'running')")
+        );
+        assert!(LEGACY_OAUTH_SCRUB_SQL.contains("legacy_oauth_payload_redacted"));
+        assert!(LEGACY_OAUTH_SCRUB_SQL.contains("RETURNING legacy.status AS previous_status"));
+        assert!(OAUTH_REPUSH_CANCEL_SQL.contains("summary LIKE 'oauth-repush/%'"));
+        assert!(!OAUTH_REPUSH_CANCEL_SQL.contains("payload->>'command'"));
+    }
+
+    #[test]
+    fn typed_payload_contains_references_only_and_validates_exact_target_and_provider() {
+        let target = uuid::Uuid::from_u128(42);
+        let payload = serde_json::to_value(OauthCredentialInstallPayload {
+            operation: OAUTH_CREDENTIAL_INSTALL_OPERATION.to_string(),
+            version: OAUTH_CREDENTIAL_INSTALL_VERSION,
+            provider: "codex".to_string(),
+            secret_ref: "openai.oauth_token.credentials".to_string(),
+            secret_version: "2026-08-05T10:00:00.000000Z".to_string(),
+            target_computer_id: target,
+        })
+        .unwrap();
+        let serialized = payload.to_string();
+        for forbidden in ["access_token", "refresh_token", "base64", "command"] {
+            assert!(
+                !serialized.contains(forbidden),
+                "payload leaked {forbidden}"
+            );
+        }
+        validate_install_payload(&payload, target).expect("canonical payload");
+
+        let mut wrong_target = payload.clone();
+        wrong_target["target_computer_id"] = Value::String(uuid::Uuid::nil().to_string());
+        assert!(validate_install_payload(&wrong_target, target).is_err());
+
+        let mut mixed_case = payload.clone();
+        mixed_case["provider"] = Value::String("Codex".to_string());
+        assert!(validate_install_payload(&mixed_case, target).is_err());
+
+        let mut wrong_ref = payload.clone();
+        wrong_ref["secret_ref"] = Value::String("other.credentials".to_string());
+        assert!(validate_install_payload(&wrong_ref, target).is_err());
+
+        let mut unknown = payload;
+        unknown["credential"] = Value::String("must-not-be-accepted".to_string());
+        assert!(validate_install_payload(&unknown, target).is_err());
+    }
+
+    #[test]
+    fn credential_validation_errors_never_echo_document_content() {
+        let provider = provider_by_name("codex").unwrap();
+        let marker = "credential-marker-that-must-not-escape";
+        for document in [
+            marker.to_string(),
+            format!(r#"{{"refresh_token":"{marker}"}}"#),
+            format!(r#"{{"access_token":"" ,"note":"{marker}"}}"#),
+        ] {
+            let error = validate_credential_document(&document, provider)
+                .expect_err("malformed or tokenless document must fail")
+                .to_string();
+            assert!(!error.contains(marker));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_installer_writes_exact_document_mode_0600_and_rejects_symlinks() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(home.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let relative = std::path::Path::new(".codex/auth.json");
+        let document = r#"{"access_token":"opaque-test-value","refresh_token":"refresh"}"#;
+        install_credential_document_under(home.path(), relative, document).unwrap();
+        let installed = home.path().join(relative);
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), document);
+        let metadata = std::fs::metadata(&installed).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.nlink(), 1);
+        assert!(
+            std::fs::read_dir(installed.parent().unwrap())
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp"))
+        );
+
+        let linked_home = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), linked_home.path().join(".codex")).unwrap();
+        let error = install_credential_document_under(linked_home.path(), relative, document)
+            .expect_err("symlinked credential directory must fail")
+            .to_string();
+        assert!(!error.contains("opaque-test-value"));
+        assert!(!outside.path().join("auth.json").exists());
+    }
+
+    #[test]
+    fn distributor_source_has_no_credential_encoding_or_shell_enqueue() {
+        let source = include_str!("oauth_distributor.rs");
+        let distribute = source
+            .split("pub async fn distribute_token")
+            .nth(1)
+            .unwrap()
+            .split("fn validate_install_payload")
+            .next()
+            .unwrap();
+        assert!(!distribute.contains("BASE64"));
+        assert!(!distribute.contains("base64 -d"));
+        assert!(!distribute.contains("pg_enqueue_shell_task_once"));
+        assert!(distribute.contains("pg_enqueue_oauth_credential_install_once"));
+    }
+
+    #[tokio::test]
+    async fn postgres_scrub_is_terminal_safe_idempotent_and_running_atomic() {
+        let Some(database_url) = std::env::var("FF_OAUTH_TEST_DATABASE_URL").ok() else {
+            eprintln!("FF_OAUTH_TEST_DATABASE_URL unset; skipping disposable PostgreSQL proof");
+            return;
+        };
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect disposable PostgreSQL");
+        sqlx::query("DROP TABLE IF EXISTS fleet_tasks")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE fleet_tasks (
+                id uuid PRIMARY KEY,
+                task_type text NOT NULL,
+                summary text NOT NULL,
+                payload jsonb NOT NULL,
+                status text NOT NULL,
+                completed_at timestamptz,
+                progress_message text,
+                dedup_signature text,
+                preferred_computer_id uuid,
+                claimed_by_computer_id uuid,
+                created_at timestamptz NOT NULL DEFAULT NOW()
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let legacy_command =
+            "set -e\nprintf '%s' 'credential-marker' | base64 -d > target\nFF_OAUTH_EOF";
+        let statuses = ["pending", "cancelled", "completed", "failed"];
+        let mut ids = Vec::new();
+        for status in statuses {
+            let id = uuid::Uuid::new_v4();
+            ids.push((id, status));
+            sqlx::query(
+                "INSERT INTO fleet_tasks
+                    (id, task_type, summary, payload, status, progress_message, dedup_signature)
+                 VALUES ($1, 'shell', $2, jsonb_build_object('command', $3), $4,
+                         'original progress', $5)",
+            )
+            .bind(id)
+            .bind(format!("oauth-distribute/codex: {status}"))
+            .bind(legacy_command)
+            .bind(status)
+            .bind(format!("audit-{status}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let repush_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fleet_tasks (id, task_type, summary, payload, status)
+             VALUES ($1, 'shell', 'oauth-repush/codex',
+                     jsonb_build_object('command', 'ff oauth refresh codex'), 'pending')",
+        )
+        .bind(repush_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let near_miss_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fleet_tasks (id, task_type, summary, payload, status)
+             VALUES ($1, 'shell', 'oauth-distribute/codex: near-miss',
+                     jsonb_build_object('command', 'base64 -d but no sentinel'), 'completed')",
+        )
+        .bind(near_miss_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before: Vec<(uuid::Uuid, chrono::DateTime<Utc>, Option<String>)> = sqlx::query_as(
+            "SELECT id, created_at, dedup_signature FROM fleet_tasks
+              WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(ids.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let dry = cancel_oauth_task_backlog(&pool, false).await.unwrap();
+        assert_eq!(dry.legacy_matched, 4);
+        assert_eq!(dry.cancel_eligible, 2);
+        assert_eq!(dry.running_blocked, 0);
+        assert_eq!(dry.scrubbed, 0);
+        assert_eq!(dry.cancelled, 0);
+
+        let applied = cancel_oauth_task_backlog(&pool, true).await.unwrap();
+        assert_eq!(applied.legacy_matched, 4);
+        assert_eq!(applied.scrubbed, 4);
+        assert_eq!(applied.cancelled, 2);
+        for (id, original_status) in &ids {
+            let (status, payload, progress): (String, Value, Option<String>) = sqlx::query_as(
+                "SELECT status, payload, progress_message FROM fleet_tasks WHERE id = $1",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            let expected_status = if *original_status == "pending" {
+                "cancelled"
+            } else {
+                original_status
+            };
+            assert_eq!(status, expected_status);
+            assert_eq!(payload["operation"], "legacy_oauth_payload_redacted");
+            assert!(!payload.to_string().contains("credential-marker"));
+            if *original_status != "pending" {
+                assert_eq!(progress.as_deref(), Some("original progress"));
+            }
+        }
+        let after: Vec<(uuid::Uuid, chrono::DateTime<Utc>, Option<String>)> = sqlx::query_as(
+            "SELECT id, created_at, dedup_signature FROM fleet_tasks
+              WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(ids.iter().map(|(id, _)| *id).collect::<Vec<_>>())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after, "audit identity changed during scrub");
+        let repush: (String, Value) =
+            sqlx::query_as("SELECT status, payload FROM fleet_tasks WHERE id = $1")
+                .bind(repush_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(repush.0, "cancelled");
+        assert_eq!(repush.1["operation"], "oauth_repush_cancelled");
+        let near_miss: Value = sqlx::query_scalar("SELECT payload FROM fleet_tasks WHERE id = $1")
+            .bind(near_miss_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(near_miss.get("command").is_some());
+        let repeated = cancel_oauth_task_backlog(&pool, true).await.unwrap();
+        assert_eq!(repeated.legacy_matched, 0);
+        assert_eq!(repeated.scrubbed, 0);
+        assert_eq!(repeated.cancelled, 0);
+
+        let running_id = uuid::Uuid::new_v4();
+        let pending_id = uuid::Uuid::new_v4();
+        for id in [running_id, pending_id] {
+            sqlx::query(
+                "INSERT INTO fleet_tasks (id, task_type, summary, payload, status)
+                 VALUES ($1, 'shell', 'oauth-distribute/codex: race',
+                         jsonb_build_object('command', $2), 'pending')",
+            )
+            .bind(id)
+            .bind(legacy_command)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let mut claim = pool.begin().await.unwrap();
+        sqlx::query("UPDATE fleet_tasks SET status = 'running' WHERE id = $1")
+            .bind(running_id)
+            .execute(&mut *claim)
+            .await
+            .unwrap();
+        let scrub_pool = pool.clone();
+        let scrub = tokio::spawn(async move { cancel_oauth_task_backlog(&scrub_pool, true).await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        claim.commit().await.unwrap();
+        let error = scrub
+            .await
+            .unwrap()
+            .expect_err("running fingerprint must block the whole scrub")
+            .to_string();
+        assert!(error.contains("matching task(s) are running"));
+        let race_rows: Vec<(uuid::Uuid, String, Value)> = sqlx::query_as(
+            "SELECT id, status, payload FROM fleet_tasks
+              WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(vec![running_id, pending_id])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(race_rows.len(), 2);
+        assert!(race_rows.iter().any(|row| row.1 == "running"));
+        assert!(race_rows.iter().any(|row| row.1 == "pending"));
+        assert!(
+            race_rows
+                .iter()
+                .all(|row| row.2["command"].as_str() == Some(legacy_command))
+        );
+
+        sqlx::query("DROP TABLE IF EXISTS fleet_secrets")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE fleet_secrets (
+                key text PRIMARY KEY,
+                value text NOT NULL,
+                updated_at timestamptz NOT NULL,
+                expires_at timestamptz,
+                disabled_reason text
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let typed_task_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fleet_tasks (
+                id, task_type, summary, payload, status,
+                preferred_computer_id, claimed_by_computer_id
+             ) VALUES ($1, 'oauth_credential_install', 'typed oauth test', '{}'::jsonb,
+                       'running', $2, $2)",
+        )
+        .bind(typed_task_id)
+        .bind(target_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let secret_version = DateTime::parse_from_rfc3339("2026-08-05T10:00:00.000000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let test_document = r#"{"access_token":"jit-test-secret"}"#;
+        sqlx::query(
+            "INSERT INTO fleet_secrets (key, value, updated_at)
+             VALUES ('openai.oauth_token.credentials', $1, $2)",
+        )
+        .bind(test_document)
+        .bind(secret_version)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut exact = pool.begin().await.unwrap();
+        let resolved = resolve_install_document(
+            &mut exact,
+            typed_task_id,
+            target_id,
+            "openai.oauth_token.credentials",
+            secret_version,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resolved, test_document);
+        exact.rollback().await.unwrap();
+
+        let mut wrong_target = pool.begin().await.unwrap();
+        let target_error = resolve_install_document(
+            &mut wrong_target,
+            typed_task_id,
+            uuid::Uuid::new_v4(),
+            "openai.oauth_token.credentials",
+            secret_version,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(!target_error.contains("jit-test-secret"));
+        wrong_target.rollback().await.unwrap();
+
+        let mut rotated = pool.begin().await.unwrap();
+        let stale_error = resolve_install_document(
+            &mut rotated,
+            typed_task_id,
+            target_id,
+            "openai.oauth_token.credentials",
+            secret_version + chrono::Duration::microseconds(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(stale_error.contains("unavailable or rotated"));
+        assert!(!stale_error.contains("jit-test-secret"));
+        rotated.rollback().await.unwrap();
+
+        sqlx::query("DROP TABLE fleet_secrets")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE fleet_tasks")
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     #[test]

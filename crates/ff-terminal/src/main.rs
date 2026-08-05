@@ -1734,10 +1734,10 @@ enum OauthCommand {
         /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`, or `all`.
         provider: String,
     },
-    /// Push the leader's credential file out to every other fleet member's
-    /// matching path (mode 0600). After this, ff-driven CLI invocations on
-    /// any member use the centralised token. Pass `all` to fan out for
-    /// every provider at once.
+    /// Queue a typed canonical credential reference for every other fleet
+    /// member. Each exact target resolves it just in time and atomically writes
+    /// the provider's matching path (mode 0600). Pass `all` to fan out for
+    /// every provider at once; credential bytes never enter the task payload.
     ///
     /// TOS WARNING: most vendor consumer subscriptions (Claude Pro,
     /// ChatGPT Plus, Kimi Pro) prohibit using one account on N concurrent
@@ -1756,8 +1756,8 @@ enum OauthCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
-    /// Show per-provider OAuth state: cred-file present on leader,
-    /// mtime, token-in-fleet_secrets, token-preview.
+    /// Show per-provider OAuth state: cred-file present on leader, mtime, and
+    /// whether the canonical token is present. Token content is never shown.
     Status,
     /// Long-running foreground watcher: re-imports + re-distributes
     /// whenever any leader cred file changes (vendor CLI refreshed its
@@ -1787,10 +1787,11 @@ enum OauthCommand {
         #[arg(default_value = "all")]
         provider: String,
     },
-    /// Preview or cancel the unstarted OAuth task flood. Only `shell` tasks
-    /// whose summary begins `oauth-repush/` or `oauth-distribute/` and whose
-    /// status is `pending`/`dispatchable` are eligible. Running and terminal
-    /// rows are never touched. Dry-run unless `--apply` is explicit.
+    /// Preview or repair retained legacy OAuth payloads and the unstarted task
+    /// flood. Apply atomically redacts every exact-fingerprint legacy payload
+    /// (including terminal history), cancels unstarted distribute/repush rows,
+    /// and refuses all changes if a matching legacy task is running. Dry-run
+    /// unless `--apply` is explicit.
     CancelBacklog {
         #[arg(long, default_value_t = false)]
         apply: bool,
@@ -5948,7 +5949,7 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("status: {e}"))?;
                     println!(
-                        "{:<10} {:<14} {:<18} {:<10} TOKEN PREVIEW",
+                        "{:<10} {:<14} {:<18} {:<10}",
                         "PROVIDER", "CRED FILE", "FILE MTIME", "IN SECRETS"
                     );
                     for s in snap {
@@ -5967,7 +5968,7 @@ async fn main() -> Result<()> {
                             })
                             .unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<10} {:<14} {:<18} {:<10} {}",
+                            "{:<10} {:<14} {:<18} {:<10}",
                             s.name,
                             if s.cred_file_present {
                                 "present"
@@ -5976,24 +5977,29 @@ async fn main() -> Result<()> {
                             },
                             mtime,
                             if s.token_in_secrets { "yes" } else { "no" },
-                            s.token_preview.unwrap_or_else(|| "-".into()),
                         );
                     }
-                    let setup_token = ff_db::pg_get_secret(&pool, "claude.setup_token")
-                        .await
-                        .ok()
-                        .flatten();
+                    let setup_token_present: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM fleet_secrets
+                             WHERE key = 'claude.setup_token' AND value <> ''
+                        )",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .context("check durable headless claude token presence")?;
                     println!();
-                    match setup_token {
-                        Some(t) if !t.trim().is_empty() => println!(
+                    if setup_token_present {
+                        println!(
                             "{GREEN}✓{RESET} durable headless claude token set (fleet_secrets[claude.setup_token]) \
                              — every node exports it as CLAUDE_CODE_OAUTH_TOKEN when spawning `claude`"
-                        ),
-                        _ => println!(
+                        );
+                    } else {
+                        println!(
                             "{YELLOW}!{RESET} no durable headless claude token — run `claude setup-token` once \
                              (browser approval), then `ff secrets set claude.setup_token` (or pipe via --stdin) \
                              to mint one that survives refresh-token rotation fleet-wide"
-                        ),
+                        );
                     }
                     Ok(())
                 }
@@ -6050,13 +6056,13 @@ async fn main() -> Result<()> {
                         .context("OAuth task backlog cleanup")?;
                     if result.applied {
                         println!(
-                            "{GREEN}✓{RESET} cancelled {} pending/dispatchable OAuth repush/distribute task(s); running and terminal rows were untouched",
-                            result.cancelled
+                            "{GREEN}✓{RESET} redacted {} retained legacy OAuth payload(s) and cancelled {} pending/dispatchable distribute/repush task(s); terminal audit metadata was preserved",
+                            result.scrubbed, result.cancelled
                         );
                     } else {
                         println!(
-                            "{YELLOW}dry-run{RESET}: {} pending/dispatchable OAuth repush/distribute task(s) would be cancelled; running and terminal rows would be untouched",
-                            result.eligible
+                            "{YELLOW}dry-run{RESET}: {} retained legacy payload(s) would be redacted and {} pending/dispatchable distribute/repush task(s) would be cancelled; {} matching task(s) are running",
+                            result.legacy_matched, result.cancel_eligible, result.running_blocked
                         );
                         println!("rerun with `ff oauth cancel-backlog --apply` to apply");
                     }
@@ -6717,6 +6723,21 @@ mod oauth_cli_guard_tests {
             "cancel-backlog",
             "--apply",
         ]));
+    }
+
+    #[test]
+    fn oauth_status_never_renders_token_content_or_preview() {
+        let source = include_str!("main.rs");
+        let status_arm = source
+            .split("OauthCommand::Status =>")
+            .nth(1)
+            .unwrap()
+            .split("OauthCommand::RefreshWatch")
+            .next()
+            .unwrap();
+        assert!(!status_arm.contains("token_preview"));
+        assert!(!status_arm.contains("TOKEN PREVIEW"));
+        assert!(!status_arm.contains("chars().take"));
     }
 
     fn parse_mesh_repair_cleanup(args: &[&str]) -> bool {
