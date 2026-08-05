@@ -88,7 +88,12 @@ pub async fn evaluate_merge_queue(
     unknown_defers: &mut HashMap<Uuid, u32>,
     auditor: &ReconciliationAuditor,
 ) -> Result<usize> {
-    let Some(item) = ff_db::pg_next_merge_queue_item(pg).await? else {
+    // A CI-green row remains visible as `mergeable` while the operator gate is
+    // off, but it must not consume the serial-drain head or block queued/CI
+    // work behind it. If the gate is later enabled, original position order is
+    // restored. The merge path rechecks the gate immediately before mutation.
+    let include_mergeable = automerge_enabled(pg).await;
+    let Some(item) = ff_db::pg_next_merge_queue_item(pg, include_mergeable).await? else {
         return Ok(0);
     };
     let Some(pr_url) = item.pr_url.clone().filter(|u| !u.trim().is_empty()) else {
@@ -2053,6 +2058,30 @@ mod tests {
         for other in ["BLOCKED", "UNSTABLE", "HAS_HOOKS", "", "clean"] {
             assert_eq!(parse_merge_state(other), PrMergeState::Other, "{other}");
         }
+    }
+
+    #[test]
+    fn automerge_gate_is_rechecked_after_queue_selection_before_merge_mutation() {
+        let source = include_str!("work_item_merge_drain.rs");
+        let start = source
+            .find("pub async fn evaluate_merge_queue")
+            .expect("merge queue evaluator");
+        let end = source[start..]
+            .find("pub(crate) fn parse_review_response")
+            .map(|offset| start + offset)
+            .expect("end of merge queue evaluator");
+        let evaluator = &source[start..end];
+        let select = evaluator
+            .find("pg_next_merge_queue_item(pg, include_mergeable)")
+            .expect("gate-aware queue selection");
+        let recheck = evaluator[select..]
+            .find("if !automerge_enabled(pg).await")
+            .map(|offset| select + offset)
+            .expect("fresh automerge gate check");
+        let merge = evaluator
+            .find("gh_merge_squash(&pr_url)")
+            .expect("merge mutation");
+        assert!(select < recheck && recheck < merge);
     }
 }
 

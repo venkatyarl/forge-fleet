@@ -1526,6 +1526,10 @@ async fn dispatch_one(
         let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
+    // Complete every remaining filesystem read before the durable handoff
+    // releases this clone's compute slot. Once mark_ready_for_review commits,
+    // the scheduler may assign a replacement to the same warm clone.
+    let sweep_warnings = post_phase.finish_without_cleanup();
     let advanced = mark_ready_for_review(
         &pg,
         &item,
@@ -1542,13 +1546,11 @@ async fn dispatch_one(
             sub_agent_id = %item.sub_agent_id,
             "work_item_dispatch: ignoring stale result after item or lease changed"
         );
-        let sweep_warnings = post_phase.finish();
         return Ok(WorkItemDispatchResult { sweep_warnings });
     }
     if normalized_cloud_backend(&backend_used).is_none() {
         mark_local_retest_passed(&pg, item.work_item_id).await?;
     }
-    let sweep_warnings = post_phase.finish_without_cleanup();
     Ok(WorkItemDispatchResult { sweep_warnings })
 }
 
@@ -2241,6 +2243,11 @@ async fn mark_ready_for_review(
                    AND sa.computer_id = l.computer_id
                    AND sa.current_work_item_id = work_items.id
                    AND sa.status = 'busy'
+                   AND sa.slot <> 99
+                   AND EXISTS (
+                       SELECT 1 FROM computers c
+                        WHERE c.id = l.computer_id
+                          AND LOWER(c.name) <> 'vinny')
             )",
     )
     .bind(item.work_item_id)
@@ -2257,18 +2264,27 @@ async fn mark_ready_for_review(
         return Ok(false);
     }
 
-    sqlx::query(
+    let worktree_recorded = sqlx::query(
         "UPDATE work_item_worktrees
             SET status = 'ready_for_review',
                 head_sha = $2
           WHERE work_item_id = $1
-            AND task_branch = $3",
+            AND task_branch = $3
+            AND sub_agent_id = $4
+            AND computer_id = $5",
     )
     .bind(item.work_item_id)
     .bind(head_sha)
     .bind(&worktree.task_branch)
+    .bind(item.sub_agent_id)
+    .bind(item.computer_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if worktree_recorded != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
 
     sqlx::query(
         r#"
@@ -2351,20 +2367,61 @@ async fn mark_ready_for_review(
     .execute(&mut *tx)
     .await?;
 
-    // Folder ownership spans build -> review -> merge. Keep the slot occupied
-    // until the serial drain reports the merged signal; the host reaper then
-    // deletes the branch/tree before this folder can claim another item.
-    sqlx::query(
-        "UPDATE work_item_leases SET lease_state = 'reviewing', heartbeat_at = NOW() \
+    // Durable PR/review custody replaces compute ownership. Release the exact
+    // lease and slot in this same transaction only after every custody record
+    // above is committed together. The caller has already completed its final
+    // filesystem inspection, so a replacement may safely reuse the warm clone.
+    // PostgreSQL MVCC makes assignment observe either the old active lease or
+    // the committed released+idle pair; assignment's slot-row lock waits if it
+    // races this UPDATE, so there is no half-visible free slot.
+    let released = sqlx::query(
+        "UPDATE work_item_leases SET lease_state = 'released', released_at = NOW(), \
+                release_reason = 'durable PR/review custody handoff', heartbeat_at = NOW() \
           WHERE id = $1 AND work_item_id = $2 AND sub_agent_id = $3 \
-            AND computer_id = $4 AND released_at IS NULL",
+            AND computer_id = $4 AND released_at IS NULL \
+            AND lease_state IN ('claimed', 'building')",
     )
     .bind(item.lease_id)
     .bind(item.work_item_id)
     .bind(item.sub_agent_id)
     .bind(item.computer_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+    if released != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+
+    let idled = sqlx::query(
+        "UPDATE sub_agents sa
+            SET status = 'idle', current_work_item_id = NULL,
+                started_at = NULL, last_heartbeat_at = NOW()
+           FROM computers c
+          WHERE sa.id = $1
+            AND sa.computer_id = $2
+            AND c.id = sa.computer_id
+            AND LOWER(c.name) <> 'vinny'
+            AND sa.slot <> 99
+            AND sa.status = 'busy'
+            AND sa.current_work_item_id = $3
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases active
+                 WHERE active.sub_agent_id = sa.id
+                   AND active.id <> $4
+                   AND active.released_at IS NULL)",
+    )
+    .bind(item.sub_agent_id)
+    .bind(item.computer_id)
+    .bind(item.work_item_id)
+    .bind(item.lease_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if idled != 1 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     tx.commit().await?;
     Ok(true)
 }
@@ -7204,6 +7261,71 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
     let mut reaped = 0usize;
     let mut reclaimed_bytes = 0u64;
     for wt in reapable {
+        let mut tx = pg.begin().await?;
+
+        // Revalidate and lock the exact item/worktree before touching disk.
+        // The candidate snapshot may be stale by the time this host reaches
+        // it, so every identity and terminal/stale predicate is repeated.
+        let custody_is_current = sqlx::query_scalar::<_, i32>(
+            "SELECT 1
+               FROM work_item_worktrees wt
+               JOIN work_items w ON w.id = wt.work_item_id
+              WHERE wt.work_item_id = $1
+                AND wt.sub_agent_id = $2
+                AND wt.computer_id = $3
+                AND wt.status <> 'cleaned'
+                AND (w.status IN ('cancelled', 'merged', 'failed', 'done')
+                     OR wt.status = 'stale')
+              FOR UPDATE OF wt, w",
+        )
+        .bind(wt.work_item_id)
+        .bind(wt.sub_agent_id)
+        .bind(wt.computer_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !custody_is_current {
+            tx.rollback().await?;
+            continue;
+        }
+
+        // Claim the slot for cleanup before filesystem mutation. Scheduler
+        // assignment locks this same row, so it must wait and then observes
+        // the final idle state only after cleanup commits. If this process
+        // crashes after partial filesystem cleanup, PostgreSQL rolls this
+        // uncommitted claim back to its prior retryable state; reset/delete
+        // operations below are bounded and idempotent on retry. A live lease, an
+        // intentional quarantine, Vinny, or slot-99 makes this fail closed.
+        let claimed = sqlx::query(
+            "UPDATE sub_agents sa
+                SET status = 'cleanup_pending',
+                    current_work_item_id = $3,
+                    last_heartbeat_at = NOW()
+               FROM computers c
+              WHERE sa.id = $1
+                AND sa.computer_id = $2
+                AND c.id = sa.computer_id
+                AND LOWER(c.name) <> 'vinny'
+                AND sa.slot <> 99
+                AND ((sa.status = 'idle' AND sa.current_work_item_id IS NULL)
+                     OR ($4 AND sa.status = 'cleanup_pending'
+                            AND sa.current_work_item_id = $3))
+                AND NOT EXISTS (
+                    SELECT 1 FROM work_item_leases l
+                     WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)",
+        )
+        .bind(wt.sub_agent_id)
+        .bind(wt.computer_id)
+        .bind(wt.work_item_id)
+        .bind(wt.stale_slot)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if claimed != 1 {
+            tx.rollback().await?;
+            continue;
+        }
+
         let repo = PathBuf::from(&wt.repo_path);
         let tree = PathBuf::from(&wt.worktree_path);
         let worktree_removed =
@@ -7223,12 +7345,13 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
             Duration::from_secs(30),
         )
         .is_ok();
-        let mut tx = pg.begin().await?;
         sqlx::query(
             "UPDATE work_item_worktrees SET status = 'cleaned', cleaned_at = NOW() \
-              WHERE work_item_id = $1",
+              WHERE work_item_id = $1 AND sub_agent_id = $2 AND computer_id = $3",
         )
         .bind(wt.work_item_id)
+        .bind(wt.sub_agent_id)
+        .bind(wt.computer_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -7248,24 +7371,34 @@ pub async fn evaluate_worktree_reaper(pg: &PgPool, worker_name: &str) -> Result<
         .bind(worktree_removed)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE work_item_leases SET lease_state = 'released', released_at = NOW(), \
-                    release_reason = 'workspace cleaned after terminal signal' \
-              WHERE work_item_id = $1 AND released_at IS NULL",
+        let idled = sqlx::query(
+            "UPDATE sub_agents
+                SET current_work_item_id = NULL, status = 'idle',
+                    started_at = NULL, last_heartbeat_at = NOW()
+              WHERE id = $1
+                AND computer_id = $2
+                AND current_work_item_id = $3
+                AND status = 'cleanup_pending'
+                AND slot <> 99
+                AND NOT EXISTS (
+                    SELECT 1 FROM work_item_leases l
+                     WHERE l.sub_agent_id = sub_agents.id
+                       AND l.released_at IS NULL)",
         )
+        .bind(wt.sub_agent_id)
+        .bind(wt.computer_id)
         .bind(wt.work_item_id)
         .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE sub_agents SET current_work_item_id = NULL, status = 'idle', \
-                    started_at = NULL, last_heartbeat_at = NOW() \
-              WHERE current_work_item_id = $1 \
-                AND ($2 = FALSE OR status = 'cleanup_pending')",
-        )
-        .bind(wt.work_item_id)
-        .bind(wt.stale_slot)
-        .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if idled != 1 {
+            tx.rollback().await?;
+            bail!(
+                "worktree cleanup lost exact slot fence for item {} on sub-agent {}",
+                wt.work_item_id,
+                wt.sub_agent_id
+            );
+        }
         if wt.stale_slot {
             sqlx::query(
                 "UPDATE work_items SET status = 'ready', assigned_to = NULL, \
@@ -7559,6 +7692,12 @@ mod tests {
             let suffix = Uuid::new_v4();
             let project_id = format!("dispatch-review-gate-{suffix}");
             let computer_id = Uuid::new_v4();
+            let test_ip = format!(
+                "127.{}.{}.{}",
+                suffix.as_bytes()[0],
+                suffix.as_bytes()[1],
+                suffix.as_bytes()[2]
+            );
             let leased_sub_agent_id = Uuid::new_v4();
             let dispatch_sub_agent_id = if mismatched {
                 Uuid::new_v4()
@@ -7573,11 +7712,13 @@ mod tests {
                 .await
                 .expect("insert test project");
             sqlx::query(
-                "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
-                 VALUES ($1, $2, '127.0.0.1', 'linux', 'test')",
+                "INSERT INTO fleet_nodes
+                    (id, name, primary_ip, ip, os_family, ssh_user)
+                 VALUES ($1, $2, $3, $3, 'linux', 'test')",
             )
             .bind(computer_id)
             .bind(format!("dispatch-review-gate-{suffix}"))
+            .bind(test_ip)
             .execute(&pool)
             .await
             .expect("insert test computer");
@@ -7609,6 +7750,20 @@ mod tests {
             .execute(&pool)
             .await
             .expect("insert test work item");
+            sqlx::query(
+                "INSERT INTO work_item_worktrees
+                    (work_item_id, computer_id, sub_agent_id, repo_path,
+                     worktree_path, base_branch, task_branch, status)
+                 VALUES ($1, $2, $3, '/tmp/dispatch-review-gate',
+                         '/tmp/dispatch-review-gate', 'main', $4, 'active')",
+            )
+            .bind(work_item_id)
+            .bind(computer_id)
+            .bind(leased_sub_agent_id)
+            .bind(format!("wi/{work_item_id}"))
+            .execute(&pool)
+            .await
+            .expect("insert test worktree");
             sqlx::query(
                 "UPDATE sub_agents
                     SET status = 'busy', current_work_item_id = $2
@@ -7683,6 +7838,32 @@ mod tests {
             .expect("count merge queue rows");
             assert_eq!(queued, i64::from(expected), "{name}");
 
+            let (lease_state, released): (String, bool) = sqlx::query_as(
+                "SELECT lease_state, released_at IS NOT NULL
+                   FROM work_item_leases WHERE id = $1",
+            )
+            .bind(lease_id)
+            .fetch_one(&pool)
+            .await
+            .expect("read lease handoff state");
+            let (slot_status, current_item): (String, Option<Uuid>) =
+                sqlx::query_as("SELECT status, current_work_item_id FROM sub_agents WHERE id = $1")
+                    .bind(leased_sub_agent_id)
+                    .fetch_one(&pool)
+                    .await
+                    .expect("read slot handoff state");
+            if expected {
+                assert_eq!(lease_state, "released", "{name}");
+                assert!(released, "{name}");
+                assert_eq!(slot_status, "idle", "{name}");
+                assert_eq!(current_item, None, "{name}");
+            } else {
+                assert_eq!(lease_state, "claimed", "{name}");
+                assert_eq!(released, name == "released", "{name}");
+                assert_eq!(slot_status, "busy", "{name}");
+                assert_eq!(current_item, Some(work_item_id), "{name}");
+            }
+
             sqlx::query("DELETE FROM work_item_merge_queue WHERE work_item_id = $1")
                 .bind(work_item_id)
                 .execute(&pool)
@@ -7694,6 +7875,11 @@ mod tests {
                 .await
                 .ok();
             sqlx::query("DELETE FROM work_item_leases WHERE work_item_id = $1")
+                .bind(work_item_id)
+                .execute(&pool)
+                .await
+                .ok();
+            sqlx::query("DELETE FROM work_item_worktrees WHERE work_item_id = $1")
                 .bind(work_item_id)
                 .execute(&pool)
                 .await
@@ -8509,6 +8695,64 @@ mod tests {
         assert!(
             return_before_ready,
             "diagnosis persistence failure must return before ready-for-review"
+        );
+    }
+
+    #[test]
+    fn post_phase_filesystem_reads_finish_before_compute_handoff() {
+        let source = include_str!("work_item_dispatch.rs");
+        let start = source
+            .find("// Complete every remaining filesystem read before the durable handoff")
+            .expect("handoff ordering marker");
+        let end = source[start..]
+            .find("#[derive(Debug, Clone, PartialEq, Eq)]")
+            .map(|offset| start + offset)
+            .expect("end of dispatch path");
+        let path = &source[start..end];
+        let post = path
+            .find("post_phase.finish_without_cleanup()")
+            .expect("post phase must finish");
+        let handoff = path
+            .find("mark_ready_for_review(")
+            .expect("durable handoff must run");
+        assert!(
+            post < handoff,
+            "filesystem inspection must precede slot release"
+        );
+        assert_eq!(
+            path.matches("post_phase.").count(),
+            1,
+            "only DB-only work may follow durable slot release"
+        );
+    }
+
+    #[test]
+    fn worktree_reaper_holds_exact_slot_fence_across_filesystem_cleanup() {
+        let source = include_str!("work_item_dispatch.rs");
+        let start = source
+            .find("pub async fn evaluate_worktree_reaper")
+            .expect("worktree reaper");
+        let end = source[start..]
+            .find("pub fn spawn_worktree_reaper")
+            .map(|offset| start + offset)
+            .expect("end of worktree reaper");
+        let reaper = &source[start..end];
+        let begin = reaper
+            .find("pg.begin().await?")
+            .expect("transaction begins");
+        let claim = reaper
+            .find("SET status = 'cleanup_pending'")
+            .expect("exact slot cleanup claim");
+        let filesystem = reaper
+            .find("remove_worktree(&repo, &tree)")
+            .expect("filesystem cleanup");
+        let commit = reaper
+            .find("tx.commit().await?")
+            .expect("transaction commits");
+        assert!(begin < claim && claim < filesystem && filesystem < commit);
+        assert!(
+            !reaper.contains("UPDATE work_item_leases SET"),
+            "cleanup must never reap an active process lease"
         );
     }
 

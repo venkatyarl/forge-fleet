@@ -6182,13 +6182,16 @@ mod tests {
                  name TEXT NOT NULL
              );
              CREATE TABLE work_items (
-                 id     UUID PRIMARY KEY,
-                 status TEXT NOT NULL DEFAULT 'ready'
+                 id          UUID PRIMARY KEY,
+                 status      TEXT NOT NULL DEFAULT 'ready',
+                 branch_name TEXT,
+                 pr_url      TEXT
              );
              CREATE TABLE sub_agents (
                  id                   UUID PRIMARY KEY,
                  computer_id          UUID NOT NULL REFERENCES computers(id),
                  slot                 INT NOT NULL,
+                 kind                 TEXT NOT NULL DEFAULT 'sub_agent',
                  status               TEXT NOT NULL DEFAULT 'idle',
                  current_work_item_id UUID REFERENCES work_items(id),
                  started_at           TIMESTAMPTZ,
@@ -6206,6 +6209,35 @@ mod tests {
                  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                  released_at      TIMESTAMPTZ,
                  release_reason   TEXT
+             );
+             CREATE TABLE work_item_worktrees (
+                 id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id  UUID NOT NULL REFERENCES work_items(id),
+                 computer_id   UUID NOT NULL REFERENCES computers(id),
+                 sub_agent_id  UUID REFERENCES sub_agents(id),
+                 repo_path     TEXT NOT NULL DEFAULT '',
+                 worktree_path TEXT NOT NULL DEFAULT '',
+                 base_branch   TEXT NOT NULL DEFAULT 'main',
+                 task_branch   TEXT NOT NULL,
+                 head_sha      TEXT,
+                 status        TEXT NOT NULL,
+                 cleaned_at    TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_merge_queue (
+                 id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id        UUID NOT NULL UNIQUE REFERENCES work_items(id),
+                 project_id          TEXT NOT NULL DEFAULT 'test',
+                 position            BIGSERIAL,
+                 status              TEXT NOT NULL DEFAULT 'queued',
+                 branch_name         TEXT NOT NULL,
+                 pr_url              TEXT,
+                 head_sha            TEXT,
+                 review_verdict      TEXT,
+                 review_completed_at TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_provenance (
+                 work_item_id UUID PRIMARY KEY REFERENCES work_items(id),
+                 pr_url       TEXT
              );",
         )
         .execute(&pool)
@@ -6788,6 +6820,243 @@ mod tests {
             .expect("reconcile slots again");
         assert_eq!((relinked2, freed2), (0, 0));
 
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn reconcile_review_custody_releases_only_exact_durable_handoffs() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let normal = uuid::Uuid::new_v4();
+        let vinny = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox'), ($2, 'Vinny')")
+            .bind(normal)
+            .bind(vinny)
+            .execute(&pool)
+            .await
+            .expect("insert computers");
+
+        // Only case 0 is an exact durable handoff. Case 1 lacks provenance,
+        // case 2 is Vinny, case 3 is sentinel slot 99, and case 4 has two
+        // non-cleaned worktree custody rows and is therefore ambiguous. Case 5
+        // still says `building`, proving stale review-looking artifacts cannot
+        // authorize release while the item retains active-build ownership.
+        let items: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
+        let slots: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
+        for i in 0..6 {
+            let computer = if i == 2 { vinny } else { normal };
+            let slot = if i == 3 { 99 } else { i as i32 };
+            let branch = format!("wi/{}", items[i]);
+            let pr = format!("https://example.invalid/pr/{}", items[i]);
+            let head = format!("head-{i}");
+            let item_status = if i == 5 { "building" } else { "in_review" };
+            sqlx::query(
+                "INSERT INTO work_items (id, status, branch_name, pr_url)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(items[i])
+            .bind(item_status)
+            .bind(&branch)
+            .bind(&pr)
+            .execute(&pool)
+            .await
+            .expect("insert review item");
+            sqlx::query(
+                "INSERT INTO sub_agents
+                    (id, computer_id, slot, status, current_work_item_id)
+                 VALUES ($1, $2, $3, 'busy', $4)",
+            )
+            .bind(slots[i])
+            .bind(computer)
+            .bind(slot)
+            .bind(items[i])
+            .execute(&pool)
+            .await
+            .expect("insert review slot");
+            sqlx::query(
+                "INSERT INTO work_item_leases
+                    (work_item_id, sub_agent_id, computer_id, lease_state,
+                     lease_expires_at, heartbeat_at)
+                 VALUES ($1, $2, $3, 'reviewing',
+                         NOW() - INTERVAL '1 hour', NOW() - INTERVAL '2 hours')",
+            )
+            .bind(items[i])
+            .bind(slots[i])
+            .bind(computer)
+            .execute(&pool)
+            .await
+            .expect("insert reviewing lease");
+            sqlx::query(
+                "INSERT INTO work_item_worktrees
+                    (work_item_id, computer_id, sub_agent_id, task_branch, head_sha, status)
+                 VALUES ($1, $2, $3, $4, $5, 'ready_for_review')",
+            )
+            .bind(items[i])
+            .bind(computer)
+            .bind(slots[i])
+            .bind(&branch)
+            .bind(&head)
+            .execute(&pool)
+            .await
+            .expect("insert review worktree");
+            sqlx::query(
+                "INSERT INTO work_item_merge_queue
+                    (work_item_id, status, branch_name, pr_url, head_sha,
+                     review_verdict, review_completed_at)
+                 VALUES ($1, 'queued', $2, $3, $4, 'approve', NOW())",
+            )
+            .bind(items[i])
+            .bind(&branch)
+            .bind(&pr)
+            .bind(&head)
+            .execute(&pool)
+            .await
+            .expect("insert review queue row");
+            if i != 1 {
+                sqlx::query(
+                    "INSERT INTO work_item_provenance (work_item_id, pr_url) VALUES ($1, $2)",
+                )
+                .bind(items[i])
+                .bind(&pr)
+                .execute(&pool)
+                .await
+                .expect("insert review provenance");
+            }
+        }
+        sqlx::query(
+            "INSERT INTO work_item_worktrees
+                (work_item_id, computer_id, sub_agent_id, task_branch, head_sha, status)
+             VALUES ($1, $2, $3, $4, 'other-head', 'active')",
+        )
+        .bind(items[4])
+        .bind(normal)
+        .bind(slots[4])
+        .bind(format!("ambiguous/{}", items[4]))
+        .execute(&pool)
+        .await
+        .expect("insert ambiguous custody row");
+
+        let (relinked, freed) = pg_reconcile_sub_agent_slots(&pool)
+            .await
+            .expect("reconcile durable review custody");
+        assert_eq!(relinked, 0);
+        assert_eq!(freed, 1, "only the exact normal-slot handoff is released");
+
+        for i in 0..6 {
+            let (slot_status, current_item, released): (String, Option<uuid::Uuid>, bool) =
+                sqlx::query_as(
+                    "SELECT sa.status, sa.current_work_item_id, l.released_at IS NOT NULL
+                       FROM sub_agents sa
+                       JOIN work_item_leases l ON l.sub_agent_id = sa.id
+                      WHERE sa.id = $1",
+                )
+                .bind(slots[i])
+                .fetch_one(&pool)
+                .await
+                .expect("read reconciled custody");
+            if i == 0 {
+                assert_eq!(slot_status, "idle");
+                assert_eq!(current_item, None);
+                assert!(released);
+            } else {
+                assert_eq!(slot_status, "busy", "case {i} must fail closed");
+                assert_eq!(current_item, Some(items[i]));
+                assert!(!released, "case {i} lease must remain owned");
+            }
+        }
+
+        assert_eq!(
+            pg_reconcile_sub_agent_slots(&pool)
+                .await
+                .expect("idempotent custody reconcile"),
+            (0, 0)
+        );
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn free_slots_exclude_quarantine_sentinels_and_vinny() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+        let normal = uuid::Uuid::new_v4();
+        let vinny = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox'), ($2, 'Vinny')")
+            .bind(normal)
+            .bind(vinny)
+            .execute(&pool)
+            .await
+            .expect("insert computers");
+        let ids: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+        for (id, computer, slot, status) in [
+            (ids[0], normal, 0, "idle"),
+            (ids[1], normal, 99, "idle"),
+            (ids[2], normal, 1, "disabled"),
+            (ids[3], vinny, 0, "idle"),
+            (ids[4], normal, 2, "error"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agents (id, computer_id, slot, status)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(computer)
+            .bind(slot)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("insert slot");
+        }
+
+        let free = pg_free_slots(&pool, None, 20)
+            .await
+            .expect("query safe free slots");
+        assert_eq!(free.len(), 1);
+        assert_eq!(free[0].sub_agent_id, ids[0]);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn mergeable_rows_only_participate_when_automerge_is_enabled() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO work_items (id) VALUES ($1), ($2)")
+            .bind(first)
+            .bind(second)
+            .execute(&pool)
+            .await
+            .expect("insert merge work items");
+        for (item, status, branch) in [(first, "mergeable", "first"), (second, "queued", "second")]
+        {
+            sqlx::query(
+                "INSERT INTO work_item_merge_queue
+                    (work_item_id, project_id, status, branch_name, review_verdict)
+                 VALUES ($1, 'ordering', $2, $3, 'approve')",
+            )
+            .bind(item)
+            .bind(status)
+            .bind(branch)
+            .execute(&pool)
+            .await
+            .expect("insert merge queue item");
+        }
+
+        let gated = pg_next_merge_queue_item(&pool, false)
+            .await
+            .expect("read gated queue")
+            .expect("queued row must remain actionable");
+        assert_eq!(gated.work_item_id, second);
+
+        let enabled = pg_next_merge_queue_item(&pool, true)
+            .await
+            .expect("read enabled queue")
+            .expect("mergeable row must rejoin original ordering");
+        assert_eq!(enabled.work_item_id, first);
         drop_temp_db(admin, pool, &db_name).await;
     }
 
@@ -11377,10 +11646,15 @@ pub async fn pg_free_slots(
            FROM sub_agents sa
            JOIN computers c ON c.id = sa.computer_id
           WHERE sa.current_work_item_id IS NULL
+            AND sa.status = 'idle'
             -- Operator quarantine: a 'disabled' slot must never claim work
             -- (2026-07-19: sarah, a 3GB traveler, kept claiming builds it
             -- cannot run because this filter was missing).
             AND COALESCE(sa.status, '') <> 'disabled'
+            -- Canonical sentinel rows describe the checkout, not capacity.
+            -- Vinny remains hard-fenced after its motherboard/data-loss event.
+            AND sa.slot <> 99
+            AND LOWER(c.name) <> 'vinny'
             -- NOTE: NO heartbeat freshness filter here (reverted 2026-07-29,
             -- same day it shipped): slot heartbeats only advance WHILE a build
             -- runs, so healthy IDLE slots look 'stale' and a freshness floor
@@ -11445,6 +11719,92 @@ pub async fn pg_free_slots(
 ///    coordinator's non-lease claims (`fleet_run` dispatch never writes lease
 ///    rows), which stay owned by the stuck-slot reaper's age ceiling.
 pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+
+    // A completed, approved PR handoff owns durable review state in Postgres;
+    // it no longer needs to monopolize the compute slot that built it. This
+    // repairs historical rows written before mark_ready_for_review released
+    // its lease. Every custody field must agree, and the lease must be both
+    // expired and stale. Ambiguous/incomplete rows deliberately stay owned.
+    // The exact slot row is locked by the UPDATE until both lease and slot
+    // changes commit, so assignment cannot observe a half-release.
+    let review_handoffs = sqlx::query(
+        r#"
+        WITH durable AS (
+            SELECT l.id AS lease_id, l.sub_agent_id, l.computer_id, l.work_item_id
+              FROM work_item_leases l
+              JOIN work_items w ON w.id = l.work_item_id
+              JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                                AND sa.computer_id = l.computer_id
+              JOIN computers c ON c.id = l.computer_id
+              JOIN work_item_worktrees wt ON wt.work_item_id = l.work_item_id
+                                          AND wt.sub_agent_id = l.sub_agent_id
+                                          AND wt.computer_id = l.computer_id
+              JOIN work_item_merge_queue mq ON mq.work_item_id = l.work_item_id
+              JOIN work_item_provenance p ON p.work_item_id = l.work_item_id
+             WHERE l.released_at IS NULL
+               AND l.lease_state = 'reviewing'
+               AND l.lease_expires_at <= NOW()
+               AND l.heartbeat_at < NOW() - INTERVAL '10 minutes'
+               AND w.status = 'in_review'
+               AND sa.status = 'busy'
+               AND sa.current_work_item_id = l.work_item_id
+               AND sa.slot <> 99
+               AND LOWER(c.name) <> 'vinny'
+               AND wt.status = 'ready_for_review'
+               AND (SELECT COUNT(*)
+                      FROM work_item_worktrees wt2
+                     WHERE wt2.work_item_id = l.work_item_id
+                       AND wt2.status <> 'cleaned') = 1
+               AND NULLIF(BTRIM(w.pr_url), '') IS NOT NULL
+               AND mq.pr_url = w.pr_url
+               AND p.pr_url = w.pr_url
+               AND mq.branch_name = w.branch_name
+               AND wt.task_branch = w.branch_name
+               AND NULLIF(BTRIM(wt.head_sha), '') IS NOT NULL
+               AND mq.head_sha = wt.head_sha
+               AND mq.status IN ('queued', 'ci_running', 'mergeable')
+               AND mq.review_verdict = 'approve'
+               AND mq.review_completed_at IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_item_leases other
+                    WHERE other.sub_agent_id = l.sub_agent_id
+                      AND other.id <> l.id
+                      AND other.released_at IS NULL)
+             -- Freeze every custody source until lease + slot release commit;
+             -- merge drain or another reconciler cannot invalidate the
+             -- evidence between qualification and mutation.
+             FOR UPDATE OF w, wt, mq, p, l, sa
+        ), released AS (
+            UPDATE work_item_leases l
+               SET lease_state = 'released',
+                   released_at = NOW(),
+                   release_reason = 'durable PR/review custody reconciled'
+              FROM durable d
+             WHERE l.id = d.lease_id
+             RETURNING l.id AS lease_id, d.sub_agent_id, d.computer_id, d.work_item_id
+        )
+        UPDATE sub_agents sa
+           SET status = 'idle',
+               current_work_item_id = NULL,
+               started_at = NULL,
+               last_heartbeat_at = NOW()
+          FROM released r
+         WHERE sa.id = r.sub_agent_id
+           AND sa.computer_id = r.computer_id
+           AND sa.status = 'busy'
+           AND sa.current_work_item_id = r.work_item_id
+           AND NOT EXISTS (
+               SELECT 1 FROM work_item_leases active
+                WHERE active.sub_agent_id = sa.id
+                  AND active.id <> r.lease_id
+                  AND active.released_at IS NULL)
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
     let relinked = sqlx::query(
         "UPDATE sub_agents sa
             SET status = 'busy',
@@ -11460,7 +11820,7 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
             AND (sa.status <> 'busy'
                  OR sa.current_work_item_id IS DISTINCT FROM l.work_item_id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
@@ -11481,11 +11841,12 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
                    AND l.work_item_id = sa.current_work_item_id
                    AND l.released_at IS NOT NULL)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
-    Ok((relinked, freed))
+    tx.commit().await?;
+    Ok((relinked, freed + review_handoffs))
 }
 
 /// Reset every `'busy'` `sub_agents` row for a single computer back to
@@ -11966,7 +12327,12 @@ pub struct MergeQueueItem {
 /// entry whose project has nothing else already in flight ahead of it —
 /// serializes merges to ONE per project. (A 'ci_running' row is one we're
 /// already watching; re-returning it lets the drain re-check its PR CI.)
-pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueueItem>> {
+/// `mergeable` rows participate only while the operator's automerge gate is
+/// enabled; while it is off they remain visible without head-blocking CI work.
+pub async fn pg_next_merge_queue_item(
+    pool: &PgPool,
+    include_mergeable: bool,
+) -> Result<Option<MergeQueueItem>> {
     // Fail-open enqueues (review produced no verdict) insert with a NULL/empty
     // review_verdict — by design they are still meant to drain ('reject' rows
     // are only ever written with status='failed', so an ACTIVE row can never
@@ -11976,17 +12342,20 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
     let row = sqlx::query(
         "SELECT id, work_item_id, project_id, pr_url, branch_name
            FROM work_item_merge_queue q
-          WHERE q.status IN ('queued', 'ci_running', 'mergeable')
+          WHERE (q.status IN ('queued', 'ci_running')
+                 OR ($1 AND q.status = 'mergeable'))
             AND COALESCE(q.review_verdict, '') <> 'reject'
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_merge_queue q2
                  WHERE q2.project_id = q.project_id
-                   AND q2.status IN ('queued', 'ci_running', 'mergeable')
+                   AND (q2.status IN ('queued', 'ci_running')
+                        OR ($1 AND q2.status = 'mergeable'))
                    AND COALESCE(q2.review_verdict, '') <> 'reject'
                    AND q2.position < q.position)
           ORDER BY q.position ASC
           LIMIT 1",
     )
+    .bind(include_mergeable)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| MergeQueueItem {
@@ -12101,6 +12470,8 @@ pub async fn pg_mark_merge_failed(
 #[derive(Debug, Clone)]
 pub struct ReapableWorktree {
     pub work_item_id: uuid::Uuid,
+    pub sub_agent_id: uuid::Uuid,
+    pub computer_id: uuid::Uuid,
     pub repo_path: String,
     pub worktree_path: String,
     pub task_branch: String,
@@ -12116,15 +12487,26 @@ pub async fn pg_reapable_worktrees(
     worker_name: &str,
 ) -> Result<Vec<ReapableWorktree>> {
     let rows = sqlx::query(
-        "SELECT wt.work_item_id, wt.repo_path, wt.worktree_path, wt.task_branch, \
+        "SELECT wt.work_item_id, wt.sub_agent_id, wt.computer_id, \
+                wt.repo_path, wt.worktree_path, wt.task_branch, \
                 wt.status = 'stale' AS stale_slot \
            FROM work_item_worktrees wt \
            JOIN work_items w ON w.id = wt.work_item_id \
            JOIN computers c ON c.id = wt.computer_id \
-          WHERE c.name = $1 \
+           JOIN sub_agents sa ON sa.id = wt.sub_agent_id \
+                             AND sa.computer_id = wt.computer_id \
+          WHERE LOWER(c.name) = LOWER($1) \
+            AND LOWER(c.name) <> 'vinny' \
+            AND sa.slot <> 99 \
             AND wt.status <> 'cleaned' \
             AND (w.status IN ('cancelled', 'merged', 'failed', 'done') \
                  OR wt.status = 'stale') \
+            AND ((sa.status = 'idle' AND sa.current_work_item_id IS NULL) \
+                 OR (wt.status = 'stale' AND sa.status = 'cleanup_pending' \
+                     AND sa.current_work_item_id = wt.work_item_id)) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM work_item_leases l \
+                 WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL) \
           LIMIT 32",
     )
     .bind(worker_name)
@@ -12134,6 +12516,8 @@ pub async fn pg_reapable_worktrees(
         .iter()
         .map(|r| ReapableWorktree {
             work_item_id: r.get("work_item_id"),
+            sub_agent_id: r.get("sub_agent_id"),
+            computer_id: r.get("computer_id"),
             repo_path: r.get("repo_path"),
             worktree_path: r.get("worktree_path"),
             task_branch: r.get("task_branch"),
