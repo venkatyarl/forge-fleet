@@ -55,7 +55,7 @@ pub enum ArtifactRegistryError {
 }
 
 /// The fixed authority root used by `ff artifact register`.
-fn local_release_build_root() -> Result<PathBuf, ArtifactRegistryError> {
+pub(crate) fn local_release_build_root() -> Result<PathBuf, ArtifactRegistryError> {
     authority_home_dir()
         .map(|home| home.join(".forgefleet").join("release-builds"))
         .ok_or(ArtifactRegistryError::HomeUnavailable)
@@ -65,7 +65,7 @@ fn local_release_build_root() -> Result<PathBuf, ArtifactRegistryError> {
 /// `FORGEFLEET_HOME`. Those environment variables are convenient configuration
 /// inputs but are not suitable roots for a custody assertion.
 #[cfg(unix)]
-fn authority_home_dir() -> Option<PathBuf> {
+pub(crate) fn authority_home_dir() -> Option<PathBuf> {
     use std::ffi::{CStr, OsString};
     use std::mem::MaybeUninit;
     use std::os::unix::ffi::OsStringExt;
@@ -116,7 +116,7 @@ fn authority_home_dir() -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn authority_home_dir() -> Option<PathBuf> {
+pub(crate) fn authority_home_dir() -> Option<PathBuf> {
     dirs::home_dir()
 }
 

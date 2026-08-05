@@ -6,6 +6,9 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 
 use ff_agent::artifact_registry::{LocalReleaseArtifactSpec, register_local_release_artifact};
+use ff_agent::release_artifact_activation::{
+    LocalReleaseActivationRequest, activate_local_release_pair,
+};
 use ff_db::ReleaseArtifactRegistrationOutcome;
 
 use crate::{GREEN, RESET};
@@ -36,6 +39,17 @@ pub enum ArtifactCommand {
         #[arg(long)]
         path: PathBuf,
         /// Emit the resulting immutable receipt as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Acquire local V291 custody when needed and transactionally activate the
+    /// exact platform-qualified `ff` + `forgefleetd` release pair.
+    Activate {
+        /// Exact full lowercase 40-hex Git source commit. The release version,
+        /// target platform, custody source, and all destinations are derived.
+        #[arg(long)]
+        source_commit: String,
+        /// Emit the immutable activation receipt as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -112,6 +126,38 @@ pub async fn handle_artifact(command: ArtifactCommand) -> Result<()> {
                 println!("  sha256:        {}", receipt.artifact.sha256);
                 println!("  size_bytes:    {}", receipt.artifact.size_bytes);
                 println!("  relative_path: {}", receipt.custody.relative_path);
+            }
+            Ok(())
+        }
+        ArtifactCommand::Activate {
+            source_commit,
+            json,
+        } => {
+            let pool = ff_agent::fleet_info::get_fleet_pool()
+                .await
+                .map_err(|error| anyhow::anyhow!("connect Postgres: {error}"))?;
+            let receipt = activate_local_release_pair(
+                &pool,
+                &LocalReleaseActivationRequest { source_commit },
+            )
+            .await
+            .context("acquire custody and activate exact release pair")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            } else {
+                println!("{GREEN}✓ exact release pair activated{RESET}");
+                println!("  transaction:  {}", receipt.transaction_id);
+                println!("  computer:     {}", receipt.computer_name);
+                println!("  version:      {}", receipt.artifact_version);
+                println!("  source:       {}", receipt.source_commit);
+                println!("  target:       {}", receipt.target_triple);
+                println!("  receipt:      {}", receipt.receipt_path);
+                for artifact in receipt.artifacts {
+                    println!("  {}: {}", artifact.artifact_name, artifact.sha256);
+                    for destination in artifact.destinations {
+                        println!("    -> {destination}");
+                    }
+                }
             }
             Ok(())
         }

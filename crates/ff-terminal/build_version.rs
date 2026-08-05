@@ -4,7 +4,8 @@
 /// Emit `FF_GIT_SHA`, `FF_BUILD_VERSION`, `FF_GIT_STATE` as rustc env vars.
 /// NEVER fails — every probe falls through to sensible defaults.
 fn emit_version_env() {
-    let sha = git_short_sha().unwrap_or_else(|| "unknown".to_string());
+    emit_git_rerun_paths();
+    let sha = git_full_sha().unwrap_or_else(|| "unknown".to_string());
     let state = detect_git_state(&sha);
     let (date_key, date_human) = today_date_parts();
     let counter = bump_daily_counter(&date_key);
@@ -24,14 +25,63 @@ fn emit_version_env() {
     println!("cargo:rustc-env=FF_BUILT_AT={built_at}");
 }
 
-fn git_short_sha() -> Option<String> {
+/// Resolve the real repository metadata paths. In a linked worktree `.git` is
+/// a file, so watching `.git/HEAD` never invalidates an incremental release
+/// build when that worktree advances.
+fn emit_git_rerun_paths() {
+    let mut git_paths = vec![
+        "HEAD".to_string(),
+        "index".to_string(),
+        "packed-refs".to_string(),
+    ];
+    if let Some(symbolic_ref) = Command::new("git")
+        .args(["rev-parse", "--symbolic-full-name", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|path| path.starts_with("refs/") && !path.contains(['\n', '\r']))
+    {
+        git_paths.push(symbolic_ref);
+    }
+    for git_path in git_paths {
+        if let Some(path) = absolute_git_path(&git_path) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
+fn absolute_git_path(git_path: &str) -> Option<String> {
     Command::new("git")
-        .args(["rev-parse", "--short=10", "HEAD"])
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            git_path,
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
+/// Return the exact immutable source identity embedded in both `ff` and
+/// `forgefleetd`.  A shortened or otherwise malformed value is not provenance:
+/// degrade to `unknown` instead of baking an ambiguous prefix into a release.
+fn git_full_sha() -> Option<String> {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
         .output()
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|sha| {
+            sha.len() == 40
+                && sha
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
 }
 
 /// Returns one of `"dirty" | "unpushed" | "pushed" | "unknown"`.
@@ -45,9 +95,10 @@ fn detect_git_state(sha: &str) -> String {
         return "unknown".to_string();
     }
     let diff = Command::new("git").args(["diff", "--quiet"]).status();
-    let cached = Command::new("git").args(["diff", "--cached", "--quiet"]).status();
-    let dirty = matches!(&diff, Ok(s) if !s.success())
-        || matches!(&cached, Ok(s) if !s.success());
+    let cached = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .status();
+    let dirty = matches!(&diff, Ok(s) if !s.success()) || matches!(&cached, Ok(s) if !s.success());
     if dirty {
         return "dirty".to_string();
     }
@@ -86,7 +137,13 @@ fn parse_zone(z: &str) -> Option<i64> {
     if z.len() != 5 {
         return None;
     }
-    let sign: i64 = if z.starts_with('+') { 1 } else if z.starts_with('-') { -1 } else { return None };
+    let sign: i64 = if z.starts_with('+') {
+        1
+    } else if z.starts_with('-') {
+        -1
+    } else {
+        return None;
+    };
     let h: i64 = z[1..3].parse().ok()?;
     let m: i64 = z[3..5].parse().ok()?;
     Some(sign * (h * 3600 + m * 60))
@@ -114,7 +171,9 @@ fn ymd_from_unix(secs: i64) -> (i32, u32, u32) {
 fn bump_daily_counter(date_key: &str) -> u32 {
     let home = std::env::var("HOME").ok();
     let Some(home) = home else { return 1 };
-    let dir = std::path::PathBuf::from(home).join(".forgefleet").join("builds");
+    let dir = std::path::PathBuf::from(home)
+        .join(".forgefleet")
+        .join("builds");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join(format!("{date_key}.count"));
     let current: u32 = std::fs::read_to_string(&path)
