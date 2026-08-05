@@ -1356,6 +1356,7 @@ mod tests {
             provenance: ResolvedTargetProvenance::Auto,
             router_enabled: false,
             accepted_model_ids: vec!["glm-4.5-air".into()],
+            accepted_model_aliases: Vec::new(),
             accepted_shard_prefixes: Vec::new(),
             served_model_id: Some("glm-4.5-air".into()),
             served_model_ids: vec!["glm-4.5-air".into()],

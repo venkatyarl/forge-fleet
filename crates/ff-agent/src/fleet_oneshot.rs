@@ -19,14 +19,14 @@
 //! First caller is `ff council --members local:<model>`; `fleet_run` can migrate
 //! onto this later.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use ff_core::llm_completion_policy::{
-    apply_completion_policy, validate_completion_response, CompletionBudget, WorkloadClass,
+    CompletionBudget, WorkloadClass, apply_completion_policy, validate_completion_response,
 };
 use ff_db::queries::{RouteCandidate, RouteFilter, pg_route_deployments};
 use serde::{Deserialize, Serialize};
@@ -74,6 +74,19 @@ pub enum EndpointAttestationState {
     UnverifiedTimeout,
 }
 
+/// Exact served-model identity explicitly authorized by one catalog variant.
+///
+/// Keeping the source fields alongside the alias makes the otherwise opaque
+/// server spelling auditable. Aliases are never inferred by normalizing model
+/// names; they must be declared on the runtime/artifact variant that owns them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServedModelAliasProvenance {
+    pub model_id: String,
+    pub runtime: String,
+    pub hf_repo: String,
+    pub quant: String,
+}
+
 impl EndpointAttestationState {
     fn as_str(self) -> &'static str {
         match self {
@@ -112,6 +125,10 @@ pub struct ResolvedFleetTarget {
     pub router_enabled: bool,
     /// Exact identities accepted from deployment, catalog, and library authority.
     pub accepted_model_ids: Vec<String>,
+    /// Explicit catalog-variant aliases included in `accepted_model_ids`, with
+    /// their runtime/artifact provenance retained for route-decision audits.
+    #[serde(default)]
+    pub accepted_model_aliases: Vec<ServedModelAliasProvenance>,
     /// Strict filename prefixes derived from catalog repo + quant metadata.
     /// They accept only a complete GGUF filename or a complete split-shard
     /// suffix, never a substring/fuzzy family match.
@@ -152,6 +169,7 @@ impl ResolvedFleetTarget {
             "provenance": self.provenance.as_str(),
             "router_enabled": self.router_enabled,
             "accepted_model_ids": self.accepted_model_ids,
+            "accepted_model_aliases": self.accepted_model_aliases,
             "accepted_shard_prefixes": self.accepted_shard_prefixes,
             "served_model_id": self.served_model_id,
             "served_model_ids": self.served_model_ids,
@@ -195,6 +213,7 @@ pub fn resolved_target_from_candidate(
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect(),
+        accepted_model_aliases: Vec::new(),
         accepted_shard_prefixes: Vec::new(),
         served_model_id: None,
         served_model_ids: Vec::new(),
@@ -411,6 +430,92 @@ fn shard_prefixes_from_variants(variants: &Value) -> BTreeSet<String> {
     prefixes
 }
 
+const MAX_SERVED_MODEL_ALIAS_BYTES: usize = 1024;
+
+/// Read exact aliases from the catalog variant matching the deployment runtime.
+///
+/// Metadata shape:
+/// `{ "runtime": "llama.cpp", "hf_repo": "org/repo", "quant": "Q4_K_M",
+///    "served_model_aliases": ["Exact-Server-ID.gguf"] }`
+///
+/// The source fields are mandatory whenever aliases are declared. Malformed or
+/// ambiguous declarations fail the entire resolution instead of silently
+/// weakening identity attestation. A missing deployment runtime accepts no
+/// aliases. Matching is exact and case-sensitive after this parsing boundary.
+fn served_model_aliases_from_variants(
+    variants: &Value,
+    deployment_runtime: Option<&str>,
+) -> Result<Vec<ServedModelAliasProvenance>> {
+    let Some(variants) = variants.as_array() else {
+        return Err(anyhow!("catalog variants must be an array"));
+    };
+    let deployment_runtime = deployment_runtime
+        .map(str::trim)
+        .filter(|runtime| !runtime.is_empty());
+    let mut aliases = BTreeMap::<String, ServedModelAliasProvenance>::new();
+
+    for (index, variant) in variants.iter().enumerate() {
+        let Some(raw_aliases) = variant.get("served_model_aliases") else {
+            continue;
+        };
+        let raw_aliases = raw_aliases.as_array().ok_or_else(|| {
+            anyhow!("catalog variant {index} served_model_aliases must be an array")
+        })?;
+        let source = |field: &str| -> Result<&str> {
+            let value = variant.get(field).and_then(Value::as_str).ok_or_else(|| {
+                anyhow!("catalog variant {index} with served_model_aliases requires string {field}")
+            })?;
+            if value.is_empty() || value.trim() != value || value.chars().any(char::is_control) {
+                return Err(anyhow!(
+                    "catalog variant {index} has invalid alias provenance field {field}"
+                ));
+            }
+            Ok(value)
+        };
+        let runtime = source("runtime")?;
+        let hf_repo = source("hf_repo")?;
+        let quant = source("quant")?;
+        // Runtime labels are routing metadata and compare case-insensitively;
+        // the served-model aliases themselves remain exact and case-sensitive.
+        let runtime_matches =
+            deployment_runtime.is_some_and(|deployed| deployed.eq_ignore_ascii_case(runtime));
+
+        for (alias_index, raw_alias) in raw_aliases.iter().enumerate() {
+            let alias = raw_alias.as_str().ok_or_else(|| {
+                anyhow!(
+                    "catalog variant {index} served_model_aliases[{alias_index}] must be a string"
+                )
+            })?;
+            if alias.is_empty()
+                || alias.trim() != alias
+                || alias.len() > MAX_SERVED_MODEL_ALIAS_BYTES
+                || alias.chars().any(char::is_control)
+            {
+                return Err(anyhow!(
+                    "catalog variant {index} served_model_aliases[{alias_index}] is invalid"
+                ));
+            }
+            if !runtime_matches {
+                continue;
+            }
+            let provenance = ServedModelAliasProvenance {
+                model_id: alias.to_string(),
+                runtime: runtime.to_string(),
+                hf_repo: hf_repo.to_string(),
+                quant: quant.to_string(),
+            };
+            if let Some(existing) = aliases.insert(alias.to_string(), provenance.clone())
+                && existing != provenance
+            {
+                return Err(anyhow!(
+                    "served model alias {alias:?} has ambiguous catalog variant provenance"
+                ));
+            }
+        }
+    }
+    Ok(aliases.into_values().collect())
+}
+
 const CATALOG_LIBRARY_IDENTITIES_SQL: &str = "SELECT file_path \
        FROM fleet_model_library \
       WHERE catalog_id = $1 \
@@ -463,7 +568,6 @@ pub async fn resolve_candidate_target(
         .cloned()
         .collect::<BTreeSet<_>>();
     accepted.extend(library_path_basenames(paths));
-    target.accepted_model_ids = accepted.into_iter().collect();
     let variants = sqlx::query_scalar::<_, Value>(
         "SELECT COALESCE(variants, '[]'::jsonb) \
            FROM fleet_model_catalog \
@@ -479,6 +583,10 @@ pub async fn resolve_candidate_target(
         )
     })?
     .unwrap_or_else(|| json!([]));
+    let aliases = served_model_aliases_from_variants(&variants, candidate.runtime.as_deref())?;
+    accepted.extend(aliases.iter().map(|alias| alias.model_id.clone()));
+    target.accepted_model_ids = accepted.into_iter().collect();
+    target.accepted_model_aliases = aliases;
     target.accepted_shard_prefixes = shard_prefixes_from_variants(&variants)
         .into_iter()
         .collect();
@@ -1513,6 +1621,152 @@ mod tests {
     }
 
     #[test]
+    fn catalog_variant_alias_is_exact_runtime_scoped_and_provenance_backed() {
+        let variants = json!([
+            {
+                "runtime": "llama.cpp",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "quant": "Q4_K_M",
+                "served_model_aliases": [
+                    "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"
+                ]
+            },
+            {
+                "runtime": "vllm",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+                "quant": "fp16",
+                "served_model_aliases": ["qwen3-vl-vllm"]
+            }
+        ]);
+        let aliases = served_model_aliases_from_variants(&variants, Some("llama.cpp")).unwrap();
+        assert_eq!(
+            aliases,
+            vec![ServedModelAliasProvenance {
+                model_id: "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf".to_string(),
+                runtime: "llama.cpp".to_string(),
+                hf_repo: "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF".to_string(),
+                quant: "Q4_K_M".to_string(),
+            }]
+        );
+        assert!(
+            served_model_aliases_from_variants(&variants, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            served_model_aliases_from_variants(&variants, Some("vllm")).unwrap()[0].model_id,
+            "qwen3-vl-vllm"
+        );
+    }
+
+    #[test]
+    fn catalog_variant_aliases_never_infer_punctuation_or_cross_variant_runtime() {
+        let no_alias = json!([{
+            "runtime": "llama.cpp",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+            "quant": "Q4_K_M"
+        }]);
+        assert!(
+            served_model_aliases_from_variants(&no_alias, Some("llama.cpp"))
+                .unwrap()
+                .is_empty()
+        );
+
+        let vllm_only = json!([{
+            "runtime": "vllm",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+            "quant": "fp16",
+            "served_model_aliases": ["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]
+        }]);
+        assert!(
+            served_model_aliases_from_variants(&vllm_only, Some("llama.cpp"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn malformed_or_ambiguous_catalog_variant_aliases_fail_closed() {
+        for variants in [
+            json!({}),
+            json!([{
+                "runtime": "llama.cpp",
+                "hf_repo": "Qwen/repo",
+                "quant": "Q4_K_M",
+                "served_model_aliases": "not-an-array"
+            }]),
+            json!([{
+                "runtime": "llama.cpp",
+                "hf_repo": "Qwen/repo",
+                "quant": "Q4_K_M",
+                "served_model_aliases": [" padded.gguf"]
+            }]),
+            json!([{
+                "runtime": "llama.cpp",
+                "hf_repo": "Qwen/repo",
+                "quant": "Q4_K_M",
+                "served_model_aliases": [42]
+            }]),
+            json!([{
+                "runtime": "llama.cpp",
+                "hf_repo": "Qwen/repo",
+                "served_model_aliases": ["exact.gguf"]
+            }]),
+            json!([
+                {
+                    "runtime": "llama.cpp",
+                    "hf_repo": "Qwen/repo-a",
+                    "quant": "Q4_K_M",
+                    "served_model_aliases": ["same.gguf"]
+                },
+                {
+                    "runtime": "llama.cpp",
+                    "hf_repo": "Qwen/repo-b",
+                    "quant": "Q4_K_M",
+                    "served_model_aliases": ["same.gguf"]
+                }
+            ]),
+        ] {
+            assert!(
+                served_model_aliases_from_variants(&variants, Some("llama.cpp")).is_err(),
+                "unexpectedly accepted {variants}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn james_qwen_alias_attests_exactly_without_fuzzy_spelling() {
+        let exact = "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf";
+        let (endpoint, chat_calls, server) =
+            spawn_attestation_server(json!({"data": [{"id": exact}]}), Duration::ZERO).await;
+        let variants = json!([{
+            "runtime": "llama.cpp",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+            "quant": "Q4_K_M",
+            "served_model_aliases": [exact]
+        }]);
+        let aliases = served_model_aliases_from_variants(&variants, Some("llama.cpp")).unwrap();
+        let accepted = aliases
+            .iter()
+            .map(|alias| alias.model_id.clone())
+            .collect::<BTreeSet<_>>();
+        let result = attest_endpoint(
+            &reqwest::Client::new(),
+            &endpoint,
+            &accepted,
+            &BTreeSet::new(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.served_model_id.as_deref(), Some(exact));
+        assert!(!accepted.contains("Qwen3-VL-30B-A3B-Instruct-Q4_K_M.gguf"));
+        assert!(!accepted.contains("qwen3vl-30b-a3b-instruct-q4_k_m.gguf"));
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
+        server.abort();
+    }
+
+    #[test]
     fn catalog_library_identity_authority_is_cross_worker_but_exact() {
         assert!(CATALOG_LIBRARY_IDENTITIES_SQL.contains("catalog_id = $1"));
         assert!(!CATALOG_LIBRARY_IDENTITIES_SQL.contains("worker_name"));
@@ -1687,6 +1941,36 @@ mod tests {
         assert_eq!(target.model_label, "Lucy 1.7B");
         assert_eq!(target.engine_label(), "local:unattested:lucy-1-7b");
         assert_eq!(target.route_decision()["provenance"], "auto");
+    }
+
+    #[test]
+    fn route_decision_retains_exact_alias_provenance() {
+        let mut candidate = candidate("http://james:55003", "james", Some("qwen"), Some(1));
+        candidate.catalog_id = Some("qwen3-vl-30b-a3b".to_string());
+        candidate.catalog_name = Some("Qwen3-VL-30B-A3B-Instruct".to_string());
+        let mut target =
+            resolved_target_from_candidate(&candidate, ResolvedTargetProvenance::Auto, false)
+                .unwrap();
+        target
+            .accepted_model_ids
+            .push("Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf".to_string());
+        target.accepted_model_aliases = vec![ServedModelAliasProvenance {
+            model_id: "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf".to_string(),
+            runtime: "llama.cpp".to_string(),
+            hf_repo: "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF".to_string(),
+            quant: "Q4_K_M".to_string(),
+        }];
+
+        let decision = target.route_decision();
+        assert_eq!(
+            decision["accepted_model_aliases"][0]["model_id"],
+            "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"
+        );
+        assert_eq!(
+            decision["accepted_model_aliases"][0]["hf_repo"],
+            "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF"
+        );
+        assert_eq!(decision["accepted_model_aliases"][0]["quant"], "Q4_K_M");
     }
 
     #[test]
