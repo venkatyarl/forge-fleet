@@ -536,7 +536,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
     if orphans > 0 {
         warn!(
             orphans,
-            "work_item_scheduler: cancelled orphaned in_progress work_items (no active lease)"
+            "work_item_scheduler: cancelled orphaned lease-managed work_items (no live custody)"
         );
     }
 

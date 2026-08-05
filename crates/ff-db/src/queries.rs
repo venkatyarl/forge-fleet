@@ -11399,73 +11399,153 @@ pub async fn pg_reap_stale_work_item_leases(
     Ok(reaped)
 }
 
-/// Count work_items orphaned in `in_progress` with NO active (unreleased) lease.
-/// These never went through — or fell out of — the lease lifecycle, so the
-/// lease-based reaper [`pg_reap_stale_work_item_leases`] can't see them; they
-/// sit `in_progress` forever. `min_age_secs` guards against a just-assigned
-/// item whose lease row is created a moment after the status flips.
+/// Count lease-managed task projections stuck in `building`/`in_progress`
+/// without live execution, worktree, review, merge, child, or task-dispatch
+/// custody.
+/// These have no active lease for the stale-lease reaper to own. `claimed` is
+/// deliberately excluded because it is a legitimate scheduler handshake.
 ///
 /// Scoped to `kind='task'` — the ONLY kind the scheduler/lease flow manages
 /// (`pg_ready_work_items` filters `kind='task'`). Non-task kinds (`dispatch`
 /// provenance containers, `audit`/`epic`/`port` backlog) are never leased by
 /// design, so judging them "orphaned" would churn legitimate rows.
-pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<i64> {
-    let n = sqlx::query_scalar(
-        "SELECT COUNT(*)
-           FROM work_items w
-          WHERE w.status = 'in_progress'
-            AND w.kind = 'task'
-            AND w.created_at < NOW() - make_interval(secs => $1)
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_leases l
-                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)",
+fn orphaned_lease_managed_predicate(alias: &str) -> String {
+    format!(
+        "{alias}.kind = 'task' \
+         AND {alias}.status IN ('building', 'in_progress') \
+         AND GREATEST( \
+             {alias}.created_at, \
+             COALESCE({alias}.started_at, {alias}.created_at), \
+             COALESCE(( \
+                 SELECT MAX(e.occurred_at) FROM work_item_events e \
+                  WHERE e.work_item_id = {alias}.id AND e.to_status = {alias}.status \
+             ), {alias}.created_at) \
+         ) < NOW() - make_interval(secs => $1) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_item_leases l \
+              WHERE l.work_item_id = {alias}.id AND l.released_at IS NULL) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM sub_agents sa \
+              WHERE sa.current_work_item_id = {alias}.id \
+                AND sa.status NOT IN ('idle', 'disabled')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_item_worktrees wt \
+              WHERE wt.work_item_id = {alias}.id AND wt.cleaned_at IS NULL \
+                AND wt.status NOT IN ('failed', 'cleaned')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_item_merge_queue mq \
+              WHERE mq.work_item_id = {alias}.id \
+                AND mq.status NOT IN ('failed', 'merged')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM fleet_tasks ft \
+              WHERE ft.parent_work_item_id = {alias}.id \
+                AND ft.status NOT IN ('cancelled', 'completed', 'failed')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_items child \
+              WHERE child.parent_id = {alias}.id \
+                AND child.status NOT IN ('done', 'merged', 'cancelled', 'failed'))"
     )
-    .bind(min_age_secs as f64)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        warn!(min_age_secs, error = %e, "pg_count_orphaned_work_items query failed");
-        e
-    })?;
+}
+
+pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM work_items w WHERE {}",
+        orphaned_lease_managed_predicate("w")
+    );
+    let n = sqlx::query_scalar(&sql)
+        .bind(min_age_secs as f64)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            warn!(min_age_secs, error = %e, "pg_count_orphaned_work_items query failed");
+            e
+        })?;
     Ok(n)
 }
 
-/// Reap orphaned `in_progress` work_items that have no active lease (see
-/// [`pg_count_orphaned_work_items`]) by marking them terminal `cancelled`.
+/// Reap orphaned `building`/`in_progress` work_items with no live custody (see
+/// [`pg_count_orphaned_work_items`]) by atomically cancelling and auditing them.
 /// Distinct from [`pg_reap_stale_work_item_leases`], which re-queues items whose
 /// lease heartbeat went stale — these have no lease to go stale, so they need a
-/// separate sweep. `cancelled` (not `ready`) is correct: a never-leased
-/// in_progress row is an abandoned/botched dispatch, and re-queueing it would
-/// re-dispatch junk forever.
+/// separate sweep. `cancelled` (not `ready`) is correct: a lease-managed row
+/// without any remaining custody is an abandoned/botched dispatch, and
+/// re-queueing it would re-dispatch junk forever.
 ///
 /// Scoped to `kind='task'` (the lease-managed kind) — see
 /// [`pg_count_orphaned_work_items`]. Without this scope it also cancelled
 /// `kind='dispatch'` provenance containers, which are not pipeline work.
 pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<u64> {
-    let res = sqlx::query(
-        "UPDATE work_items
-            SET status = 'cancelled',
-                completed_at = NOW(),
-                last_error = 'auto-reaped: in_progress with no active lease'
-          WHERE status = 'in_progress'
-            AND kind = 'task'
-            AND created_at < NOW() - make_interval(secs => $1)
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_leases l
-                 WHERE l.work_item_id = work_items.id AND l.released_at IS NULL)",
-    )
-    .bind(min_age_secs as f64)
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        warn!(min_age_secs, error = %e, "pg_reap_orphaned_work_items query failed");
-        e
-    })?;
-    let rows = res.rows_affected();
+    let predicate = orphaned_lease_managed_predicate("w");
+    let sql = format!(
+        "WITH candidates AS ( \
+             SELECT w.id, w.status, w.assigned_computer, w.attempts \
+               FROM work_items w \
+              WHERE {predicate} \
+              ORDER BY w.id FOR UPDATE SKIP LOCKED \
+         ), updated AS ( \
+             UPDATE work_items w \
+                SET status = 'cancelled', \
+                    completed_at = COALESCE(w.completed_at, NOW()), \
+                    last_error = CONCAT_WS(E'\\n', \
+                        NULLIF(BTRIM(COALESCE(w.last_error, '')), ''), \
+                        FORMAT('auto-reaped: orphaned %s with no live custody', c.status)) \
+               FROM candidates c \
+              WHERE w.id = c.id AND w.status = c.status \
+                AND {predicate} \
+              RETURNING w.id, c.status AS from_status, \
+                        w.assigned_computer, w.attempts \
+         ), events AS ( \
+             INSERT INTO work_item_events \
+                 (work_item_id, from_status, to_status, computer, attempt, detail) \
+             SELECT id, from_status, 'cancelled', assigned_computer, attempts, \
+                    FORMAT('auto-reaped: orphaned %s with no live custody', from_status) \
+               FROM updated \
+             RETURNING 1 \
+         ) \
+         SELECT COUNT(*) FROM events"
+    );
+    let rows: i64 = sqlx::query_scalar(&sql)
+        .bind(min_age_secs as f64)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            warn!(min_age_secs, error = %e, "pg_reap_orphaned_work_items query failed");
+            e
+        })?;
+    let rows = rows.max(0) as u64;
     if rows > 0 {
         info!(rows, min_age_secs, "reaped orphaned work_items");
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod orphaned_lease_managed_tests {
+    use super::orphaned_lease_managed_predicate;
+
+    #[test]
+    fn predicate_is_bounded_to_stale_lease_managed_rows_without_custody() {
+        let predicate = orphaned_lease_managed_predicate("candidate");
+
+        assert!(predicate.contains("candidate.kind = 'task'"));
+        assert!(predicate.contains("candidate.status IN ('building', 'in_progress')"));
+        assert!(!predicate.contains("'claimed'"));
+        assert!(predicate.contains("MAX(e.occurred_at)"));
+        assert!(predicate.contains("e.to_status = candidate.status"));
+        for custody_table in [
+            "work_item_leases",
+            "sub_agents",
+            "work_item_worktrees",
+            "work_item_merge_queue",
+            "fleet_tasks",
+            "work_items child",
+        ] {
+            assert!(
+                predicate.contains(custody_table),
+                "missing custody fence for {custody_table}"
+            );
+        }
+    }
 }
 
 /// Prune terminal (`completed`/`failed`/`cancelled`) rows older than

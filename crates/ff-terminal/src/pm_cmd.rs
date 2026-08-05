@@ -1305,10 +1305,10 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
         project_fair_share(project_active.len(), active_leases + schedulable_free_slots);
     let project_active: Vec<_> = project_active.into_iter().collect();
 
-    // Orphaned `in_progress` work_items with NO active lease — invisible to the
-    // lease-based reaper, so they sit forever. The scheduler's orphan sweep
-    // cancels them after an hour; surface any here so "healthy" isn't a lie.
-    let orphaned_in_progress = ff_db::pg_count_orphaned_work_items(pool, 3600)
+    // Orphaned lease-managed projections with no live custody are invisible to
+    // the stale-lease reaper. The scheduler cancels them after an hour; surface
+    // any here so "healthy" isn't a lie.
+    let orphaned_lease_managed = ff_db::pg_count_orphaned_work_items(pool, 3600)
         .await
         .map_err(|e| anyhow::anyhow!("doctor orphaned work_items: {e}"))?;
     let jira_dispatch: (i64, i64, i64, i64) = sqlx::query_as(jira_dispatch_doctor_sql())
@@ -1351,12 +1351,12 @@ async fn print_pm_doctor(pool: &sqlx::PgPool) -> Result<()> {
         println!("{YELLOW}⚠ free slots{RESET}: 0 idle sub_agents");
     }
 
-    let orphans_ok = orphaned_in_progress == 0;
+    let orphans_ok = orphaned_lease_managed == 0;
     if orphans_ok {
-        println!("{GREEN}✓ orphaned in_progress{RESET}: 0");
+        println!("{GREEN}✓ orphaned lease-managed{RESET}: 0");
     } else {
         println!(
-            "{YELLOW}⚠ orphaned in_progress{RESET}: {orphaned_in_progress} (no active lease — the scheduler sweep cancels these hourly)"
+            "{YELLOW}⚠ orphaned lease-managed{RESET}: {orphaned_lease_managed} (no live custody — the scheduler sweep cancels these hourly)"
         );
     }
 
