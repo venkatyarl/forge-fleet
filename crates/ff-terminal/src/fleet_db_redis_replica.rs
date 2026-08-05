@@ -116,7 +116,7 @@ fn parse_replication_info(raw: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn redis_connection(url: &str) -> Result<redis::aio::MultiplexedConnection> {
+pub(crate) async fn redis_connection(url: &str) -> Result<redis::aio::MultiplexedConnection> {
     let client = redis::Client::open(url).context("open Redis client")?;
     tokio::time::timeout(REDIS_IO_TIMEOUT, client.get_multiplexed_async_connection())
         .await
@@ -124,7 +124,7 @@ async fn redis_connection(url: &str) -> Result<redis::aio::MultiplexedConnection
         .context("connect Redis")
 }
 
-async fn redis_info(url: &str, section: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) async fn redis_info(url: &str, section: &str) -> Result<BTreeMap<String, String>> {
     let mut connection = redis_connection(url).await?;
     let raw: String = tokio::time::timeout(
         REDIS_IO_TIMEOUT,
@@ -140,7 +140,7 @@ async fn replication_info(url: &str) -> Result<BTreeMap<String, String>> {
     redis_info(url, "replication").await
 }
 
-async fn redis_config_value(url: &str, key: &str) -> Result<String> {
+pub(crate) async fn redis_config_value(url: &str, key: &str) -> Result<String> {
     let mut connection = redis_connection(url).await?;
     let values: Vec<String> = tokio::time::timeout(
         REDIS_IO_TIMEOUT,
@@ -158,7 +158,7 @@ async fn redis_config_value(url: &str, key: &str) -> Result<String> {
     Ok(values[1].clone())
 }
 
-fn primary_identity(info: &BTreeMap<String, String>) -> Result<(String, i64)> {
+pub(crate) fn primary_identity(info: &BTreeMap<String, String>) -> Result<(String, i64)> {
     if info.get("role").map(String::as_str) != Some("master") {
         bail!("named Redis authority does not report role=master");
     }
@@ -380,7 +380,7 @@ async fn enqueue_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<String> {
     Ok(id.to_string())
 }
 
-async fn docker_output(args: &[&str]) -> Result<std::process::Output> {
+pub(crate) async fn docker_output(args: &[&str]) -> Result<std::process::Output> {
     tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::process::Command::new("docker")

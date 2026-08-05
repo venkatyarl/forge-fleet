@@ -59,6 +59,7 @@ mod events_cmd;
 mod ext_cmd;
 mod fabric_cmd;
 mod fleet_cmd;
+mod fleet_db_falkordb_replica;
 mod fleet_db_redis_replica;
 mod fleet_db_replica;
 mod github_cmd;
@@ -2376,6 +2377,13 @@ pub enum FleetDbCommand {
         #[command(subcommand)]
         command: FleetDbRedisReplicaCommand,
     },
+    /// Plan, apply, inspect, or non-destructively retire a loopback-only
+    /// FalkorDB replica. Priya remains authoritative; promotion and automatic
+    /// failover are deliberately unavailable.
+    FalkordbReplica {
+        #[command(subcommand)]
+        command: FleetDbFalkordbReplicaCommand,
+    },
     /// Register an off-site Postgres replica reachable via Tailscale (or
     /// another overlay network). Stores a row in `database_replicas` with
     /// role='wan_replica' and prints the compose command to run on the
@@ -2617,6 +2625,89 @@ pub enum FleetDbRedisReplicaCommand {
         primary: String,
         #[arg(long)]
         plan_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbFalkordbReplicaCommand {
+    /// Read-only authority, restore-proof, firewall, and target preflight.
+    Plan {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+    },
+    /// Enqueue the exact, previously planned bootstrap on the target node.
+    Apply {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Read-only topology and exact target-container attestation.
+    Status {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+    },
+    /// Remove only the attested replica container and topology row. Its
+    /// durable volume is always preserved for audit and recovery.
+    Decommission {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long, default_value_t = false)]
+        preserve_volume: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Permanently remove a previously preserved replica volume. Requires the
+    /// exact proof emitted by `status` after topology removal.
+    PurgeVolume {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        proof: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Target-side bootstrap used only by the deferred-task worker.
+    #[command(hide = true)]
+    LocalApply {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+    },
+    /// Target-side non-destructive retirement used by the deferred worker.
+    #[command(hide = true)]
+    LocalDecommission {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        proof: String,
+    },
+    /// Target-side exact-volume purge used by the deferred worker.
+    #[command(hide = true)]
+    LocalPurgeVolume {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        proof: String,
     },
 }
 

@@ -593,6 +593,9 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::RedisReplica { command } => {
             crate::fleet_db_redis_replica::handle(pool, command).await?;
         }
+        FleetDbCommand::FalkordbReplica { command } => {
+            crate::fleet_db_falkordb_replica::handle(pool, command).await?;
+        }
         FleetDbCommand::Failover { to, force, yes } => {
             handle_fleet_db_failover(pool, &to, force, yes).await?;
         }
@@ -959,7 +962,7 @@ fn remote_drill_payload(
 /// Require host-local checksum+decrypt evidence for the exact catalog
 /// checksum before dispatching a remote restore. Legacy `rsync completed`
 /// arrays and evidence for a different host/checksum fail closed.
-fn validate_remote_backup_receipt(
+pub(crate) fn validate_remote_backup_receipt(
     distribution_status: &serde_json::Value,
     expected_backup_id: uuid::Uuid,
     expected_computer_id: uuid::Uuid,
