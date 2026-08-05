@@ -14,6 +14,9 @@ use uuid::Uuid;
 
 const CONFIG_NAME: &str = "hireflow360";
 const PROJECT_ID: &str = "hireflow360";
+const JIRA_BLOCKED_HOLD: &str = "jira_blocked";
+const JIRA_HOLD_PRIOR_STATUS: &str = "jira_hold_prior_status";
+const JIRA_HOLD_PRIOR_PARKED: &str = "jira_hold_prior_parked";
 
 #[derive(sqlx::FromRow)]
 struct JiraConfig {
@@ -207,6 +210,8 @@ async fn upsert_issue(
         .status
         .as_ref()
         .map(|field| field.name.as_str());
+    let blocked_status = is_jira_blocked_status(status);
+    let resumable_status = is_jira_resumable_status(status);
     let assignee = issue
         .fields
         .assignee
@@ -219,6 +224,11 @@ async fn upsert_issue(
         "jira_project_key": config.project_key,
         "jira_status": status
     });
+    let mut insert_metadata = metadata.clone();
+    if blocked_status {
+        insert_metadata["jira_execution_hold"] = json!(JIRA_BLOCKED_HOLD);
+        insert_metadata[JIRA_HOLD_PRIOR_STATUS] = json!("ready");
+    }
     let original_signal = json!({
         "kind": "jira",
         "signature": format!("jira:{}:{}", config.name, issue.id),
@@ -248,7 +258,7 @@ async fn upsert_issue(
     .fetch_optional(&mut **tx)
     .await?;
 
-    if let Some(id) = existing {
+    let work_item_id = if let Some(id) = existing {
         sqlx::query(
             "UPDATE work_items \
                 SET title = $2, description = $3, labels = $4, priority = $5, \
@@ -264,23 +274,32 @@ async fn upsert_issue(
         .bind(original_signal)
         .execute(&mut **tx)
         .await?;
+        id
     } else {
-        sqlx::query(
+        sqlx::query_scalar(
             "INSERT INTO work_items \
                 (project_id, kind, title, description, labels, status, priority, \
                  created_by, metadata, original_signal) \
-             VALUES ($1, 'jira', $2, $3, $4, 'ready', $5, \
-                     'jira_ingest_tick', $6, $7)",
+             VALUES ($1, 'jira', $2, $3, $4, $5, $6, \
+                     'jira_ingest_tick', $7, $8) \
+             RETURNING id",
         )
         .bind(PROJECT_ID)
         .bind(title)
         .bind(description)
         .bind(labels)
+        .bind(if blocked_status { "blocked" } else { "ready" })
         .bind(priority)
-        .bind(metadata.clone())
+        .bind(insert_metadata)
         .bind(original_signal)
-        .execute(&mut **tx)
-        .await?;
+        .fetch_one(&mut **tx)
+        .await?
+    };
+
+    if blocked_status {
+        hold_jira_parent_and_descendants(tx, work_item_id).await?;
+    } else if resumable_status {
+        restore_jira_parent_and_descendants(tx, work_item_id).await?;
     }
 
     sqlx::query(
@@ -303,6 +322,115 @@ async fn upsert_issue(
     Ok(())
 }
 
+async fn hold_jira_parent_and_descendants(
+    tx: &mut Transaction<'_, Postgres>,
+    parent_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_items \
+            SET status = 'blocked', \
+                metadata = metadata \
+                    || jsonb_build_object( \
+                        'jira_execution_hold', $2::text, \
+                        'jira_held_at', NOW(), \
+                        'jira_hold_prior_status', status) \
+          WHERE id = $1 \
+            AND status IN ('ready', 'decomposed') \
+            AND started_at IS NULL \
+            AND completed_at IS NULL \
+            AND (NULLIF(BTRIM(COALESCE(metadata->>'jira_execution_hold', '')), '') IS NULL \
+                 OR metadata->>'jira_execution_hold' = $2)",
+    )
+    .bind(parent_id)
+    .bind(JIRA_BLOCKED_HOLD)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "WITH RECURSIVE descendants AS ( \
+             SELECT id, parent_id FROM work_items WHERE parent_id = $1 \
+             UNION ALL \
+             SELECT child.id, child.parent_id \
+               FROM work_items child \
+               JOIN descendants parent ON child.parent_id = parent.id \
+          ) \
+          UPDATE work_items child \
+             SET parked = true, \
+                 metadata = child.metadata \
+                    || jsonb_build_object( \
+                        'jira_execution_hold', $2::text, \
+                        'jira_held_at', NOW(), \
+                        'jira_hold_prior_status', child.status, \
+                        'jira_hold_prior_parked', child.parked) \
+            FROM descendants d \
+           WHERE child.id = d.id \
+             AND child.status IN ('idea', 'backlog', 'ready', 'decomposed') \
+             AND child.started_at IS NULL \
+             AND child.completed_at IS NULL \
+             AND NULLIF(BTRIM(COALESCE(child.metadata->>'jira_execution_hold', '')), '') IS NULL",
+    )
+    .bind(parent_id)
+    .bind(JIRA_BLOCKED_HOLD)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+async fn restore_jira_parent_and_descendants(
+    tx: &mut Transaction<'_, Postgres>,
+    parent_id: Uuid,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE work_items \
+            SET status = metadata->>$2, \
+                metadata = metadata - 'jira_execution_hold' - 'jira_held_at' - $2 \
+          WHERE id = $1 \
+            AND status = 'blocked' \
+            AND metadata->>'jira_execution_hold' = $3 \
+            AND metadata->>$2 IN ('ready', 'decomposed') \
+            AND started_at IS NULL \
+            AND completed_at IS NULL",
+    )
+    .bind(parent_id)
+    .bind(JIRA_HOLD_PRIOR_STATUS)
+    .bind(JIRA_BLOCKED_HOLD)
+    .execute(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "WITH RECURSIVE descendants AS ( \
+             SELECT id, parent_id FROM work_items WHERE parent_id = $1 \
+             UNION ALL \
+             SELECT child.id, child.parent_id \
+               FROM work_items child \
+               JOIN descendants parent ON child.parent_id = parent.id \
+          ) \
+          UPDATE work_items child \
+             SET parked = COALESCE((child.metadata->>$3)::boolean, false), \
+                 status = CASE \
+                    WHEN child.metadata->>$2 IN ('idea', 'backlog', 'ready', 'decomposed') \
+                    THEN child.metadata->>$2 \
+                    ELSE child.status \
+                 END, \
+                 metadata = child.metadata - 'jira_execution_hold' - 'jira_held_at' - $2 - $3 \
+            FROM descendants d \
+           WHERE child.id = d.id \
+             AND child.metadata->>'jira_execution_hold' = $4 \
+             AND child.status IN ('idea', 'backlog', 'ready', 'decomposed') \
+             AND child.started_at IS NULL \
+             AND child.completed_at IS NULL",
+    )
+    .bind(parent_id)
+    .bind(JIRA_HOLD_PRIOR_STATUS)
+    .bind(JIRA_HOLD_PRIOR_PARKED)
+    .bind(JIRA_BLOCKED_HOLD)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 async fn required_secret(pg: &PgPool, key: &str) -> Result<String> {
     ff_db::pg_get_secret(pg, key)
         .await?
@@ -317,6 +445,27 @@ fn normalize_priority(priority: Option<&str>) -> &'static str {
         Some("low" | "lowest" | "minor" | "trivial") => "low",
         _ => "normal",
     }
+}
+
+fn normalize_jira_status(status: Option<&str>) -> Option<String> {
+    status
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+        .map(str::to_ascii_lowercase)
+}
+
+fn is_jira_blocked_status(status: Option<&str>) -> bool {
+    matches!(
+        normalize_jira_status(status).as_deref(),
+        Some("blocked" | "blocked on vinny")
+    )
+}
+
+fn is_jira_resumable_status(status: Option<&str>) -> bool {
+    matches!(
+        normalize_jira_status(status).as_deref(),
+        Some("to do" | "in progress")
+    )
 }
 
 fn adf_text(value: &Value) -> String {
@@ -367,6 +516,26 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_jira_blocked_transition_matrix() {
+        let cases = [
+            (Some("Blocked"), true, false),
+            (Some(" blocked "), true, false),
+            (Some("Blocked on Vinny"), true, false),
+            (Some("BLOCKED ON VINNY"), true, false),
+            (Some("To Do"), false, true),
+            (Some(" in progress "), false, true),
+            (Some("In Review"), false, false),
+            (Some("Done"), false, false),
+            (None, false, false),
+        ];
+
+        for (status, blocked, resumable) in cases {
+            assert_eq!(is_jira_blocked_status(status), blocked, "{status:?}");
+            assert_eq!(is_jira_resumable_status(status), resumable, "{status:?}");
+        }
+    }
+
+    #[test]
     fn extracts_adf_description_text() {
         let value = json!({
             "type": "doc",
@@ -380,5 +549,240 @@ mod tests {
         });
 
         assert_eq!(adf_text(&value), "first\nsecond");
+    }
+
+    #[tokio::test]
+    async fn jira_blocked_hold_parks_and_restores_only_not_started_descendants() {
+        let Some(database_url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let pg = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+        let mut tx = pg.begin().await.expect("begin test transaction");
+        let project_id = format!("jira-ingest-test-{}", Uuid::new_v4());
+
+        let parent: Uuid = sqlx::query_scalar(
+            "INSERT INTO work_items \
+                (project_id, kind, title, status, priority, labels, created_by, metadata, original_signal) \
+             VALUES ($1, 'jira', 'parent', 'decomposed', 'normal', '[]'::jsonb, 'test', \
+                     '{\"jira_status\":\"Blocked\"}'::jsonb, '{}'::jsonb) \
+             RETURNING id",
+        )
+        .bind(&project_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("insert parent");
+        let ready_child: Uuid =
+            insert_child(&mut tx, &project_id, parent, "ready", false, json!({}))
+                .await
+                .expect("insert ready child");
+        let unrelated_hold_child: Uuid = insert_child(
+            &mut tx,
+            &project_id,
+            parent,
+            "ready",
+            false,
+            json!({"jira_execution_hold": "awaiting_council"}),
+        )
+        .await
+        .expect("insert unrelated hold child");
+        let active_child: Uuid =
+            insert_child(&mut tx, &project_id, parent, "building", false, json!({}))
+                .await
+                .expect("insert active child");
+        sqlx::query("UPDATE work_items SET started_at = NOW() WHERE id = $1")
+            .bind(active_child)
+            .execute(&mut *tx)
+            .await
+            .expect("mark active child started");
+        let failed_child: Uuid =
+            insert_child(&mut tx, &project_id, parent, "failed", false, json!({}))
+                .await
+                .expect("insert failed child");
+
+        hold_jira_parent_and_descendants(&mut tx, parent)
+            .await
+            .expect("hold parent");
+
+        let (parent_status, parent_hold, parent_prior): (String, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT status, metadata->>'jira_execution_hold', metadata->>$2 \
+                 FROM work_items WHERE id = $1",
+            )
+            .bind(parent)
+            .bind(JIRA_HOLD_PRIOR_STATUS)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("read held parent");
+        assert_eq!(parent_status, "blocked");
+        assert_eq!(parent_hold.as_deref(), Some(JIRA_BLOCKED_HOLD));
+        assert_eq!(parent_prior.as_deref(), Some("decomposed"));
+        assert_child_state(&mut tx, ready_child, "ready", true, Some(JIRA_BLOCKED_HOLD)).await;
+        assert_child_state(
+            &mut tx,
+            unrelated_hold_child,
+            "ready",
+            false,
+            Some("awaiting_council"),
+        )
+        .await;
+        assert_child_state(&mut tx, active_child, "building", false, None).await;
+        assert_child_state(&mut tx, failed_child, "failed", false, None).await;
+
+        restore_jira_parent_and_descendants(&mut tx, parent)
+            .await
+            .expect("restore parent");
+
+        let (parent_status, parent_hold): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, metadata->>'jira_execution_hold' FROM work_items WHERE id = $1",
+        )
+        .bind(parent)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read restored parent");
+        assert_eq!(parent_status, "decomposed");
+        assert_eq!(parent_hold, None);
+        assert_child_state(&mut tx, ready_child, "ready", false, None).await;
+        assert_child_state(
+            &mut tx,
+            unrelated_hold_child,
+            "ready",
+            false,
+            Some("awaiting_council"),
+        )
+        .await;
+        assert_child_state(&mut tx, active_child, "building", false, None).await;
+        assert_child_state(&mut tx, failed_child, "failed", false, None).await;
+
+        tx.rollback().await.expect("rollback test transaction");
+    }
+
+    #[tokio::test]
+    async fn new_blocked_jira_parent_is_inserted_non_dispatchable() {
+        let Some(database_url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let pg = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+        let mut tx = pg.begin().await.expect("begin test transaction");
+        let config = JiraConfig {
+            name: format!("test-config-{}", Uuid::new_v4()),
+            project_key: "HFPROD".to_owned(),
+            jira_secret_ref: "unused".to_owned(),
+            queue_jql: "unused".to_owned(),
+        };
+        let blocked_issue_id = Uuid::new_v4().to_string();
+        let ready_issue_id = Uuid::new_v4().to_string();
+
+        upsert_issue(
+            &mut tx,
+            "https://jira.example.test",
+            &config,
+            &jira_issue(&blocked_issue_id, "HFPROD-1", "Blocked on Vinny"),
+        )
+        .await
+        .expect("upsert blocked issue");
+        upsert_issue(
+            &mut tx,
+            "https://jira.example.test",
+            &config,
+            &jira_issue(&ready_issue_id, "HFPROD-2", "To Do"),
+        )
+        .await
+        .expect("upsert ready issue");
+
+        let (blocked_status, blocked_hold, blocked_prior): (
+            String,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT status, metadata->>'jira_execution_hold', metadata->>$2 \
+             FROM work_items WHERE kind = 'jira' AND metadata->>'jira_issue_id' = $1",
+        )
+        .bind(&blocked_issue_id)
+        .bind(JIRA_HOLD_PRIOR_STATUS)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read blocked insert");
+        assert_eq!(blocked_status, "blocked");
+        assert_eq!(blocked_hold.as_deref(), Some(JIRA_BLOCKED_HOLD));
+        assert_eq!(blocked_prior.as_deref(), Some("ready"));
+
+        let (ready_status, ready_hold): (String, Option<String>) = sqlx::query_as(
+            "SELECT status, metadata->>'jira_execution_hold' \
+             FROM work_items WHERE kind = 'jira' AND metadata->>'jira_issue_id' = $1",
+        )
+        .bind(&ready_issue_id)
+        .fetch_one(&mut *tx)
+        .await
+        .expect("read ready insert");
+        assert_eq!(ready_status, "ready");
+        assert_eq!(ready_hold, None);
+
+        tx.rollback().await.expect("rollback test transaction");
+    }
+
+    async fn insert_child(
+        tx: &mut Transaction<'_, Postgres>,
+        project_id: &str,
+        parent_id: Uuid,
+        status: &str,
+        parked: bool,
+        metadata: Value,
+    ) -> Result<Uuid, sqlx::Error> {
+        sqlx::query_scalar(
+            "INSERT INTO work_items \
+                (project_id, parent_id, kind, title, status, priority, labels, created_by, parked, metadata, original_signal) \
+             VALUES ($1, $2, 'task', 'child', $3, 'normal', '[]'::jsonb, 'test', $4, $5, '{}'::jsonb) \
+             RETURNING id",
+        )
+        .bind(project_id)
+        .bind(parent_id)
+        .bind(status)
+        .bind(parked)
+        .bind(metadata)
+        .fetch_one(&mut **tx)
+        .await
+    }
+
+    async fn assert_child_state(
+        tx: &mut Transaction<'_, Postgres>,
+        id: Uuid,
+        expected_status: &str,
+        expected_parked: bool,
+        expected_hold: Option<&str>,
+    ) {
+        let (status, parked, hold): (String, bool, Option<String>) = sqlx::query_as(
+            "SELECT status, parked, metadata->>'jira_execution_hold' FROM work_items WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&mut **tx)
+        .await
+        .expect("read child");
+        assert_eq!(status, expected_status);
+        assert_eq!(parked, expected_parked);
+        assert_eq!(hold.as_deref(), expected_hold);
+    }
+
+    fn jira_issue(id: &str, key: &str, status: &str) -> JiraIssue {
+        JiraIssue {
+            id: id.to_owned(),
+            key: key.to_owned(),
+            fields: JiraFields {
+                summary: "summary".to_owned(),
+                status: Some(NamedField {
+                    name: status.to_owned(),
+                }),
+                ..JiraFields::default()
+            },
+        }
     }
 }
