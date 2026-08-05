@@ -11528,8 +11528,11 @@ FROM cloud_budget_buckets b;
 "#;
 
 /// V211 — Make venkatyarl the sole permanent fleet GitHub identity and remove
-/// the retired vinny-oclaw credentials from the fleet-wide registry.
-pub const SCHEMA_V211_DECOMMISSION_VINNY_GITHUB_IDENTITY: &str = r#"
+/// the retired taylor-oclaw credentials from the fleet-wide registry.
+///
+/// Historical migrations are immutable: the later Taylor -> Vinny node rename
+/// must not rename this already-applied migration or rewrite its SQL.
+pub const SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY: &str = r#"
 UPDATE github_ssh_aliases
 SET is_canonical = (alias_name = 'github.com-venkat'),
     description = CASE
@@ -11541,10 +11544,10 @@ SET is_canonical = (alias_name = 'github.com-venkat'),
 WHERE hostname = 'github.com';
 
 DELETE FROM github_ssh_aliases
-WHERE alias_name = 'github.com-vinny';
+WHERE alias_name = 'github.com-taylor';
 
 DELETE FROM fleet_secrets
-WHERE key IN ('github_ssh_id_vinny_priv', 'github_ssh_id_vinny_pub');
+WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub');
 "#;
 
 /// V212 — One bounded read interface across raw, hourly, and daily computer
@@ -12325,10 +12328,13 @@ INSERT INTO cloud_backends (backend, refresher_node) VALUES
 ON CONFLICT (backend) DO NOTHING;
 "#;
 
-/// Optional project metadata used to attach projects to workstreams and create
-/// their initial digest configuration.
-pub const SCHEMA_V274_PROJECT_DIGEST_FIELDS: &str =
-    include_str!("migrations/20260725000000_add_workstream_digest_fields.sql");
+/// V274's immutable historical meaning: metadata populated by project scans.
+/// The later project digest fields are a separate forward repair in V295.
+pub const SCHEMA_V274_PROJECT_REPO_SCAN_METADATA: &str = r#"
+ALTER TABLE project_repos
+    ADD COLUMN IF NOT EXISTS tech_stack TEXT,
+    ADD COLUMN IF NOT EXISTS local_path TEXT;
+"#;
 
 /// First-class capability store. Skills are copied, not moved, so existing
 /// consumers remain compatible while capability-aware consumers gain one
@@ -12439,17 +12445,41 @@ LEFT JOIN work_items w ON w.id = b.work_item_id
 GROUP BY b.builder;
 "#;
 
-/// Immutable start of actual execution for data-derived lease timeouts.
-pub const SCHEMA_V277_WORK_ITEM_LEASE_BUILD_STARTED_AT: &str = r#"
-ALTER TABLE work_item_leases
-    ADD COLUMN IF NOT EXISTS build_started_at TIMESTAMPTZ;
+/// V277's immutable historical meaning: per-node resource-health snapshots.
+pub const SCHEMA_V277_NODE_HEALTH: &str = r#"
+CREATE TABLE IF NOT EXISTS node_health (
+    worker_name          TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    sampled_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mem_total_kb         BIGINT NOT NULL,
+    mem_available_kb     BIGINT NOT NULL,
+    mem_available_gb     DOUBLE PRECISION NOT NULL,
+    swap_total_kb        BIGINT NOT NULL DEFAULT 0,
+    swap_free_kb         BIGINT NOT NULL DEFAULT 0,
+    load_avg_1m          DOUBLE PRECISION,
+    load_avg_5m          DOUBLE PRECISION,
+    load_avg_15m         DOUBLE PRECISION,
+    service_rss_json     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    oom_kills_json       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dmesg_cursor         TEXT,
+    pressure_state       TEXT NOT NULL DEFAULT 'healthy'
+        CHECK (pressure_state IN ('healthy', 'build_paused', 'critical')),
+    build_reserve_gb     DOUBLE PRECISION NOT NULL DEFAULT 4.0,
+    PRIMARY KEY (worker_name, sampled_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_health_latest
+    ON node_health (worker_name, sampled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_node_health_pressure
+    ON node_health (pressure_state, sampled_at DESC);
 "#;
 
 /// Append-only store for fleet node log lines.
 pub const SCHEMA_V279_FLEET_LOGS: &str =
     include_str!("migrations/20260727000000_create_fleet_logs.sql");
 
-/// Merge the physical computer and worker registries into `fleet_nodes`.
+/// Retired V280 proposal. This SQL is retained for archaeology and tests only;
+/// it is deliberately absent from every runnable migration list because the
+/// live fleet recorded V280 as `merge_fleet_tables__QUARANTINED_MANUAL`.
 pub const SCHEMA_V280_MERGE_FLEET_TABLES: &str =
     include_str!("migrations/20260728000000_merge_fleet_tables.sql");
 
@@ -13828,6 +13858,50 @@ END
 $v294_ace_gemma4_mlx_exact_authority$;
 "#;
 
+/// Exact forward repair for the one reviewed empty, partial V247 deployment.
+/// Callers must validate the complete legacy ledger and this exact pre-shape
+/// under the migration lock before executing it.
+pub const SCHEMA_V295_REPAIR_REVIEWED_EMPTY_V247: &str = r#"
+ALTER TABLE error_signatures
+    ALTER COLUMN first_seen SET NOT NULL,
+    ALTER COLUMN last_seen SET NOT NULL,
+    ALTER COLUMN count_24h SET NOT NULL,
+    ALTER COLUMN count_total SET NOT NULL,
+    ALTER COLUMN state SET NOT NULL;
+
+ALTER TABLE error_signatures
+    ADD CONSTRAINT error_signatures_state_check
+        CHECK (state IN ('new', 'filed', 'fix_merged', 'verifying', 'resolved', 'regressed'));
+
+CREATE TABLE fleet_log_digest (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node       TEXT NOT NULL,
+    day        DATE NOT NULL,
+    level      TEXT NOT NULL,
+    line_class TEXT NOT NULL,
+    count      INT NOT NULL DEFAULT 0,
+    sample     TEXT,
+    UNIQUE (node, day, level, line_class)
+);
+"#;
+
+/// Current consumers require these later branch effects. Their historical
+/// migration numbers were already owned, so V295 carries them forward rather
+/// than rewriting V274/V277.
+pub const SCHEMA_V295_FORWARD_COMPATIBILITY_REPAIR: &str = r#"
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS workstream_id TEXT,
+    ADD COLUMN IF NOT EXISTS digest_template_id JSONB,
+    ADD COLUMN IF NOT EXISTS logo_url TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_projects_workstream_id
+    ON projects (workstream_id)
+    WHERE workstream_id IS NOT NULL;
+
+ALTER TABLE work_item_leases
+    ADD COLUMN IF NOT EXISTS build_started_at TIMESTAMPTZ;
+"#;
+
 /// v295: immutable exact release-rollout authority and leased execution state.
 ///
 /// This migration is explicit-only. Ordinary daemon/startup migration paths
@@ -13839,9 +13913,15 @@ ALTER TABLE _migrations
     ADD COLUMN source_commit TEXT,
     ADD COLUMN applied_by TEXT,
     ADD CONSTRAINT migrations_v295_source_commit
-        CHECK (version <> 295 OR source_commit ~ '^[0-9a-f]{40}$'),
+        CHECK (
+            (version <> 295 AND (version <> 247 OR source_commit IS NULL))
+            OR (source_commit IS NOT NULL AND source_commit ~ '^[0-9a-f]{40}$')
+        ),
     ADD CONSTRAINT migrations_v295_applied_by
-        CHECK (version <> 295 OR applied_by ~ '^[A-Za-z0-9._@-]{1,128}$');
+        CHECK (
+            (version <> 295 AND (version <> 247 OR applied_by IS NULL))
+            OR (applied_by IS NOT NULL AND applied_by ~ '^[A-Za-z0-9._@-]{1,128}$')
+        );
 
 CREATE TABLE release_rollout_authorities (
     id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),

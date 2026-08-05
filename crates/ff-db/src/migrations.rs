@@ -1043,8 +1043,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 211,
-        name: "decommission_vinny_github_identity",
-        sql: schema::SCHEMA_V211_DECOMMISSION_VINNY_GITHUB_IDENTITY,
+        name: "decommission_taylor_github_identity",
+        sql: schema::SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY,
     },
     PgMigration {
         version: 212,
@@ -1222,8 +1222,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 274,
-        name: "project_digest_fields",
-        sql: schema::SCHEMA_V274_PROJECT_DIGEST_FIELDS,
+        name: "project_repo_scan_metadata",
+        sql: schema::SCHEMA_V274_PROJECT_REPO_SCAN_METADATA,
     },
     PgMigration {
         version: 275,
@@ -1237,8 +1237,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 277,
-        name: "work_item_lease_build_started_at",
-        sql: schema::SCHEMA_V277_WORK_ITEM_LEASE_BUILD_STARTED_AT,
+        name: "node_health",
+        sql: schema::SCHEMA_V277_NODE_HEALTH,
     },
     PgMigration {
         version: 278,
@@ -1250,11 +1250,9 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_logs",
         sql: schema::SCHEMA_V279_FLEET_LOGS,
     },
-    PgMigration {
-        version: 280,
-        name: "merge_fleet_tables",
-        sql: schema::SCHEMA_V280_MERGE_FLEET_TABLES,
-    },
+    // V280 was quarantined manually on the live fleet. Its destructive table
+    // merge is intentionally not runnable; the exact historical ledger row is
+    // recognized by REVIEWED_LEGACY_LEDGER_ROWS below.
     PgMigration {
         version: 281,
         name: "work_item_acceptance_criteria",
@@ -1336,6 +1334,67 @@ static EXPLICIT_PG_MIGRATIONS: &[PgMigration] = &[PgMigration {
     sql: schema::SCHEMA_V295_RELEASE_ROLLOUT_AUTHORITY,
 }];
 
+/// Exact evidence from the one reviewed legacy V290 fleet ledger. These rows
+/// are deliberately separate from runnable migrations: their source branches
+/// were either superseded before merge or, for V280, explicitly quarantined.
+/// They authorize status/reconciliation only at the recorded microsecond and
+/// with no retroactive provenance; they must never be inserted by startup.
+struct ReviewedLegacyLedgerRow {
+    version: u32,
+    name: &'static str,
+    applied_at: &'static str,
+}
+
+static REVIEWED_LEGACY_LEDGER_ROWS: &[ReviewedLegacyLedgerRow] = &[
+    ReviewedLegacyLedgerRow {
+        version: 211,
+        name: "decommission_taylor_github_identity",
+        applied_at: "2026-07-20T16:39:14.109001Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 234,
+        name: "work_item_cortex_subgraph_id",
+        applied_at: "2026-07-22T04:50:37.318577Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 236,
+        name: "work_item_context_and_cortex_subgraph",
+        applied_at: "2026-07-22T15:13:32.818634Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 246,
+        name: "glm_45_air_ab_catalog",
+        applied_at: "2026-07-24T03:03:02.342428Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 260,
+        name: "model_utilization_view",
+        applied_at: "2026-07-24T20:49:10.028987Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 270,
+        name: "workstream_session_fields",
+        applied_at: "2026-07-25T19:04:23.380858Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 274,
+        name: "project_repo_scan_metadata",
+        applied_at: "2026-07-26T05:54:24.449824Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 277,
+        name: "node_health",
+        applied_at: "2026-07-26T18:23:36.239244Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 280,
+        name: "merge_fleet_tables__QUARANTINED_MANUAL",
+        applied_at: "2026-07-27T06:28:42.086663Z",
+    },
+];
+
+const REVIEWED_LEDGER_ONLY_VERSIONS: &[u32] = &[234, 236, 246, 260, 270, 280];
+
 pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 = 294;
 pub const LATEST_EXPLICIT_POSTGRES_MIGRATION: u32 = 295;
 
@@ -1365,6 +1424,10 @@ pub struct PostgresMigrationStatus {
     pub applied: Vec<AppliedPostgresMigration>,
     pub drift: Vec<String>,
     pub rollout_schema_valid: Option<bool>,
+    /// True only for the exact reviewed V290 ledger + physical V247 pre-state.
+    pub reviewed_v247_repair_pending: bool,
+    /// Exact forward-repair postcondition once V295 has been recorded.
+    pub reconciliation_schema_valid: Option<bool>,
 }
 
 type AppliedMigrationQueryRow = (
@@ -1697,6 +1760,35 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
         }
     }
 
+    // A missing migration below the current maximum is never an automatic
+    // backfill. In particular, the reviewed live fleet is at V290 with an
+    // exact empty partial V247; advancing V291-V294 first would destroy the
+    // bounded repair profile. Hold that exact state for the explicit V295
+    // transaction, and reject every unreviewed missing-V247 lineage.
+    if current >= 247 {
+        let applied = read_applied_postgres_migrations_conn(&mut *conn).await?;
+        if !applied.iter().any(|row| row.version == 247) {
+            let reviewed_hold = current == 290
+                && reviewed_live_v290_ledger_matches(&applied)
+                && reviewed_historical_schema_is_exact(&mut *conn).await?
+                && forward_compatibility_state(&mut *conn, "projects").await?
+                    == ForwardCompatibilityState::Absent
+                && forward_compatibility_state(&mut *conn, "work_item_leases").await?
+                    == ForwardCompatibilityState::Exact
+                && v247_schema_state(&mut *conn).await? == V247SchemaState::ReviewedEmptyPartial;
+            if reviewed_hold {
+                warn!(
+                    current_version = current,
+                    "holding reviewed legacy V290 for explicit V247/V295 reconciliation"
+                );
+                return Ok(current);
+            }
+            return Err(DbError::Migration(format!(
+                "v247 is missing below current v{current}; automatic migration advance is blocked"
+            )));
+        }
+    }
+
     let pending: Vec<&PgMigration> = PG_MIGRATIONS
         .iter()
         .filter(|m| m.version > current)
@@ -1912,6 +2004,325 @@ async fn read_applied_postgres_migrations(pool: &PgPool) -> Result<Vec<AppliedPo
         .collect()
 }
 
+async fn read_applied_postgres_migrations_conn(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<AppliedPostgresMigration>> {
+    let has_provenance: bool = sqlx::query_scalar(
+        "SELECT count(*) = 2
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = '_migrations'
+            AND column_name IN ('source_commit', 'applied_by')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let rows: Vec<AppliedMigrationQueryRow> = if has_provenance {
+        sqlx::query_as(
+            "SELECT version, name, source_commit, applied_by, applied_at
+               FROM _migrations ORDER BY version",
+        )
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT version, name, NULL::text, NULL::text, applied_at
+               FROM _migrations ORDER BY version",
+        )
+        .fetch_all(&mut *conn)
+        .await?
+    };
+    rows.into_iter()
+        .map(|(version, name, source_commit, applied_by, applied_at)| {
+            Ok(AppliedPostgresMigration {
+                version: u32::try_from(version).map_err(|_| {
+                    DbError::Migration("_migrations contains a negative version".to_string())
+                })?,
+                name,
+                source_commit,
+                applied_by,
+                applied_at,
+            })
+        })
+        .collect()
+}
+
+fn reviewed_legacy_row_matches(
+    row: &AppliedPostgresMigration,
+    reviewed: &ReviewedLegacyLedgerRow,
+) -> bool {
+    row.version == reviewed.version
+        && row.name == reviewed.name
+        && row.source_commit.is_none()
+        && row.applied_by.is_none()
+        && row
+            .applied_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+            == reviewed.applied_at
+}
+
+fn reviewed_live_v290_ledger_matches(applied: &[AppliedPostgresMigration]) -> bool {
+    applied.last().is_some_and(|row| row.version == 290)
+        && REVIEWED_LEGACY_LEDGER_ROWS.iter().all(|reviewed| {
+            applied
+                .iter()
+                .find(|row| row.version == reviewed.version)
+                .is_some_and(|row| reviewed_legacy_row_matches(row, reviewed))
+        })
+        && !applied.iter().any(|row| row.version == 247)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V247SchemaState {
+    Exact,
+    ReviewedEmptyPartial,
+    Drift,
+}
+
+/// Classify V247 by its complete column/constraint/index shape. The partial
+/// branch is intentionally narrower than `CREATE TABLE IF NOT EXISTS`: it is
+/// the one observed empty fleet table and cannot absorb arbitrary drift.
+async fn v247_schema_state(conn: &mut sqlx::PgConnection) -> Result<V247SchemaState> {
+    let state: String = sqlx::query_scalar(
+        r#"
+        WITH error_columns AS (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_array(column_name, data_type, is_nullable, column_default)
+                    ORDER BY ordinal_position
+                ), '[]'::jsonb
+            ) AS shape
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'error_signatures'
+        ), error_constraints AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE conname = 'error_signatures_pkey'
+                         AND contype = 'p' AND conkey = ARRAY[1]::smallint[]
+                   ) AS exact_pk,
+                   count(*) FILTER (
+                       WHERE conname = 'error_signatures_state_check'
+                         AND contype = 'c' AND conkey = ARRAY[9]::smallint[]
+                         AND pg_get_constraintdef(oid, true) =
+                             'CHECK (state = ANY (ARRAY[''new''::text, ''filed''::text, ''fix_merged''::text, ''verifying''::text, ''resolved''::text, ''regressed''::text]))'
+                   ) AS exact_state
+              FROM pg_constraint
+             WHERE conrelid = to_regclass('public.error_signatures')
+        ), error_indexes AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE indexname = 'error_signatures_pkey'
+                         AND indexdef = 'CREATE UNIQUE INDEX error_signatures_pkey ON public.error_signatures USING btree (signature)'
+                   ) AS exact_pk
+              FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'error_signatures'
+        ), digest_columns AS (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_array(column_name, data_type, is_nullable, column_default)
+                    ORDER BY ordinal_position
+                ), '[]'::jsonb
+            ) AS shape
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'fleet_log_digest'
+        ), digest_constraints AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE conname = 'fleet_log_digest_pkey'
+                         AND contype = 'p' AND conkey = ARRAY[1]::smallint[]
+                   ) AS exact_pk,
+                   count(*) FILTER (
+                       WHERE conname = 'fleet_log_digest_node_day_level_line_class_key'
+                         AND contype = 'u' AND conkey = ARRAY[2,3,4,5]::smallint[]
+                   ) AS exact_unique
+              FROM pg_constraint
+             WHERE conrelid = to_regclass('public.fleet_log_digest')
+        ), digest_indexes AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE indexname = 'fleet_log_digest_pkey'
+                         AND indexdef = 'CREATE UNIQUE INDEX fleet_log_digest_pkey ON public.fleet_log_digest USING btree (id)'
+                   ) AS exact_pk,
+                   count(*) FILTER (
+                       WHERE indexname = 'fleet_log_digest_node_day_level_line_class_key'
+                         AND indexdef = 'CREATE UNIQUE INDEX fleet_log_digest_node_day_level_line_class_key ON public.fleet_log_digest USING btree (node, day, level, line_class)'
+                   ) AS exact_unique
+              FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'fleet_log_digest'
+        )
+        SELECT CASE
+            WHEN error_columns.shape =
+                '[["signature","text","NO",null],["error_class","text","YES",null],["first_seen","timestamp with time zone","NO","now()"],["last_seen","timestamp with time zone","NO","now()"],["count_24h","integer","NO","0"],["count_total","integer","NO","0"],["sample_text","text","YES",null],["affected_nodes","jsonb","YES",null],["state","text","NO","''new''::text"],["work_item_id","uuid","YES",null],["fix_commit_sha","text","YES",null],["resolved_at","timestamp with time zone","YES",null]]'::jsonb
+              AND error_constraints.total = 2
+              AND error_constraints.exact_pk = 1
+              AND error_constraints.exact_state = 1
+              AND error_indexes.total = 1 AND error_indexes.exact_pk = 1
+              AND digest_columns.shape =
+                '[["id","uuid","NO","gen_random_uuid()"],["node","text","NO",null],["day","date","NO",null],["level","text","NO",null],["line_class","text","NO",null],["count","integer","NO","0"],["sample","text","YES",null]]'::jsonb
+              AND digest_constraints.total = 2
+              AND digest_constraints.exact_pk = 1
+              AND digest_constraints.exact_unique = 1
+              AND digest_indexes.total = 2
+              AND digest_indexes.exact_pk = 1
+              AND digest_indexes.exact_unique = 1
+            THEN 'exact'
+            WHEN error_columns.shape =
+                '[["signature","text","NO",null],["error_class","text","YES",null],["first_seen","timestamp with time zone","YES","now()"],["last_seen","timestamp with time zone","YES","now()"],["count_24h","integer","YES","0"],["count_total","integer","YES","0"],["sample_text","text","YES",null],["affected_nodes","jsonb","YES",null],["state","text","YES","''new''::text"],["work_item_id","uuid","YES",null],["fix_commit_sha","text","YES",null],["resolved_at","timestamp with time zone","YES",null]]'::jsonb
+              AND error_constraints.total = 1
+              AND error_constraints.exact_pk = 1
+              AND error_constraints.exact_state = 0
+              AND error_indexes.total = 1 AND error_indexes.exact_pk = 1
+              AND to_regclass('public.fleet_log_digest') IS NULL
+            THEN 'reviewed_empty_partial_candidate'
+            ELSE 'drift'
+        END
+          FROM error_columns, error_constraints, error_indexes,
+               digest_columns, digest_constraints, digest_indexes
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if state == "reviewed_empty_partial_candidate" {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM error_signatures")
+            .fetch_one(&mut *conn)
+            .await?;
+        return Ok(if rows == 0 {
+            V247SchemaState::ReviewedEmptyPartial
+        } else {
+            V247SchemaState::Drift
+        });
+    }
+    Ok(match state.as_str() {
+        "exact" => V247SchemaState::Exact,
+        _ => V247SchemaState::Drift,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardCompatibilityState {
+    Absent,
+    Exact,
+    Drift,
+}
+
+/// Validate the historical effects whose migration numbers were repurposed,
+/// plus the one deliberately unexecuted V280 roster layout.
+async fn reviewed_historical_schema_is_exact(conn: &mut sqlx::PgConnection) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        r#"
+        WITH scan_columns AS (
+            SELECT count(*) = 2
+                   AND bool_and(data_type = 'text' AND is_nullable = 'YES' AND column_default IS NULL)
+                   AS exact
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'project_repos'
+               AND column_name IN ('tech_stack', 'local_path')
+        ), health_columns AS (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_array(column_name, data_type, is_nullable, column_default)
+                    ORDER BY ordinal_position
+                ), '[]'::jsonb
+            ) = '[["worker_name","text","NO",null],["sampled_at","timestamp with time zone","NO","now()"],["mem_total_kb","bigint","NO",null],["mem_available_kb","bigint","NO",null],["mem_available_gb","double precision","NO",null],["swap_total_kb","bigint","NO","0"],["swap_free_kb","bigint","NO","0"],["load_avg_1m","double precision","YES",null],["load_avg_5m","double precision","YES",null],["load_avg_15m","double precision","YES",null],["service_rss_json","jsonb","NO","''[]''::jsonb"],["oom_kills_json","jsonb","NO","''[]''::jsonb"],["dmesg_cursor","text","YES",null],["pressure_state","text","NO","''healthy''::text"],["build_reserve_gb","double precision","NO","4.0"]]'::jsonb AS exact
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'node_health'
+        ), health_constraints AS (
+            SELECT count(*) = 3
+               AND count(*) FILTER (WHERE conname = 'node_health_pkey' AND contype = 'p' AND conkey = ARRAY[1,2]::smallint[]) = 1
+               AND count(*) FILTER (WHERE conname = 'node_health_worker_name_fkey' AND contype = 'f' AND conkey = ARRAY[1]::smallint[]) = 1
+               AND count(*) FILTER (
+                    WHERE conname = 'node_health_pressure_state_check' AND contype = 'c'
+                      AND conkey = ARRAY[14]::smallint[]
+                      AND pg_get_constraintdef(oid, true) = 'CHECK (pressure_state = ANY (ARRAY[''healthy''::text, ''build_paused''::text, ''critical''::text]))'
+               ) = 1 AS exact
+              FROM pg_constraint
+             WHERE conrelid = to_regclass('public.node_health')
+        ), health_indexes AS (
+            SELECT count(*) = 3
+               AND count(*) FILTER (WHERE indexname = 'node_health_pkey' AND indexdef = 'CREATE UNIQUE INDEX node_health_pkey ON public.node_health USING btree (worker_name, sampled_at)') = 1
+               AND count(*) FILTER (WHERE indexname = 'idx_node_health_latest' AND indexdef = 'CREATE INDEX idx_node_health_latest ON public.node_health USING btree (worker_name, sampled_at DESC)') = 1
+               AND count(*) FILTER (WHERE indexname = 'idx_node_health_pressure' AND indexdef = 'CREATE INDEX idx_node_health_pressure ON public.node_health USING btree (pressure_state, sampled_at DESC)') = 1 AS exact
+              FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'node_health'
+        ), roster AS (
+            SELECT count(*) = 2
+               AND count(*) FILTER (WHERE relname = 'computers' AND relkind = 'r') = 1
+               AND count(*) FILTER (WHERE relname = 'fleet_workers' AND relkind = 'r') = 1 AS exact
+              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND relname IN ('computers', 'fleet_workers', 'fleet_nodes', 'fleet_workers_legacy')
+        )
+        SELECT scan_columns.exact AND health_columns.exact
+           AND health_constraints.exact AND health_indexes.exact AND roster.exact
+          FROM scan_columns, health_columns, health_constraints, health_indexes, roster
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+async fn forward_compatibility_state(
+    conn: &mut sqlx::PgConnection,
+    table_name: &str,
+) -> Result<ForwardCompatibilityState> {
+    let state: String = match table_name {
+        "projects" => sqlx::query_scalar(
+            r#"
+            WITH columns AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (WHERE column_name = 'workstream_id' AND data_type = 'text' AND is_nullable = 'YES' AND column_default IS NULL) AS workstream,
+                       count(*) FILTER (WHERE column_name = 'digest_template_id' AND data_type = 'jsonb' AND is_nullable = 'YES' AND column_default IS NULL) AS digest,
+                       count(*) FILTER (WHERE column_name = 'logo_url' AND data_type = 'text' AND is_nullable = 'YES' AND column_default IS NULL) AS logo
+                  FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'projects'
+                   AND column_name IN ('workstream_id', 'digest_template_id', 'logo_url')
+            ), indexes AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (
+                           WHERE indexname = 'idx_projects_workstream_id'
+                             AND indexdef = 'CREATE INDEX idx_projects_workstream_id ON public.projects USING btree (workstream_id) WHERE (workstream_id IS NOT NULL)'
+                       ) AS exact
+                  FROM pg_indexes
+                 WHERE schemaname = 'public' AND tablename = 'projects'
+                   AND indexname = 'idx_projects_workstream_id'
+            )
+            SELECT CASE
+                     WHEN columns.total = 0 AND indexes.total = 0 THEN 'absent'
+                     WHEN columns.total = 3 AND columns.workstream = 1
+                          AND columns.digest = 1 AND columns.logo = 1
+                          AND indexes.total = 1 AND indexes.exact = 1 THEN 'exact'
+                     ELSE 'drift'
+                   END
+              FROM columns, indexes
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await?,
+        "work_item_leases" => sqlx::query_scalar(
+            r#"
+            SELECT CASE
+                     WHEN count(*) = 0 THEN 'absent'
+                     WHEN count(*) = 1
+                      AND bool_and(data_type = 'timestamp with time zone'
+                                   AND is_nullable = 'YES' AND column_default IS NULL)
+                       THEN 'exact'
+                     ELSE 'drift'
+                   END
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'work_item_leases'
+               AND column_name = 'build_started_at'
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await?,
+        _ => unreachable!("fixed internal compatibility target"),
+    };
+    Ok(match state.as_str() {
+        "absent" => ForwardCompatibilityState::Absent,
+        "exact" => ForwardCompatibilityState::Exact,
+        _ => ForwardCompatibilityState::Drift,
+    })
+}
+
 /// Read migration state without creating tables, taking locks, or applying DDL.
 pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigrationStatus> {
     let applied = read_applied_postgres_migrations(pool).await?;
@@ -1920,6 +2331,13 @@ pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigratio
         .map(|migration| migration.version)
         .collect::<BTreeSet<_>>();
     let current_version = applied_versions.iter().next_back().copied().unwrap_or(0);
+    let mut schema_conn = pool.acquire().await?;
+    let v247_state = v247_schema_state(&mut schema_conn).await?;
+    let historical_schema_exact = reviewed_historical_schema_is_exact(&mut schema_conn).await?;
+    let project_forward_state = forward_compatibility_state(&mut schema_conn, "projects").await?;
+    let lease_forward_state =
+        forward_compatibility_state(&mut schema_conn, "work_item_leases").await?;
+    drop(schema_conn);
     let embedded = PG_MIGRATIONS
         .iter()
         .map(|migration| (migration.version, (migration, false)))
@@ -1952,27 +2370,64 @@ pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigratio
                 ));
             }
         } else if row.version > BOOTSTRAP_BASELINE_VERSION {
-            drift.push(format!(
-                "v{} is applied but absent from this binary",
-                row.version
-            ));
+            let reviewed = REVIEWED_LEGACY_LEDGER_ROWS
+                .iter()
+                .find(|reviewed| reviewed.version == row.version);
+            if !REVIEWED_LEDGER_ONLY_VERSIONS.contains(&row.version)
+                || reviewed.is_none_or(|reviewed| !reviewed_legacy_row_matches(row, reviewed))
+            {
+                drift.push(format!(
+                    "v{} is applied but absent from this binary or differs from the exact reviewed legacy row",
+                    row.version
+                ));
+            }
         }
     }
+
+    // Once any ledger-only version is present, this is the reviewed legacy
+    // lineage. Bind every reviewed row to its exact microsecond and preserve
+    // its original NULL provenance; a matching name alone is insufficient.
+    let legacy_lineage = applied
+        .iter()
+        .any(|row| REVIEWED_LEDGER_ONLY_VERSIONS.contains(&row.version));
+    if legacy_lineage {
+        for reviewed in REVIEWED_LEGACY_LEDGER_ROWS {
+            match applied.iter().find(|row| row.version == reviewed.version) {
+                Some(row) if reviewed_legacy_row_matches(row, reviewed) => {}
+                Some(_) => drift.push(format!(
+                    "v{} reviewed legacy timestamp/name/provenance drift",
+                    reviewed.version
+                )),
+                None => drift.push(format!(
+                    "v{} reviewed legacy ledger row is missing",
+                    reviewed.version
+                )),
+            }
+        }
+    }
+
+    let reviewed_v247_repair_pending = reviewed_live_v290_ledger_matches(&applied)
+        && historical_schema_exact
+        && project_forward_state == ForwardCompatibilityState::Absent
+        && lease_forward_state == ForwardCompatibilityState::Exact
+        && v247_state == V247SchemaState::ReviewedEmptyPartial;
     for (version, (expected, _)) in &embedded {
         if *version > BOOTSTRAP_BASELINE_VERSION
             && *version <= current_version
             && !applied_versions.contains(version)
         {
-            drift.push(format!(
-                "v{version} ({}) is missing below current v{current_version}",
-                expected.name
-            ));
+            if *version != 247 || !reviewed_v247_repair_pending {
+                drift.push(format!(
+                    "v{version} ({}) is missing below current v{current_version}",
+                    expected.name
+                ));
+            }
         }
     }
 
     let pending_automatic = PG_MIGRATIONS
         .iter()
-        .filter(|migration| !applied_versions.contains(&migration.version))
+        .filter(|migration| migration.version > current_version && !reviewed_v247_repair_pending)
         .map(|migration| migration_descriptor(migration, false))
         .collect();
     let pending_explicit = EXPLICIT_PG_MIGRATIONS
@@ -1988,6 +2443,38 @@ pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigratio
     if rollout_schema_valid == Some(false) {
         drift.push("v295 rollout authority schema or committed data drifted".to_string());
     }
+    let reconciliation_schema_valid = if applied_versions.contains(&295) {
+        Some(
+            v247_state == V247SchemaState::Exact
+                && historical_schema_exact
+                && project_forward_state == ForwardCompatibilityState::Exact
+                && lease_forward_state == ForwardCompatibilityState::Exact,
+        )
+    } else {
+        None
+    };
+    if reconciliation_schema_valid == Some(false) {
+        drift.push("v295 historical reconciliation schema drifted".to_string());
+    }
+
+    if let Some(v247) = applied.iter().find(|row| row.version == 247) {
+        if v247.source_commit.is_some() || v247.applied_by.is_some() {
+            let bound = applied
+                .iter()
+                .find(|row| row.version == 295)
+                .is_some_and(|v295| {
+                    v247.source_commit == v295.source_commit
+                        && v247.applied_by == v295.applied_by
+                        && v247.applied_at == v295.applied_at
+                });
+            if !bound {
+                drift.push(
+                    "late-applied v247 provenance/timestamp is not bound exactly to v295"
+                        .to_string(),
+                );
+            }
+        }
+    }
 
     Ok(PostgresMigrationStatus {
         current_version,
@@ -1998,6 +2485,8 @@ pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigratio
         applied,
         drift,
         rollout_schema_valid,
+        reviewed_v247_repair_pending,
+        reconciliation_schema_valid,
     })
 }
 
@@ -2091,7 +2580,20 @@ pub async fn apply_explicit_postgres_migrations(
             ));
         }
 
-        let locked_current = pg_current_version(&mut conn).await?;
+        let mut tx = conn.begin().await?;
+        sqlx::query("LOCK TABLE _migrations IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let locked_applied = read_applied_postgres_migrations_conn(&mut tx).await?;
+        if locked_applied != before.applied {
+            return Err(DbError::Migration(
+                "migration ledger changed while acquiring the explicit lock; retry".to_string(),
+            ));
+        }
+        let locked_current = locked_applied
+            .last()
+            .map(|row| row.version)
+            .unwrap_or(0);
         if locked_current != before.current_version {
             return Err(DbError::Migration(format!(
                 "migration version changed from v{} to v{} while acquiring the explicit lock; retry",
@@ -2105,7 +2607,67 @@ pub async fn apply_explicit_postgres_migrations(
                     applied.source_commit
                 )));
             }
+            tx.rollback().await?;
             return Ok(());
+        }
+
+        if !reviewed_historical_schema_is_exact(&mut tx).await? {
+            return Err(DbError::Migration(
+                "reviewed V274/V277/V280 historical schema profile is not exact".to_string(),
+            ));
+        }
+        let project_state = forward_compatibility_state(&mut tx, "projects").await?;
+        let lease_state = forward_compatibility_state(&mut tx, "work_item_leases").await?;
+        if project_state == ForwardCompatibilityState::Drift
+            || lease_state == ForwardCompatibilityState::Drift
+        {
+            return Err(DbError::Migration(
+                "V295 forward-compatibility pre-state drifted".to_string(),
+            ));
+        }
+
+        let repair_v247 = before.reviewed_v247_repair_pending;
+        let locked_v247_state = v247_schema_state(&mut tx).await?;
+        if repair_v247 {
+            if !reviewed_live_v290_ledger_matches(&locked_applied)
+                || locked_v247_state != V247SchemaState::ReviewedEmptyPartial
+                || project_state != ForwardCompatibilityState::Absent
+                || lease_state != ForwardCompatibilityState::Exact
+            {
+                return Err(DbError::Migration(
+                    "reviewed V247 forward-repair pre-state changed under lock".to_string(),
+                ));
+            }
+            sqlx::raw_sql(schema::SCHEMA_V295_REPAIR_REVIEWED_EMPTY_V247)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    DbError::Migration(format!("explicit V247 forward repair failed: {error}"))
+                })?;
+        } else if locked_v247_state != V247SchemaState::Exact
+            || !locked_applied.iter().any(|row| row.version == 247)
+        {
+            return Err(DbError::Migration(
+                "V247 must be exact and recorded, or match the one reviewed repair profile"
+                    .to_string(),
+            ));
+        }
+
+        sqlx::raw_sql(schema::SCHEMA_V295_FORWARD_COMPATIBILITY_REPAIR)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                DbError::Migration(format!("explicit V295 compatibility repair failed: {error}"))
+            })?;
+        if v247_schema_state(&mut tx).await? != V247SchemaState::Exact
+            || forward_compatibility_state(&mut tx, "projects").await?
+                != ForwardCompatibilityState::Exact
+            || forward_compatibility_state(&mut tx, "work_item_leases").await?
+                != ForwardCompatibilityState::Exact
+        {
+            return Err(DbError::Migration(
+                "V295 compatibility repair postcondition is not exact".to_string(),
+            ));
         }
 
         let mut current = before.current_version;
@@ -2115,7 +2677,6 @@ pub async fn apply_explicit_postgres_migrations(
             .filter(|migration| migration.version > current && migration.version <= target)
             .collect::<Vec<_>>();
         for migration in ordered {
-            let mut tx = conn.begin().await?;
             sqlx::raw_sql(migration.sql)
                 .execute(&mut *tx)
                 .await
@@ -2126,12 +2687,30 @@ pub async fn apply_explicit_postgres_migrations(
                     ))
                 })?;
             if migration.version == LATEST_EXPLICIT_POSTGRES_MIGRATION {
+                let applied_at: chrono::DateTime<chrono::Utc> =
+                    sqlx::query_scalar("SELECT clock_timestamp()")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if repair_v247 {
+                    sqlx::query(
+                        "INSERT INTO _migrations
+                            (version, name, applied_at, source_commit, applied_by)
+                         VALUES (247, 'error_miner_tables', $1, $2, $3)",
+                    )
+                    .bind(applied_at)
+                    .bind(expected_source_commit)
+                    .bind(applied_by)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 sqlx::query(
-                    "INSERT INTO _migrations (version, name, source_commit, applied_by)
-                     VALUES ($1, $2, $3, $4)",
+                    "INSERT INTO _migrations
+                        (version, name, applied_at, source_commit, applied_by)
+                     VALUES ($1, $2, $3, $4, $5)",
                 )
                 .bind(i32::try_from(migration.version).expect("migration version fits i32"))
                 .bind(migration.name)
+                .bind(applied_at)
                 .bind(expected_source_commit)
                 .bind(applied_by)
                 .execute(&mut *tx)
@@ -2143,7 +2722,6 @@ pub async fn apply_explicit_postgres_migrations(
                     .execute(&mut *tx)
                     .await?;
             }
-            tx.commit().await?;
             current = migration.version;
         }
         if current != target {
@@ -2151,6 +2729,7 @@ pub async fn apply_explicit_postgres_migrations(
                 "bounded explicit migration stopped at v{current}, expected v{target}"
             )));
         }
+        tx.commit().await?;
         Ok(())
     }
     .await;
@@ -2311,23 +2890,8 @@ mod tests {
                 .unwrap();
             tx.commit().await.unwrap();
         }
-        // The live V290 authority still uses the reviewed legacy roster tables,
-        // while the squashed fresh baseline projects these names as views. Build
-        // the equivalent empty legacy shape before exercising the live V290→295
-        // explicit path; v291 correctly requires a table-backed FK authority.
-        sqlx::raw_sql(
-            r#"
-            ALTER VIEW computers RENAME TO computers_unified_v295_test;
-            ALTER VIEW fleet_workers RENAME TO fleet_workers_unified_v295_test;
-            CREATE TABLE computers AS TABLE computers_unified_v295_test WITH NO DATA;
-            ALTER TABLE computers ADD PRIMARY KEY (id), ADD UNIQUE (name);
-            CREATE TABLE fleet_workers AS TABLE fleet_workers_unified_v295_test WITH NO DATA;
-            ALTER TABLE fleet_workers ADD PRIMARY KEY (name);
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("construct fresh reviewed legacy V290 roster layout");
+        // V280 is intentionally non-runnable; fresh replay retains the exact
+        // table-backed roster layout required by V291 and the reviewed fleet.
         assert_eq!(
             postgres_migration_status(&pool)
                 .await
@@ -2373,6 +2937,7 @@ mod tests {
                 .expect("apply exact v295");
         assert_eq!(applied.current_version, 295);
         assert_eq!(applied.rollout_schema_valid, Some(true));
+        assert_eq!(applied.reconciliation_schema_valid, Some(true));
         assert!(applied.drift.is_empty());
 
         let replay =
@@ -2410,11 +2975,14 @@ mod tests {
             "deferred authority validator must reject an unsealed partial authority"
         );
 
-        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'vinny')")
-            .bind(crate::rollout_authority::FORBIDDEN_VINNY_ID)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, 'vinny', '192.0.2.9', 'macos', 'test')",
+        )
+        .bind(crate::rollout_authority::FORBIDDEN_VINNY_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
         let mut forbidden = pool.begin().await.unwrap();
         let forbidden_authority: Uuid = sqlx::query_scalar(
             "INSERT INTO release_rollout_authorities
@@ -2600,6 +3168,261 @@ mod tests {
         .expect_err("replay over schema drift must fail closed")
         .to_string()
         .contains("migration authority drift"));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v295_reconciles_only_the_exact_reviewed_legacy_v247_profile() {
+        const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_reviewed_legacy_v290(&pool).await;
+
+        let ready = postgres_migration_status(&pool).await.unwrap();
+        assert_eq!(ready.current_version, 290);
+        assert!(
+            ready.drift.is_empty(),
+            "unexpected drift: {:?}",
+            ready.drift
+        );
+        assert!(ready.reviewed_v247_repair_pending);
+        assert!(ready.pending_automatic.is_empty());
+        assert_eq!(
+            run_postgres_migrations(&pool)
+                .await
+                .expect("startup must hold the reviewed repair profile"),
+            290
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.release_artifacts')::text",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None,
+            "automatic V291-V294 must not advance ahead of V247 repair",
+        );
+
+        sqlx::query(
+            "UPDATE _migrations
+                SET applied_at = applied_at + interval '1 microsecond'
+              WHERE version = 260",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let timestamp_drift = postgres_migration_status(&pool).await.unwrap();
+        assert!(!timestamp_drift.reviewed_v247_repair_pending);
+        assert!(
+            timestamp_drift
+                .drift
+                .iter()
+                .any(|item| item.contains("v260"))
+        );
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                SOURCE,
+                SOURCE,
+                "unpushed",
+                "test@legacy",
+            )
+            .await
+            .expect_err("one-microsecond legacy drift must block")
+            .to_string()
+            .contains("migration authority drift")
+        );
+        sqlx::query(
+            "UPDATE _migrations
+                SET applied_at = '2026-07-24T20:49:10.028987Z'
+              WHERE version = 260",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO error_signatures (signature, state)
+             VALUES ('must-not-coerce', 'not-a-reviewed-state')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let nonempty = postgres_migration_status(&pool).await.unwrap();
+        assert!(!nonempty.reviewed_v247_repair_pending);
+        assert!(!nonempty.drift.is_empty());
+        sqlx::query("DELETE FROM error_signatures")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("ALTER TABLE error_signatures ALTER COLUMN count_24h SET DEFAULT 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !postgres_migration_status(&pool)
+                .await
+                .unwrap()
+                .reviewed_v247_repair_pending
+        );
+        sqlx::query("ALTER TABLE error_signatures ALTER COLUMN count_24h SET DEFAULT 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("CREATE INDEX unreviewed_error_state_idx ON error_signatures(state)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !postgres_migration_status(&pool)
+                .await
+                .unwrap()
+                .reviewed_v247_repair_pending
+        );
+        sqlx::query("DROP INDEX unreviewed_error_state_idx")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Force a late V295 failure and prove V247 + V291-V295 + compatibility
+        // repairs share one rollback boundary.
+        sqlx::query("CREATE TABLE release_rollout_authorities (wrong INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let failed = apply_explicit_postgres_migrations(
+            &pool,
+            295,
+            SOURCE,
+            SOURCE,
+            "unpushed",
+            "test@legacy",
+        )
+        .await
+        .expect_err("conflicting V295 relation must roll the whole repair back");
+        assert!(failed.to_string().contains("explicit v295"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM _migrations WHERE version = 247")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name='projects'
+                    AND column_name IN ('workstream_id','digest_template_id','logo_url')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.release_artifacts')::text",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        let mut rolled_back = pool.acquire().await.unwrap();
+        assert_eq!(
+            v247_schema_state(&mut rolled_back).await.unwrap(),
+            V247SchemaState::ReviewedEmptyPartial
+        );
+        drop(rolled_back);
+        sqlx::query("DROP TABLE release_rollout_authorities")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let applied = apply_explicit_postgres_migrations(
+            &pool,
+            295,
+            SOURCE,
+            SOURCE,
+            "unpushed",
+            "test@legacy",
+        )
+        .await
+        .expect("exact reviewed legacy repair");
+        assert_eq!(applied.current_version, 295);
+        assert!(!applied.reviewed_v247_repair_pending);
+        assert_eq!(applied.reconciliation_schema_valid, Some(true));
+        assert!(applied.drift.is_empty());
+        for reviewed in REVIEWED_LEGACY_LEDGER_ROWS {
+            let row = applied
+                .applied
+                .iter()
+                .find(|row| row.version == reviewed.version)
+                .unwrap();
+            assert!(reviewed_legacy_row_matches(row, reviewed));
+        }
+        let repaired = applied
+            .applied
+            .iter()
+            .find(|row| row.version == 247)
+            .unwrap();
+        let authority = applied
+            .applied
+            .iter()
+            .find(|row| row.version == 295)
+            .unwrap();
+        assert_eq!(repaired.name, "error_miner_tables");
+        assert_eq!(repaired.source_commit.as_deref(), Some(SOURCE));
+        assert_eq!(repaired.applied_by.as_deref(), Some("test@legacy"));
+        assert_eq!(repaired.applied_at, authority.applied_at);
+        assert_eq!(repaired.source_commit, authority.source_commit);
+        assert_eq!(repaired.applied_by, authority.applied_by);
+
+        let replay = apply_explicit_postgres_migrations(
+            &pool,
+            295,
+            SOURCE,
+            SOURCE,
+            "unpushed",
+            "test@legacy",
+        )
+        .await
+        .expect("exact replay is idempotent");
+        assert_eq!(replay.current_version, 295);
+
+        sqlx::query(
+            "UPDATE _migrations
+                SET applied_at = applied_at + interval '1 microsecond'
+              WHERE version = 247",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bound_drift = postgres_migration_status(&pool).await.unwrap();
+        assert!(
+            bound_drift
+                .drift
+                .iter()
+                .any(|item| item.contains("not bound"))
+        );
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                SOURCE,
+                SOURCE,
+                "unpushed",
+                "test@legacy",
+            )
+            .await
+            .is_err()
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
@@ -2820,29 +3643,16 @@ mod tests {
     }
 
     #[test]
-    fn v274_adds_project_workstream_digest_fields() {
+    fn v274_preserves_project_repo_scan_history() {
         let migration = PG_MIGRATIONS
             .iter()
             .find(|migration| migration.version == 274)
             .expect("V274 must be registered");
-        assert_eq!(migration.name, "project_digest_fields");
-        assert!(
-            migration
-                .sql
-                .contains("ADD COLUMN IF NOT EXISTS workstream_id TEXT")
-        );
-        assert!(
-            migration
-                .sql
-                .contains("ADD COLUMN IF NOT EXISTS digest_template_id JSONB")
-        );
-        assert!(
-            migration
-                .sql
-                .contains("ADD COLUMN IF NOT EXISTS logo_url TEXT")
-        );
-        assert!(migration.sql.contains("idx_projects_workstream_id"));
-        assert!(migration.sql.contains("Rollback:"));
+        assert_eq!(migration.name, "project_repo_scan_metadata");
+        assert!(migration.sql.contains("ALTER TABLE project_repos"));
+        assert!(migration.sql.contains("tech_stack TEXT"));
+        assert!(migration.sql.contains("local_path TEXT"));
+        assert!(!migration.sql.contains("workstream_id"));
     }
 
     #[test]
@@ -2964,6 +3774,68 @@ mod tests {
             .ok()?;
 
         Some((admin, pool, db_name))
+    }
+
+    async fn prepare_reviewed_legacy_v290(pool: &PgPool) {
+        sqlx::raw_sql(schema::BOOTSTRAP_V161_SQL)
+            .execute(pool)
+            .await
+            .expect("fresh baseline");
+        for migration in PG_MIGRATIONS.iter().filter(|migration| {
+            migration.version > BOOTSTRAP_BASELINE_VERSION && migration.version <= 290
+        }) {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("strict fresh v{} failed: {error}", migration.version)
+                });
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                .bind(migration.version as i32)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Reproduce the exact reviewed fleet evidence without touching the live
+        // database. This fixture intentionally uses DDL only in its disposable
+        // database so the production path can remain validation-first.
+        sqlx::raw_sql(
+            r#"
+            DELETE FROM _migrations WHERE version = 247;
+            DROP TABLE fleet_log_digest;
+            ALTER TABLE error_signatures
+                ALTER COLUMN first_seen DROP NOT NULL,
+                ALTER COLUMN last_seen DROP NOT NULL,
+                ALTER COLUMN count_24h DROP NOT NULL,
+                ALTER COLUMN count_total DROP NOT NULL,
+                ALTER COLUMN state DROP NOT NULL,
+                DROP CONSTRAINT error_signatures_state_check;
+            ALTER TABLE work_item_leases
+                ADD COLUMN build_started_at TIMESTAMPTZ;
+
+            UPDATE _migrations SET applied_at = '2026-07-20T16:39:14.109001Z'
+             WHERE version = 211;
+            UPDATE _migrations SET applied_at = '2026-07-26T05:54:24.449824Z'
+             WHERE version = 274;
+            UPDATE _migrations SET applied_at = '2026-07-26T18:23:36.239244Z'
+             WHERE version = 277;
+
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (234, 'work_item_cortex_subgraph_id', '2026-07-22T04:50:37.318577Z'),
+              (236, 'work_item_context_and_cortex_subgraph', '2026-07-22T15:13:32.818634Z'),
+              (246, 'glm_45_air_ab_catalog', '2026-07-24T03:03:02.342428Z'),
+              (260, 'model_utilization_view', '2026-07-24T20:49:10.028987Z'),
+              (270, 'workstream_session_fields', '2026-07-25T19:04:23.380858Z'),
+              (280, 'merge_fleet_tables__QUARANTINED_MANUAL', '2026-07-27T06:28:42.086663Z');
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("construct exact reviewed legacy V290 fixture");
     }
 
     async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
@@ -3847,6 +4719,18 @@ mod tests {
     }
 
     async fn switch_test_roster_to_legacy_tables(pool: &PgPool) {
+        let already_legacy: bool = sqlx::query_scalar(
+            "SELECT count(*) = 2
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relkind = 'r'
+                AND c.relname IN ('computers', 'fleet_workers')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("inspect test roster relations");
+        if already_legacy {
+            return;
+        }
         sqlx::raw_sql(
             r#"
             DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_canonical_name;
@@ -3955,7 +4839,7 @@ mod tests {
         .expect("insert test skill");
 
         for _ in 0..2 {
-            sqlx::query(schema::SCHEMA_V275_FF_CAPABILITIES)
+            sqlx::raw_sql(schema::SCHEMA_V275_FF_CAPABILITIES)
                 .execute(&pool)
                 .await
                 .expect("capability backfill is rerunnable");
@@ -4077,8 +4961,9 @@ mod tests {
             .expect("migrations should apply on fresh DB");
 
         let first_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, total_ram_gb)
-             VALUES ('v227-old-name', '10.0.0.227', 32)
+            "INSERT INTO computers
+                (name, primary_ip, total_ram_gb, os_family, ssh_user)
+             VALUES ('v227-old-name', '10.0.0.227', 32, 'linux-ubuntu', 'test')
              RETURNING id",
         )
         .fetch_one(&pool)
@@ -4086,8 +4971,9 @@ mod tests {
         .expect("insert initial computer");
 
         let upserted_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, total_ram_gb)
-             VALUES ('v227-new-name', '10.0.0.227', 64)
+            "INSERT INTO computers
+                (name, primary_ip, total_ram_gb, os_family, ssh_user)
+             VALUES ('v227-new-name', '10.0.0.227', 64, 'linux-ubuntu', 'test')
              ON CONFLICT (primary_ip) WHERE btrim(primary_ip) <> ''
              DO UPDATE SET name = EXCLUDED.name,
                            total_ram_gb = EXCLUDED.total_ram_gb
@@ -4376,8 +5262,10 @@ mod tests {
             .await
             .expect("migrations should apply on fresh DB");
         let computer_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, total_ram_gb)
-             VALUES ('v184-metrics-node', '127.0.0.184', 64) RETURNING id",
+            "INSERT INTO computers
+                (name, primary_ip, total_ram_gb, os_family, ssh_user)
+             VALUES ('v184-metrics-node', '127.0.0.184', 64, 'linux-ubuntu', 'test')
+             RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -4510,7 +5398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v211_decommissions_vinny_github_identity() {
+    async fn v211_preserves_taylor_github_identity_history() {
         // CI has no Postgres. Keep this integration test optional on both
         // supported database URL variables.
         let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
@@ -4523,7 +5411,7 @@ mod tests {
         let aliases: Vec<(String, bool)> = sqlx::query_as(
             "SELECT alias_name, is_canonical
                FROM github_ssh_aliases
-              WHERE alias_name IN ('github.com-venkat', 'github.com-vinny')
+              WHERE alias_name IN ('github.com-venkat', 'github.com-taylor')
               ORDER BY alias_name",
         )
         .fetch_all(&pool)
@@ -4533,7 +5421,7 @@ mod tests {
 
         let legacy_secrets: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM fleet_secrets
-              WHERE key IN ('github_ssh_id_vinny_priv', 'github_ssh_id_vinny_pub')",
+              WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub')",
         )
         .fetch_one(&pool)
         .await
@@ -4562,8 +5450,8 @@ mod tests {
         .await
         .expect("insert test worker");
         let computer_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, os_family)
-             VALUES ('v215-test-node', '10.0.0.215', 'linux-ubuntu')
+            "INSERT INTO computers (name, primary_ip, os_family, ssh_user)
+             VALUES ('v215-test-node', '10.0.0.215', 'linux-ubuntu', 'test')
              RETURNING id",
         )
         .fetch_one(&pool)
@@ -4587,6 +5475,13 @@ mod tests {
                 .expect("read initial statuses");
         assert_eq!(initial, vec![(1, "idle".into()), (2, "busy".into())]);
 
+        // Slot synchronization expands the stored capacity while rows are
+        // inserted. Reassert the simulated daemon-computed capacity before
+        // exercising V215's release boundary.
+        sqlx::query("UPDATE fleet_workers SET sub_agent_count = 2 WHERE name = 'v215-test-node'")
+            .execute(&pool)
+            .await
+            .expect("restore bounded test capacity");
         sqlx::query("UPDATE sub_agents SET status = 'idle' WHERE slot = 2")
             .execute(&pool)
             .await
@@ -4704,11 +5599,14 @@ mod tests {
             .expect("migrations should apply on a fresh database");
 
         let computer_id = uuid::Uuid::new_v4();
-        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'v244-testbox')")
-            .bind(computer_id)
-            .execute(&pool)
-            .await
-            .expect("insert computers row");
+        sqlx::query(
+            "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, 'v244-testbox', '127.0.0.244', 'linux-ubuntu', 'test')",
+        )
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("insert computers row");
 
         let row: crate::models::Slot = sqlx::query_as(
             "INSERT INTO sub_agents
@@ -4825,60 +5723,23 @@ mod tests {
     }
 
     #[test]
-    fn v280_merges_fleet_tables() {
-        let migration = PG_MIGRATIONS
+    fn v277_is_node_health_and_v280_is_not_runnable() {
+        let v277 = PG_MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 280)
-            .expect("V280 must be registered");
-        assert_eq!(migration.name, "merge_fleet_tables");
+            .find(|migration| migration.version == 277)
+            .expect("historical V277 must be registered");
+        assert_eq!(v277.name, "node_health");
+        assert!(v277.sql.contains("CREATE TABLE IF NOT EXISTS node_health"));
+        assert!(!v277.sql.contains("build_started_at"));
         assert!(
-            migration
-                .sql
-                .contains("ALTER TABLE computers RENAME TO fleet_nodes")
+            PG_MIGRATIONS
+                .iter()
+                .all(|migration| migration.version != 280)
         );
-        assert!(
-            migration
-                .sql
-                .contains("DROP TABLE fleet_workers_legacy RESTRICT")
-        );
-    }
-
-    #[tokio::test]
-    async fn v280_applies_and_is_idempotent() {
-        // CI commonly has no Postgres; the helper checks both supported URL vars.
-        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
-            return;
-        };
-        run_postgres_migrations(&pool)
-            .await
-            .expect("migrations should apply on a fresh database");
-
-        let relations: Vec<(String, String)> = sqlx::query_as(
-            "SELECT relname, relkind::text
-               FROM pg_class c
-               JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = 'public'
-                AND relname IN ('fleet_nodes', 'computers', 'fleet_workers')
-              ORDER BY relname",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("read merged fleet relations");
-        assert_eq!(
-            relations,
-            vec![
-                ("computers".into(), "v".into()),
-                ("fleet_nodes".into(), "r".into()),
-                ("fleet_workers".into(), "v".into()),
-            ]
-        );
-
-        sqlx::raw_sql(schema::SCHEMA_V280_MERGE_FLEET_TABLES)
-            .execute(&pool)
-            .await
-            .expect("V280 should be idempotent");
-
-        drop_temp_db(admin, pool, &db_name).await;
+        assert!(schema::SCHEMA_V280_MERGE_FLEET_TABLES.contains("RENAME TO fleet_nodes"));
+        assert!(REVIEWED_LEGACY_LEDGER_ROWS.iter().any(|row| {
+            row.version == 280 && row.name == "merge_fleet_tables__QUARANTINED_MANUAL"
+        }));
     }
 
     #[test]
@@ -5283,14 +6144,14 @@ mod tests {
         switch_test_roster_to_legacy_tables(&pool).await;
         sqlx::raw_sql(
             r#"
-            CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_canonical_name
                 ON computers (lower(name));
-            CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_primary_ip
                 ON computers (primary_ip)
                 WHERE NULLIF(primary_ip, '') IS NOT NULL;
-            CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_canonical_name
                 ON fleet_workers (lower(name));
-            CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_ip
                 ON fleet_workers (ip)
                 WHERE NULLIF(ip, '') IS NOT NULL;
             "#,

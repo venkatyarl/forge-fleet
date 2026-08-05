@@ -66,6 +66,11 @@ fn print_status(status: &ff_db::PostgresMigrationStatus) {
     if let Some(valid) = status.rollout_schema_valid {
         println!("V295 schema exact:   {valid}");
     }
+    if status.reviewed_v247_repair_pending {
+        println!("Legacy repair:       reviewed V247 forward repair pending");
+    } else if let Some(valid) = status.reconciliation_schema_valid {
+        println!("Reconciliation exact:{valid:>6}");
+    }
     if status.pending_automatic.is_empty() {
         println!("Pending automatic:  none");
     } else {
