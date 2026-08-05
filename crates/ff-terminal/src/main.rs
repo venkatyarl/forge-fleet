@@ -3950,6 +3950,10 @@ pub enum ModelCommand {
         #[arg(long)]
         models_dir: Option<PathBuf>,
     },
+    /// Import Ace's one reviewed Gemma 4 E4B MLX artifact from its exact
+    /// Hugging Face cache revision, then register the verified final directory.
+    /// This verb accepts no path, node, force, repo, or revision overrides.
+    ImportAceGemma4Mlx,
     /// Show latest disk usage per node (from fleet_disk_usage snapshots).
     Disk {
         /// Emit JSON (every field incl. total_bytes + RFC3339 sampled_at) — for
@@ -6989,6 +6993,44 @@ mod memory_cli_guard_tests {
                     scope_key,
                 ]),
                 ("project".to_string(), scope_key.to_string(), false)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ace_mlx_cli_tests {
+    use super::{Cli, Command, ModelCommand};
+    use clap::Parser;
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let args = args
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .expect("spawn CLI parser")
+            .join()
+            .expect("CLI parser thread")
+    }
+
+    #[test]
+    fn ace_mlx_import_is_a_fixed_no_argument_verb() {
+        let cli = try_parse(&["ff", "model", "import-ace-gemma4-mlx"])
+            .expect("fixed Ace MLX import verb must parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Model {
+                command: ModelCommand::ImportAceGemma4Mlx
+            })
+        ));
+
+        for forbidden in ["--path", "--node", "--force", "--repo", "--revision"] {
+            assert!(
+                try_parse(&["ff", "model", "import-ace-gemma4-mlx", forbidden]).is_err(),
+                "accepted forbidden importer override {forbidden}"
             );
         }
     }

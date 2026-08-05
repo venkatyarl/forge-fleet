@@ -13681,6 +13681,153 @@ END
 $v293_smolvlm_exact_variant_authority$;
 "#;
 
+/// v294: authorize Ace's exact Gemma 4 E4B MLX artifact.
+///
+/// This is a new catalog identity, so there is no reviewed legacy row to
+/// repair.  The migration accepts only an absent row (which it inserts) or the
+/// exact final row (idempotent replay).  Every partial or drifted state fails
+/// closed.  The variant carries the complete bounded upstream manifest used by
+/// the Ace importer; a repo name or revision alone is not artifact authority.
+pub const SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY: &str = r#"
+DO $v294_ace_gemma4_mlx_exact_authority$
+DECLARE
+    target_catalog_id CONSTANT TEXT := 'gemma4-e4b-it';
+    exact_row CONSTANT JSONB := '{
+        "id": "gemma4-e4b-it",
+        "name": "Gemma 4 E4B Instruct",
+        "family": "gemma",
+        "parameters": "E4B",
+        "tier": 1,
+        "description": "Gemma 4 E4B instruction-tuned multimodal MLX 4-bit artifact pinned for Apple Silicon",
+        "gated": false,
+        "preferred_workloads": ["chat", "vision", "audio", "video", "multimodal"],
+        "variants": [{
+            "runtime": "mlx",
+            "quant": "4bit",
+            "hf_repo": "mlx-community/gemma-4-e4b-it-4bit",
+            "source_revision": "475b9088d29754a3379866cf5aeb6b41acd313c2",
+            "base_hf_repo": "google/gemma-4-E4B-it",
+            "base_source_revision": "fee6332c1abaafb77f6f9624236c63aa2f1d0187",
+            "target_triple": "aarch64-apple-darwin",
+            "artifact_size_bytes": 5179241512,
+            "files": [
+                {"name": ".gitattributes", "size_bytes": 1570, "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"},
+                {"name": "README.md", "size_bytes": 593, "sha256": "8e9717df49219943b8992eeccecd8050535318d34fffbbaeaac924ed01f27155"},
+                {"name": "chat_template.jinja", "size_bytes": 17336, "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"},
+                {"name": "config.json", "size_bytes": 6628, "sha256": "780ccb3a514a5f1ced161d383f948fc22eca9b84b752ca19494f625bd9bad7a6"},
+                {"name": "generation_config.json", "size_bytes": 208, "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"},
+                {"name": "model.safetensors", "size_bytes": 5146800534, "sha256": "932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff"},
+                {"name": "model.safetensors.index.json", "size_bytes": 240961, "sha256": "f8accac59ee7efe87e0c298c854610b262c3cadd477407503147c71209ff0093"},
+                {"name": "processor_config.json", "size_bytes": 1316, "sha256": "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37"},
+                {"name": "tokenizer.json", "size_bytes": 32169626, "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"},
+                {"name": "tokenizer_config.json", "size_bytes": 2740, "sha256": "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656"}
+            ]
+        }],
+        "tool_calling": false,
+        "display_name": null,
+        "tasks": null,
+        "modalities": null,
+        "benchmarks": null,
+        "license": "gemma",
+        "lifecycle": "active"
+    }'::jsonb;
+    catalog_row_count BIGINT;
+    actual_row JSONB;
+    inserted_rows BIGINT;
+BEGIN
+    SELECT count(*)
+      INTO catalog_row_count
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+
+    IF catalog_row_count = 0 THEN
+        INSERT INTO fleet_model_catalog (
+            id, name, family, parameters, tier, description, gated,
+            preferred_workloads, variants, tool_calling, display_name,
+            tasks, modalities, benchmarks, license, lifecycle
+        ) VALUES (
+            target_catalog_id,
+            'Gemma 4 E4B Instruct',
+            'gemma',
+            'E4B',
+            1,
+            'Gemma 4 E4B instruction-tuned multimodal MLX 4-bit artifact pinned for Apple Silicon',
+            false,
+            '["chat", "vision", "audio", "video", "multimodal"]'::jsonb,
+            exact_row->'variants',
+            false,
+            NULL, NULL, NULL, NULL,
+            'gemma',
+            'active'
+        );
+        GET DIAGNOSTICS inserted_rows = ROW_COUNT;
+        IF inserted_rows <> 1 THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v294 failed to insert exactly one Gemma 4 E4B authority row',
+                DETAIL = format('inserted %s rows', inserted_rows);
+        END IF;
+    ELSIF catalog_row_count = 1 THEN
+        SELECT jsonb_build_object(
+                   'id', id,
+                   'name', name,
+                   'family', family,
+                   'parameters', parameters,
+                   'tier', tier,
+                   'description', description,
+                   'gated', gated,
+                   'preferred_workloads', preferred_workloads,
+                   'variants', variants,
+                   'tool_calling', tool_calling,
+                   'display_name', display_name,
+                   'tasks', tasks,
+                   'modalities', modalities,
+                   'benchmarks', benchmarks,
+                   'license', license,
+                   'lifecycle', lifecycle
+               )
+          INTO actual_row
+          FROM fleet_model_catalog
+         WHERE id = target_catalog_id
+           FOR UPDATE;
+        IF actual_row IS DISTINCT FROM exact_row THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v294 found unreviewed Gemma 4 E4B authority state',
+                DETAIL = format('catalog row=%s', actual_row::text);
+        END IF;
+    ELSE
+        RAISE EXCEPTION USING
+            MESSAGE = 'v294 found duplicate gemma4-e4b-it catalog rows',
+            DETAIL = format('found %s rows', catalog_row_count);
+    END IF;
+
+    SELECT jsonb_build_object(
+               'id', id,
+               'name', name,
+               'family', family,
+               'parameters', parameters,
+               'tier', tier,
+               'description', description,
+               'gated', gated,
+               'preferred_workloads', preferred_workloads,
+               'variants', variants,
+               'tool_calling', tool_calling,
+               'display_name', display_name,
+               'tasks', tasks,
+               'modalities', modalities,
+               'benchmarks', benchmarks,
+               'license', license,
+               'lifecycle', lifecycle
+           )
+      INTO actual_row
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF actual_row IS DISTINCT FROM exact_row THEN
+        RAISE EXCEPTION 'v294 postcondition failed: catalog row differs from exact authority';
+    END IF;
+END
+$v294_ace_gemma4_mlx_exact_authority$;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

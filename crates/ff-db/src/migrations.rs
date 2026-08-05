@@ -1319,6 +1319,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "smolvlm_exact_variant_authority",
         sql: schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY,
     },
+    PgMigration {
+        version: 294,
+        name: "ace_gemma4_mlx_exact_authority",
+        sql: schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY,
+    },
 ];
 
 /// Fail closed unless the enrollment authority table is exactly the reviewed
@@ -1908,12 +1913,58 @@ mod tests {
                 "v293 must not repair or fuzz authority through {forbidden}"
             );
         }
+        let v293_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 293)
+            .expect("v293 position");
+        let v294_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 294)
+            .expect("v294 position");
+        assert_eq!(v294_position, v293_position + 1, "v294 must follow v293");
+    }
+
+    #[test]
+    fn v294_is_exact_fail_closed_ace_gemma4_mlx_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 294)
+            .expect("v294 must be appended after v293");
+        assert_eq!(migration.name, "ace_gemma4_mlx_exact_authority");
+        for required in [
+            "catalog_row_count = 0",
+            "catalog_row_count = 1",
+            "FOR UPDATE",
+            "actual_row IS DISTINCT FROM exact_row",
+            "found duplicate gemma4-e4b-it catalog rows",
+            "mlx-community/gemma-4-e4b-it-4bit",
+            "475b9088d29754a3379866cf5aeb6b41acd313c2",
+            "fee6332c1abaafb77f6f9624236c63aa2f1d0187",
+            "aarch64-apple-darwin",
+            "5179241512",
+            "932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff",
+            "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+        ] {
+            assert!(migration.sql.contains(required), "v294 missing {required}");
+        }
+        for forbidden in [
+            "ILIKE",
+            "LOWER(",
+            "ON CONFLICT",
+            "DO UPDATE",
+            "original_variants = '[]'",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v294 must not repair or fuzz authority through {forbidden}"
+            );
+        }
         assert_eq!(
             PG_MIGRATIONS
                 .iter()
-                .position(|migration| migration.version == 293),
+                .position(|migration| migration.version == 294),
             PG_MIGRATIONS.len().checked_sub(1),
-            "v293 must remain the final forward migration"
+            "v294 must remain the final forward migration"
         );
     }
 
@@ -2251,7 +2302,7 @@ mod tests {
         let final_version = run_postgres_migrations(&pool)
             .await
             .expect("fresh V161 bootstrap plus forward migrations must converge");
-        assert_eq!(final_version, 293);
+        assert_eq!(final_version, 294);
         let migration_name: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 292")
                 .fetch_one(&pool)
@@ -2644,7 +2695,7 @@ mod tests {
         let final_version = run_postgres_migrations(&pool)
             .await
             .expect("fresh V161 bootstrap plus forward migrations must converge");
-        assert_eq!(final_version, 293);
+        assert_eq!(final_version, 294);
         let migration_name: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 293")
                 .fetch_one(&pool)
@@ -2776,6 +2827,194 @@ mod tests {
         drop_temp_db(admin, pool, &db_name).await;
     }
 
+    async fn v294_rejection(pool: &PgPool) -> String {
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(pool)
+            .await
+            .expect_err("V294 authority drift must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v294_absent_to_exact_is_idempotent_and_preserves_unrelated_rows_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO fleet_model_catalog (
+                id, name, family, parameters, tier, description, gated,
+                preferred_workloads, variants, tool_calling, sentinel
+            ) VALUES (
+                'unrelated-v294', 'Unrelated', 'test', '1B', 1, NULL, false,
+                '[]', '[{"keep":true}]', false, '{"keep":"other"}'
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated V294 row");
+        let unrelated_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated-v294'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot unrelated V294 row");
+
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V294 must insert an absent exact authority row");
+        let first: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' - 'sentinel'
+               FROM fleet_model_catalog catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read exact V294 row");
+        assert_eq!(first["id"], "gemma4-e4b-it");
+        assert_eq!(first["family"], "gemma");
+        assert_eq!(first["parameters"], "E4B");
+        assert_eq!(first["tool_calling"], false);
+        assert_eq!(first["variants"].as_array().unwrap().len(), 1);
+        let variant = &first["variants"][0];
+        assert_eq!(variant["runtime"], "mlx");
+        assert_eq!(variant["quant"], "4bit");
+        assert_eq!(
+            variant["source_revision"],
+            "475b9088d29754a3379866cf5aeb6b41acd313c2"
+        );
+        assert_eq!(variant["artifact_size_bytes"], 5_179_241_512_i64);
+        assert_eq!(variant["files"].as_array().unwrap().len(), 10);
+
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("exact final V294 state must be idempotent");
+        let after_replay: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' - 'sentinel'
+               FROM fleet_model_catalog catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed V294 row");
+        let unrelated_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated-v294'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read unrelated V294 row");
+        assert_eq!(after_replay, first);
+        assert_eq!(unrelated_after, unrelated_before);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v294_rejects_empty_partial_metadata_and_duplicate_states_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("seed exact V294 authority");
+
+        sqlx::query("UPDATE fleet_model_catalog SET variants = '[]' WHERE id = 'gemma4-e4b-it'")
+            .execute(&pool)
+            .await
+            .expect("create empty V294 variant drift");
+        let empty_error = v294_rejection(&pool).await;
+        assert!(
+            empty_error.contains("found unreviewed Gemma 4 E4B authority state"),
+            "unexpected empty-state error: {empty_error}"
+        );
+        let variants_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rejected empty V294 state");
+        assert_eq!(variants_after, serde_json::json!([]));
+
+        sqlx::query("DELETE FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'")
+            .execute(&pool)
+            .await
+            .expect("reset V294 drift fixture");
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("restore exact V294 authority");
+        sqlx::query(
+            "UPDATE fleet_model_catalog SET name = 'Drifted Gemma' WHERE id = 'gemma4-e4b-it'",
+        )
+        .execute(&pool)
+        .await
+        .expect("create V294 metadata drift");
+        let metadata_error = v294_rejection(&pool).await;
+        assert!(metadata_error.contains("found unreviewed Gemma 4 E4B authority state"));
+        let name_after: String =
+            sqlx::query_scalar("SELECT name FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'")
+                .fetch_one(&pool)
+                .await
+                .expect("read rejected V294 metadata drift");
+        assert_eq!(name_after, "Drifted Gemma");
+
+        sqlx::query("DELETE FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'")
+            .execute(&pool)
+            .await
+            .expect("reset V294 duplicate fixture");
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("restore exact V294 row for duplicate fixture");
+        sqlx::query(
+            "INSERT INTO fleet_model_catalog
+             SELECT * FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .execute(&pool)
+        .await
+        .expect("create duplicate exact V294 row");
+        let duplicate_error = v294_rejection(&pool).await;
+        assert!(
+            duplicate_error.contains("found duplicate gemma4-e4b-it catalog rows"),
+            "unexpected duplicate-state error: {duplicate_error}"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v294_fresh_v161_bootstrap_converges_to_exact_authority_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh V161 bootstrap plus V294 must converge");
+        assert_eq!(final_version, 294);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 294")
+                .fetch_one(&pool)
+                .await
+                .expect("V294 must be durably recorded");
+        assert_eq!(migration_name, "ace_gemma4_mlx_exact_authority");
+        let exact_files: i32 = sqlx::query_scalar(
+            "SELECT jsonb_array_length(variants->0->'files')
+               FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bootstrapped V294 authority");
+        assert_eq!(exact_files, 10);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
     async fn reset_enrollment_authority_to_original_v289(pool: &PgPool) {
         sqlx::raw_sql(
             r#"
@@ -2796,10 +3035,10 @@ mod tests {
             .execute(pool)
             .await
             .expect("recreate immutable V289 enrollment authority");
-        sqlx::query("DELETE FROM _migrations WHERE version = 290")
+        sqlx::query("DELETE FROM _migrations WHERE version >= 290")
             .execute(pool)
             .await
-            .expect("rewind only the V290 test marker");
+            .expect("rewind V290 and every later test marker");
     }
 
     async fn switch_test_roster_to_legacy_tables(pool: &PgPool) {
@@ -4213,7 +4452,7 @@ mod tests {
         let final_version = run_postgres_migrations(&pool)
             .await
             .expect("V290 runner repair should apply");
-        assert_eq!(final_version, 290);
+        assert_eq!(final_version, 294);
         let migration_name: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 290")
                 .fetch_one(&pool)
@@ -4261,15 +4500,15 @@ mod tests {
         .execute(&pool)
         .await
         .expect("simulate the already-hardened V289 deployment");
-        sqlx::query("DELETE FROM _migrations WHERE version = 290")
+        sqlx::query("DELETE FROM _migrations WHERE version >= 290")
             .execute(&pool)
             .await
-            .expect("rewind only the V290 test marker");
+            .expect("rewind V290 and every later test marker");
 
         let final_version = run_postgres_migrations(&pool)
             .await
             .expect("V290 should accept the reviewed hardened V289 shape");
-        assert_eq!(final_version, 290);
+        assert_eq!(final_version, 294);
         validate_secure_enrollment_schema(&pool)
             .await
             .expect("idempotent V290 must preserve the exact authority");

@@ -492,6 +492,20 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 human_bytes(summary.total_bytes)
             );
         }
+        crate::ModelCommand::ImportAceGemma4Mlx => {
+            let report = ff_agent::ace_mlx_import::import_ace_gemma4_mlx(&pool).await?;
+            let disposition = match report.disposition {
+                ff_agent::ace_mlx_import::ImportDisposition::Imported => "imported",
+                ff_agent::ace_mlx_import::ImportDisposition::AlreadyPresent => {
+                    "already present and reverified"
+                }
+            };
+            println!(
+                "Ace Gemma 4 E4B MLX: {disposition}; path={}; library_id={}",
+                report.final_path.display(),
+                report.library_id
+            );
+        }
         crate::ModelCommand::Disk { json } => {
             let rows = ff_db::pg_latest_disk_usage(&pool).await?;
             if json {

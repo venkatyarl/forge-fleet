@@ -10,6 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use ff_db::{pg_delete_library, pg_list_catalog, pg_list_library, pg_upsert_library};
+use sqlx::Row;
 
 /// Summary of a scan run.
 #[derive(Debug, Clone, Default)]
@@ -141,6 +142,45 @@ pub async fn scan_local_library(
 
     for d in &discovered {
         let was_present = existing_paths.contains(&d.file_path);
+        if exact_ace_rescan_candidate(worker_name, d) {
+            if let Err(error) =
+                crate::ace_mlx_import::verify_installed_ace_gemma4_mlx(Path::new(&d.file_path))
+            {
+                tracing::error!(
+                    "exact Ace Gemma 4 verification failed for {}: {error:#}",
+                    d.file_path
+                );
+                if verbose {
+                    eprintln!(
+                        "[scan] EXACT ACE VERIFY FAILED for {}: {error:#}",
+                        d.file_path
+                    );
+                }
+                continue;
+            }
+            match index_exact_ace_gemma4_mlx(pool, Path::new(&d.file_path)).await {
+                Ok(_) => {
+                    if was_present {
+                        summary.updated += 1;
+                    } else {
+                        summary.added += 1;
+                    }
+                    summary.total_bytes = summary.total_bytes.saturating_add(d.size_bytes);
+                    seen_paths.insert(d.file_path.clone());
+                }
+                Err(error) => {
+                    tracing::error!(
+                        "exact Ace Gemma 4 index failed for {}: {error}",
+                        d.file_path
+                    );
+                    if verbose {
+                        eprintln!("[scan] EXACT ACE INDEX FAILED for {}: {error}", d.file_path);
+                    }
+                }
+            }
+            // Never let the generic upsert repair or rewrite Ace's exact row.
+            continue;
+        }
         match pg_upsert_library(
             pool,
             worker_name,
@@ -188,6 +228,208 @@ pub async fn scan_local_library(
     }
 
     Ok(summary)
+}
+
+fn exact_ace_rescan_candidate(worker_name: &str, discovered: &Discovered) -> bool {
+    worker_name == "ace" && discovered.catalog_id == crate::ace_mlx_import::CATALOG_ID
+}
+
+/// Register only the exact, already-promoted Ace Gemma 4 E4B MLX directory.
+///
+/// The general scanner intentionally reconciles an entire models root and can
+/// delete rows for missing paths.  The fixed Ace importer must not acquire that
+/// unrelated blast radius, so it uses this narrow post-promotion path instead.
+/// Filesystem manifest verification and catalog authority comparison happen in
+/// `ace_mlx_import` before this helper is called; this still requires the exact
+/// catalog match produced by the scanner classifier before writing one pinned
+/// library row.
+pub(crate) async fn index_exact_ace_gemma4_mlx(
+    pool: &sqlx::PgPool,
+    final_path: &Path,
+) -> Result<String, String> {
+    let catalog_row = ff_db::pg_get_catalog(pool, crate::ace_mlx_import::CATALOG_ID)
+        .await
+        .map_err(|error| format!("read exact Ace Gemma 4 catalog row: {error}"))?
+        .ok_or_else(|| "exact Ace Gemma 4 catalog row is missing".to_string())?;
+    let discovered =
+        classify_dir_with_runtime_hint(final_path, std::slice::from_ref(&catalog_row), Some("mlx"))
+            .ok_or_else(|| {
+                "promoted Ace Gemma 4 directory failed MLX classification".to_string()
+            })?;
+    let exact_path = final_path
+        .to_str()
+        .ok_or_else(|| "exact Ace model path is not valid UTF-8".to_string())?
+        .to_string();
+    let expected_weight_bytes = crate::ace_mlx_import::MANIFEST
+        .iter()
+        .find(|entry| entry.name == "model.safetensors")
+        .map(|entry| entry.size_bytes)
+        .ok_or_else(|| "compiled Ace manifest has no model.safetensors".to_string())?;
+    if discovered.catalog_id != crate::ace_mlx_import::CATALOG_ID
+        || discovered.runtime != "mlx"
+        || discovered.quant.as_deref() != Some("4bit")
+        || discovered.file_path != exact_path
+        || discovered.size_bytes != expected_weight_bytes
+    {
+        return Err(format!(
+            "promoted Ace Gemma 4 scanner identity drifted: catalog={} runtime={} quant={:?} path={} size={}",
+            discovered.catalog_id,
+            discovered.runtime,
+            discovered.quant,
+            discovered.file_path,
+            discovered.size_bytes
+        ));
+    }
+
+    let expected_weight_bytes = i64::try_from(expected_weight_bytes)
+        .map_err(|_| "Ace model weight size exceeds i64".to_string())?;
+    crate::ace_mlx_import::verify_installed_ace_gemma4_mlx(final_path)
+        .map_err(|error| format!("reverify exact Ace Gemma 4 before indexing: {error:#}"))?;
+    let mut transaction = pool
+        .begin()
+        .await
+        .map_err(|error| format!("begin exact Ace library transaction: {error}"))?;
+    // Hold the exact catalog authority stable through the library write.  The
+    // pre-copy check prevents wasting the multi-gigabyte copy under drift; this
+    // in-transaction check closes the final validation-to-index race.
+    let authority_rows: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+                   'id', id, 'name', name, 'family', family,
+                   'parameters', parameters, 'tier', tier,
+                   'description', description, 'gated', gated,
+                   'preferred_workloads', preferred_workloads,
+                   'variants', variants, 'tool_calling', tool_calling,
+                   'display_name', display_name, 'tasks', tasks,
+                   'modalities', modalities, 'benchmarks', benchmarks,
+                   'license', license, 'lifecycle', lifecycle)
+           FROM fleet_model_catalog
+          WHERE id = $1
+          FOR SHARE",
+    )
+    .bind(crate::ace_mlx_import::CATALOG_ID)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|error| format!("lock exact Ace Gemma 4 catalog authority: {error}"))?;
+    match authority_rows.as_slice() {
+        [actual] if *actual == crate::ace_mlx_import::expected_catalog_row() => {}
+        [actual] => {
+            return Err(format!(
+                "Ace Gemma 4 catalog authority drifted before indexing: {actual}"
+            ));
+        }
+        [] => return Err("Ace Gemma 4 catalog authority disappeared before indexing".to_string()),
+        _ => {
+            return Err(format!(
+                "Ace Gemma 4 catalog authority duplicated before indexing: found {} rows",
+                authority_rows.len()
+            ));
+        }
+    }
+    let rows = sqlx::query(
+        "SELECT id::text AS id, worker_name, catalog_id, runtime, quant,
+                file_path, size_bytes, sha256, source_url, state, pinned
+           FROM fleet_model_library
+          WHERE worker_name = 'ace' AND file_path = $1
+          FOR UPDATE",
+    )
+    .bind(&exact_path)
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|error| format!("lock exact Ace Gemma 4 library row: {error}"))?;
+
+    let library_id = match rows.as_slice() {
+        [] => sqlx::query_scalar::<_, String>(
+            "INSERT INTO fleet_model_library
+                (worker_name, catalog_id, runtime, quant, file_path, size_bytes,
+                 sha256, source_url, state, pinned)
+             VALUES ('ace', $1, 'mlx', '4bit', $2, $3, NULL, $4, 'cold', true)
+             RETURNING id::text",
+        )
+        .bind(crate::ace_mlx_import::CATALOG_ID)
+        .bind(&exact_path)
+        .bind(expected_weight_bytes)
+        .bind(crate::ace_mlx_import::SOURCE_URL)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(|error| format!("insert exact Ace Gemma 4 library row: {error}"))?,
+        [row] => {
+            let id: String = row
+                .try_get("id")
+                .map_err(|error| format!("read exact Ace library id: {error}"))?;
+            let worker_name: String = row
+                .try_get("worker_name")
+                .map_err(|error| format!("read exact Ace library worker: {error}"))?;
+            let catalog_id: String = row
+                .try_get("catalog_id")
+                .map_err(|error| format!("read exact Ace library catalog: {error}"))?;
+            let runtime: String = row
+                .try_get("runtime")
+                .map_err(|error| format!("read exact Ace library runtime: {error}"))?;
+            let quant: Option<String> = row
+                .try_get("quant")
+                .map_err(|error| format!("read exact Ace library quant: {error}"))?;
+            let file_path: String = row
+                .try_get("file_path")
+                .map_err(|error| format!("read exact Ace library path: {error}"))?;
+            let size_bytes: i64 = row
+                .try_get("size_bytes")
+                .map_err(|error| format!("read exact Ace library size: {error}"))?;
+            let sha256: Option<String> = row
+                .try_get("sha256")
+                .map_err(|error| format!("read exact Ace library hash: {error}"))?;
+            let existing_source_url: Option<String> = row
+                .try_get("source_url")
+                .map_err(|error| format!("read exact Ace library source: {error}"))?;
+            let state: String = row
+                .try_get("state")
+                .map_err(|error| format!("read exact Ace library state: {error}"))?;
+            let pinned: bool = row
+                .try_get("pinned")
+                .map_err(|error| format!("read exact Ace library pin: {error}"))?;
+            if worker_name != "ace"
+                || catalog_id != crate::ace_mlx_import::CATALOG_ID
+                || runtime != "mlx"
+                || quant.as_deref() != Some("4bit")
+                || file_path != exact_path
+                || size_bytes != expected_weight_bytes
+                || sha256.is_some()
+                || existing_source_url.as_deref() != Some(crate::ace_mlx_import::SOURCE_URL)
+                || !matches!(state.as_str(), "cold" | "hot")
+            {
+                return Err(format!(
+                    "existing Ace Gemma 4 library row {id} has unreviewed authority drift"
+                ));
+            }
+            if !pinned {
+                let updated = sqlx::query(
+                    "UPDATE fleet_model_library SET pinned = true
+                      WHERE id = $1::uuid AND pinned = false",
+                )
+                .bind(&id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|error| format!("pin exact Ace Gemma 4 library row: {error}"))?
+                .rows_affected();
+                if updated != 1 {
+                    return Err(format!(
+                        "exact Ace Gemma 4 pin transition changed {updated} rows"
+                    ));
+                }
+            }
+            id
+        }
+        _ => {
+            return Err(format!(
+                "duplicate Ace Gemma 4 library authority: found {} rows",
+                rows.len()
+            ));
+        }
+    };
+    transaction
+        .commit()
+        .await
+        .map_err(|error| format!("commit exact Ace Gemma 4 library row: {error}"))?;
+    Ok(library_id)
 }
 
 /// Classify a top-level directory, descending one level for known directories
@@ -1038,6 +1280,53 @@ mod tests {
         assert_eq!(discovered[0].quant.as_deref(), Some("4bit"));
         assert_eq!(discovered[0].file_path, model.to_string_lossy());
         assert_eq!(discovered[0].size_bytes, 7);
+    }
+
+    #[test]
+    fn exact_gemma4_e4b_mlx_directory_resolves_to_v294_catalog_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let vendor = temp.path().join("mlx");
+        let model = vendor.join("gemma-4-e4b-it-4bit");
+        write_valid_mlx_model(&model, true);
+        let catalog = vec![row_with_variants(
+            "gemma4-e4b-it",
+            "Gemma 4 E4B Instruct",
+            serde_json::json!([{
+                "runtime": "mlx",
+                "quant": "4bit",
+                "hf_repo": "mlx-community/gemma-4-e4b-it-4bit",
+                "source_revision": "475b9088d29754a3379866cf5aeb6b41acd313c2"
+            }]),
+        )];
+
+        let discovered = classify_top_level_dir(&vendor, &catalog);
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].catalog_id, "gemma4-e4b-it");
+        assert_eq!(discovered[0].runtime, "mlx");
+        assert_eq!(discovered[0].quant.as_deref(), Some("4bit"));
+        assert_eq!(discovered[0].file_path, model.to_string_lossy());
+    }
+
+    #[test]
+    fn generic_ace_rescan_routes_minimally_valid_drift_away_from_generic_upsert() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("gemma-4-e4b-it-4bit");
+        write_valid_mlx_model(&model, true);
+        let discovered = Discovered {
+            catalog_id: crate::ace_mlx_import::CATALOG_ID.to_string(),
+            runtime: "mlx".to_string(),
+            quant: Some("4bit".to_string()),
+            file_path: model.to_string_lossy().to_string(),
+            size_bytes: 7,
+        };
+
+        assert!(exact_ace_rescan_candidate("ace", &discovered));
+        assert!(!exact_ace_rescan_candidate("adele", &discovered));
+        assert!(
+            crate::ace_mlx_import::verify_installed_ace_gemma4_mlx(&model).is_err(),
+            "a minimally valid MLX directory must not satisfy the exact ten-file authority"
+        );
     }
 
     #[test]
