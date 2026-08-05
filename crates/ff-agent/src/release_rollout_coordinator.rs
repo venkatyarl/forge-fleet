@@ -1953,7 +1953,7 @@ async fn acquire_to_coordinator_cache(
         ])
         .stdout(Stdio::from(temp.reopen()?))
         .stderr(Stdio::piped());
-    let output = command.output().await?;
+    let output = wait_with_preserved_stdio(&mut command).await?;
     if !output.status.success() {
         return Err(ReleaseRolloutError::Transport(format!(
             "candidate custody transfer failed: {}",
@@ -1982,6 +1982,12 @@ async fn acquire_to_coordinator_cache(
         ));
     }
     Ok(temp)
+}
+
+async fn wait_with_preserved_stdio(
+    command: &mut tokio::process::Command,
+) -> std::io::Result<std::process::Output> {
+    command.spawn()?.wait_with_output().await
 }
 
 fn ssh_destination(endpoint: &RolloutEndpoint) -> Result<String> {
@@ -2971,5 +2977,22 @@ mod tests {
                 if message.contains("another foreground coordinator")
         ));
         assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn candidate_capture_preserves_preconfigured_stdout_file() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "printf candidate-bytes; printf diagnostic >&2"])
+            .stdout(Stdio::from(temp.reopen().unwrap()))
+            .stderr(Stdio::piped());
+
+        let output = wait_with_preserved_stdio(&mut command).await.unwrap();
+
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"diagnostic");
+        assert_eq!(std::fs::read(temp.path()).unwrap(), b"candidate-bytes");
     }
 }
