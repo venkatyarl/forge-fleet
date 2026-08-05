@@ -1198,13 +1198,21 @@ async fn dispatch_one(
     // Split (backend, output) into the backend used + a plain Result<Output> for
     // the existing consumers. On error, no backend is carried, so use the
     // best-effort primary (for training attribution).
-    let (backend_used, dispatch_result): (String, Result<Output>) = match dispatch_full {
-        Ok((b, out)) => (b, Ok(out)),
+    let (backend_used, dispatch_result, dispatch_outcome): (
+        String,
+        Result<Output>,
+        DispatchOutcome,
+    ) = match dispatch_full {
+        Ok((b, out, outcome)) => (b, Ok(out), outcome),
         Err(e) => (
             primary_dispatch_backend(&pg, item.computer_id).await,
             Err(e),
+            DispatchOutcome::FailedNoDiff,
         ),
     };
+    let deliverable_diff = worktree_has_diff(&worktree.worktree_path);
+    let deliverable_commits =
+        head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch);
 
     // Capture the dispatch I/O in ff_interactions (training data) — `ff cli` is a
     // pass-through that doesn't log itself, so the dispatch records its own turn.
@@ -1214,6 +1222,9 @@ async fn dispatch_one(
         &worker_name,
         &backend_used,
         &dispatch_result,
+        dispatch_outcome,
+        deliverable_diff,
+        deliverable_commits,
         started.elapsed(),
     )
     .await;
@@ -3546,6 +3557,82 @@ pub enum DispatchOutcome {
     TimeoutSalvaged,
 }
 
+impl DispatchOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "clean_success",
+            Self::FailedNoDiff => "failed_no_diff",
+            Self::FailedWithDiff => "failed_with_diff",
+            Self::TimeoutSalvaged => "timeout_salvaged",
+        }
+    }
+
+    fn produced_deliverable_work(self) -> bool {
+        !matches!(self, Self::FailedNoDiff)
+    }
+}
+
+fn classify_completed_output(output: &Output, has_deliverable_work: bool) -> DispatchOutcome {
+    if !has_deliverable_work {
+        DispatchOutcome::FailedNoDiff
+    } else if output.status.success() {
+        DispatchOutcome::Success
+    } else {
+        DispatchOutcome::FailedWithDiff
+    }
+}
+
+fn dispatch_interaction_outcome(
+    backend: &str,
+    dispatch_outcome: DispatchOutcome,
+) -> (&'static str, Option<String>) {
+    if dispatch_outcome.produced_deliverable_work() {
+        ("success", None)
+    } else {
+        (
+            "error",
+            Some(format!("backend {backend} produced no deliverable diff")),
+        )
+    }
+}
+
+fn dispatch_request_meta(
+    result: &Result<Output>,
+    dispatch_outcome: DispatchOutcome,
+    deliverable_diff: bool,
+    deliverable_commits: bool,
+    tokens_estimated: bool,
+) -> serde_json::Value {
+    let process_exit_code = match dispatch_outcome {
+        DispatchOutcome::Success
+        | DispatchOutcome::FailedNoDiff
+        | DispatchOutcome::FailedWithDiff => {
+            result.as_ref().ok().and_then(|output| output.status.code())
+        }
+        DispatchOutcome::TimeoutSalvaged => None,
+    };
+    let timed_out = matches!(dispatch_outcome, DispatchOutcome::TimeoutSalvaged)
+        || result.as_ref().err().is_some_and(|error| {
+            let text = error.to_string().to_ascii_lowercase();
+            text.contains("timed out") || text.contains("timeout")
+        });
+    let response_empty = result
+        .as_ref()
+        .ok()
+        .is_none_or(|output| output.stdout.iter().all(u8::is_ascii_whitespace));
+
+    serde_json::json!({
+        "tokens_estimated": tokens_estimated,
+        "dispatch_contract_version": 1,
+        "dispatch_outcome": dispatch_outcome.as_str(),
+        "process_exit_code": process_exit_code,
+        "timed_out": timed_out,
+        "deliverable_diff": deliverable_diff,
+        "deliverable_commits": deliverable_commits,
+        "response_empty": response_empty,
+    })
+}
+
 /// A clean, quick exit with no stdout and no diff is a backend failure: the
 /// task never received a usable agent result. Timeouts without a diff are the
 /// same class regardless of elapsed time.
@@ -4118,9 +4205,18 @@ async fn record_dispatch_interaction(
     worker_name: &str,
     backend: &str,
     result: &Result<Output>,
+    dispatch_outcome: DispatchOutcome,
+    deliverable_diff: bool,
+    deliverable_commits: bool,
     elapsed: Duration,
 ) {
     let request_text = dispatch_prompt(item);
+    let dispatch_outcome = if result.is_err() {
+        DispatchOutcome::FailedNoDiff
+    } else {
+        dispatch_outcome
+    };
+    let (coarse_outcome, no_diff_error) = dispatch_interaction_outcome(backend, dispatch_outcome);
     let (response_text, outcome, error_text, tokens_in, tokens_out, tokens_estimated) = match result
     {
         Ok(out) => {
@@ -4135,7 +4231,14 @@ async fn record_dispatch_interaction(
             let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&combined);
             let (tin, tout, estimated) =
                 crate::llm_attribution::tokens_or_estimate(tin, tout, &request_text, &text);
-            (text, "success".to_string(), None, tin, tout, estimated)
+            (
+                text,
+                coarse_outcome.to_string(),
+                no_diff_error,
+                tin,
+                tout,
+                estimated,
+            )
         }
         Err(e) => (
             String::new(),
@@ -4168,7 +4271,13 @@ async fn record_dispatch_interaction(
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
         request_text,
-        request_meta: serde_json::json!({ "tokens_estimated": tokens_estimated }),
+        request_meta: dispatch_request_meta(
+            result,
+            dispatch_outcome,
+            deliverable_diff,
+            deliverable_commits,
+            tokens_estimated,
+        ),
         engine: Some(engine),
         response_text,
         tokens_in,
@@ -4325,7 +4434,7 @@ async fn run_ff_dispatch(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
-) -> Result<(String, Output)> {
+) -> Result<(String, Output, DispatchOutcome)> {
     let mut prompt = dispatch_prompt(item);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
     // pulled from the shared code graph, so the agent starts there instead of
@@ -4621,6 +4730,7 @@ async fn run_ff_dispatch(
                 return Ok((
                     "local".to_string(),
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
+                    DispatchOutcome::Success,
                 ));
             }
             Ok(Ok(outcome)) => {
@@ -4681,7 +4791,7 @@ async fn run_ff_dispatch(
         lane15_breaker_open,
     ) {
         if let Some((backend, output)) = dispatch_to_480b(pg, item, worktree, &prompt).await {
-            return Ok((backend, output));
+            return Ok((backend, output, DispatchOutcome::Success));
         }
     } else if lane15_trigger && !lane15_enabled {
         info!(
@@ -4906,6 +5016,7 @@ async fn run_ff_dispatch(
                         return Ok((
                             backend.clone(),
                             synthetic_output("salvaged diff after backend timeout"),
+                            DispatchOutcome::TimeoutSalvaged,
                         ));
                     }
                     // The backend may have COMMITTED its changes and then hung.
@@ -4922,6 +5033,7 @@ async fn run_ff_dispatch(
                         return Ok((
                             backend.clone(),
                             synthetic_output("salvaged self-commits after backend timeout"),
+                            DispatchOutcome::TimeoutSalvaged,
                         ));
                     }
                     // No diff → genuine failure: record it and SWITCH to the next
@@ -5007,27 +5119,49 @@ async fn run_ff_dispatch(
                 }
             }
             if out.status.success() {
-                let _ =
-                    crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
-                crate::cloud_budget::record_success(
-                    pg,
-                    backend,
-                    budget.as_ref().and_then(|row| row.window_exhausted_until),
-                )
-                .await;
-                // Clean run → full headroom signal (self-corrects a prior limit).
-                let _ =
-                    crate::circuit_breaker::record_usage_signal(pg, computer_id, backend, 100.0)
-                        .await;
-                if attempt > 0 || backend != &backends[0] {
-                    info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
+                let has_deliverable_work = worktree_has_diff(&worktree.worktree_path)
+                    || head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch);
+                let outcome = classify_completed_output(&out, has_deliverable_work);
+                if outcome.produced_deliverable_work() {
+                    let _ =
+                        crate::circuit_breaker::record_provider_success(pg, computer_id, backend)
+                            .await;
+                    crate::cloud_budget::record_success(
+                        pg,
+                        backend,
+                        budget.as_ref().and_then(|row| row.window_exhausted_until),
+                    )
+                    .await;
+                    // Clean run with deliverable work → full headroom signal.
+                    let _ = crate::circuit_breaker::record_usage_signal(
+                        pg,
+                        computer_id,
+                        backend,
+                        100.0,
+                    )
+                    .await;
+                    if attempt > 0 || backend != &backends[0] {
+                        info!(backend = %backend, attempt, "run_ff_dispatch: recovered via auto-continue/failover");
+                    }
+                } else {
+                    let _ = crate::circuit_breaker::record_provider_failure(
+                        pg,
+                        computer_id,
+                        backend,
+                        "no_deliverable_work",
+                    )
+                    .await;
+                    warn!(backend = %backend, "run_ff_dispatch: clean process exit produced no deliverable work");
                 }
-                return Ok((backend.clone(), out));
+                return Ok((backend.clone(), out, outcome));
             }
             // A `--require-change` no-op (exit 3) is a task-level failure, not a
             // provider fault — surface it without classify/retry/switch.
             if out.status.code() == Some(3) {
-                return Ok((backend.clone(), out));
+                let has_deliverable_work = worktree_has_diff(&worktree.worktree_path)
+                    || head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch);
+                let outcome = classify_completed_output(&out, has_deliverable_work);
+                return Ok((backend.clone(), out, outcome));
             }
             // A non-zero exit that STILL wrote a real diff (the backend edited
             // files, then its own final verify/exit step failed) is salvageable
@@ -5044,10 +5178,7 @@ async fn run_ff_dispatch(
                     budget.as_ref().and_then(|row| row.window_exhausted_until),
                 )
                 .await;
-                return Ok((
-                    backend.clone(),
-                    synthetic_output("salvaged diff after non-zero backend exit"),
-                ));
+                return Ok((backend.clone(), out, DispatchOutcome::FailedWithDiff));
             }
             // Same self-commit case: backend committed, then its own verify step
             // failed and exited non-zero. The commits are still deliverable.
@@ -5055,10 +5186,7 @@ async fn run_ff_dispatch(
                 warn!(backend = %backend, code = ?out.status.code(), "run_ff_dispatch: backend exited non-zero but self-committed — salvaging");
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
-                return Ok((
-                    backend.clone(),
-                    synthetic_output("salvaged self-commits after non-zero backend exit"),
-                ));
+                return Ok((backend.clone(), out, DispatchOutcome::FailedWithDiff));
             }
             let combined = format!(
                 "{}\n{}",
@@ -5134,6 +5262,7 @@ async fn run_ff_dispatch(
                         synthetic_output(
                             "cloud exhausted — built on local fleet router (glm/devstral)",
                         ),
+                        DispatchOutcome::Success,
                     ));
                 }
                 Ok(outcome) => {
@@ -5164,10 +5293,13 @@ async fn run_ff_dispatch(
                     .await;
                     bail!("forced backend {forced_backend} exited successfully with empty stdout");
                 }
-                if out.status.success() {
+                let has_deliverable_work = worktree_has_diff(&worktree.worktree_path)
+                    || head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch);
+                let outcome = classify_completed_output(&out, has_deliverable_work);
+                if outcome.produced_deliverable_work() {
                     crate::cloud_budget::record_success(pg, &forced_backend, None).await;
                 }
-                return Ok((forced_backend, out));
+                return Ok((forced_backend, out, outcome));
             }
             Err(e) => {
                 if is_dispatch_authority_error(&e) {
@@ -5184,6 +5316,7 @@ async fn run_ff_dispatch(
                     return Ok((
                         forced_backend,
                         synthetic_output("salvaged diff after forced backend timeout"),
+                        DispatchOutcome::TimeoutSalvaged,
                     ));
                 }
                 if head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch) {
@@ -5197,6 +5330,7 @@ async fn run_ff_dispatch(
                     return Ok((
                         forced_backend,
                         synthetic_output("salvaged self-commits after forced backend timeout"),
+                        DispatchOutcome::TimeoutSalvaged,
                     ));
                 }
                 let _ = crate::circuit_breaker::record_provider_failure(
@@ -5216,7 +5350,9 @@ async fn run_ff_dispatch(
             }
         }
     }
-    last_output.map(Ok).unwrap_or_else(|| {
+    last_output
+        .map(|(backend, output)| Ok((backend, output, DispatchOutcome::FailedNoDiff)))
+        .unwrap_or_else(|| {
         if backend_errors.is_empty() {
             // Genuinely nothing to run: every backend was breaker-open / skipped.
             bail!(
@@ -5231,7 +5367,7 @@ async fn run_ff_dispatch(
                 backend_errors.join("\n")
             )
         }
-    })
+        })
 }
 
 fn primary_or_default_backend(backends: &[String]) -> String {
@@ -7515,18 +7651,20 @@ mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
         WorktreeRecord, affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, check_dispatch_prerequisites, classify_dispatch_outcome,
-        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
-        contains_file_line_citation, default_clone_path, dispatch_budget_for_host, dispatch_prompt,
-        expand_home, is_build_timeout, legacy_acceptance_sql, local_failure_diagnosis_for,
-        local_failure_diagnosis_for_attempt, mark_local_retest_failed, mark_local_retest_passed,
-        mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
-        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
-        rewrite_github_host_alias, same_model_family, should_attempt_lane15,
-        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
-        try_acquire_lane15_480b_permit, use_local_lane, validate_manifest_fields,
+        builder_excludes_480b, check_dispatch_prerequisites, classify_completed_output,
+        classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
+        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
+        dispatch_budget_for_host, dispatch_interaction_outcome, dispatch_prompt,
+        dispatch_request_meta, expand_home, is_build_timeout, legacy_acceptance_sql,
+        local_failure_diagnosis_for, local_failure_diagnosis_for_attempt, mark_local_retest_failed,
+        mark_local_retest_passed, mark_ready_for_review, mirror_repo_url, normalized_cloud_backend,
+        order_cloud_reviewers, parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis,
+        primary_or_default_backend, quick_empty_success_is_provider_failure,
+        record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
+        resolve_dispatch_repo_binding, retry_error_is_actionable, rewrite_github_host_alias,
+        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
+        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
+        use_local_lane, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::{Path, PathBuf};
@@ -9432,6 +9570,94 @@ mod tests {
             classify_dispatch_outcome(&ok_output(), true),
             DispatchOutcome::Success
         );
+    }
+
+    #[test]
+    fn completed_output_requires_deliverable_work_for_success() {
+        let clean = ok_output().expect("output");
+        assert_eq!(
+            classify_completed_output(&clean, false),
+            DispatchOutcome::FailedNoDiff
+        );
+        assert_eq!(
+            classify_completed_output(&clean, true),
+            DispatchOutcome::Success
+        );
+
+        let nonzero = Output {
+            status: std::process::ExitStatus::from_raw(1 << 8),
+            stdout: Vec::new(),
+            stderr: b"verification failed".to_vec(),
+        };
+        assert_eq!(
+            classify_completed_output(&nonzero, true),
+            DispatchOutcome::FailedWithDiff
+        );
+    }
+
+    #[test]
+    fn interaction_keeps_coarse_outcome_and_exact_dispatch_subtype() {
+        let (coarse, error) = dispatch_interaction_outcome("kimi", DispatchOutcome::FailedNoDiff);
+        assert_eq!(coarse, "error");
+        assert_eq!(
+            error.as_deref(),
+            Some("backend kimi produced no deliverable diff")
+        );
+        assert_eq!(DispatchOutcome::FailedNoDiff.as_str(), "failed_no_diff");
+
+        for (outcome, exact) in [
+            (DispatchOutcome::Success, "clean_success"),
+            (DispatchOutcome::FailedWithDiff, "failed_with_diff"),
+            (DispatchOutcome::TimeoutSalvaged, "timeout_salvaged"),
+        ] {
+            let (coarse, error) = dispatch_interaction_outcome("kimi", outcome);
+            assert_eq!(coarse, "success");
+            assert!(error.is_none());
+            assert_eq!(outcome.as_str(), exact);
+        }
+    }
+
+    #[test]
+    fn interaction_metadata_preserves_process_and_deliverable_truth() {
+        let clean = ok_output();
+        let failed =
+            dispatch_request_meta(&clean, DispatchOutcome::FailedNoDiff, false, false, true);
+        assert_eq!(failed["dispatch_contract_version"], 1);
+        assert_eq!(failed["dispatch_outcome"], "failed_no_diff");
+        assert_eq!(failed["process_exit_code"], 0);
+        assert_eq!(failed["timed_out"], false);
+        assert_eq!(failed["deliverable_diff"], false);
+        assert_eq!(failed["deliverable_commits"], false);
+        assert_eq!(failed["response_empty"], false);
+        assert_eq!(failed["tokens_estimated"], true);
+
+        let timeout = dispatch_request_meta(
+            &ok_output(),
+            DispatchOutcome::TimeoutSalvaged,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(timeout["dispatch_outcome"], "timeout_salvaged");
+        assert!(timeout["process_exit_code"].is_null());
+        assert_eq!(timeout["timed_out"], true);
+        assert_eq!(timeout["deliverable_diff"], true);
+
+        let nonzero = Ok(Output {
+            status: std::process::ExitStatus::from_raw(3 << 8),
+            stdout: b"partial work".to_vec(),
+            stderr: b"verification failed".to_vec(),
+        });
+        let salvaged = dispatch_request_meta(
+            &nonzero,
+            DispatchOutcome::FailedWithDiff,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(salvaged["dispatch_outcome"], "failed_with_diff");
+        assert_eq!(salvaged["process_exit_code"], 3);
+        assert_eq!(salvaged["timed_out"], false);
     }
 
     #[test]
