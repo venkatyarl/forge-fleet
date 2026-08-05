@@ -20,6 +20,7 @@ pub mod operational_store;
 pub mod pm;
 pub mod postgres;
 pub mod queries;
+pub mod rollout_authority;
 pub mod runtime_registry;
 pub mod schema;
 pub mod work_queue;
@@ -27,6 +28,11 @@ pub mod work_queue;
 pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
+pub use migrations::{
+    AppliedPostgresMigration, LATEST_AUTOMATIC_POSTGRES_MIGRATION,
+    LATEST_EXPLICIT_POSTGRES_MIGRATION, PostgresMigrationDescriptor, PostgresMigrationStatus,
+    apply_explicit_postgres_migrations, postgres_migration_status,
+};
 pub use migrations::{
     SECURE_ENROLLMENT_XACT_LOCK_KEY, run_postgres_migrations, validate_secure_enrollment_schema,
 };
@@ -313,6 +319,16 @@ pub use queries::{
     // Orchestrator P2 — demand sensing emission (V116)
     record_session_work_signal,
     seed_from_fleet_toml,
+};
+pub use rollout_authority::{
+    FORBIDDEN_VINNY_ID, FORBIDDEN_VINNY_NAME, ReleaseRolloutAuthorityRow,
+    ReleaseRolloutAuthoritySpec, ReleaseRolloutTargetStateRow, ReleaseRolloutTransactionRow,
+    RolloutArtifactAuthority, RolloutAuthorityRegistration, RolloutAuthorityRegistrationOutcome,
+    RolloutTargetAuthority, RolloutTransactionBegin, RolloutTransactionBeginOutcome,
+    pg_begin_release_rollout, pg_cas_release_rollout_target_state,
+    pg_cas_release_rollout_transaction_state, pg_register_release_rollout_authority,
+    pg_renew_release_rollout_lease, pg_take_over_release_rollout_lease,
+    release_rollout_schema_is_exact,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sqlx::PgPool;

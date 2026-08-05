@@ -13828,6 +13828,446 @@ END
 $v294_ace_gemma4_mlx_exact_authority$;
 "#;
 
+/// v295: immutable exact release-rollout authority and leased execution state.
+///
+/// This migration is explicit-only. Ordinary daemon/startup migration paths
+/// must never apply it. Authority is assembled and sealed in one transaction;
+/// the deferred validators prevent any partial authority or transaction target
+/// set from becoming visible. V291 release rows remain the content authority.
+pub const SCHEMA_V295_RELEASE_ROLLOUT_AUTHORITY: &str = r#"
+ALTER TABLE _migrations
+    ADD COLUMN source_commit TEXT,
+    ADD COLUMN applied_by TEXT,
+    ADD CONSTRAINT migrations_v295_source_commit
+        CHECK (version <> 295 OR source_commit ~ '^[0-9a-f]{40}$'),
+    ADD CONSTRAINT migrations_v295_applied_by
+        CHECK (version <> 295 OR applied_by ~ '^[A-Za-z0-9._@-]{1,128}$');
+
+CREATE TABLE release_rollout_authorities (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_commit           TEXT NOT NULL UNIQUE,
+    expected_target_count   INTEGER NOT NULL,
+    expected_artifact_count INTEGER NOT NULL,
+    created_by              TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    sealed_at               TIMESTAMPTZ,
+    CONSTRAINT release_rollout_authority_source
+        CHECK (source_commit ~ '^[0-9a-f]{40}$'),
+    CONSTRAINT release_rollout_authority_target_count
+        CHECK (expected_target_count BETWEEN 1 AND 64),
+    CONSTRAINT release_rollout_authority_artifact_count
+        CHECK (expected_artifact_count = expected_target_count * 2),
+    CONSTRAINT release_rollout_authority_creator
+        CHECK (created_by ~ '^[A-Za-z0-9._@-]{1,128}$')
+);
+
+CREATE TABLE release_rollout_authority_targets (
+    authority_id      UUID NOT NULL
+        REFERENCES release_rollout_authorities(id) ON DELETE RESTRICT,
+    target_ordinal    INTEGER NOT NULL,
+    computer_id       UUID NOT NULL REFERENCES computers(id) ON DELETE RESTRICT,
+    computer_name     TEXT NOT NULL,
+    target_triple     TEXT NOT NULL,
+    artifact_version  TEXT NOT NULL,
+    PRIMARY KEY (authority_id, computer_id),
+    CONSTRAINT release_rollout_target_ordinal_unique
+        UNIQUE (authority_id, target_ordinal),
+    CONSTRAINT release_rollout_target_name_unique
+        UNIQUE (authority_id, computer_name),
+    CONSTRAINT release_rollout_target_ordinal
+        CHECK (target_ordinal BETWEEN 0 AND 63),
+    CONSTRAINT release_rollout_target_name
+        CHECK (computer_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    CONSTRAINT release_rollout_target_triple
+        CHECK (target_triple ~ '^[a-z0-9_]+(-[a-z0-9_.]+){2,4}$'),
+    CONSTRAINT release_rollout_target_version
+        CHECK (artifact_version ~ '^[a-z0-9][a-z0-9._+-]{0,127}$'),
+    CONSTRAINT release_rollout_target_not_vinny_name
+        CHECK (lower(computer_name) <> 'vinny'),
+    CONSTRAINT release_rollout_target_not_vinny_id
+        CHECK (computer_id <> 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+);
+
+CREATE TABLE release_rollout_authority_artifacts (
+    authority_id UUID NOT NULL,
+    computer_id  UUID NOT NULL,
+    artifact_name TEXT NOT NULL,
+    artifact_id  UUID NOT NULL REFERENCES release_artifacts(id) ON DELETE RESTRICT,
+    PRIMARY KEY (authority_id, computer_id, artifact_name),
+    CONSTRAINT release_rollout_authority_artifact_target
+        FOREIGN KEY (authority_id, computer_id)
+        REFERENCES release_rollout_authority_targets(authority_id, computer_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT release_rollout_required_artifact_name
+        CHECK (artifact_name IN ('ff', 'forgefleetd'))
+);
+
+CREATE TABLE release_rollout_transactions (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id            UUID NOT NULL UNIQUE,
+    authority_id          UUID NOT NULL
+        REFERENCES release_rollout_authorities(id) ON DELETE RESTRICT,
+    state                 TEXT NOT NULL DEFAULT 'planned',
+    lease_token           UUID NOT NULL DEFAULT gen_random_uuid(),
+    lease_owner           TEXT NOT NULL,
+    lease_expires_at      TIMESTAMPTZ NOT NULL,
+    lease_seconds         INTEGER NOT NULL,
+    cas_revision          BIGINT NOT NULL DEFAULT 0,
+    expected_target_count INTEGER NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    completed_at          TIMESTAMPTZ,
+    CONSTRAINT release_rollout_transaction_state
+        CHECK (state IN (
+            'planned', 'running', 'rolling_back',
+            'succeeded', 'failed', 'rolled_back', 'cancelled'
+        )),
+    CONSTRAINT release_rollout_transaction_owner
+        CHECK (lease_owner ~ '^[A-Za-z0-9._@-]{1,128}$'),
+    CONSTRAINT release_rollout_transaction_lease_seconds
+        CHECK (lease_seconds BETWEEN 30 AND 3600),
+    CONSTRAINT release_rollout_transaction_lease_time
+        CHECK (lease_expires_at > created_at),
+    CONSTRAINT release_rollout_transaction_revision
+        CHECK (cas_revision >= 0),
+    CONSTRAINT release_rollout_transaction_target_count
+        CHECK (expected_target_count BETWEEN 1 AND 64),
+    CONSTRAINT release_rollout_transaction_completion
+        CHECK ((state IN ('succeeded', 'failed', 'rolled_back', 'cancelled'))
+               = (completed_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX release_rollout_one_active_transaction
+    ON release_rollout_transactions ((1))
+    WHERE state IN ('planned', 'running', 'rolling_back');
+
+CREATE TABLE release_rollout_target_states (
+    transaction_id   UUID NOT NULL
+        REFERENCES release_rollout_transactions(id) ON DELETE RESTRICT,
+    computer_id      UUID NOT NULL REFERENCES computers(id) ON DELETE RESTRICT,
+    computer_name    TEXT NOT NULL,
+    target_ordinal   INTEGER NOT NULL,
+    target_triple    TEXT NOT NULL,
+    artifact_version TEXT NOT NULL,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    cas_revision     BIGINT NOT NULL DEFAULT 0,
+    detail           TEXT,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (transaction_id, computer_id),
+    CONSTRAINT release_rollout_state_ordinal_unique
+        UNIQUE (transaction_id, target_ordinal),
+    CONSTRAINT release_rollout_target_state
+        CHECK (state IN (
+            'pending', 'installing', 'verifying', 'succeeded',
+            'failed', 'rolling_back', 'rolled_back', 'skipped'
+        )),
+    CONSTRAINT release_rollout_target_state_revision CHECK (cas_revision >= 0),
+    CONSTRAINT release_rollout_state_not_vinny_name
+        CHECK (lower(computer_name) <> 'vinny'),
+    CONSTRAINT release_rollout_state_not_vinny_id
+        CHECK (computer_id <> 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+);
+
+CREATE FUNCTION release_rollout_authority_mutation_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_authority_mutation_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'sealed rollout authority cannot be deleted';
+    END IF;
+    IF OLD.sealed_at IS NULL
+       AND NEW.sealed_at IS NOT NULL
+       AND NEW.id = OLD.id
+       AND NEW.source_commit = OLD.source_commit
+       AND NEW.expected_target_count = OLD.expected_target_count
+       AND NEW.expected_artifact_count = OLD.expected_artifact_count
+       AND NEW.created_by = OLD.created_by
+       AND NEW.created_at = OLD.created_at
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'rollout authority permits only one exact seal transition';
+END
+$release_rollout_authority_mutation_guard$;
+
+CREATE TRIGGER release_rollout_authorities_immutable
+    BEFORE UPDATE OR DELETE ON release_rollout_authorities
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_authority_mutation_guard();
+
+CREATE FUNCTION release_rollout_child_mutation_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_child_mutation_guard$
+DECLARE
+    parent_id UUID;
+    parent_sealed_at TIMESTAMPTZ;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        parent_id := NEW.authority_id;
+    ELSE
+        parent_id := OLD.authority_id;
+        IF TG_OP = 'UPDATE' AND NEW.authority_id <> OLD.authority_id THEN
+            RAISE EXCEPTION 'rollout authority child cannot move between parents';
+        END IF;
+    END IF;
+    SELECT sealed_at INTO parent_sealed_at
+      FROM release_rollout_authorities
+     WHERE id = parent_id
+     FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rollout authority parent is missing';
+    END IF;
+    IF parent_sealed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'sealed rollout authority children are immutable';
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$release_rollout_child_mutation_guard$;
+
+CREATE TRIGGER release_rollout_targets_immutable_after_seal
+    BEFORE INSERT OR UPDATE OR DELETE ON release_rollout_authority_targets
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_child_mutation_guard();
+CREATE TRIGGER release_rollout_artifacts_immutable_after_seal
+    BEFORE INSERT OR UPDATE OR DELETE ON release_rollout_authority_artifacts
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_child_mutation_guard();
+
+CREATE FUNCTION validate_release_rollout_authority()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $validate_release_rollout_authority$
+DECLARE
+    authority release_rollout_authorities%ROWTYPE;
+    target_count BIGINT;
+    artifact_count BIGINT;
+BEGIN
+    SELECT * INTO authority
+      FROM release_rollout_authorities
+     WHERE id = NEW.id;
+    IF NOT FOUND OR authority.sealed_at IS NULL THEN
+        RAISE EXCEPTION 'partial rollout authority cannot commit unsealed';
+    END IF;
+
+    SELECT count(*) INTO target_count
+      FROM release_rollout_authority_targets
+     WHERE authority_id = authority.id;
+    SELECT count(*) INTO artifact_count
+      FROM release_rollout_authority_artifacts
+     WHERE authority_id = authority.id;
+    IF target_count <> authority.expected_target_count
+       OR artifact_count <> authority.expected_artifact_count
+    THEN
+        RAISE EXCEPTION 'partial rollout authority count mismatch';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM release_rollout_authority_targets target
+          LEFT JOIN computers computer ON computer.id = target.computer_id
+         WHERE target.authority_id = authority.id
+           AND (computer.id IS NULL
+                OR computer.name IS DISTINCT FROM target.computer_name
+                OR lower(computer.name) = 'vinny'
+                OR computer.id = 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+    ) THEN
+        RAISE EXCEPTION 'rollout target identity drift or forbidden Vinny target';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM release_rollout_authority_targets target
+          LEFT JOIN release_rollout_authority_artifacts exact_artifact
+            ON exact_artifact.authority_id = target.authority_id
+           AND exact_artifact.computer_id = target.computer_id
+          LEFT JOIN release_artifacts artifact ON artifact.id = exact_artifact.artifact_id
+         WHERE target.authority_id = authority.id
+         GROUP BY target.authority_id, target.computer_id,
+                  target.target_triple, target.artifact_version
+        HAVING count(exact_artifact.*) <> 2
+            OR count(*) FILTER (WHERE exact_artifact.artifact_name = 'ff') <> 1
+            OR count(*) FILTER (WHERE exact_artifact.artifact_name = 'forgefleetd') <> 1
+            OR bool_or(artifact.id IS NULL)
+            OR bool_or(artifact.artifact_name IS DISTINCT FROM exact_artifact.artifact_name)
+            OR bool_or(artifact.source_commit IS DISTINCT FROM authority.source_commit)
+            OR bool_or(artifact.target_triple IS DISTINCT FROM target.target_triple)
+            OR bool_or(artifact.artifact_version IS DISTINCT FROM target.artifact_version)
+    ) THEN
+        RAISE EXCEPTION 'rollout release identity is partial or drifted';
+    END IF;
+    RETURN NEW;
+END
+$validate_release_rollout_authority$;
+
+CREATE CONSTRAINT TRIGGER release_rollout_authority_exact_at_commit
+    AFTER INSERT OR UPDATE ON release_rollout_authorities
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION validate_release_rollout_authority();
+
+CREATE FUNCTION release_rollout_transaction_update_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_transaction_update_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'rollout transaction evidence cannot be deleted';
+    END IF;
+    IF OLD.state IN ('succeeded', 'failed', 'rolled_back', 'cancelled') THEN
+        RAISE EXCEPTION 'terminal rollout transaction evidence is immutable';
+    END IF;
+    IF NEW.id <> OLD.id
+       OR NEW.request_id <> OLD.request_id
+       OR NEW.authority_id <> OLD.authority_id
+       OR NEW.expected_target_count <> OLD.expected_target_count
+       OR NEW.created_at <> OLD.created_at
+       OR NEW.lease_seconds <> OLD.lease_seconds
+       OR NEW.cas_revision <> OLD.cas_revision + 1
+    THEN
+        RAISE EXCEPTION 'rollout transaction identity/CAS drift';
+    END IF;
+    IF NEW.lease_token = OLD.lease_token THEN
+        IF OLD.lease_expires_at <= clock_timestamp() THEN
+            RAISE EXCEPTION 'expired rollout lease cannot renew or mutate state';
+        END IF;
+        IF NEW.lease_owner <> OLD.lease_owner
+           OR NEW.lease_expires_at < OLD.lease_expires_at
+        THEN
+            RAISE EXCEPTION 'rollout lease renewal drift';
+        END IF;
+    ELSIF NEW.state <> OLD.state
+          OR NEW.completed_at IS DISTINCT FROM OLD.completed_at
+          OR OLD.lease_expires_at > clock_timestamp()
+          OR OLD.state NOT IN ('planned', 'running', 'rolling_back')
+    THEN
+        RAISE EXCEPTION 'rollout lease takeover requires an expired active lease';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state = 'planned' AND NEW.state IN ('running', 'failed', 'cancelled')) OR
+        (OLD.state = 'running' AND NEW.state IN ('rolling_back', 'succeeded', 'failed', 'cancelled')) OR
+        (OLD.state = 'rolling_back' AND NEW.state IN ('rolled_back', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid rollout transaction state transition';
+    END IF;
+    RETURN NEW;
+END
+$release_rollout_transaction_update_guard$;
+
+CREATE TRIGGER release_rollout_transactions_guard
+    BEFORE UPDATE OR DELETE ON release_rollout_transactions
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_transaction_update_guard();
+
+CREATE FUNCTION release_rollout_target_state_update_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_target_state_update_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'rollout target evidence cannot be deleted';
+    END IF;
+    IF NEW.transaction_id <> OLD.transaction_id
+       OR NEW.computer_id <> OLD.computer_id
+       OR NEW.computer_name <> OLD.computer_name
+       OR NEW.target_ordinal <> OLD.target_ordinal
+       OR NEW.target_triple <> OLD.target_triple
+       OR NEW.artifact_version <> OLD.artifact_version
+       OR NEW.cas_revision <> OLD.cas_revision + 1
+    THEN
+        RAISE EXCEPTION 'rollout target identity/CAS drift';
+    END IF;
+    PERFORM 1
+      FROM release_rollout_transactions rollout
+     WHERE rollout.id = OLD.transaction_id
+       AND rollout.state IN ('planned', 'running', 'rolling_back')
+       AND rollout.lease_expires_at > clock_timestamp()
+     FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rollout target update requires a live active parent lease';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state = 'pending' AND NEW.state IN ('installing', 'skipped', 'failed')) OR
+        (OLD.state = 'installing' AND NEW.state IN ('verifying', 'failed', 'rolling_back')) OR
+        (OLD.state = 'verifying' AND NEW.state IN ('succeeded', 'failed', 'rolling_back')) OR
+        (OLD.state = 'succeeded' AND NEW.state = 'rolling_back') OR
+        (OLD.state = 'failed' AND NEW.state = 'rolling_back') OR
+        (OLD.state = 'rolling_back' AND NEW.state IN ('rolled_back', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid rollout target state transition';
+    END IF;
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END
+$release_rollout_target_state_update_guard$;
+
+CREATE TRIGGER release_rollout_target_states_guard
+    BEFORE UPDATE OR DELETE ON release_rollout_target_states
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_target_state_update_guard();
+
+CREATE FUNCTION validate_release_rollout_transaction_targets()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $validate_release_rollout_transaction_targets$
+BEGIN
+    IF (SELECT count(*) FROM release_rollout_target_states
+         WHERE transaction_id = NEW.id) <> NEW.expected_target_count
+       OR EXISTS (
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_authority_targets
+             WHERE authority_id = NEW.authority_id)
+           EXCEPT
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_target_states
+             WHERE transaction_id = NEW.id)
+       )
+       OR EXISTS (
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_target_states
+             WHERE transaction_id = NEW.id)
+           EXCEPT
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_authority_targets
+             WHERE authority_id = NEW.authority_id)
+       )
+    THEN
+        RAISE EXCEPTION 'partial or drifted rollout transaction target set';
+    END IF;
+    RETURN NEW;
+END
+$validate_release_rollout_transaction_targets$;
+
+CREATE CONSTRAINT TRIGGER release_rollout_transaction_targets_exact_at_commit
+    AFTER INSERT ON release_rollout_transactions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION validate_release_rollout_transaction_targets();
+
+CREATE FUNCTION forbid_release_rollout_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $forbid_release_rollout_truncate$
+BEGIN
+    RAISE EXCEPTION 'release rollout authority and evidence cannot be truncated';
+END
+$forbid_release_rollout_truncate$;
+
+CREATE TRIGGER release_rollout_authorities_no_truncate
+    BEFORE TRUNCATE ON release_rollout_authorities
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_targets_no_truncate
+    BEFORE TRUNCATE ON release_rollout_authority_targets
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_artifacts_no_truncate
+    BEFORE TRUNCATE ON release_rollout_authority_artifacts
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_transactions_no_truncate
+    BEFORE TRUNCATE ON release_rollout_transactions
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_target_states_no_truncate
+    BEFORE TRUNCATE ON release_rollout_target_states
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+
+COMMENT ON TABLE release_rollout_authorities IS
+    'Sealed exact source/release/target rollout authority; explicit V295 migration only.';
+COMMENT ON TABLE release_rollout_transactions IS
+    'One-active leased rollout transaction with request idempotency and CAS revision.';
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -4,6 +4,7 @@
 //! with version tracking via a `_migrations` meta-table.
 
 use sqlx::{Acquire, PgPool};
+use std::collections::{BTreeMap, BTreeSet};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DbError, Result};
@@ -1326,6 +1327,54 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
 ];
 
+/// Explicit-only migrations are structurally unreachable from
+/// [`run_postgres_migrations`], which is called by daemon/startup paths.
+/// Applying one requires the bounded, source-attested operator API below.
+static EXPLICIT_PG_MIGRATIONS: &[PgMigration] = &[PgMigration {
+    version: 295,
+    name: "release_rollout_authority",
+    sql: schema::SCHEMA_V295_RELEASE_ROLLOUT_AUTHORITY,
+}];
+
+pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 = 294;
+pub const LATEST_EXPLICIT_POSTGRES_MIGRATION: u32 = 295;
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PostgresMigrationDescriptor {
+    pub version: u32,
+    pub name: String,
+    pub explicit_only: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct AppliedPostgresMigration {
+    pub version: u32,
+    pub name: String,
+    pub source_commit: Option<String>,
+    pub applied_by: Option<String>,
+    pub applied_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PostgresMigrationStatus {
+    pub current_version: u32,
+    pub automatic_ceiling: u32,
+    pub explicit_ceiling: u32,
+    pub pending_automatic: Vec<PostgresMigrationDescriptor>,
+    pub pending_explicit: Vec<PostgresMigrationDescriptor>,
+    pub applied: Vec<AppliedPostgresMigration>,
+    pub drift: Vec<String>,
+    pub rollout_schema_valid: Option<bool>,
+}
+
+type AppliedMigrationQueryRow = (
+    i32,
+    String,
+    Option<String>,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+);
+
 /// Fail closed unless the enrollment authority table is exactly the reviewed
 /// v290 shape. This is intentionally validation-only: callers such as
 /// `ff onboard` and the TLS supervisor must never repair or create authority
@@ -1760,11 +1809,381 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
     Ok(final_version)
 }
 
+fn migration_descriptor(
+    migration: &PgMigration,
+    explicit_only: bool,
+) -> PostgresMigrationDescriptor {
+    PostgresMigrationDescriptor {
+        version: migration.version,
+        name: migration.name.to_string(),
+        explicit_only,
+    }
+}
+
+fn validate_explicit_apply_identity(
+    expected_source_commit: &str,
+    running_source_commit: &str,
+    running_git_state: &str,
+    applied_by: &str,
+) -> Result<()> {
+    let full_lower_sha = |value: &str| {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !full_lower_sha(expected_source_commit) || !full_lower_sha(running_source_commit) {
+        return Err(DbError::Migration(
+            "explicit migration requires full lowercase 40-character source commits".to_string(),
+        ));
+    }
+    if expected_source_commit != running_source_commit {
+        return Err(DbError::Migration(format!(
+            "explicit migration source mismatch: requested {expected_source_commit}, running {running_source_commit}"
+        )));
+    }
+    if !matches!(running_git_state, "pushed" | "unpushed") {
+        return Err(DbError::Migration(format!(
+            "explicit migration refuses build state {running_git_state:?}; use a clean exact-source binary"
+        )));
+    }
+    if applied_by.is_empty()
+        || applied_by.len() > 128
+        || !applied_by
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b'-'))
+    {
+        return Err(DbError::Migration(
+            "explicit migration applied_by identity is not canonical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn postgres_migration_table_exists(pool: &PgPool) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('public._migrations') IS NOT NULL")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn read_applied_postgres_migrations(pool: &PgPool) -> Result<Vec<AppliedPostgresMigration>> {
+    if !postgres_migration_table_exists(pool).await? {
+        return Ok(Vec::new());
+    }
+    let has_provenance: bool = sqlx::query_scalar(
+        "SELECT count(*) = 2
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = '_migrations'
+            AND column_name IN ('source_commit', 'applied_by')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let rows: Vec<AppliedMigrationQueryRow> = if has_provenance {
+        sqlx::query_as(
+            "SELECT version, name, source_commit, applied_by, applied_at
+                   FROM _migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT version, name, NULL::text, NULL::text, applied_at
+                   FROM _migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    rows.into_iter()
+        .map(|(version, name, source_commit, applied_by, applied_at)| {
+            let version = u32::try_from(version).map_err(|_| {
+                DbError::Migration("_migrations contains a negative version".to_string())
+            })?;
+            Ok(AppliedPostgresMigration {
+                version,
+                name,
+                source_commit,
+                applied_by,
+                applied_at,
+            })
+        })
+        .collect()
+}
+
+/// Read migration state without creating tables, taking locks, or applying DDL.
+pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigrationStatus> {
+    let applied = read_applied_postgres_migrations(pool).await?;
+    let applied_versions = applied
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<BTreeSet<_>>();
+    let current_version = applied_versions.iter().next_back().copied().unwrap_or(0);
+    let embedded = PG_MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version, (migration, false)))
+        .chain(
+            EXPLICIT_PG_MIGRATIONS
+                .iter()
+                .map(|migration| (migration.version, (migration, true))),
+        )
+        .collect::<BTreeMap<_, _>>();
+    let mut drift = Vec::new();
+    for row in &applied {
+        if let Some((expected, explicit)) = embedded.get(&row.version) {
+            if row.name != expected.name {
+                drift.push(format!(
+                    "v{} name drift: stored {:?}, embedded {:?}",
+                    row.version, row.name, expected.name
+                ));
+            }
+            if *explicit
+                && (row.source_commit.as_deref().is_none_or(|source| {
+                    source.len() != 40
+                        || !source
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) || row.applied_by.as_deref().is_none_or(str::is_empty))
+            {
+                drift.push(format!(
+                    "v{} explicit provenance is missing or invalid",
+                    row.version
+                ));
+            }
+        } else if row.version > BOOTSTRAP_BASELINE_VERSION {
+            drift.push(format!(
+                "v{} is applied but absent from this binary",
+                row.version
+            ));
+        }
+    }
+    for (version, (expected, _)) in &embedded {
+        if *version > BOOTSTRAP_BASELINE_VERSION
+            && *version <= current_version
+            && !applied_versions.contains(version)
+        {
+            drift.push(format!(
+                "v{version} ({}) is missing below current v{current_version}",
+                expected.name
+            ));
+        }
+    }
+
+    let pending_automatic = PG_MIGRATIONS
+        .iter()
+        .filter(|migration| !applied_versions.contains(&migration.version))
+        .map(|migration| migration_descriptor(migration, false))
+        .collect();
+    let pending_explicit = EXPLICIT_PG_MIGRATIONS
+        .iter()
+        .filter(|migration| !applied_versions.contains(&migration.version))
+        .map(|migration| migration_descriptor(migration, true))
+        .collect();
+    let rollout_schema_valid = if applied_versions.contains(&295) {
+        Some(crate::rollout_authority::release_rollout_schema_is_exact(pool).await?)
+    } else {
+        None
+    };
+    if rollout_schema_valid == Some(false) {
+        drift.push("v295 rollout authority schema or committed data drifted".to_string());
+    }
+
+    Ok(PostgresMigrationStatus {
+        current_version,
+        automatic_ceiling: LATEST_AUTOMATIC_POSTGRES_MIGRATION,
+        explicit_ceiling: LATEST_EXPLICIT_POSTGRES_MIGRATION,
+        pending_automatic,
+        pending_explicit,
+        applied,
+        drift,
+        rollout_schema_valid,
+    })
+}
+
+async fn explicit_migration_failures_exist(
+    conn: &mut sqlx::PgConnection,
+    target: u32,
+) -> Result<bool> {
+    let failures_table: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._migration_failures') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !failures_table {
+        return Ok(false);
+    }
+    Ok(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM _migration_failures WHERE version <= $1",
+        )
+        .bind(
+            i32::try_from(target).map_err(|_| {
+                DbError::Migration("explicit migration target exceeds i32".to_string())
+            })?,
+        )
+        .fetch_one(&mut *conn)
+        .await?
+            > 0,
+    )
+}
+
+/// Apply through the one explicit migration ceiling under exact source
+/// provenance. Unlike the startup runner, every failure is fatal and rolls the
+/// current migration back; nothing is quarantined or marked applied on error.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_explicit_postgres_migrations(
+    pool: &PgPool,
+    target: u32,
+    expected_source_commit: &str,
+    running_source_commit: &str,
+    running_git_state: &str,
+    applied_by: &str,
+) -> Result<PostgresMigrationStatus> {
+    if target != LATEST_EXPLICIT_POSTGRES_MIGRATION {
+        return Err(DbError::Migration(format!(
+            "explicit migration target must be exactly v{LATEST_EXPLICIT_POSTGRES_MIGRATION}; got v{target}"
+        )));
+    }
+    validate_explicit_apply_identity(
+        expected_source_commit,
+        running_source_commit,
+        running_git_state,
+        applied_by,
+    )?;
+
+    let before = postgres_migration_status(pool).await?;
+    if !before.drift.is_empty() {
+        return Err(DbError::Migration(format!(
+            "migration authority drift: {}",
+            before.drift.join("; ")
+        )));
+    }
+    if before.current_version > target {
+        return Err(DbError::Migration(format!(
+            "database v{} is newer than bounded target v{target}",
+            before.current_version
+        )));
+    }
+    if before.current_version < 290 {
+        return Err(DbError::Migration(format!(
+            "explicit v{target} requires the reviewed v290-or-newer base; database is v{}",
+            before.current_version
+        )));
+    }
+
+    let mut conn = pool.acquire().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !acquired {
+        return Err(DbError::Migration(
+            "another migration runner holds the migration lock".to_string(),
+        ));
+    }
+
+    let result = async {
+        ensure_pg_migrations_table(&mut conn).await?;
+        if explicit_migration_failures_exist(&mut conn, target).await? {
+            return Err(DbError::Migration(
+                "explicit migration refuses a database with quarantined migration failures"
+                    .to_string(),
+            ));
+        }
+
+        let locked_current = pg_current_version(&mut conn).await?;
+        if locked_current != before.current_version {
+            return Err(DbError::Migration(format!(
+                "migration version changed from v{} to v{} while acquiring the explicit lock; retry",
+                before.current_version, locked_current
+            )));
+        }
+        if let Some(applied) = before.applied.iter().find(|row| row.version == target) {
+            if applied.source_commit.as_deref() != Some(expected_source_commit) {
+                return Err(DbError::Migration(format!(
+                    "v{target} provenance drift: stored {:?}, requested {expected_source_commit}",
+                    applied.source_commit
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut current = before.current_version;
+        let ordered = PG_MIGRATIONS
+            .iter()
+            .chain(EXPLICIT_PG_MIGRATIONS.iter())
+            .filter(|migration| migration.version > current && migration.version <= target)
+            .collect::<Vec<_>>();
+        for migration in ordered {
+            let mut tx = conn.begin().await?;
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    DbError::Migration(format!(
+                        "explicit v{} ({}) failed: {error}",
+                        migration.version, migration.name
+                    ))
+                })?;
+            if migration.version == LATEST_EXPLICIT_POSTGRES_MIGRATION {
+                sqlx::query(
+                    "INSERT INTO _migrations (version, name, source_commit, applied_by)
+                     VALUES ($1, $2, $3, $4)",
+                )
+                .bind(i32::try_from(migration.version).expect("migration version fits i32"))
+                .bind(migration.name)
+                .bind(expected_source_commit)
+                .bind(applied_by)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                    .bind(i32::try_from(migration.version).expect("migration version fits i32"))
+                    .bind(migration.name)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            current = migration.version;
+        }
+        if current != target {
+            return Err(DbError::Migration(format!(
+                "bounded explicit migration stopped at v{current}, expected v{target}"
+            )));
+        }
+        Ok(())
+    }
+    .await;
+
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .fetch_one(&mut *conn)
+        .await;
+    if !matches!(unlocked, Ok(true)) {
+        conn.close().await.ok();
+        return Err(DbError::Migration(format!(
+            "explicit migration lock release failed: {unlocked:?}"
+        )));
+    }
+    result?;
+
+    let after = postgres_migration_status(pool).await?;
+    if after.current_version != target || !after.drift.is_empty() {
+        return Err(DbError::Migration(format!(
+            "explicit migration postcondition failed at v{}: {}",
+            after.current_version,
+            after.drift.join("; ")
+        )));
+    }
+    Ok(after)
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1797,6 +2216,392 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn v295_is_explicit_only_and_directly_follows_v294() {
+        assert_eq!(LATEST_AUTOMATIC_POSTGRES_MIGRATION, 294);
+        assert_eq!(LATEST_EXPLICIT_POSTGRES_MIGRATION, 295);
+        assert_eq!(PG_MIGRATIONS.last().unwrap().version, 294);
+        assert!(
+            PG_MIGRATIONS
+                .iter()
+                .all(|migration| migration.version != 295)
+        );
+        assert_eq!(EXPLICIT_PG_MIGRATIONS.len(), 1);
+        assert_eq!(EXPLICIT_PG_MIGRATIONS[0].version, 295);
+        assert_eq!(EXPLICIT_PG_MIGRATIONS[0].name, "release_rollout_authority");
+    }
+
+    #[test]
+    fn explicit_apply_identity_requires_exact_clean_source() {
+        const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+        validate_explicit_apply_identity(SOURCE, SOURCE, "unpushed", "adele@host").unwrap();
+        assert!(validate_explicit_apply_identity(SOURCE, SOURCE, "pushed", "adele@host").is_ok());
+        assert!(
+            validate_explicit_apply_identity(SOURCE, &"a".repeat(40), "unpushed", "adele@host")
+                .is_err()
+        );
+        assert!(validate_explicit_apply_identity(SOURCE, SOURCE, "dirty", "adele@host").is_err());
+        assert!(
+            validate_explicit_apply_identity("short", SOURCE, "unpushed", "adele@host").is_err()
+        );
+        assert!(
+            validate_explicit_apply_identity(SOURCE, SOURCE, "unpushed", "bad operator").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn v295_explicit_fresh_replay_drift_lock_and_rollout_authority() {
+        use crate::rollout_authority::{
+            ReleaseRolloutAuthoritySpec, RolloutArtifactAuthority,
+            RolloutAuthorityRegistrationOutcome, RolloutTargetAuthority,
+            RolloutTransactionBeginOutcome, pg_begin_release_rollout,
+            pg_cas_release_rollout_target_state, pg_cas_release_rollout_transaction_state,
+            pg_register_release_rollout_authority,
+        };
+
+        const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+        const TARGET_ID: Uuid = Uuid::from_u128(0xb5f0a59f_a46d_4e88_8113_847fa275f782);
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        let blank = postgres_migration_status(&pool).await.unwrap();
+        assert_eq!(blank.current_version, 0);
+        assert!(!postgres_migration_table_exists(&pool).await.unwrap());
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                SOURCE,
+                SOURCE,
+                "unpushed",
+                "test@v295",
+            )
+            .await
+            .expect_err("explicit rollout migration needs the reviewed v290 base")
+            .to_string()
+            .contains("v290-or-newer")
+        );
+        assert!(
+            !postgres_migration_table_exists(&pool).await.unwrap(),
+            "rejected fresh apply must not create migration state"
+        );
+
+        sqlx::raw_sql(schema::BOOTSTRAP_V161_SQL)
+            .execute(&pool)
+            .await
+            .expect("fresh baseline");
+        for migration in PG_MIGRATIONS.iter().filter(|migration| {
+            migration.version > BOOTSTRAP_BASELINE_VERSION && migration.version <= 290
+        }) {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("strict fresh v{} failed: {error}", migration.version)
+                });
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                .bind(migration.version as i32)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        // The live V290 authority still uses the reviewed legacy roster tables,
+        // while the squashed fresh baseline projects these names as views. Build
+        // the equivalent empty legacy shape before exercising the live V290→295
+        // explicit path; v291 correctly requires a table-backed FK authority.
+        sqlx::raw_sql(
+            r#"
+            ALTER VIEW computers RENAME TO computers_unified_v295_test;
+            ALTER VIEW fleet_workers RENAME TO fleet_workers_unified_v295_test;
+            CREATE TABLE computers AS TABLE computers_unified_v295_test WITH NO DATA;
+            ALTER TABLE computers ADD PRIMARY KEY (id), ADD UNIQUE (name);
+            CREATE TABLE fleet_workers AS TABLE fleet_workers_unified_v295_test WITH NO DATA;
+            ALTER TABLE fleet_workers ADD PRIMARY KEY (name);
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("construct fresh reviewed legacy V290 roster layout");
+        assert_eq!(
+            postgres_migration_status(&pool)
+                .await
+                .unwrap()
+                .current_version,
+            290
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.release_rollout_authorities')::text",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None,
+            "V290 must not contain v295 objects",
+        );
+
+        let mut lock_holder = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_holder)
+            .await
+            .unwrap();
+        let lock_error =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect_err("concurrent explicit migration must fail fast");
+        assert!(
+            lock_error.to_string().contains("migration lock"),
+            "unexpected lock failure: {lock_error}"
+        );
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_holder)
+            .await
+            .unwrap();
+        drop(lock_holder);
+
+        let applied =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect("apply exact v295");
+        assert_eq!(applied.current_version, 295);
+        assert_eq!(applied.rollout_schema_valid, Some(true));
+        assert!(applied.drift.is_empty());
+
+        let replay =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect("exact replay must be idempotent");
+        assert_eq!(replay.current_version, 295);
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                &"a".repeat(40),
+                &"a".repeat(40),
+                "unpushed",
+                "test@v295",
+            )
+            .await
+            .expect_err("stored provenance mismatch must fail")
+            .to_string()
+            .contains("provenance drift")
+        );
+
+        let mut partial = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO release_rollout_authorities
+                (source_commit, expected_target_count, expected_artifact_count, created_by)
+             VALUES ($1, 1, 2, 'test@v295')",
+        )
+        .bind("3".repeat(40))
+        .execute(&mut *partial)
+        .await
+        .unwrap();
+        assert!(
+            partial.commit().await.is_err(),
+            "deferred authority validator must reject an unsealed partial authority"
+        );
+
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'vinny')")
+            .bind(crate::rollout_authority::FORBIDDEN_VINNY_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut forbidden = pool.begin().await.unwrap();
+        let forbidden_authority: Uuid = sqlx::query_scalar(
+            "INSERT INTO release_rollout_authorities
+                (source_commit, expected_target_count, expected_artifact_count, created_by)
+             VALUES ($1, 1, 2, 'test@v295') RETURNING id",
+        )
+        .bind("4".repeat(40))
+        .fetch_one(&mut *forbidden)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(
+                "INSERT INTO release_rollout_authority_targets
+                    (authority_id, target_ordinal, computer_id, computer_name,
+                     target_triple, artifact_version)
+                 VALUES ($1, 0, $2, 'vinny', 'aarch64-unknown-linux-gnu', 'forbidden')",
+            )
+            .bind(forbidden_authority)
+            .bind(crate::rollout_authority::FORBIDDEN_VINNY_ID)
+            .execute(&mut *forbidden)
+            .await
+            .is_err(),
+            "database constraints must reject Vinny by exact name and UUID"
+        );
+        forbidden.rollback().await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO computers
+                (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, 'beyonce', '192.0.2.10', 'linux-ubuntu', 'test')",
+        )
+        .bind(TARGET_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let artifact_version = format!("recovery.{SOURCE}.ubuntu24-arm64");
+        let ff_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO release_artifacts
+                (artifact_name, artifact_version, source_commit, target_triple, sha256, size_bytes)
+             VALUES ('ff', $1, $2, 'aarch64-unknown-linux-gnu', $3, 10)
+             RETURNING id",
+        )
+        .bind(&artifact_version)
+        .bind(SOURCE)
+        .bind("1".repeat(64))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let daemon_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO release_artifacts
+                (artifact_name, artifact_version, source_commit, target_triple, sha256, size_bytes)
+             VALUES ('forgefleetd', $1, $2, 'aarch64-unknown-linux-gnu', $3, 20)
+             RETURNING id",
+        )
+        .bind(&artifact_version)
+        .bind(SOURCE)
+        .bind("2".repeat(64))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let spec = ReleaseRolloutAuthoritySpec {
+            source_commit: SOURCE.to_string(),
+            created_by: "test@v295".to_string(),
+            targets: vec![RolloutTargetAuthority {
+                target_ordinal: 0,
+                computer_id: TARGET_ID,
+                computer_name: "beyonce".to_string(),
+                target_triple: "aarch64-unknown-linux-gnu".to_string(),
+                artifact_version,
+                artifacts: vec![
+                    RolloutArtifactAuthority {
+                        artifact_name: "ff".to_string(),
+                        artifact_id: ff_id,
+                    },
+                    RolloutArtifactAuthority {
+                        artifact_name: "forgefleetd".to_string(),
+                        artifact_id: daemon_id,
+                    },
+                ],
+            }],
+        };
+        let authority = pg_register_release_rollout_authority(&pool, &spec)
+            .await
+            .expect("seal complete exact authority");
+        assert_eq!(
+            authority.outcome,
+            RolloutAuthorityRegistrationOutcome::Inserted
+        );
+        assert_eq!(
+            pg_register_release_rollout_authority(&pool, &spec)
+                .await
+                .unwrap()
+                .outcome,
+            RolloutAuthorityRegistrationOutcome::ExactExisting,
+        );
+        let mut drifted = spec.clone();
+        drifted.created_by = "other@test".to_string();
+        assert!(
+            pg_register_release_rollout_authority(&pool, &drifted)
+                .await
+                .is_err()
+        );
+
+        let request_id = Uuid::new_v4();
+        let begun =
+            pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30)
+                .await
+                .expect("begin complete leased transaction");
+        assert_eq!(begun.outcome, RolloutTransactionBeginOutcome::Inserted);
+        assert_eq!(
+            pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30,)
+                .await
+                .unwrap()
+                .outcome,
+            RolloutTransactionBeginOutcome::ExactExisting,
+        );
+        assert!(
+            pg_begin_release_rollout(
+                &pool,
+                Uuid::new_v4(),
+                authority.authority.id,
+                "test@v295",
+                30,
+            )
+            .await
+            .is_err(),
+            "one-active constraint must reject a second transaction"
+        );
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            begun.transaction.id,
+            TARGET_ID,
+            begun.transaction.lease_token,
+            0,
+            "pending",
+            "installing",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("exact target CAS");
+        assert_eq!(target.cas_revision, 1);
+        assert!(
+            pg_cas_release_rollout_target_state(
+                &pool,
+                begun.transaction.id,
+                TARGET_ID,
+                begun.transaction.lease_token,
+                0,
+                "pending",
+                "installing",
+                None,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale target CAS must be rejected"
+        );
+        let running = pg_cas_release_rollout_transaction_state(
+            &pool,
+            begun.transaction.id,
+            begun.transaction.lease_token,
+            begun.transaction.cas_revision,
+            "planned",
+            "running",
+        )
+        .await
+        .unwrap()
+        .expect("exact parent CAS");
+        assert_eq!(running.cas_revision, 1);
+
+        sqlx::query("DROP INDEX release_rollout_one_active_transaction")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let drift = postgres_migration_status(&pool).await.unwrap();
+        assert_eq!(drift.rollout_schema_valid, Some(false));
+        assert!(!drift.drift.is_empty());
+        assert!(apply_explicit_postgres_migrations(
+            &pool, 295, SOURCE, SOURCE, "unpushed", "test@v295",
+        )
+        .await
+        .expect_err("replay over schema drift must fail closed")
+        .to_string()
+        .contains("migration authority drift"));
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 
     #[test]

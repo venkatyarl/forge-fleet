@@ -54,6 +54,7 @@ mod cortex_cmd;
 mod council_cmd;
 mod daemon_cmd;
 mod db_cmd;
+mod db_migrate_cmd;
 mod defer_cmd;
 mod doctor_cmd;
 mod events_cmd;
@@ -878,10 +879,9 @@ enum Command {
         #[command(subcommand)]
         command: PortsCommand,
     },
-    /// Read-only SQL against the ForgeFleet Postgres. Runs inside a READ ONLY
-    /// transaction (the server rejects writes) — a safe inspection escape
-    /// hatch so a typed `ff db query …` no longer falls through to the LLM
-    /// agent (which would hallucinate against a non-existent database).
+    /// PostgreSQL inspection and explicit bounded migration control. Queries
+    /// run READ ONLY; explicit-only migration versions require the dedicated
+    /// source-attested `migrate apply` command and are never applied at startup.
     Db {
         #[command(subcommand)]
         command: DbCommand,
@@ -2920,6 +2920,35 @@ enum DbCommand {
         /// Cap rows returned (default 200); extra rows are noted as truncated.
         #[arg(long, default_value_t = 200)]
         max_rows: usize,
+    },
+    /// Inspect or explicitly apply bounded PostgreSQL migrations. Ordinary
+    /// daemon/startup migration paths never apply explicit-only versions.
+    Migrate {
+        #[command(subcommand)]
+        command: DbMigrateCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum DbMigrateCommand {
+    /// Read migration status without taking locks, creating tables, or writing.
+    Status {
+        /// Emit the complete status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply through one exact explicit migration version. There is no force
+    /// bypass: the binary commit, requested commit, DB history, and schema must agree.
+    Apply {
+        /// Exact bounded migration target (currently 295 only).
+        #[arg(long)]
+        to: u32,
+        /// Full lowercase commit SHA of this exact clean ff binary.
+        #[arg(long)]
+        source_commit: String,
+        /// Required acknowledgement that this performs PostgreSQL DDL.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
