@@ -37,6 +37,20 @@ pub const ROLLOUT_CANARIES: [&str; 4] = ["beyonce", "lily", "ace", "logan"];
 pub const MAX_ROLLOUT_TARGETS: usize = 64;
 const LEASE_OWNER: &str = "ff-artifact-rollout";
 const DEFAULT_LEASE_SECONDS: i32 = 120;
+const RUN_CANDIDATE_SCRIPT: &str = r#"set -eu
+tx=$1; expected_sha=$2; expected_size=$3; platform=$4; provided_candidate=$5; shift 5
+base="$HOME/.forgefleet/release-rollout/candidates/$tx"
+candidate="$base/ff"; lock="$base.lock"
+[ "$candidate" = "$provided_candidate" ]
+if ! mkdir "$lock" 2>/dev/null; then exit 75; fi
+trap 'rm -rf "$lock"' EXIT HUP INT TERM
+[ -f "$candidate" ] && [ ! -L "$candidate" ]
+actual_size=$(/usr/bin/wc -c < "$candidate" | /usr/bin/tr -d ' ')
+if command -v sha256sum >/dev/null 2>&1; then actual_sha=$(sha256sum "$candidate" | /usr/bin/awk '{print $1}'); else actual_sha=$(shasum -a 256 "$candidate" | /usr/bin/awk '{print $1}'); fi
+[ "$actual_size" = "$expected_size" ] && [ "$actual_sha" = "$expected_sha" ]
+if [ "$platform" = macos ]; then /usr/bin/codesign --verify --strict "$candidate"; fi
+"$candidate" "$@"
+"#;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReleaseRolloutError {
@@ -2067,20 +2081,6 @@ async fn run_candidate(
         ));
     }
     let material = ff_material(target)?;
-    const SCRIPT: &str = r#"set -eu
-tx=$1; expected_sha=$2; expected_size=$3; platform=$4; provided_candidate=$5; shift 5
-base="$HOME/.forgefleet/release-rollout/candidates/$tx"
-candidate="$base/ff"; lock="$base.lock"
-[ "$candidate" = "$provided_candidate" ]
-if ! mkdir "$lock" 2>/dev/null; then exit 75; fi
-trap 'rm -rf "$lock"' EXIT HUP INT TERM
-[ -f "$candidate" ] && [ ! -L "$candidate" ]
-actual_size=$(/usr/bin/wc -c < "$candidate" | /usr/bin/tr -d ' ')
-if command -v sha256sum >/dev/null 2>&1; then actual_sha=$(sha256sum "$candidate" | /usr/bin/awk '{print $1}'); else actual_sha=$(shasum -a 256 "$candidate" | /usr/bin/awk '{print $1}'); fi
-[ "$actual_size" = "$expected_size" ] && [ "$actual_sha" = "$expected_sha" ]
-if [ "$platform" = macos ]; then /usr/bin/codesign --verify --strict "$candidate"; fi
-exec "$candidate" "$@"
-"#;
     let mut script_args = vec![
         candidate.transaction_id.to_string(),
         material.artifact.sha256.clone(),
@@ -2089,7 +2089,7 @@ exec "$candidate" "$@"
         candidate.absolute_path.clone(),
     ];
     script_args.extend_from_slice(args);
-    ssh_script(&target.endpoint, SCRIPT, &script_args, None).await
+    ssh_script(&target.endpoint, RUN_CANDIDATE_SCRIPT, &script_args, None).await
 }
 
 #[cfg(test)]
@@ -2994,5 +2994,46 @@ mod tests {
         assert!(output.stdout.is_empty());
         assert_eq!(output.stderr, b"diagnostic");
         assert_eq!(std::fs::read(temp.path()).unwrap(), b"candidate-bytes");
+    }
+
+    #[tokio::test]
+    async fn candidate_lock_is_removed_after_nonzero_command_exit() {
+        let home = tempfile::tempdir().unwrap();
+        let transaction_id = Uuid::new_v4();
+        let base = home
+            .path()
+            .join(".forgefleet")
+            .join("release-rollout")
+            .join("candidates")
+            .join(transaction_id.to_string());
+        std::fs::create_dir_all(&base).unwrap();
+        let candidate = base.join("ff");
+        std::fs::write(&candidate, b"#!/bin/sh\nexit 7\n").unwrap();
+        std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let bytes = std::fs::read(&candidate).unwrap();
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let lock = std::path::PathBuf::from(format!("{}.lock", base.display()));
+
+        let output = tokio::process::Command::new("/bin/sh")
+            .args([
+                "-ceu",
+                RUN_CANDIDATE_SCRIPT,
+                "--",
+                &transaction_id.to_string(),
+                &sha256,
+                &bytes.len().to_string(),
+                "linux",
+                candidate.to_str().unwrap(),
+            ])
+            .env("HOME", home.path())
+            .output()
+            .await
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(7));
+        assert!(
+            !lock.exists(),
+            "candidate lock must be removed by EXIT trap"
+        );
     }
 }
