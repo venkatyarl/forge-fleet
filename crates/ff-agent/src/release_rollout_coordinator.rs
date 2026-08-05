@@ -316,7 +316,8 @@ impl ReleaseRolloutDatabase for PgReleaseRolloutDatabase<'_> {
         let rows = sqlx::query(
             "SELECT a.id, a.artifact_name, a.artifact_version, a.source_commit,
                     a.target_triple, a.sha256, a.size_bytes, a.created_at,
-                    custody.computer_id, custody.holder_name_at_registration,
+                    custody.computer_id, c.name AS computer_name,
+                    custody.holder_name_at_registration,
                     custody.relative_path, custody.first_verified_at,
                     c.primary_ip, c.ssh_user, c.ssh_port,
                     c.status AS computer_status, fw.status AS worker_status
