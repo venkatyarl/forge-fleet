@@ -108,6 +108,54 @@ fn round_diagnostic(round: u32, stage: &str, detail: impl std::fmt::Display) -> 
     format!("round {round} {stage}: {detail}")
 }
 
+/// Immutable identity of the fleet deployment that served a model turn.
+///
+/// Labels and hints describe what the caller requested; these fields describe
+/// what the router actually selected.  Keep the terminal successful turn with
+/// the codegen outcome so later provenance and reviewer-separation checks do
+/// not have to reconstruct identity from a lease label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedModelAttribution {
+    pub deployment_id: sqlx::types::Uuid,
+    pub endpoint: String,
+    pub worker_name: String,
+    pub catalog_id: Option<String>,
+    pub model: String,
+}
+
+impl From<&crate::fleet_oneshot::FleetOneshot> for RoutedModelAttribution {
+    fn from(response: &crate::fleet_oneshot::FleetOneshot) -> Self {
+        Self {
+            deployment_id: response.deployment_id,
+            endpoint: response.endpoint.clone(),
+            worker_name: response.worker_name.clone(),
+            catalog_id: response.catalog_id.clone(),
+            model: response.model.clone(),
+        }
+    }
+}
+
+impl RoutedModelAttribution {
+    /// Durable builder/reviewer label derived from the served model, never from
+    /// the requested hint.
+    pub fn local_model_label(&self) -> Option<String> {
+        let model = self
+            .catalog_id
+            .as_deref()
+            .filter(|id| !id.trim().is_empty())
+            .unwrap_or(&self.model)
+            .trim();
+        if model.is_empty() {
+            return None;
+        }
+        if model.to_ascii_lowercase().starts_with("local:") {
+            Some(model.to_string())
+        } else {
+            Some(format!("local:{model}"))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CodegenOutcome {
     pub applied: bool,
@@ -116,10 +164,30 @@ pub struct CodegenOutcome {
     pub error: Option<String>,
     /// Stable catalog id of the local fleet model that produced the terminal response.
     pub builder_catalog_id: Option<String>,
+    /// Actual deployment selected for the terminal successful response.
+    pub builder_attribution: Option<RoutedModelAttribution>,
     /// The model reported the task is ALREADY implemented / no change needed (it inspected the
     /// repo, often ran the tests, and produced no edits on purpose). The caller should mark the
     /// work_item done — NOT fail-retry — so an already-satisfied task drains instead of thrashing.
     pub already_done: bool,
+}
+
+fn terminal_codegen_outcome(
+    response: &crate::fleet_oneshot::FleetOneshot,
+    applied: bool,
+    rounds: u32,
+    final_diff: Option<String>,
+    already_done: bool,
+) -> CodegenOutcome {
+    CodegenOutcome {
+        applied,
+        rounds,
+        final_diff,
+        error: None,
+        builder_catalog_id: response.catalog_id.clone(),
+        builder_attribution: Some(RoutedModelAttribution::from(response)),
+        already_done,
+    }
 }
 
 /// Heuristic: a no-edit-blocks model response that AFFIRMATIVELY states the work is already
@@ -423,14 +491,9 @@ pub async fn codegen_apply_with_target(
                         round,
                         "codegen: model reports task already implemented — no changes needed (marking done)"
                     );
-                    return Ok(CodegenOutcome {
-                        applied: false,
-                        rounds,
-                        final_diff: None,
-                        error: None,
-                        builder_catalog_id: response.catalog_id.clone(),
-                        already_done: true,
-                    });
+                    return Ok(terminal_codegen_outcome(
+                        &response, false, rounds, None, true,
+                    ));
                 }
                 let diagnostic = round_diagnostic(
                     round,
@@ -575,14 +638,13 @@ pub async fn codegen_apply_with_target(
         }
 
         transaction.commit();
-        return Ok(CodegenOutcome {
-            applied: true,
+        return Ok(terminal_codegen_outcome(
+            &response,
+            true,
             rounds,
-            final_diff: Some(edit_summary),
-            error: None,
-            builder_catalog_id: response.catalog_id.clone(),
-            already_done: false,
-        });
+            Some(edit_summary),
+            false,
+        ));
     }
 
     Ok(CodegenOutcome {
@@ -595,6 +657,7 @@ pub async fn codegen_apply_with_target(
             Some(diagnostics.join("\n"))
         },
         builder_catalog_id: None,
+        builder_attribution: None,
         already_done: false,
     })
 }
@@ -2192,6 +2255,52 @@ mod tests {
         let rec = round_interaction(None, 1, "do the task", &resp);
         assert_eq!(rec.work_item_id, None);
         assert_eq!(rec.purpose.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn terminal_outcomes_retain_actual_routed_identity() {
+        let deployment_id = uuid::Uuid::new_v4();
+        let response = crate::fleet_oneshot::FleetOneshot {
+            text: "terminal response".to_string(),
+            deployment_id,
+            endpoint: "http://192.168.5.116:55020".to_string(),
+            worker_name: "sia".to_string(),
+            catalog_id: Some("qwen3-coder-30b".to_string()),
+            model: "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf".to_string(),
+            provenance: crate::fleet_oneshot::ResolvedTargetProvenance::Auto,
+            latency_ms: 10,
+            tokens_in: 1,
+            tokens_out: 2,
+        };
+
+        for outcome in [
+            terminal_codegen_outcome(&response, true, 2, Some("diff".to_string()), false),
+            terminal_codegen_outcome(&response, false, 1, None, true),
+        ] {
+            let attribution = outcome
+                .builder_attribution
+                .expect("terminal outcome must retain router identity");
+            assert_eq!(attribution.deployment_id, deployment_id);
+            assert_eq!(attribution.endpoint, response.endpoint);
+            assert_eq!(attribution.worker_name, "sia");
+            assert_eq!(attribution.catalog_id.as_deref(), Some("qwen3-coder-30b"));
+            assert_eq!(
+                attribution.local_model_label().as_deref(),
+                Some("local:qwen3-coder-30b")
+            );
+        }
+    }
+
+    #[test]
+    fn routed_model_label_rejects_empty_identity() {
+        let attribution = RoutedModelAttribution {
+            deployment_id: uuid::Uuid::new_v4(),
+            endpoint: "http://192.168.5.116:55020".to_string(),
+            worker_name: "sia".to_string(),
+            catalog_id: Some("  ".to_string()),
+            model: "  ".to_string(),
+        };
+        assert_eq!(attribution.local_model_label(), None);
     }
 
     #[test]

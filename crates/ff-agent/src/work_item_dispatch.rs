@@ -6,6 +6,7 @@
 //! lease, push a branch, open a PR, enqueue merge, then free the slot.
 
 use anyhow::{Context, Result, anyhow, bail};
+use ff_db::queries::{RouteFilter, pg_route_deployments};
 use regex::Regex;
 use sqlx::{PgPool, Row};
 use std::{
@@ -26,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use crate::codegen_apply::RoutedModelAttribution;
 use crate::sub_agents::ensure_workspaces;
 
 /// How often the dispatch loop bumps a work_item lease's `heartbeat_at` while a
@@ -1198,14 +1200,16 @@ async fn dispatch_one(
     // Split (backend, output) into the backend used + a plain Result<Output> for
     // the existing consumers. On error, no backend is carried, so use the
     // best-effort primary (for training attribution).
-    let (backend_used, dispatch_result, dispatch_outcome): (
+    let (backend_used, builder_attribution, dispatch_result, dispatch_outcome): (
         String,
+        Option<RoutedModelAttribution>,
         Result<Output>,
         DispatchOutcome,
     ) = match dispatch_full {
-        Ok((b, out, outcome)) => (b, Ok(out), outcome),
+        Ok((b, attribution, out, outcome)) => (b, attribution, Ok(out), outcome),
         Err(e) => (
             primary_dispatch_backend(&pg, item.computer_id).await,
+            None,
             Err(e),
             DispatchOutcome::FailedNoDiff,
         ),
@@ -1221,6 +1225,7 @@ async fn dispatch_one(
         &item,
         &worker_name,
         &backend_used,
+        builder_attribution.as_ref(),
         &dispatch_result,
         dispatch_outcome,
         deliverable_diff,
@@ -1477,13 +1482,28 @@ async fn dispatch_one(
     let head_sha = git_head_sha(&worktree.worktree_path)?;
     push_branch(&item.repo_path, &worktree.task_branch)?;
     let pr_url = create_pr(&worktree.worktree_path, &item, &worktree).await?;
-    record_pr_provenance(&pg, &item, &backend_used, &pr_url).await?;
+    record_pr_provenance(
+        &pg,
+        &item,
+        &backend_used,
+        builder_attribution.as_ref(),
+        &pr_url,
+    )
+    .await?;
 
     // In-place review (Pillar-4 v2): judge the change IN the still-warm build
     // workspace — diff vs base + item spec + a real `cargo test` run — before
     // it enters the merge queue. Review is fail-closed: the serial drain is a
     // pure merger and only sees rows carrying an approval from this folder.
-    let review = match run_in_place_review(&pg, &item, &worktree, &backend_used).await {
+    let review = match run_in_place_review(
+        &pg,
+        &item,
+        &worktree,
+        &backend_used,
+        builder_attribution.as_ref(),
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             requeue_or_fail(&pg, &item, &format!("in-place review unavailable: {e:#}")).await?;
@@ -1548,6 +1568,7 @@ async fn dispatch_one(
         &head_sha,
         &pr_url,
         &backend_used,
+        builder_attribution.as_ref(),
         Some(&review),
     )
     .await?;
@@ -1821,14 +1842,20 @@ async fn record_pr_provenance(
     pg: &PgPool,
     item: &AssignedWorkItem,
     builder: &str,
+    builder_attribution: Option<&RoutedModelAttribution>,
     pr_url: &str,
 ) -> Result<()> {
+    let builder_computer = builder_attribution
+        .map(|attribution| attribution.worker_name.as_str())
+        .unwrap_or(&item.computer_name);
+    let builder_port =
+        builder_attribution.and_then(|attribution| route_endpoint_port(&attribution.endpoint));
     sqlx::query(
         r#"INSERT INTO work_item_provenance
               (work_item_id, builder_model, builder_computer, builder_port, builder_lane,
                pr_url, pr_created_at, pr_created_by)
             SELECT $1, $2, $3,
-                   NULLIF(substring(l.endpoint FROM ':(\d+)(?:/|$)'), '')::int,
+                   COALESCE($6, NULLIF(substring(l.endpoint FROM ':(\d+)(?:/|$)'), '')::int),
                    CASE WHEN l.endpoint LIKE 'cloud:%' OR $2 ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
                         THEN 'cloud' ELSE 'local' END,
                    $4, NOW(), $5
@@ -1846,9 +1873,10 @@ async fn record_pr_provenance(
     )
     .bind(item.work_item_id)
     .bind(builder)
-    .bind(&item.computer_name)
+    .bind(builder_computer)
     .bind(pr_url)
     .bind(format!("sub-agent:{} / {builder}", item.sub_agent_id))
+    .bind(builder_port)
     .execute(pg)
     .await?;
     Ok(())
@@ -2230,8 +2258,14 @@ async fn mark_ready_for_review(
     head_sha: &str,
     pr_url: &str,
     builder: &str,
+    builder_attribution: Option<&RoutedModelAttribution>,
     review: Option<&ReviewOutcome>,
 ) -> Result<bool> {
+    let builder_computer = builder_attribution
+        .map(|attribution| attribution.worker_name.as_str())
+        .unwrap_or(&item.computer_name);
+    let builder_port =
+        builder_attribution.and_then(|attribution| route_endpoint_port(&attribution.endpoint));
     let mut tx = pg.begin().await?;
     let transitioned = sqlx::query(
         "UPDATE work_items
@@ -2331,7 +2365,11 @@ async fn mark_ready_for_review(
     .bind(review.map(|r| truncate_for_db(&r.reason)))
     .bind(review.map(|r| r.started_at))
     .bind(review.map(|r| r.completed_at))
-    .bind(review.map(|_| item.computer_name.as_str()))
+    .bind(review.map(|r| {
+        r.reviewer_computer
+            .as_deref()
+            .unwrap_or(&item.computer_name)
+    }))
     .execute(&mut *tx)
     .await?;
 
@@ -2341,7 +2379,7 @@ async fn mark_ready_for_review(
                reviewer_model, reviewer_computer, reviewer_port, reviewer_lane,
                pr_url, pr_created_at, pr_created_by, updated_at)
             SELECT $1, $2, $3,
-                   NULLIF(substring(l.endpoint FROM ':(\d+)(?:/|$)'), '')::int,
+                   COALESCE($10, NULLIF(substring(l.endpoint FROM ':(\d+)(?:/|$)'), '')::int),
                    CASE WHEN l.endpoint LIKE 'cloud:%' OR $2 ~ '^(codex|claude|kimi|gemini|grok)(:|$)'
                         THEN 'cloud' ELSE 'local' END,
                    $4, $7, $8,
@@ -2364,7 +2402,7 @@ async fn mark_ready_for_review(
     )
     .bind(item.work_item_id)
     .bind(builder)
-    .bind(&item.computer_name)
+    .bind(builder_computer)
     .bind(review.map(|r| r.reviewer.as_str()))
     .bind(pr_url)
     .bind(format!("sub-agent:{} / {builder}", item.sub_agent_id))
@@ -2375,6 +2413,7 @@ async fn mark_ready_for_review(
     )
     .bind(review.and_then(|r| r.reviewer_port))
     .bind(item.lease_id)
+    .bind(builder_port)
     .execute(&mut *tx)
     .await?;
 
@@ -2439,9 +2478,6 @@ async fn mark_ready_for_review(
 
 // ── Pillar 4 v2: in-place review stage (after build+PR, before enqueue) ──────
 
-/// Reviewer label recorded when the qwen3-coder-480b ring reviews an item.
-const LOCAL_REVIEWER_480B: &str = "local:qwen3-coder-480b";
-
 /// Hard cap on a single cloud reviewer invocation.
 const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(600);
 
@@ -2489,6 +2525,178 @@ fn same_model_family(builder: &str, reviewer: &str) -> bool {
     builder == reviewer
         || builder.ends_with(&format!(":{reviewer}"))
         || builder.starts_with(&format!("{reviewer}:"))
+}
+
+/// Router endpoint identity used for separation and durable port attribution.
+/// Paths and trailing slashes are intentionally ignored: deployments expose
+/// multiple OpenAI-compatible paths on the same physical listener.
+fn canonical_route_endpoint(endpoint: &str) -> Option<String> {
+    let url = reqwest::Url::parse(endpoint.trim()).ok()?;
+    url.host_str()?;
+    url.port_or_known_default()?;
+    Some(url.origin().ascii_serialization())
+}
+
+fn route_endpoint_port(endpoint: &str) -> Option<i32> {
+    reqwest::Url::parse(endpoint.trim())
+        .ok()?
+        .port()
+        .map(i32::from)
+}
+
+fn canonical_routed_model(catalog_id: Option<&str>, served_model: &str) -> Option<String> {
+    let raw = catalog_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            let model = served_model.trim();
+            (!model.is_empty()).then_some(model)
+        })?;
+    let normalized = ff_core::model_id::normalize_model_id(raw);
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn validate_local_routed_attribution(
+    attribution: &RoutedModelAttribution,
+) -> Result<(String, i32)> {
+    if attribution.deployment_id.is_nil() || attribution.worker_name.trim().is_empty() {
+        bail!("local routed attribution is missing deployment or worker identity");
+    }
+    let label = attribution
+        .local_model_label()
+        .ok_or_else(|| anyhow!("local routed attribution is missing catalog/model identity"))?;
+    canonical_routed_model(attribution.catalog_id.as_deref(), &attribution.model)
+        .ok_or_else(|| anyhow!("local routed attribution model identity is not canonicalizable"))?;
+    let port = route_endpoint_port(&attribution.endpoint)
+        .ok_or_else(|| anyhow!("local routed attribution endpoint has no explicit port"))?;
+    canonical_route_endpoint(&attribution.endpoint)
+        .ok_or_else(|| anyhow!("local routed attribution endpoint is not canonicalizable"))?;
+    Ok((label, port))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalReviewerSeparation {
+    Distinct,
+    SameModel,
+    SameDeployment,
+    SameWorker,
+    SameEndpoint,
+    Unproven,
+}
+
+/// Prove that a fleet-local reviewer is physically independent of the local
+/// deployment that generated the terminal codegen result. A different router
+/// label is not evidence: deployment id is checked first, and canonical
+/// endpoint remains a mandatory backstop against a re-created deployment row.
+fn local_reviewer_separation(
+    builder: Option<&RoutedModelAttribution>,
+    reviewer: &crate::fleet_oneshot::FleetOneshot,
+) -> LocalReviewerSeparation {
+    let Some(builder) = builder else {
+        return LocalReviewerSeparation::Unproven;
+    };
+    if builder.deployment_id.is_nil() || reviewer.deployment_id.is_nil() {
+        return LocalReviewerSeparation::Unproven;
+    }
+    if builder.deployment_id == reviewer.deployment_id {
+        return LocalReviewerSeparation::SameDeployment;
+    }
+    if builder.worker_name.trim().is_empty() || reviewer.worker_name.trim().is_empty() {
+        return LocalReviewerSeparation::Unproven;
+    }
+    if builder
+        .worker_name
+        .eq_ignore_ascii_case(&reviewer.worker_name)
+    {
+        return LocalReviewerSeparation::SameWorker;
+    }
+    let Some(builder_model) = canonical_routed_model(builder.catalog_id.as_deref(), &builder.model)
+    else {
+        return LocalReviewerSeparation::Unproven;
+    };
+    let Some(reviewer_model) =
+        canonical_routed_model(reviewer.catalog_id.as_deref(), &reviewer.model)
+    else {
+        return LocalReviewerSeparation::Unproven;
+    };
+    if builder_model == reviewer_model {
+        return LocalReviewerSeparation::SameModel;
+    }
+
+    let (Some(builder_endpoint), Some(reviewer_endpoint)) = (
+        canonical_route_endpoint(&builder.endpoint),
+        canonical_route_endpoint(&reviewer.endpoint),
+    ) else {
+        return LocalReviewerSeparation::Unproven;
+    };
+    if builder_endpoint == reviewer_endpoint {
+        LocalReviewerSeparation::SameEndpoint
+    } else {
+        LocalReviewerSeparation::Distinct
+    }
+}
+
+/// Select a code-capable reviewer target while excluding the builder's host,
+/// deployment row, and listener. The exact target is then pinned for the
+/// request so a later automatic failover cannot silently route back to the
+/// builder.
+async fn resolve_distinct_local_review_target(
+    pg: &PgPool,
+    builder: &RoutedModelAttribution,
+) -> Result<crate::fleet_oneshot::ResolvedFleetTarget> {
+    validate_local_routed_attribution(builder)
+        .context("local builder attribution is incomplete")?;
+    let builder_endpoint = canonical_route_endpoint(&builder.endpoint)
+        .ok_or_else(|| anyhow!("local builder endpoint is not canonicalizable"))?;
+    let builder_model = canonical_routed_model(builder.catalog_id.as_deref(), &builder.model)
+        .ok_or_else(|| anyhow!("local builder model identity is not canonicalizable"))?;
+    let filter = RouteFilter {
+        workload: Some("code".to_string()),
+        require_tool_calling: false,
+        min_ctx: None,
+        exclude_hosts: vec![builder.worker_name.clone()],
+        max_health_age_sec: Some(180),
+        prefer_least_loaded: true,
+        limit: 64,
+    };
+    let candidates = pg_route_deployments(pg, &filter)
+        .await
+        .context("route distinct fleet-local reviewer")?;
+    let mut last_error = None;
+    for candidate in candidates {
+        let candidate_model = candidate
+            .catalog_id
+            .as_deref()
+            .or(candidate.catalog_name.as_deref())
+            .and_then(|identity| canonical_routed_model(Some(identity), ""));
+        if candidate.deployment_id.is_nil()
+            || candidate.deployment_id == builder.deployment_id
+            || candidate_model.as_deref() == Some(builder_model.as_str())
+            || candidate_model.is_none()
+            || canonical_route_endpoint(&candidate.endpoint).as_deref()
+                == Some(builder_endpoint.as_str())
+        {
+            continue;
+        }
+        match crate::fleet_oneshot::resolve_candidate_target(
+            pg,
+            &candidate,
+            crate::fleet_oneshot::ResolvedTargetProvenance::Auto,
+            false,
+        )
+        .await
+        {
+            Ok(target) => return Ok(target),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        anyhow!(
+            "no healthy code-capable fleet-local reviewer is provably distinct from builder {} on {}",
+            builder.deployment_id,
+            builder.endpoint
+        )
+    }))
 }
 
 /// Observed per-reviewer review history (recent window), read from the same
@@ -2568,13 +2776,14 @@ fn order_cloud_reviewers(
 ///   3. The 480B ring participates only when [`GATE_480B`] has a free permit
 ///      RIGHT NOW (`try_acquire`) — builds have priority on the ring, and a
 ///      busy ring means cloud review without waiting.
-/// `Err` means NO reviewer produced a verdict — the caller enqueues unreviewed
-/// (fail-open) rather than stranding an already-pushed PR.
+/// `Err` means no independent reviewer produced a verdict. The caller requeues
+/// the item and never hands it to merge custody (fail closed).
 async fn run_in_place_review(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
     builder: &str,
+    builder_attribution: Option<&RoutedModelAttribution>,
 ) -> Result<ReviewOutcome> {
     let prompt = build_review_prompt(item, worktree).await;
 
@@ -2584,9 +2793,9 @@ async fn run_in_place_review(
             let verdict = review_via_480b_inplace(pg, item.work_item_id, &prompt).await;
             drop(permit);
             match verdict {
-                Ok((approved, reason, reviewer_computer, reviewer_port)) => {
+                Ok((approved, reason, reviewer, reviewer_computer, reviewer_port)) => {
                     return Ok(ReviewOutcome {
-                        reviewer: LOCAL_REVIEWER_480B.to_string(),
+                        reviewer,
                         reviewer_computer: Some(reviewer_computer),
                         reviewer_port,
                         approved,
@@ -2647,6 +2856,7 @@ async fn run_in_place_review(
                     &prompt,
                     &res.stdout,
                     i32::try_from(res.duration_ms).ok(),
+                    None,
                 )
                 .await;
                 let (approved, reason) =
@@ -2683,14 +2893,34 @@ async fn run_in_place_review(
     // ANY healthy fleet LLM — fleet_oneshot picks the next available deployment
     // across ALL nodes, the same fleet-wide local routing the build lane uses.
     // A local-Devstral review beats failing the item outright.
+    let local_builder = normalized_cloud_backend(builder).is_none();
+    let explicit_target = if local_builder {
+        Some(
+            resolve_distinct_local_review_target(
+                pg,
+                builder_attribution.ok_or_else(|| {
+                    anyhow!(
+                        "local builder is missing actual routed identity; refusing local review"
+                    )
+                })?,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let started_at = chrono::Utc::now();
     let health = ff_pulse::lane_1_5::check_llm_health(|| async {
-        crate::fleet_oneshot::fleet_oneshot_for(
+        crate::fleet_oneshot::fleet_oneshot_for_ctx_with_target(
             pg,
             &prompt,
             None,
             Some(REVIEW_CLOUD_TIMEOUT),
             Some("code"),
+            None,
+            None,
+            4096,
+            explicit_target.as_ref(),
         )
         .await
         .map(|response| {
@@ -2701,13 +2931,26 @@ async fn run_in_place_review(
     .await;
     match health {
         ff_pulse::lane_1_5::LlmHealthGate::Healthy(resp) => {
+            if local_builder {
+                let separation = local_reviewer_separation(builder_attribution, &resp);
+                if separation != LocalReviewerSeparation::Distinct {
+                    bail!(
+                        "fleet-local reviewer is not provably independent of the builder: {separation:?}"
+                    );
+                }
+            }
+            let reviewer_attribution = RoutedModelAttribution::from(&resp);
+            let (reviewer, reviewer_port) =
+                validate_local_routed_attribution(&reviewer_attribution)
+                    .context("fleet-local reviewer returned incomplete routed identity")?;
             record_review_interaction(
                 pg,
                 item.work_item_id,
-                &format!("local:{}", resp.worker_name),
+                &reviewer,
                 &prompt,
                 &resp.text,
                 None,
+                Some(&resp),
             )
             .await;
             let (approved, reason) =
@@ -2717,9 +2960,9 @@ async fn run_in_place_review(
                 "work_item_dispatch: in-place review via fleet-local LLM (480b+cloud unavailable)"
             );
             return Ok(ReviewOutcome {
-                reviewer: format!("local:{}", resp.worker_name),
+                reviewer,
                 reviewer_computer: Some(resp.worker_name.clone()),
-                reviewer_port: None,
+                reviewer_port: Some(reviewer_port),
                 approved,
                 reason,
                 started_at,
@@ -3101,6 +3344,7 @@ async fn verify_already_done_claim(
                     &prompt,
                     &res.stdout,
                     i32::try_from(res.duration_ms).ok(),
+                    None,
                 )
                 .await;
                 let (approved, reason) =
@@ -3163,7 +3407,7 @@ async fn review_via_480b_inplace(
     pg: &PgPool,
     work_item_id: Uuid,
     prompt: &str,
-) -> Result<(bool, String, String, Option<i32>)> {
+) -> Result<(bool, String, String, String, Option<i32>)> {
     let resp =
         crate::fleet_oneshot::fleet_oneshot(pg, prompt, Some("480b"), Some(REVIEW_480B_TIMEOUT))
             .await
@@ -3182,14 +3426,14 @@ async fn review_via_480b_inplace(
         prompt,
         &resp.text,
         i32::try_from(resp.latency_ms).ok(),
+        Some(&resp),
     )
     .await;
     let (approved, reason) = crate::work_item_merge_drain::parse_review_response(&resp.text);
-    let port = resp
-        .endpoint
-        .rsplit_once(':')
-        .and_then(|(_, value)| value.trim_end_matches('/').parse().ok());
-    Ok((approved, reason, resp.worker_name, port))
+    let reviewer_attribution = RoutedModelAttribution::from(&resp);
+    let (reviewer, port) = validate_local_routed_attribution(&reviewer_attribution)
+        .context("480b reviewer returned incomplete routed identity")?;
+    Ok((approved, reason, reviewer, resp.worker_name, Some(port)))
 }
 
 /// Reviewer input: the branch diff vs base + the item spec + a real
@@ -3263,14 +3507,32 @@ async fn record_review_interaction(
     prompt: &str,
     response: &str,
     latency_ms: Option<i32>,
+    routed: Option<&crate::fleet_oneshot::FleetOneshot>,
 ) {
     let rec = ff_db::InteractionRecord {
         channel: "dispatch_inplace_review".to_string(),
         request_text: prompt.chars().take(16000).collect(),
         engine: Some(engine.to_string()),
+        route_decision: routed
+            .map(|response| {
+                serde_json::json!({
+                    "deployment_id": response.deployment_id,
+                    "endpoint": response.endpoint,
+                    "worker_name": response.worker_name,
+                    "catalog_id": response.catalog_id,
+                    "model": response.model,
+                    "provenance": response.provenance.as_str(),
+                })
+            })
+            .unwrap_or_else(|| serde_json::json!({})),
         response_text: response.chars().take(16000).collect(),
-        latency_ms,
+        tokens_in: routed.map(|response| response.tokens_in).unwrap_or(0),
+        tokens_out: routed.map(|response| response.tokens_out).unwrap_or(0),
+        latency_ms: latency_ms
+            .or_else(|| routed.and_then(|response| i32::try_from(response.latency_ms).ok())),
         outcome: "success".to_string(),
+        worker_name: routed.map(|response| response.worker_name.clone()),
+        endpoint: routed.map(|response| response.endpoint.clone()),
         work_item_id: Some(work_item_id),
         purpose: Some("review".to_string()),
         ..Default::default()
@@ -3330,7 +3592,12 @@ async fn record_review_rejection(
     .bind(truncate_for_db(&review.reason))
     .bind(review.started_at)
     .bind(review.completed_at)
-    .bind(&item.computer_name)
+    .bind(
+        review
+            .reviewer_computer
+            .as_deref()
+            .unwrap_or(&item.computer_name),
+    )
     .execute(pg)
     .await?;
     sqlx::query(
@@ -4204,6 +4471,7 @@ async fn record_dispatch_interaction(
     item: &AssignedWorkItem,
     worker_name: &str,
     backend: &str,
+    builder_attribution: Option<&RoutedModelAttribution>,
     result: &Result<Output>,
     dispatch_outcome: DispatchOutcome,
     deliverable_diff: bool,
@@ -4263,10 +4531,8 @@ async fn record_dispatch_interaction(
         sig
     });
 
-    // Vendor backends keep their name (claude/codex/kimi); the local codegen
-    // lane's "local" backend stays `local`. Cost comes from the config-driven
-    // rates table — $0 for local, published per-token rates for cloud.
-    let engine = crate::llm_attribution::engine_label(backend);
+    let (engine, interaction_worker, interaction_endpoint, route_decision) =
+        dispatch_interaction_route(worker_name, backend, builder_attribution);
     let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
     let rec = ff_db::InteractionRecord {
         channel: "work_item_dispatch".to_string(),
@@ -4278,6 +4544,7 @@ async fn record_dispatch_interaction(
             deliverable_commits,
             tokens_estimated,
         ),
+        route_decision,
         engine: Some(engine),
         response_text,
         tokens_in,
@@ -4287,8 +4554,8 @@ async fn record_dispatch_interaction(
         outcome,
         error_text,
         error_signature,
-        worker_name: Some(worker_name.to_string()),
-        endpoint: Some(format!("ff cli {backend}")),
+        worker_name: Some(interaction_worker),
+        endpoint: Some(interaction_endpoint),
         work_item_id: Some(item.work_item_id),
         purpose: Some("build".to_string()),
         ..Default::default()
@@ -4298,19 +4565,51 @@ async fn record_dispatch_interaction(
     }
 }
 
+fn dispatch_interaction_route(
+    worker_name: &str,
+    backend: &str,
+    builder_attribution: Option<&RoutedModelAttribution>,
+) -> (String, String, String, serde_json::Value) {
+    match builder_attribution {
+        Some(attribution) => {
+            let engine = attribution
+                .local_model_label()
+                .unwrap_or_else(|| backend.to_string());
+            (
+                crate::llm_attribution::engine_label(&engine),
+                attribution.worker_name.clone(),
+                attribution.endpoint.clone(),
+                serde_json::json!({
+                    "deployment_id": attribution.deployment_id,
+                    "endpoint": attribution.endpoint,
+                    "worker_name": attribution.worker_name,
+                    "catalog_id": attribution.catalog_id,
+                    "model": attribution.model,
+                }),
+            )
+        }
+        None => (
+            crate::llm_attribution::engine_label(backend),
+            worker_name.to_string(),
+            format!("ff cli {backend}"),
+            serde_json::json!({}),
+        ),
+    }
+}
+
 /// Lane 1.5 route: acquire a permit on the shared process-wide 480B semaphore
 /// and run one bounded round on the local 480B codegen endpoint. Mirrors the
 /// Lane-1 dispatch pattern (bounded timeout, breaker bookkeeping, synthetic
 /// Output on success) but gated on the shared ring's concurrency instead of
-/// Lane 1's per-node breaker. Returns `Some((backend, output))` when the
-/// change lands; `None` when the caller should pass through to the Lane 2
+/// Lane 1's per-node breaker. Returns the actual routed builder identity when
+/// the change lands; `None` when the caller should pass through to the Lane 2
 /// cloud backstop (ring busy, no-op, error, or timeout).
 async fn dispatch_to_480b(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
     prompt: &str,
-) -> Option<(String, Output)> {
+) -> Option<(String, RoutedModelAttribution, Output)> {
     let _permit = match tokio::time::timeout(
         Duration::from_millis(LANE15_480B_PERMIT_WAIT_MS),
         crate::dispatch_concurrency::acquire_480b_permit(),
@@ -4353,6 +4652,22 @@ async fn dispatch_to_480b(
     .await;
     match lane15 {
         Ok(Ok(outcome)) if outcome.applied => {
+            let Some(attribution) = outcome.builder_attribution.clone() else {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    "work_item_dispatch: Lane-1.5 applied without routed builder identity; refusing result"
+                );
+                return None;
+            };
+            let Ok((builder, _)) = validate_local_routed_attribution(&attribution) else {
+                warn!(
+                    work_item_id = %item.work_item_id,
+                    stage = "lane1.5",
+                    "work_item_dispatch: Lane-1.5 applied with incomplete routed identity; refusing result"
+                );
+                return None;
+            };
             let _ = crate::circuit_breaker::record_provider_success(
                 pg,
                 item.computer_id,
@@ -4366,7 +4681,8 @@ async fn dispatch_to_480b(
                 "work_item_dispatch: Lane-1.5 480B codegen landed the change"
             );
             Some((
-                "local-480b".to_string(),
+                builder,
+                attribution,
                 synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
             ))
         }
@@ -4434,7 +4750,12 @@ async fn run_ff_dispatch(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worktree: &WorktreeRecord,
-) -> Result<(String, Output, DispatchOutcome)> {
+) -> Result<(
+    String,
+    Option<RoutedModelAttribution>,
+    Output,
+    DispatchOutcome,
+)> {
     let mut prompt = dispatch_prompt(item);
     // Prepend a Cortex context pack: the exact existing symbols this task touches,
     // pulled from the shared code graph, so the agent starts there instead of
@@ -4621,6 +4942,11 @@ async fn run_ff_dispatch(
         };
         match lane1 {
             Ok(Ok(outcome)) if outcome.already_done => {
+                let attribution = outcome.builder_attribution.as_ref().ok_or_else(|| {
+                    anyhow!("local already_done response is missing actual routed identity")
+                })?;
+                let (builder, _) = validate_local_routed_attribution(attribution)
+                    .context("local already_done response has incomplete routed identity")?;
                 // The model claims the task is ALREADY implemented (feature exists, tests
                 // pass, nothing to commit). Do NOT trust that claim on its face — a
                 // 2026-07-23 incident closed a work_item as ALREADY_IMPLEMENTED with zero
@@ -4628,7 +4954,7 @@ async fn run_ff_dispatch(
                 // re-closing it every attempt. Run the claim through an independent
                 // in-place reviewer (never the builder) and require an APPROVE verdict
                 // backed by a concrete file:line citation before marking it done.
-                match verify_already_done_claim(pg, item, worktree, "local").await {
+                match verify_already_done_claim(pg, item, worktree, &builder).await {
                     Ok(v) if v.verified => {
                         // Terminal 'done' is protected from later requeue_or_fail by its
                         // status guard.
@@ -4702,6 +5028,11 @@ async fn run_ff_dispatch(
                 }
             }
             Ok(Ok(outcome)) if outcome.applied => {
+                let attribution = outcome.builder_attribution.clone().ok_or_else(|| {
+                    anyhow!("local applied result is missing actual routed identity")
+                })?;
+                let (builder, _) = validate_local_routed_attribution(&attribution)
+                    .context("local applied result has incomplete routed identity")?;
                 let _ = crate::circuit_breaker::record_provider_success(
                     pg,
                     item.computer_id,
@@ -4728,7 +5059,8 @@ async fn run_ff_dispatch(
                     .await;
                 }
                 return Ok((
-                    "local".to_string(),
+                    builder,
+                    Some(attribution),
                     synthetic_output(&outcome.final_diff.unwrap_or_else(|| "applied".into())),
                     DispatchOutcome::Success,
                 ));
@@ -4790,8 +5122,10 @@ async fn run_ff_dispatch(
         lane15_enabled,
         lane15_breaker_open,
     ) {
-        if let Some((backend, output)) = dispatch_to_480b(pg, item, worktree, &prompt).await {
-            return Ok((backend, output, DispatchOutcome::Success));
+        if let Some((backend, attribution, output)) =
+            dispatch_to_480b(pg, item, worktree, &prompt).await
+        {
+            return Ok((backend, Some(attribution), output, DispatchOutcome::Success));
         }
     } else if lane15_trigger && !lane15_enabled {
         info!(
@@ -5015,6 +5349,7 @@ async fn run_ff_dispatch(
                         .await;
                         return Ok((
                             backend.clone(),
+                            None,
                             synthetic_output("salvaged diff after backend timeout"),
                             DispatchOutcome::TimeoutSalvaged,
                         ));
@@ -5032,6 +5367,7 @@ async fn run_ff_dispatch(
                         .await;
                         return Ok((
                             backend.clone(),
+                            None,
                             synthetic_output("salvaged self-commits after backend timeout"),
                             DispatchOutcome::TimeoutSalvaged,
                         ));
@@ -5153,7 +5489,7 @@ async fn run_ff_dispatch(
                     .await;
                     warn!(backend = %backend, "run_ff_dispatch: clean process exit produced no deliverable work");
                 }
-                return Ok((backend.clone(), out, outcome));
+                return Ok((backend.clone(), None, out, outcome));
             }
             // A `--require-change` no-op (exit 3) is a task-level failure, not a
             // provider fault — surface it without classify/retry/switch.
@@ -5161,7 +5497,7 @@ async fn run_ff_dispatch(
                 let has_deliverable_work = worktree_has_diff(&worktree.worktree_path)
                     || head_has_deliverable_commits(&worktree.worktree_path, &worktree.base_branch);
                 let outcome = classify_completed_output(&out, has_deliverable_work);
-                return Ok((backend.clone(), out, outcome));
+                return Ok((backend.clone(), None, out, outcome));
             }
             // A non-zero exit that STILL wrote a real diff (the backend edited
             // files, then its own final verify/exit step failed) is salvageable
@@ -5178,7 +5514,7 @@ async fn run_ff_dispatch(
                     budget.as_ref().and_then(|row| row.window_exhausted_until),
                 )
                 .await;
-                return Ok((backend.clone(), out, DispatchOutcome::FailedWithDiff));
+                return Ok((backend.clone(), None, out, DispatchOutcome::FailedWithDiff));
             }
             // Same self-commit case: backend committed, then its own verify step
             // failed and exited non-zero. The commits are still deliverable.
@@ -5186,7 +5522,7 @@ async fn run_ff_dispatch(
                 warn!(backend = %backend, code = ?out.status.code(), "run_ff_dispatch: backend exited non-zero but self-committed — salvaging");
                 let _ =
                     crate::circuit_breaker::record_provider_success(pg, computer_id, backend).await;
-                return Ok((backend.clone(), out, DispatchOutcome::FailedWithDiff));
+                return Ok((backend.clone(), None, out, DispatchOutcome::FailedWithDiff));
             }
             let combined = format!(
                 "{}\n{}",
@@ -5251,6 +5587,11 @@ async fn run_ff_dispatch(
             .await
             {
                 Ok(outcome) if outcome.applied || outcome.already_done => {
+                    let attribution = outcome.builder_attribution.clone().ok_or_else(|| {
+                        anyhow!("local-router fallback succeeded without actual routed identity")
+                    })?;
+                    let (builder, _) = validate_local_routed_attribution(&attribution)
+                        .context("local-router fallback has incomplete routed identity")?;
                     let _ = crate::circuit_breaker::record_provider_success(
                         pg,
                         computer_id,
@@ -5258,7 +5599,8 @@ async fn run_ff_dispatch(
                     )
                     .await;
                     return Ok((
-                        format!("local:{}", hint.as_deref().unwrap_or("fleet")),
+                        builder,
+                        Some(attribution),
                         synthetic_output(
                             "cloud exhausted — built on local fleet router (glm/devstral)",
                         ),
@@ -5299,7 +5641,7 @@ async fn run_ff_dispatch(
                 if outcome.produced_deliverable_work() {
                     crate::cloud_budget::record_success(pg, &forced_backend, None).await;
                 }
-                return Ok((forced_backend, out, outcome));
+                return Ok((forced_backend, None, out, outcome));
             }
             Err(e) => {
                 if is_dispatch_authority_error(&e) {
@@ -5315,6 +5657,7 @@ async fn run_ff_dispatch(
                     .await;
                     return Ok((
                         forced_backend,
+                        None,
                         synthetic_output("salvaged diff after forced backend timeout"),
                         DispatchOutcome::TimeoutSalvaged,
                     ));
@@ -5329,6 +5672,7 @@ async fn run_ff_dispatch(
                     .await;
                     return Ok((
                         forced_backend,
+                        None,
                         synthetic_output("salvaged self-commits after forced backend timeout"),
                         DispatchOutcome::TimeoutSalvaged,
                     ));
@@ -5351,7 +5695,7 @@ async fn run_ff_dispatch(
         }
     }
     last_output
-        .map(|(backend, output)| Ok((backend, output, DispatchOutcome::FailedNoDiff)))
+        .map(|(backend, output)| Ok((backend, None, output, DispatchOutcome::FailedNoDiff)))
         .unwrap_or_else(|| {
         if backend_errors.is_empty() {
             // Genuinely nothing to run: every backend was breaker-open / skipped.
@@ -7690,22 +8034,25 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS, ReviewerStat,
-        WorktreeRecord, affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, check_dispatch_prerequisites, classify_completed_output,
-        classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
-        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
-        dispatch_budget_for_host, dispatch_interaction_outcome, dispatch_prompt,
-        dispatch_request_meta, expand_home, is_build_timeout, legacy_acceptance_sql,
-        local_failure_diagnosis_for, local_failure_diagnosis_for_attempt, mark_local_retest_failed,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
+        LocalReviewerSeparation, ReviewerStat, WorktreeRecord, affected_crate_manifests,
+        agent_output_tail, backend_failed_without_output, builder_excludes_480b,
+        canonical_route_endpoint, canonical_routed_model, check_dispatch_prerequisites,
+        classify_completed_output, classify_dispatch_outcome, collect_leftover_tmp_output,
+        command_display, complexity_at_least_moderate, contains_file_line_citation,
+        default_clone_path, dispatch_budget_for_host, dispatch_interaction_outcome,
+        dispatch_interaction_route, dispatch_prompt, dispatch_request_meta, expand_home,
+        is_build_timeout, legacy_acceptance_sql, local_failure_diagnosis_for,
+        local_failure_diagnosis_for_attempt, local_reviewer_separation, mark_local_retest_failed,
         mark_local_retest_passed, mark_ready_for_review, mirror_repo_url, normalized_cloud_backend,
         order_cloud_reviewers, parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis,
         primary_or_default_backend, quick_empty_success_is_provider_failure,
         record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
         resolve_dispatch_repo_binding, retry_error_is_actionable, rewrite_github_host_alias,
-        same_model_family, should_attempt_lane15, status_output_is_clean, synthetic_output,
-        task_failed_alert_text, task_prefers_cloud_lane, try_acquire_lane15_480b_permit,
-        use_local_lane, validate_manifest_fields,
+        route_endpoint_port, same_model_family, should_attempt_lane15, status_output_is_clean,
+        synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_local_routed_attribution,
+        validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::{Path, PathBuf};
@@ -7995,6 +8342,7 @@ mod tests {
                 "deadbeef",
                 &format!("https://example.invalid/pr/{work_item_id}"),
                 "codex",
+                None,
                 None,
             )
             .await
@@ -8429,6 +8777,204 @@ mod tests {
         assert!(!complexity_at_least_moderate(""));
         assert!(complexity_at_least_moderate("moderate"));
         assert!(complexity_at_least_moderate("complex"));
+    }
+
+    fn routed_attribution(
+        deployment_id: Uuid,
+        endpoint: &str,
+        worker: &str,
+        catalog: Option<&str>,
+        model: &str,
+    ) -> crate::codegen_apply::RoutedModelAttribution {
+        crate::codegen_apply::RoutedModelAttribution {
+            deployment_id,
+            endpoint: endpoint.to_string(),
+            worker_name: worker.to_string(),
+            catalog_id: catalog.map(str::to_string),
+            model: model.to_string(),
+        }
+    }
+
+    fn routed_response(
+        deployment_id: Uuid,
+        endpoint: &str,
+        worker: &str,
+        catalog: Option<&str>,
+        model: &str,
+    ) -> crate::fleet_oneshot::FleetOneshot {
+        crate::fleet_oneshot::FleetOneshot {
+            text: "APPROVE\nindependent".to_string(),
+            deployment_id,
+            endpoint: endpoint.to_string(),
+            worker_name: worker.to_string(),
+            catalog_id: catalog.map(str::to_string),
+            model: model.to_string(),
+            provenance: crate::fleet_oneshot::ResolvedTargetProvenance::Auto,
+            latency_ms: 1,
+            tokens_in: 1,
+            tokens_out: 1,
+        }
+    }
+
+    #[test]
+    fn routed_identity_requires_explicit_port_and_canonical_model() {
+        let valid = routed_attribution(
+            Uuid::new_v4(),
+            "HTTP://SIA:55020/v1/",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        );
+        assert_eq!(route_endpoint_port(&valid.endpoint), Some(55020));
+        assert_eq!(
+            canonical_route_endpoint(&valid.endpoint).as_deref(),
+            Some("http://sia:55020")
+        );
+        assert_eq!(
+            validate_local_routed_attribution(&valid).unwrap(),
+            ("local:qwen3-coder-30b".to_string(), 55020)
+        );
+
+        let without_port = routed_attribution(
+            Uuid::new_v4(),
+            "http://sia/v1",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert_eq!(route_endpoint_port(&without_port.endpoint), None);
+        assert!(validate_local_routed_attribution(&without_port).is_err());
+
+        let empty_model =
+            routed_attribution(Uuid::new_v4(), "http://sia:55020", "sia", Some("  "), "  ");
+        assert!(validate_local_routed_attribution(&empty_model).is_err());
+        let nil_deployment = routed_attribution(
+            Uuid::nil(),
+            "http://sia:55020",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert!(validate_local_routed_attribution(&nil_deployment).is_err());
+    }
+
+    #[test]
+    fn dispatch_summary_uses_actual_local_route_and_preserves_cloud_shape() {
+        let attribution = routed_attribution(
+            Uuid::new_v4(),
+            "http://sia:55020",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+        );
+        let (engine, worker, endpoint, route) =
+            dispatch_interaction_route("adele", "local", Some(&attribution));
+        assert_eq!(engine, "local:qwen3-coder-30b");
+        assert_eq!(worker, "sia");
+        assert_eq!(endpoint, "http://sia:55020");
+        assert_eq!(
+            route["deployment_id"],
+            attribution.deployment_id.to_string()
+        );
+        assert_eq!(route["catalog_id"], "qwen3-coder-30b");
+
+        let (engine, worker, endpoint, route) = dispatch_interaction_route("adele", "codex", None);
+        assert_eq!(engine, "codex");
+        assert_eq!(worker, "adele");
+        assert_eq!(endpoint, "ff cli codex");
+        assert_eq!(route, serde_json::json!({}));
+    }
+
+    #[test]
+    fn local_reviewer_requires_distinct_model_deployment_and_endpoint() {
+        let builder_id = Uuid::new_v4();
+        let builder = routed_attribution(
+            builder_id,
+            "http://thalia:55000",
+            "thalia",
+            Some("glm-4.5-air"),
+            "zai-org_GLM-4.5-Air-Q4_K_M-00001-of-00002.gguf",
+        );
+
+        let same_deployment = routed_response(
+            builder_id,
+            "http://sia:55020",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert_eq!(
+            local_reviewer_separation(Some(&builder), &same_deployment),
+            LocalReviewerSeparation::SameDeployment
+        );
+
+        let same_catalog_alias = routed_response(
+            Uuid::new_v4(),
+            "http://shakira:55000",
+            "shakira",
+            Some("GLM_4.5_AIR"),
+            "different-runtime-label.gguf",
+        );
+        assert_eq!(
+            canonical_routed_model(Some("glm-4.5-air"), ""),
+            canonical_routed_model(Some("GLM_4.5_AIR"), "")
+        );
+        assert_eq!(
+            local_reviewer_separation(Some(&builder), &same_catalog_alias),
+            LocalReviewerSeparation::SameModel
+        );
+
+        let same_worker = routed_response(
+            Uuid::new_v4(),
+            "http://thalia:55020",
+            "THALIA",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert_eq!(
+            local_reviewer_separation(Some(&builder), &same_worker),
+            LocalReviewerSeparation::SameWorker
+        );
+
+        let same_endpoint = routed_response(
+            Uuid::new_v4(),
+            "http://THALIA:55000/v1/",
+            "adele",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert_eq!(
+            local_reviewer_separation(Some(&builder), &same_endpoint),
+            LocalReviewerSeparation::SameEndpoint
+        );
+
+        let distinct = routed_response(
+            Uuid::new_v4(),
+            "http://sia:55020",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert_eq!(
+            local_reviewer_separation(Some(&builder), &distinct),
+            LocalReviewerSeparation::Distinct
+        );
+
+        let nil_reviewer = routed_response(
+            Uuid::nil(),
+            "http://sia:55020",
+            "sia",
+            Some("qwen3-coder-30b"),
+            "qwen3-coder-30b",
+        );
+        assert_eq!(
+            local_reviewer_separation(Some(&builder), &nil_reviewer),
+            LocalReviewerSeparation::Unproven
+        );
+        assert_eq!(
+            local_reviewer_separation(None, &distinct),
+            LocalReviewerSeparation::Unproven
+        );
     }
 
     #[test]
