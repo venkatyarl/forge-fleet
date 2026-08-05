@@ -6726,6 +6726,45 @@ fn git_head_sha(worktree_path: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Resolve the exact base commit self-verification may trust. The checkout path
+/// fetches (or requires an existing) `origin/<base_branch>` before creating the
+/// task branch, so falling back to a local branch here would silently broaden a
+/// task's diff when that local branch is stale. Returning the resolved commit
+/// SHA also prevents a concurrent fetch from moving the remote-tracking ref
+/// between verification's two diff commands. This deliberately differs from
+/// [`resolve_base_ref`], whose squash-only recovery path permits both a symbolic
+/// ref and a local fallback.
+fn verification_base_commit(
+    worktree_path: &Path,
+    base_branch: &str,
+) -> std::result::Result<String, String> {
+    let base_ref = format!("refs/remotes/origin/{base_branch}");
+    let commit_ref = format!("{base_ref}^{{commit}}");
+    let out = run_git(
+        worktree_path,
+        ["rev-parse", "--verify", "--quiet", &commit_ref],
+        Duration::from_secs(30),
+    )
+    .map_err(|e| {
+        format!(
+            "authoritative self-verify base ref {base_ref} is unavailable; refusing local fallback: {e}"
+        )
+    })?;
+    let commit = std::str::from_utf8(&out.stdout)
+        .map_err(|_| format!("authoritative self-verify base ref {base_ref} returned non-UTF-8"))?
+        .trim();
+    if commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "authoritative self-verify base ref {base_ref} returned invalid commit identity"
+        ));
+    }
+    Ok(commit.to_string())
+}
+
 /// Self-verify a built worktree BEFORE it becomes a PR — the cheap local checks
 /// a competent engineer runs before calling a change "done": no empty /
 /// whitespace-only added files, the workspace still compiles, and cheap tests
@@ -6746,9 +6785,11 @@ async fn self_verify_worktree_with_database_url(
     base_branch: &str,
     database_url: Option<String>,
 ) -> std::result::Result<(), String> {
+    let base_commit = verification_base_commit(worktree_path, base_branch)?;
+
     // 1) Reject empty / whitespace-only ADDED files (instant, catches the
     //    empty-stub failure mode directly).
-    let range = format!("{base_branch}...HEAD");
+    let range = format!("{base_commit}...HEAD");
     let out = run_git(
         worktree_path,
         ["diff", "--diff-filter=A", "--name-only", &range],
@@ -6786,7 +6827,7 @@ async fn self_verify_worktree_with_database_url(
 
     // 3) Every affected crate must compile all library tests and run its full
     //    ordinary unit suite. PostgreSQL dependencies never exempt a crate.
-    for manifest in affected_crate_manifests(worktree_path, base_branch)? {
+    for manifest in affected_crate_manifests(worktree_path, &base_commit)? {
         let manifest_arg = manifest.to_string_lossy().into_owned();
         run_verification_command(
             worktree_path,
@@ -6973,9 +7014,9 @@ async fn run_verification_command_output(
 
 fn affected_crate_manifests(
     worktree_path: &Path,
-    base_branch: &str,
+    base_commit: &str,
 ) -> std::result::Result<Vec<PathBuf>, String> {
-    let range = format!("{base_branch}...HEAD");
+    let range = format!("{base_commit}...HEAD");
     let out = run_git(
         worktree_path,
         ["diff", "--name-only", &range],
@@ -9914,6 +9955,12 @@ mod tests {
         super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["update-ref", "refs/remotes/origin/main", "HEAD"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
         super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
         std::fs::write(repo.join("empty.txt"), " \n\t").unwrap();
         super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
@@ -9921,6 +9968,36 @@ mod tests {
 
         let error = super::self_verify_worktree(repo, "main").await.unwrap_err();
         assert!(error.contains("empty.txt"));
+    }
+
+    #[tokio::test]
+    async fn self_verify_fails_closed_without_authoritative_origin_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(repo.join("base.txt"), "base").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
+
+        let error = super::self_verify_worktree_with_database_url(repo, "main", None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("refs/remotes/origin/main"));
+        assert!(error.contains("refusing local fallback"));
     }
 
     fn init_self_verify_cargo_repo(repo: &Path, manifest_extra: &str, test_body: &str) {
@@ -9956,6 +10033,12 @@ mod tests {
         super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["update-ref", "refs/remotes/origin/main", "HEAD"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
         super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
         std::fs::write(repo.join("crates/demo/src/lib.rs"), test_body).unwrap();
         super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
@@ -10030,6 +10113,12 @@ mod tests {
         super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["commit", "-m", "base"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["update-ref", "refs/remotes/origin/main", "HEAD"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
         super::run_git(repo, ["checkout", "-b", "task"], Duration::from_secs(10)).unwrap();
         std::fs::create_dir_all(repo.join("crates/demo/src")).unwrap();
         std::fs::write(
@@ -10041,10 +10130,119 @@ mod tests {
         super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
         super::run_git(repo, ["commit", "-m", "change"], Duration::from_secs(10)).unwrap();
 
+        let base_commit = super::verification_base_commit(repo, "main").unwrap();
         assert_eq!(
-            affected_crate_manifests(repo, "main").unwrap(),
+            affected_crate_manifests(repo, &base_commit).unwrap(),
             vec![PathBuf::from("crates/demo/Cargo.toml")]
         );
+    }
+
+    #[tokio::test]
+    async fn self_verify_ignores_changes_between_stale_local_and_origin_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        super::run_git(repo, ["init"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.name", "Test"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["config", "user.email", "test@example.com"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("crates/demo/src")).unwrap();
+        std::fs::write(
+            repo.join("Cargo.toml"),
+            "[workspace]\nmembers=['crates/demo']\nresolver='2'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("crates/demo/Cargo.toml"),
+            "[package]\nname='demo'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("crates/demo/src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n",
+        )
+        .unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "stale local base"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(repo, ["branch", "-M", "main"], Duration::from_secs(10)).unwrap();
+
+        super::run_git(
+            repo,
+            ["checkout", "-b", "upstream"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::write(
+            repo.join("crates/demo/src/lib.rs"),
+            "pub fn value() -> i32 { 1 }\n#[test]\nfn unrelated_upstream_failure() { assert_eq!(1, 2); }\n",
+        )
+        .unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(
+            repo,
+            ["commit", "-m", "fresh origin base"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["update-ref", "refs/remotes/origin/main", "HEAD"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        super::run_git(
+            repo,
+            ["checkout", "-b", "task", "refs/remotes/origin/main"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        std::fs::write(repo.join("docs/note.md"), "task documentation\n").unwrap();
+        super::run_git(repo, ["add", "-A"], Duration::from_secs(10)).unwrap();
+        super::run_git(repo, ["commit", "-m", "docs only"], Duration::from_secs(10)).unwrap();
+
+        let stale_diff = super::run_git(
+            repo,
+            ["diff", "--name-only", "main...HEAD"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8_lossy(&stale_diff.stdout).contains("crates/demo/src/lib.rs"),
+            "fixture must reproduce the stale-local-base false positive"
+        );
+        let base_commit = super::verification_base_commit(repo, "main").unwrap();
+        let origin_commit = super::run_git(
+            repo,
+            ["rev-parse", "refs/remotes/origin/main^{commit}"],
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        assert_eq!(
+            base_commit,
+            String::from_utf8_lossy(&origin_commit.stdout).trim()
+        );
+        assert!(
+            affected_crate_manifests(repo, &base_commit)
+                .unwrap()
+                .is_empty()
+        );
+        super::self_verify_worktree_with_database_url(repo, "main", None)
+            .await
+            .expect("docs-only task must not run tests for unrelated upstream changes");
     }
 
     #[test]
