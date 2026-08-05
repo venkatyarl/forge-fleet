@@ -19,7 +19,11 @@ tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 dashmap.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

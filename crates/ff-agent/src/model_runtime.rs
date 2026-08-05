@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ff_runtime::process_manager::{
+    LlamaServerBackend, LlamaServerSelection, resolve_llama_server_binary,
+};
+
 const STARTUP_TIMEOUT_ENV: &str = "FORGEFLEET_MODEL_STARTUP_TIMEOUT_SECS";
 const STARTUP_TIMEOUT_FLOOR_SECS: u64 = 120;
 const STARTUP_TIMEOUT_CAP_SECS: u64 = 1_800;
@@ -751,9 +755,11 @@ async fn load_model_with_authority(
     };
 
     // Build the launch command per runtime.
-    let (program, args, runtime_label) = match lib.runtime.as_str() {
+    let (program, args, runtime_label, llama_selection) = match lib.runtime.as_str() {
         "llama.cpp" => {
-            let bin = llama_server_binary();
+            let selection = resolve_llama_server_binary()
+                .map_err(|error| format!("llama-server runtime policy: {error}"))?;
+            let bin = selection.path.display().to_string();
             // llama-server expects a single .gguf file, not a directory.
             // The library scanner often registers a directory (the model
             // root); resolve to the largest .gguf inside so the spawn
@@ -855,12 +861,21 @@ async fn load_model_with_authority(
                     args.push("--reranking".into());
                 }
             }
-            // On macOS Metal builds this enables full-GPU inference.
-            if cfg!(target_os = "macos") {
+            // Strict backend identity owns the offload setting. ROCm may not
+            // silently relaunch CPU-only, and an authorized CPU rollback may
+            // not drift back onto a GPU backend.
+            if selection.backend == LlamaServerBackend::Rocm {
+                args.push("--n-gpu-layers".into());
+                args.push("999".into());
+            } else if selection.backend == LlamaServerBackend::CpuRollback {
+                args.push("--n-gpu-layers".into());
+                args.push("0".into());
+            } else if cfg!(target_os = "macos") {
+                // Legacy macOS Metal behavior remains unchanged.
                 args.push("--n-gpu-layers".into());
                 args.push("999".into());
             }
-            (bin, args, "llama.cpp")
+            (bin, args, "llama.cpp", Some(selection))
         }
         "mlx" => {
             // mlx_lm.server is chat-only — no /v1/embeddings, no /v1/rerank.
@@ -897,7 +912,7 @@ async fn load_model_with_authority(
                 "--port".into(),
                 port.to_string(),
             ]);
-            (program, args, "mlx")
+            (program, args, "mlx", None)
         }
         "vllm" => {
             if mode != ServingMode::Chat {
@@ -930,7 +945,7 @@ async fn load_model_with_authority(
                 "--max-model-len".into(),
                 ctx.to_string(),
             ];
-            ("vllm".to_string(), args, "vllm")
+            ("vllm".to_string(), args, "vllm", None)
         }
         other => return Err(format!("unsupported runtime: {other}")),
     };
@@ -975,7 +990,15 @@ async fn load_model_with_authority(
     // LD_LIBRARY_PATH so co-located .so files resolve. Harmless on macOS
     // (Mach-O uses different linker plumbing) and on system-installed
     // builds where the libs are already on the global loader path.
-    if cfg!(target_os = "linux")
+    if llama_selection
+        .as_ref()
+        .is_some_and(LlamaServerSelection::is_strict)
+    {
+        llama_selection
+            .as_ref()
+            .expect("strict selection exists")
+            .configure_command(&mut cmd);
+    } else if cfg!(target_os = "linux")
         && program.contains("llama-server")
         && let Some(bin_dir) = std::path::Path::new(&program).parent()
     {
@@ -1031,7 +1054,13 @@ async fn load_model_with_authority(
     // type-checked on every target while only executing on Linux. Falls back
     // to the manual spawn if systemd isn't usable (no user manager, etc.).
     let mut systemd_pid: Option<u32> = None;
-    if cfg!(target_os = "linux") {
+    let strict_llama = llama_selection
+        .as_ref()
+        .is_some_and(LlamaServerSelection::is_strict);
+    // User-owned persistent units can restart later without re-entering the
+    // root-policy resolver. Keep strict launches on the directly-attested
+    // path until a typed privileged ff operation owns a root system unit.
+    if cfg!(target_os = "linux") && !strict_llama {
         match write_systemd_unit(&program, &args, port, &log_path).await {
             Ok(()) => match start_systemd_unit(port).await {
                 Ok(p) => {
@@ -1059,6 +1088,11 @@ async fn load_model_with_authority(
     let pid = if let Some(p) = systemd_pid {
         p
     } else {
+        if let Some(selection) = &llama_selection {
+            selection.revalidate().map_err(|error| {
+                format!("llama-server changed before manual launch: {error}")
+            })?;
+        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1095,6 +1129,16 @@ async fn load_model_with_authority(
             return Err(format!("launched pid {pid} exited before identity capture"));
         }
     };
+    if let Some(selection) = &llama_selection
+        && let Err(error) = selection.attest_process(pid)
+    {
+        if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
+            release_reservation = false;
+        }
+        return Err(format!(
+            "launched llama-server failed executable/environment attestation: {error}"
+        ));
+    }
     let launched_model_path = match launched_model_path(runtime_label, &args) {
         Some(path) => path,
         None => {
@@ -1202,6 +1246,17 @@ async fn load_model_with_authority(
             .await;
         }
         return Err(message);
+    }
+
+    if let Some(selection) = llama_selection.as_ref().filter(|selection| selection.is_strict()) {
+        let expect_rocm = selection.backend == LlamaServerBackend::Rocm;
+        if let Err(attestation_error) = attest_strict_backend_endpoint(port, expect_rocm).await {
+            launch_guard.cleanup_now().await;
+            release_reservation = false;
+            return Err(format!(
+                "refusing to activate {worker_name}:{port}: strict backend attestation failed: {attestation_error}"
+            ));
+        }
     }
 
     // Record the parallel slot count so the data plane can compute
@@ -1968,27 +2023,6 @@ fn find_sibling_mmproj(model_path: &str) -> Option<String> {
     best.map(|(_, ep)| ep.to_string_lossy().to_string())
 }
 
-fn llama_server_binary() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    // Known install locations across the fleet. The "no-prefix" form
-    // (`llama.cpp/build/bin/llama-server` at `$HOME`) is the layout used
-    // by sophie and other operators who cloned llama.cpp at the home
-    // root rather than under `projects/`. Discovered 2026-05-16 when
-    // `ff model load` on sophie failed with "No such file or directory".
-    for rel in [
-        "llama.cpp/build/bin/llama-server",
-        "projects/llama.cpp/build/bin/llama-server",
-        ".forgefleet/llama.cpp/build/bin/llama-server",
-    ] {
-        let candidate = PathBuf::from(&home).join(rel);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().to_string();
-        }
-    }
-    // Fallback: rely on PATH.
-    "llama-server".to_string()
-}
-
 /// Resolve the MLX HTTP launcher without assuming pip installed its console
 /// script into the current process's PATH.
 ///
@@ -2291,6 +2325,51 @@ pub async fn probe_agent_ctx(runtime: &str, port: u16) -> Option<(i32, i32)> {
         }
         _ => None,
     }
+}
+
+/// A healthy HTTP listener cannot prove a strict backend identity. The running
+/// server's `/props` evidence must agree with either ROCm or the authorized
+/// CPU-only rollback before its deployment is activated.
+async fn attest_strict_backend_endpoint(port: u16, expect_rocm: bool) -> Result<(), String> {
+    let response = SHARED_HTTP
+        .get(format!("http://127.0.0.1:{port}/props"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|error| format!("GET /props: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GET /props returned {}", response.status()));
+    }
+    let props: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("decode /props: {error}"))?;
+    let reports_rocm = llama_props_report_rocm(&props);
+    if reports_rocm != expect_rocm {
+        let expected = if expect_rocm { "ROCm" } else { "CPU-only" };
+        return Err(format!(
+            "/props system_info does not report the required {expected} backend identity"
+        ));
+    }
+    Ok(())
+}
+
+fn llama_props_report_rocm(value: &serde_json::Value) -> bool {
+    fn visit(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                (key == "system_info"
+                    && value.as_str().is_some_and(|info| {
+                        info.split('|')
+                            .any(|field| field.trim().starts_with("ROCm :"))
+                    }))
+                    || visit(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().any(visit),
+            _ => false,
+        }
+    }
+    visit(value)
 }
 
 /// Extract `(per_slot_ctx, total_slots)` from a llama.cpp `/props` body.
@@ -3633,6 +3712,22 @@ mod tests {
             "model_path": "/x"
         });
         assert_eq!(parse_llama_props_ctx(&v), Some((4096, 4)));
+    }
+
+    #[test]
+    fn strict_rocm_props_attestation_requires_system_info_backend_field() {
+        let rocm = serde_json::json!({
+            "system_info": "threads = 16 | ROCm : NO_VMM = 1 | CPU : AVX2 = 1 |",
+            "default_generation_settings": {"n_ctx": 32768}
+        });
+        assert!(llama_props_report_rocm(&rocm));
+        assert!(!llama_props_report_rocm(&serde_json::json!({
+            "system_info": "threads = 16 | CPU : AVX2 = 1 |",
+            "note": "ROCm : text outside system_info must not count"
+        })));
+        assert!(!llama_props_report_rocm(&serde_json::json!({
+            "system_info": "threads = 16 | ROCm support unavailable |"
+        })));
     }
 
     #[test]
