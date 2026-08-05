@@ -3434,7 +3434,7 @@ pub enum CorpusCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum OnboardCommand {
-    /// Print the copy-paste curl command for onboarding a new computer.
+    /// Issue a bound one-time token and print a pinned-HTTPS bootstrap command.
     Show {
         #[arg(long)]
         name: String,

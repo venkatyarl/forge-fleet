@@ -56,7 +56,8 @@ pub async fn resolve_enrollment_policy(
 
 // ─── Bootstrap script rendering ──────────────────────────────────────────
 
-const BOOTSTRAP_TEMPLATE: &str = include_str!("../../../scripts/bootstrap-computer-template.sh");
+pub(crate) const BOOTSTRAP_TEMPLATE: &str =
+    include_str!("../../../scripts/bootstrap-computer-template.sh");
 
 const BOOTSTRAP_TEMPLATE_PS1: &str =
     include_str!("../../../scripts/bootstrap-computer-template.ps1");
@@ -102,76 +103,43 @@ pub struct BootstrapQuery {
 }
 
 pub async fn bootstrap_script(
-    State(state): State<Arc<GatewayState>>,
-    headers: HeaderMap,
-    Query(q): Query<BootstrapQuery>,
+    State(_state): State<Arc<GatewayState>>,
+    _headers: HeaderMap,
+    Query(_q): Query<BootstrapQuery>,
 ) -> axum::response::Response {
-    if !secure_onboarding_transport_available() {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            ONBOARDING_TRANSPORT_QUARANTINE,
-        )
-            .into_response();
-    }
-    // Resolve enrollment policy (config/env, with fleet-vault fallback).
-    let policy = resolve_enrollment_policy(&state).await;
-    match &policy {
-        ff_core::config::EnrollmentEnforcement::Disabled => {
-            tracing::warn!(
-                endpoint = "/onboard/bootstrap.sh",
-                "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
-            );
-        }
-        ff_core::config::EnrollmentEnforcement::Required(expected)
-            if bootstrap_bearer_token(&headers) != Some(expected.as_str()) =>
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                "enrollment bearer token missing or invalid\n",
-            )
-                .into_response();
-        }
-        ff_core::config::EnrollmentEnforcement::Required(_) => {}
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "# enrollment shared secret not configured\n",
-            )
-                .into_response();
-        }
-    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ONBOARDING_TRANSPORT_QUARANTINE,
+    )
+        .into_response()
+}
 
-    // Leader host: derive from the operator's browser connection if possible;
-    // else fall back to env / config.
-    let leader_host =
-        std::env::var("FORGEFLEET_LEADER_HOST").unwrap_or_else(|_| "192.168.5.100".to_string());
-    let leader_port =
-        std::env::var("FORGEFLEET_LEADER_PORT").unwrap_or_else(|_| "51002".to_string());
+pub(crate) struct SecureBootstrapRender<'a> {
+    pub leader_host: &'a str,
+    pub tls_server_name: &'a str,
+    pub tls_ca_pem_b64: &'a str,
+    pub tls_spki_pin: &'a str,
+    pub name: &'a str,
+    pub ip: &'a str,
+    pub ssh_user: &'a str,
+    pub role: &'a str,
+    pub runtime: &'a str,
+}
 
-    // Caller's LAN IP: prefer explicit query param, fall back to
-    // X-Forwarded-For / X-Real-IP headers (if a reverse proxy added them),
-    // then to a generic placeholder the script will override with `hostname -I`.
-    let ip =
-        q.ip.filter(|s| !s.is_empty())
-            .or_else(|| {
-                headers
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.split(',').next())
-                    .map(|s| s.trim().to_string())
-            })
-            .or_else(|| {
-                headers
-                    .get("x-real-ip")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "auto".to_string());
-
-    let name = q.name.unwrap_or_else(|| "newnode".into());
-    let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
-    let role = q.role.unwrap_or_else(|| "builder".into());
-    let runtime = q.runtime.unwrap_or_else(|| "auto".into());
+/// Render the Unix bootstrap only after the dedicated TLS handler has
+/// authenticated the one-time token, peer IP, canonical node name, and leader
+/// epoch. The ordinary HTTP route above never calls this helper.
+pub(crate) async fn render_secure_bootstrap_script(
+    state: &GatewayState,
+    claim: &SecureBootstrapRender<'_>,
+) -> axum::response::Response {
+    let leader_host = claim.leader_host;
+    let leader_port = "51443";
+    let name = claim.name;
+    let ssh_user = claim.ssh_user;
+    let role = claim.role;
+    let runtime = claim.runtime;
+    let ip = claim.ip;
 
     // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
     fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
@@ -196,11 +164,11 @@ pub async fn bootstrap_script(
             valid
         }
     }
-    let name = sanitize_bootstrap_value(&name, 64);
-    let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
-    let role = sanitize_bootstrap_value(&role, 32);
-    let runtime = sanitize_bootstrap_value(&runtime, 32);
-    let ip = sanitize_bootstrap_value(&ip, 64);
+    let name = sanitize_bootstrap_value(name, 64);
+    let ssh_user = sanitize_bootstrap_value(ssh_user, 64);
+    let role = sanitize_bootstrap_value(role, 32);
+    let runtime = sanitize_bootstrap_value(runtime, 32);
+    let ip = sanitize_bootstrap_value(ip, 64);
     let is_vinny = if name.eq_ignore_ascii_case("vinny") || ip == "192.168.5.100" {
         "true"
     } else {
@@ -280,6 +248,9 @@ pub async fn bootstrap_script(
     let script = BOOTSTRAP_TEMPLATE
         .replace("{{LEADER_HOST}}", &leader_host)
         .replace("{{LEADER_PORT}}", &leader_port)
+        .replace("{{TLS_SERVER_NAME}}", claim.tls_server_name)
+        .replace("{{TLS_CA_PEM_B64}}", claim.tls_ca_pem_b64)
+        .replace("{{TLS_SPKI_PIN}}", claim.tls_spki_pin)
         .replace("{{DB_HOST}}", &db_host)
         .replace("{{DB_PORT}}", &db_port)
         .replace("{{REDIS_HOST}}", &redis_host)
@@ -294,10 +265,13 @@ pub async fn bootstrap_script(
 
     (
         StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/x-shellscript; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/x-shellscript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         script,
     )
         .into_response()
@@ -450,6 +424,10 @@ pub async fn bootstrap_script_ps1(
 
 #[derive(Debug, Deserialize)]
 pub struct SelfEnrollPayload {
+    /// Legacy body field retained for rolling wire compatibility. The secure
+    /// TLS handler requires it to be empty and authenticates only from the
+    /// Authorization header.
+    #[serde(default)]
     pub token: String,
     pub name: String,
     pub hostname: Option<String>,
@@ -486,7 +464,7 @@ pub struct SelfEnrollPayload {
 ///   4. `os_id=="ubuntu"` or `os_id` starts with `linux-ubuntu` → `"linux-ubuntu"`
 ///   5. `os_id=="windows"` → `"windows"`
 ///   6. fallback: whatever `os_id` was, or `"linux"`
-fn derive_os_family(os_id: Option<&str>, kernel: Option<&str>) -> String {
+pub(crate) fn derive_os_family(os_id: Option<&str>, kernel: Option<&str>) -> String {
     let os = os_id.unwrap_or("").to_ascii_lowercase();
     if os == "macos" || os == "darwin" {
         return "macos".into();
@@ -816,6 +794,9 @@ pub async fn enrollment_progress(
     State(_state): State<Arc<GatewayState>>,
     Json(payload): Json<EnrollmentProgress>,
 ) -> impl IntoResponse {
+    if !secure_onboarding_transport_available() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     // Lightweight pass-through: publish to Redis so the dashboard's WS can
     // relay without doing its own Postgres poll. Do NOT block on Redis error.
     let channel = format!("fleet:enrollment:{}", payload.name);
@@ -1087,7 +1068,7 @@ fn db_err(op: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 /// Parse the type and fingerprint of an OpenSSH public-key string. Returns
 /// ("unknown", sha256-of-key-body) if parsing fails — good enough for DB
 /// dedup via unique constraint on (worker_name, fingerprint).
-fn parse_pubkey_meta(pubkey: &str) -> (String, String) {
+pub(crate) fn parse_pubkey_meta(pubkey: &str) -> (String, String) {
     use sha2::{Digest, Sha256};
     let mut parts = pubkey.split_whitespace();
     let key_type = parts.next().unwrap_or("unknown").to_string();
@@ -1111,7 +1092,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Compute default sub_agent_count: `max(1, min(cores/2, ram_gb/16, 4))`,
 /// softcap bumped to 8 if the node has an NVIDIA GPU and ≥ 64 GB RAM.
-fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 {
+pub(crate) fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 {
     let from_cores = (cores / 2).max(1);
     let from_ram = (ram_gb / 16).max(1);
     let soft_cap = if has_nvidia && ram_gb >= 64 { 8 } else { 4 };
@@ -1125,7 +1106,7 @@ fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 
 /// Lightweight Redis publish; no dedicated crate import — we shell out to a
 /// tiny helper to avoid adding another dep on ff-gateway (ff-pulse has the
 /// redis crate). Best-effort: failures are logged, not raised.
-async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
+pub(crate) async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
     // Read redis URL from env; default localhost:56379.
     let url = std::env::var("FORGEFLEET_REDIS_URL")
         .unwrap_or_else(|_| "redis://192.168.5.100:56379".into());
@@ -1600,9 +1581,8 @@ exercise_case absent_private_failure absent private
         assert!(!BOOTSTRAP_TEMPLATE.contains("{{TOKEN}}"));
         assert!(BOOTSTRAP_TEMPLATE.contains("TOKEN=\"${FORGEFLEET_ENROLLMENT_TOKEN:-}\""));
         assert!(
-            BOOTSTRAP_TEMPLATE.contains(
-                "FORGEFLEET_ENROLLMENT_TOKEN is required out-of-band for self-enrollment"
-            )
+            BOOTSTRAP_TEMPLATE
+                .contains("a valid one-time FORGEFLEET_ENROLLMENT_TOKEN is required")
         );
         assert!(BOOTSTRAP_TEMPLATE.contains("--data-binary @-"));
         assert!(

@@ -3,7 +3,10 @@
 #
 # Placeholders substituted by crates/ff-gateway/src/onboard.rs::render_bootstrap:
 #   {{LEADER_HOST}}            — e.g. "192.168.5.100"
-#   {{LEADER_PORT}}            — e.g. "51002"
+#   {{LEADER_PORT}}            — dedicated TLS enrollment port (51443)
+#   {{TLS_SERVER_NAME}}        — certificate DNS name (not request-derived)
+#   {{TLS_CA_PEM_B64}}         — public fleet CA, base64 encoded
+#   {{TLS_SPKI_PIN}}           — curl sha256// SPKI pin
 #   {{COMPUTER_NAME}}              — desired fleet_workers.name (from form)
 #   {{COMPUTER_IP}}                — computer's LAN IP (from form / server remote_addr)
 #   {{SSH_USER}}               — ssh_user for this computer
@@ -16,7 +19,7 @@
 #   read -rsp 'Enrollment token: ' FORGEFLEET_ENROLLMENT_TOKEN; echo
 #   read -rsp '1Password service-account token: ' OP_SERVICE_ACCOUNT_TOKEN; echo
 #   export FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN
-#   curl -fsSL 'http://...' | sudo --preserve-env=FORGEFLEET_ENROLLMENT_TOKEN,OP_SERVICE_ACCOUNT_TOKEN bash
+#   (use the `ff onboard show` command; it pins both CA and SPKI)
 # Both credentials are accepted only through the inherited environment; never
 # put them in this script's URL or command-line arguments.
 #
@@ -27,7 +30,11 @@
 set -eu
 set -o pipefail
 
-LEADER="http://{{LEADER_HOST}}:{{LEADER_PORT}}"
+LEADER_IP="{{LEADER_HOST}}"
+TLS_SERVER_NAME="{{TLS_SERVER_NAME}}"
+TLS_CA_PEM_B64="{{TLS_CA_PEM_B64}}"
+TLS_SPKI_PIN="{{TLS_SPKI_PIN}}"
+LEADER="https://${TLS_SERVER_NAME}:{{LEADER_PORT}}"
 TOKEN="${FORGEFLEET_ENROLLMENT_TOKEN:-}"
 NAME="{{COMPUTER_NAME}}"
 IP="{{COMPUTER_IP}}"
@@ -36,6 +43,13 @@ ROLE="{{ROLE}}"
 RUNTIME_HINT="{{RUNTIME}}"
 GITHUB_OWNER="{{GITHUB_OWNER}}"
 IS_VINNY="{{IS_VINNY}}"
+
+# Reject malformed input before it can enter curl's stdin configuration. The
+# server accepts exactly a 32-byte random token encoded as ffe1_<base64url>.
+if [[ ! "$TOKEN" =~ ^ffe1_[A-Za-z0-9_-]{43}$ ]]; then
+  echo "ERROR: a valid one-time FORGEFLEET_ENROLLMENT_TOKEN is required" >&2
+  exit 1
+fi
 
 # Non-secret 1Password authority references. Operators may override these IDs
 # out-of-band without editing the rendered bootstrap. Secret values themselves
@@ -54,6 +68,28 @@ export -n FORGEFLEET_ENROLLMENT_TOKEN OP_SERVICE_ACCOUNT_TOKEN 2>/dev/null || tr
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
 say() { printf '▶ %s\n' "$*"; }
+decode_tls_ca() {
+  if [ "$(uname -s)" = "Darwin" ]; then
+    printf '%s' "$TLS_CA_PEM_B64" | base64 -D
+  else
+    printf '%s' "$TLS_CA_PEM_B64" | base64 -d
+  fi
+}
+tls_curl() {
+  # CA bytes and SPKI are public trust anchors embedded by the authenticated
+  # renderer. Process substitution keeps even the CA out of durable temp files;
+  # --resolve pins the certificate name to the elected leader IP without DNS.
+  curl --proto '=https' --tlsv1.3 \
+    --resolve "${TLS_SERVER_NAME}:{{LEADER_PORT}}:${LEADER_IP}" \
+    --cacert <(decode_tls_ca) \
+    --pinnedpubkey "$TLS_SPKI_PIN" \
+    "$@"
+}
+enrollment_auth_config() {
+  # TOKEN is expanded by bash's builtin printf into an anonymous pipe, not a
+  # child argv, URL, environment, or durable file.
+  printf 'header = "Authorization: Bearer %s"\n' "$TOKEN"
+}
 # JSON-escape a detail string WITHOUT python3 (the bootstrap's report/die/trap
 # paths must never depend on a binary that can hang: vinny 2026-08-04).
 json_escape() {
@@ -62,7 +98,8 @@ json_escape() {
 report() {
   # POST progress event to the leader so the dashboard can show live status.
   local step="$1" status="${2:-running}" detail="${3:-}"
-  curl -fsS -m 5 -X POST \
+  tls_curl -fsS -m 5 -X POST \
+    --config <(enrollment_auth_config) \
     -H "Content-Type: application/json" \
     --data "$(printf '{"name":"%s","step":"%s","status":"%s","detail":"%s"}' \
       "$NAME" "$step" "$status" "$(json_escape "$detail")")" \
@@ -240,13 +277,10 @@ run_as_user mkdir -p "$USER_HOME/.local/bin" "$USER_HOME/.forgefleet/logs"
 
 say "ForgeFleet onboarding for $NAME ($IP) — runtime hint: $RUNTIME_HINT"
 
-[ -n "$TOKEN" ] \
-  || die "FORGEFLEET_ENROLLMENT_TOKEN is required out-of-band for self-enrollment"
-
 # ─── Preflight: the leader must be reachable BEFORE doing any work ────────
 # A wrong subnet/VLAN (e.g. Wi-Fi on 192.168.4.x vs fleet LAN 192.168.5.x)
 # used to surface as a dead curl with no explanation an hour in.
-if ! curl -fsS -m 5 "$LEADER/health" >/dev/null 2>&1; then
+if ! tls_curl -fsS -m 5 "$LEADER/health" >/dev/null 2>&1; then
   echo "ERROR: cannot reach the ForgeFleet leader at $LEADER" >&2
   echo "  → check this computer is on the fleet LAN (correct subnet/VLAN; on a Mac, try turning Wi-Fi off)" >&2
   exit 1
@@ -943,7 +977,6 @@ print(json.dumps(lines))
 KERNEL_REL="$(uname -r 2>/dev/null || echo unknown)"
 ENROLL_PAYLOAD="$(cat <<EOF
 {
-  "token": "$TOKEN",
   "name": "$NAME",
   "hostname": "$(hostname)",
   "ip": "$IP",
@@ -966,14 +999,15 @@ ENROLL_PAYLOAD="$(cat <<EOF
 EOF
 )"
 
-ENROLL_RESP="$(printf '%s' "$ENROLL_PAYLOAD" | curl -fsS -m 30 -X POST \
+ENROLL_RESP="$(printf '%s' "$ENROLL_PAYLOAD" | tls_curl -fsS -m 30 -X POST \
+  --config <(enrollment_auth_config) \
   -H "Content-Type: application/json" \
   --data-binary @- \
-  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP request failed"
-unset ENROLL_PAYLOAD TOKEN FORGEFLEET_ENROLLMENT_TOKEN
+  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTPS request failed"
 
 say "Enrolled: $ENROLL_RESP"
 report "enroll" ok
+unset ENROLL_PAYLOAD TOKEN FORGEFLEET_ENROLLMENT_TOKEN
 
 # ─── 10. Import peer SSH identities ──────────────────────────────────────
 

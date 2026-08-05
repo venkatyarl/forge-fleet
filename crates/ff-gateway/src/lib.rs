@@ -30,6 +30,7 @@ pub mod pgcat_config;
 pub mod pulse_api;
 pub mod router;
 pub mod screen_ctrl;
+pub mod secure_enrollment;
 pub mod server;
 pub mod skills_api;
 pub mod static_files;

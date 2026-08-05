@@ -467,6 +467,7 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
     info!("starting subsystem: gateway");
     subsystem_tasks.push(start_gateway_subsystem(
         config.clone(),
+        worker_name.clone(),
         config_path.to_string_lossy().to_string(),
         backend_registry.clone(),
         registry.clone(),
@@ -2719,6 +2720,7 @@ fn start_agent_subsystem(
 
 fn start_gateway_subsystem(
     config: FleetConfig,
+    worker_name: String,
     config_path: String,
     backend_registry: std::sync::Arc<BackendRegistry>,
     discovery_registry: Arc<ff_discovery::NodeRegistry>,
@@ -2737,6 +2739,7 @@ fn start_gateway_subsystem(
     };
     let gateway_config = GatewayConfig {
         bind_addr: format!("{gateway_host}:{}", config.fleet.api_port.saturating_add(2)), // Web UI on api_port + 2 (51002)
+        node_name: Some(worker_name),
         fleet_config: Some(config.clone()),
         config_path: Some(config_path),
         backend_registry: Some(backend_registry),

@@ -12651,6 +12651,55 @@ ON CONFLICT (id) DO UPDATE SET
     );
 "#;
 
+/// v289: single-use, leader-epoch-fenced credentials for the dedicated TLS
+/// enrollment listener. Only SHA-256 digests are persisted; plaintext bearer
+/// tokens exist solely in the issuing CLI and enrolling client processes.
+pub const SCHEMA_V289_SECURE_ENROLLMENT_TOKENS: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_enrollment_tokens (
+    token_hash       BYTEA PRIMARY KEY,
+    node_name        TEXT NOT NULL,
+    intended_ip      INET NOT NULL,
+    ssh_user         TEXT NOT NULL,
+    role             TEXT NOT NULL,
+    runtime          TEXT NOT NULL,
+    purpose          TEXT NOT NULL DEFAULT 'node-enrollment',
+    leader_name      TEXT NOT NULL,
+    leader_epoch     BIGINT NOT NULL,
+    expires_at       TIMESTAMPTZ NOT NULL,
+    consumed_at      TIMESTAMPTZ,
+    consumed_peer_ip INET,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    created_by       TEXT,
+    CONSTRAINT fleet_enrollment_tokens_hash_length
+        CHECK (octet_length(token_hash) = 32),
+    CONSTRAINT fleet_enrollment_tokens_canonical_name
+        CHECK (node_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    CONSTRAINT fleet_enrollment_tokens_canonical_ssh_user
+        CHECK (ssh_user ~ '^[a-z_][a-z0-9_-]{0,63}$'),
+    CONSTRAINT fleet_enrollment_tokens_role
+        CHECK (role IN ('builder', 'gateway', 'testbed')),
+    CONSTRAINT fleet_enrollment_tokens_runtime
+        CHECK (runtime ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
+    CONSTRAINT fleet_enrollment_tokens_purpose
+        CHECK (purpose = 'node-enrollment'),
+    CONSTRAINT fleet_enrollment_tokens_epoch
+        CHECK (leader_epoch >= 0),
+    CONSTRAINT fleet_enrollment_tokens_expiry
+        CHECK (expires_at > created_at
+            AND expires_at <= created_at + interval '15 minutes'),
+    CONSTRAINT fleet_enrollment_tokens_consumption
+        CHECK ((consumed_at IS NULL AND consumed_peer_ip IS NULL)
+            OR (consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_expiry
+    ON fleet_enrollment_tokens (expires_at)
+    WHERE consumed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_node
+    ON fleet_enrollment_tokens (node_name, created_at DESC);
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

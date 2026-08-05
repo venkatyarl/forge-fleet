@@ -1290,6 +1290,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ubuntu_2604_software_projection",
         sql: schema::SCHEMA_V288_UBUNTU_2604_SOFTWARE_PROJECTION,
     },
+    PgMigration {
+        version: 289,
+        name: "secure_enrollment_tokens",
+        sql: schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS,
+    },
 ];
 
 /// Postgres advisory-lock key guarding the migration runner.
@@ -3135,5 +3140,29 @@ mod tests {
                 .sql
                 .contains("COALESCE(software_registry.detection")
         );
+    }
+
+    #[test]
+    fn v289_stores_only_bound_one_time_token_hashes() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 289)
+            .expect("V289 must be registered");
+        assert_eq!(migration.name, "secure_enrollment_tokens");
+        for required in [
+            "token_hash       BYTEA PRIMARY KEY",
+            "octet_length(token_hash) = 32",
+            "node_name",
+            "intended_ip      INET",
+            "leader_name",
+            "leader_epoch",
+            "expires_at",
+            "consumed_at",
+            "consumed_peer_ip",
+        ] {
+            assert!(migration.sql.contains(required), "missing {required}");
+        }
+        assert!(!migration.sql.contains("plaintext"));
+        assert!(!migration.sql.contains("token_value"));
     }
 }

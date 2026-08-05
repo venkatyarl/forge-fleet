@@ -319,6 +319,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-server"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1ab4a3ec9ea8a657c72d99a03a824af695bd0fb5ec639ccbd9cd3543b41a5f9"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "fs-err",
+ "http",
+ "http-body",
+ "hyper",
+ "hyper-util",
+ "pin-project-lite",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tower-service",
+]
+
+[[package]]
 name = "backon"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1513,6 +1535,8 @@ dependencies = [
  "anyhow",
  "async-nats",
  "axum",
+ "axum-server",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "dashmap",
@@ -1540,6 +1564,8 @@ dependencies = [
  "redis",
  "reqwest",
  "rust-embed",
+ "rustls",
+ "rustls-pemfile",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1554,6 +1580,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -1834,6 +1861,7 @@ dependencies = [
  "ff-voice",
  "futures",
  "notify",
+ "rand 0.8.5",
  "ratatui",
  "redis",
  "regex",
@@ -1851,6 +1879,7 @@ dependencies = [
  "tracing-subscriber",
  "unicode-width 0.2.0",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -2077,6 +2106,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
 dependencies = [
  "percent-encoding",
+]
+
+[[package]]
+name = "fs-err"
+version = "3.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b91aa448ca50d7e79433bdf3ee8d99215430d2ec02ade5aefab2a073a1822e8a"
+dependencies = [
+ "autocfg",
+ "tokio",
 ]
 
 [[package]]

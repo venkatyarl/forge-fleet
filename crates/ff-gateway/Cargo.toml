@@ -53,6 +53,11 @@ futures = "0.3"
 tokio-stream = "0.1"
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 jsonwebtoken = "9"
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+zeroize = "1"
+base64 = "0.22"
 
 [dev-dependencies]
 tower.workspace = true

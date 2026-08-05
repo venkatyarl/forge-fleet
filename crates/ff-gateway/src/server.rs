@@ -56,6 +56,9 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub bind_addr: String,
+    /// Canonical local fleet member name. When present, the gateway supervises
+    /// the separate leader-only TLS enrollment listener on port 51443.
+    pub node_name: Option<String>,
     pub bot_aliases: Vec<String>,
     pub command_prefixes: Vec<char>,
     /// Fleet config for /api/config and fleet status.
@@ -76,6 +79,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:8787".to_string(),
+            node_name: None,
             bot_aliases: vec!["forgefleet".to_string(), "vinny".to_string()],
             command_prefixes: vec!['/', '!'],
             fleet_config: None,
@@ -480,6 +484,14 @@ impl GatewayServer {
 
         let cancel_token = self.state.cancel_token.clone();
 
+        let enrollment_handle = self.config.node_name.clone().map(|node_name| {
+            tokio::spawn(crate::secure_enrollment::run_supervisor(
+                self.state.clone(),
+                node_name,
+                cancel_token.clone(),
+            ))
+        });
+
         // Spawn WebSocket heartbeat pruning task (30s interval, 60s timeout).
         let heartbeat_handle = self.state.ws_hub.spawn_heartbeat_task(
             std::time::Duration::from_secs(30),
@@ -488,9 +500,9 @@ impl GatewayServer {
         );
 
         info!(address = %listener.local_addr()?, "ff-gateway listening");
-        axum::serve(listener, self.app())
+        let serve_result = axum::serve(listener, self.app())
             .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
-            .await?;
+            .await;
 
         // Graceful shutdown: cancel background tasks and signal warmer.
         cancel_token.cancel();
@@ -498,10 +510,14 @@ impl GatewayServer {
             let _ = tx.send(true);
         }
         heartbeat_handle.abort();
+        if let Some(enrollment_handle) = enrollment_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), enrollment_handle).await;
+        }
         if let Some(flush_handle) = self.flush_handle.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), flush_handle).await;
         }
         info!("ff-gateway shutdown complete");
+        serve_result?;
         Ok(())
     }
 
