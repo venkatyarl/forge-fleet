@@ -14348,6 +14348,49 @@ COMMENT ON TABLE release_rollout_transactions IS
     'One-active leased rollout transaction with request idempotency and CAS revision.';
 "#;
 
+/// v296: make Devstral's proven code capability durable in the canonical
+/// catalog without treating the compatibility `model_catalog` view as a
+/// second authority.
+///
+/// A fresh database has no Devstral seed, so the absent-row path installs the
+/// exact reviewed live catalog identity whose endpoints passed the direct code
+/// probe audit. An upgraded database keeps every existing column and workload
+/// element in place; only a missing, case-insensitive `code` capability is
+/// appended. Malformed workload metadata is left alone for operator review
+/// rather than guessed at.
+pub const SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY: &str = r#"
+INSERT INTO fleet_model_catalog (
+    id, name, family, parameters, tier, description, gated,
+    preferred_workloads, variants, tool_calling
+) VALUES (
+    'devstral-small-2-24b',
+    'Devstral Small 2 24B',
+    'devstral',
+    '24B',
+    2,
+    'Mistral dense 24B - multi-file coding/agentic specialist',
+    false,
+    '["reasoning", "tool_calling", "code"]'::jsonb,
+    '[{"runtime":"llama.cpp","quant":"UD-Q4_K_XL","hf_repo":"unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF","size_gb":14}]'::jsonb,
+    true
+)
+ON CONFLICT (id) DO UPDATE
+SET preferred_workloads =
+    fleet_model_catalog.preferred_workloads || '["code"]'::jsonb
+WHERE jsonb_typeof(fleet_model_catalog.preferred_workloads) = 'array'
+  AND NOT EXISTS (
+      SELECT 1
+        FROM jsonb_array_elements_text(
+                 CASE
+                   WHEN jsonb_typeof(fleet_model_catalog.preferred_workloads) = 'array'
+                   THEN fleet_model_catalog.preferred_workloads
+                   ELSE '[]'::jsonb
+                 END
+             ) AS workload(value)
+       WHERE lower(workload.value) = 'code'
+  );
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

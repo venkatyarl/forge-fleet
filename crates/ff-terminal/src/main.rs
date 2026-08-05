@@ -3913,7 +3913,7 @@ pub enum ModelCommand {
         #[arg(long = "gpu-memory-utilization", default_value_t = 0.85)]
         gpu_memory_utilization: f32,
     },
-    /// Sync the curated model catalog TOML into Postgres.
+    /// Reconcile the constrained canonical Devstral capability in PostgreSQL.
     SyncCatalog,
     /// Search the catalog (fuzzy on id/name/family).
     Search { query: String },

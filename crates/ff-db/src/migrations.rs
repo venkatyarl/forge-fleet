@@ -1323,6 +1323,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ace_gemma4_mlx_exact_authority",
         sql: schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY,
     },
+    PgMigration {
+        version: 296,
+        name: "devstral_code_capability_authority",
+        sql: schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY,
+    },
 ];
 
 /// Explicit-only migrations are structurally unreachable from
@@ -1395,8 +1400,19 @@ static REVIEWED_LEGACY_LEDGER_ROWS: &[ReviewedLegacyLedgerRow] = &[
 
 const REVIEWED_LEDGER_ONLY_VERSIONS: &[u32] = &[234, 236, 246, 260, 270, 280];
 
-pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 = 294;
+const RELEASE_ROLLOUT_AUTHORITY_MIGRATION: u32 = 295;
+const DEVSTRAL_CODE_CAPABILITY_MIGRATION: u32 = 296;
+
+pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 = DEVSTRAL_CODE_CAPABILITY_MIGRATION;
 pub const LATEST_EXPLICIT_POSTGRES_MIGRATION: u32 = 295;
+
+fn automatic_migration_prerequisites_satisfied(
+    migration_version: u32,
+    applied_versions: &BTreeSet<u32>,
+) -> bool {
+    migration_version != DEVSTRAL_CODE_CAPABILITY_MIGRATION
+        || applied_versions.contains(&RELEASE_ROLLOUT_AUTHORITY_MIGRATION)
+}
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub struct PostgresMigrationDescriptor {
@@ -1789,13 +1805,33 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
         }
     }
 
+    let applied_versions = read_applied_postgres_migrations_conn(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|row| row.version)
+        .collect::<BTreeSet<_>>();
+    let v296_held_for_v295 = current < DEVSTRAL_CODE_CAPABILITY_MIGRATION
+        && !automatic_migration_prerequisites_satisfied(
+            DEVSTRAL_CODE_CAPABILITY_MIGRATION,
+            &applied_versions,
+        );
     let pending: Vec<&PgMigration> = PG_MIGRATIONS
         .iter()
         .filter(|m| m.version > current)
+        .filter(|m| automatic_migration_prerequisites_satisfied(m.version, &applied_versions))
         .collect();
 
     if pending.is_empty() {
-        debug!(current_version = current, "postgres database is up to date");
+        if v296_held_for_v295 {
+            warn!(
+                current_version = current,
+                required_version = RELEASE_ROLLOUT_AUTHORITY_MIGRATION,
+                held_version = DEVSTRAL_CODE_CAPABILITY_MIGRATION,
+                "holding automatic Devstral capability migration until explicit rollout authority is recorded"
+            );
+        } else {
+            debug!(current_version = current, "postgres database is up to date");
+        }
         return Ok(current);
     }
 
@@ -2547,12 +2583,6 @@ pub async fn apply_explicit_postgres_migrations(
             before.drift.join("; ")
         )));
     }
-    if before.current_version > target {
-        return Err(DbError::Migration(format!(
-            "database v{} is newer than bounded target v{target}",
-            before.current_version
-        )));
-    }
     if before.current_version < 290 {
         return Err(DbError::Migration(format!(
             "explicit v{target} requires the reviewed v290-or-newer base; database is v{}",
@@ -2609,6 +2639,12 @@ pub async fn apply_explicit_postgres_migrations(
             }
             tx.rollback().await?;
             return Ok(());
+        }
+        if locked_current > target {
+            return Err(DbError::Migration(format!(
+                "database v{locked_current} is newer than bounded target v{target}, \
+                 but the exact source-attested v{target} ledger row is missing"
+            )));
         }
 
         if !reviewed_historical_schema_is_exact(&mut tx).await? {
@@ -2747,10 +2783,14 @@ pub async fn apply_explicit_postgres_migrations(
     result?;
 
     let after = postgres_migration_status(pool).await?;
-    if after.current_version != target || !after.drift.is_empty() {
+    let target_provenance_is_exact = after.applied.iter().any(|row| {
+        row.version == target && row.source_commit.as_deref() == Some(expected_source_commit)
+    });
+    if after.current_version < target || !target_provenance_is_exact || !after.drift.is_empty() {
         return Err(DbError::Migration(format!(
-            "explicit migration postcondition failed at v{}: {}",
+            "explicit migration postcondition failed at v{} (target provenance exact={}): {}",
             after.current_version,
+            target_provenance_is_exact,
             after.drift.join("; ")
         )));
     }
@@ -2798,10 +2838,10 @@ mod tests {
     }
 
     #[test]
-    fn v295_is_explicit_only_and_directly_follows_v294() {
-        assert_eq!(LATEST_AUTOMATIC_POSTGRES_MIGRATION, 294);
+    fn v295_remains_explicit_only_and_v296_waits_for_it() {
+        assert_eq!(LATEST_AUTOMATIC_POSTGRES_MIGRATION, 296);
         assert_eq!(LATEST_EXPLICIT_POSTGRES_MIGRATION, 295);
-        assert_eq!(PG_MIGRATIONS.last().unwrap().version, 294);
+        assert_eq!(PG_MIGRATIONS.last().unwrap().version, 296);
         assert!(
             PG_MIGRATIONS
                 .iter()
@@ -2810,6 +2850,27 @@ mod tests {
         assert_eq!(EXPLICIT_PG_MIGRATIONS.len(), 1);
         assert_eq!(EXPLICIT_PG_MIGRATIONS[0].version, 295);
         assert_eq!(EXPLICIT_PG_MIGRATIONS[0].name, "release_rollout_authority");
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 296)
+            .expect("V296 must be registered");
+        assert_eq!(migration.name, "devstral_code_capability_authority");
+        assert!(migration.sql.contains("INSERT INTO fleet_model_catalog"));
+        assert!(!migration.sql.contains("INSERT INTO model_catalog"));
+        assert!(!migration.sql.contains("UPDATE model_catalog"));
+
+        assert!(!automatic_migration_prerequisites_satisfied(
+            296,
+            &BTreeSet::new()
+        ));
+        assert!(automatic_migration_prerequisites_satisfied(
+            296,
+            &BTreeSet::from([295])
+        ));
+        assert!(automatic_migration_prerequisites_satisfied(
+            294,
+            &BTreeSet::new()
+        ));
     }
 
     #[test]
@@ -2945,6 +3006,16 @@ mod tests {
                 .await
                 .expect("exact replay must be idempotent");
         assert_eq!(replay.current_version, 295);
+
+        let advanced = run_postgres_migrations(&pool)
+            .await
+            .expect("automatic V296 must follow recorded explicit V295");
+        assert_eq!(advanced, 296);
+        let replay_after_v296 =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect("exact V295 replay must remain idempotent after V296");
+        assert_eq!(replay_after_v296.current_version, 296);
         assert!(
             apply_explicit_postgres_migrations(
                 &pool,
@@ -4688,6 +4759,222 @@ mod tests {
         .await
         .expect("read bootstrapped V294 authority");
         assert_eq!(exact_files, 10);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v296_waits_for_v295_then_seeds_and_repairs_devstral_idempotently_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        let held_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh automatic migrations must stop before gated V296");
+        assert_eq!(held_version, 294);
+        let absent_before_v295: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM fleet_model_catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count fresh Devstral rows before V295");
+        assert_eq!(absent_before_v295, 0);
+        let v296_before_v295: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _migrations WHERE version = 296")
+                .fetch_one(&pool)
+                .await
+                .expect("read held V296 ledger state");
+        assert_eq!(v296_before_v295, 0);
+
+        sqlx::query(
+            "INSERT INTO _migrations (version, name) \
+             VALUES (295, 'release_rollout_authority')",
+        )
+        .execute(&pool)
+        .await
+        .expect("record reviewed V295 prerequisite fixture");
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("V296 must run once explicit V295 is recorded");
+        assert_eq!(final_version, 296);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 296")
+                .fetch_one(&pool)
+                .await
+                .expect("V296 must be durably recorded");
+        assert_eq!(migration_name, "devstral_code_capability_authority");
+
+        let seeded: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read seeded Devstral authority");
+        assert_eq!(
+            seeded,
+            serde_json::json!({
+                "id": "devstral-small-2-24b",
+                "name": "Devstral Small 2 24B",
+                "family": "devstral",
+                "parameters": "24B",
+                "tier": 2,
+                "description": "Mistral dense 24B - multi-file coding/agentic specialist",
+                "gated": false,
+                "preferred_workloads": ["reasoning", "tool_calling", "code"],
+                "variants": [{
+                    "runtime": "llama.cpp",
+                    "quant": "UD-Q4_K_XL",
+                    "hf_repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF",
+                    "size_gb": 14
+                }],
+                "tool_calling": true,
+                "display_name": null,
+                "tasks": null,
+                "modalities": null,
+                "benchmarks": null,
+                "license": null,
+                "lifecycle": null
+            })
+        );
+
+        sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("exact seeded V296 authority must replay idempotently");
+        let seeded_after_replay: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed seeded authority");
+        assert_eq!(seeded_after_replay, seeded);
+
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO fleet_model_catalog (id, name, family, parameters, tier)
+            VALUES ('v296-unrelated', 'Unrelated', 'test', '1B', 4);
+
+            UPDATE fleet_model_catalog
+               SET name = 'Operator Devstral',
+                   family = 'operator-family',
+                   parameters = '99B',
+                   tier = 4,
+                   description = 'operator description',
+                   gated = true,
+                   preferred_workloads = '["reasoning", "tool_calling"]',
+                   variants = '[{"operator":true}]',
+                   updated_at = '2026-01-02T03:04:05Z',
+                   tool_calling = false,
+                   display_name = 'Operator Display',
+                   tasks = '["operator-task"]',
+                   modalities = '["operator-modality"]',
+                   benchmarks = '{"operator":99}',
+                   license = 'operator-license',
+                   lifecycle = 'candidate'
+             WHERE id = 'devstral-small-2-24b';
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install upgraded-database preservation fixture");
+        let nonworkload_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'preferred_workloads' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot every non-workload column");
+        let unrelated_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+              WHERE id = 'v296-unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot unrelated row");
+
+        sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V296 must append the missing code capability");
+        let repaired: (serde_json::Value, serde_json::Value) = sqlx::query_as(
+            "SELECT preferred_workloads, to_jsonb(catalog) - 'preferred_workloads' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired upgraded row");
+        assert_eq!(
+            repaired.0,
+            serde_json::json!(["reasoning", "tool_calling", "code"])
+        );
+        assert_eq!(repaired.1, nonworkload_before);
+
+        sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("repaired upgraded state must replay idempotently");
+        let repaired_after_replay: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed repaired row");
+        assert_eq!(
+            repaired_after_replay["preferred_workloads"],
+            serde_json::json!(["reasoning", "tool_calling", "code"])
+        );
+
+        for protected_workloads in [
+            serde_json::json!(["reasoning", "CoDe"]),
+            serde_json::json!("code"),
+            serde_json::json!({"code": true}),
+        ] {
+            sqlx::query(
+                "UPDATE fleet_model_catalog SET preferred_workloads = $1 \
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .bind(&protected_workloads)
+            .execute(&pool)
+            .await
+            .expect("install protected workload fixture");
+            let before: serde_json::Value = sqlx::query_scalar(
+                "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot protected workload fixture");
+            sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+                .execute(&pool)
+                .await
+                .expect("V296 protected workload replay");
+            let after: serde_json::Value = sqlx::query_scalar(
+                "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read protected workload fixture");
+            assert_eq!(after, before);
+        }
+
+        let unrelated_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+              WHERE id = 'v296-unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read unrelated row after V296 replays");
+        assert_eq!(unrelated_after, unrelated_before);
 
         drop_temp_db(admin, pool, &db_name).await;
     }

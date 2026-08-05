@@ -328,7 +328,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             let n = ff_agent::model_catalog::sync_catalog(&pool)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
-            println!("Synced {n} catalog entries from TOML to Postgres");
+            println!("Reconciled {n} canonical catalog row(s) in PostgreSQL");
         }
         crate::ModelCommand::Search { query } => {
             let rows = ff_db::pg_search_catalog(&pool, &query).await?;
@@ -362,7 +362,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 return Ok(());
             }
             if rows.is_empty() {
-                println!("(catalog empty — run `ff model sync-catalog` first)");
+                println!("(catalog empty — database catalog migrations have not been applied)");
                 return Ok(());
             }
             println!(
