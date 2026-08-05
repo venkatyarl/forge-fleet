@@ -3655,6 +3655,8 @@ pub async fn pg_record_backup_distribution_receipt(
                         'expected_checksum', LOWER($2::text),
                         'observed_checksum', LOWER($6::text),
                         'size_bytes', $7::bigint,
+                        'database_kind', $10::text,
+                        'file_name', $11::text,
                         'checksum', 'ok',
                         'decrypt', 'ok',
                         'age_format', true,
@@ -7147,6 +7149,14 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status["hosts"][&lily_key]["host"], "lily");
+        assert_eq!(
+            status["hosts"][&lily_key]["database_kind"],
+            "postgres"
+        );
+        assert_eq!(
+            status["hosts"][&lily_key]["file_name"],
+            "pg-exact.tar.gz.age"
+        );
         assert_eq!(status["hosts"][&rihanna_key]["host"], "rihanna");
         assert_eq!(status["hosts"].as_object().unwrap().len(), 2);
 

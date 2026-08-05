@@ -1507,6 +1507,11 @@ impl BackupOrchestrator {
     /// freshness ticker, not through the PM work-item scheduler, so recovery
     /// remains active while `work_item_execution_enabled=false`.
     async fn reconcile_local_distribution_receipts(&self) -> Result<usize, BackupError> {
+        // Resolve the stable enrollment identity once per reconciliation pass.
+        // `my_node_name` may retain old casing or a pre-rename value, while the
+        // immutable computer UUID continues to identify this host.
+        let (computer_id, canonical_host) =
+            canonical_receipt_host_by_id(&self.pg, self.my_computer_id).await?;
         let rows: Vec<(Uuid, String, String, String, i64, serde_json::Value)> = sqlx::query_as(
             "SELECT id, database_kind, file_name, checksum_sha256, size_bytes,
                     distribution_status
@@ -1516,7 +1521,7 @@ impl BackupOrchestrator {
               ORDER BY created_at DESC, id DESC
               LIMIT $2",
         )
-        .bind(self.my_computer_id)
+        .bind(computer_id)
         .bind(RECEIPT_RECONCILE_SCAN_LIMIT)
         .fetch_all(&self.pg)
         .await?;
@@ -1528,10 +1533,12 @@ impl BackupOrchestrator {
             if existing_receipt_is_current(
                 &distribution_status,
                 backup_id,
-                self.my_computer_id,
-                &self.my_node_name,
+                computer_id,
+                &canonical_host,
                 &checksum,
                 size_bytes,
+                &kind,
+                &file_name,
                 now,
             ) {
                 continue;
@@ -1555,9 +1562,10 @@ impl BackupOrchestrator {
                 break;
             }
             attempted += 1;
-            match record_backup_distribution_receipt(
+            match record_backup_distribution_receipt_for_host(
                 &self.pg,
-                &self.my_node_name,
+                computer_id,
+                &canonical_host,
                 backup_id,
                 &checksum,
                 Some(&self.backup_dir),
@@ -2312,7 +2320,25 @@ pub fn verify_backup_artifact(
     }
 }
 
-async fn canonical_receipt_host(
+fn require_unique_canonical_receipt_host(
+    rows: Vec<(Uuid, String)>,
+    identity: &str,
+) -> Result<(Uuid, String), BackupError> {
+    match rows.as_slice() {
+        [(id, name)] if !name.trim().is_empty() => Ok((*id, name.clone())),
+        [] => Err(BackupError::Cmd(format!(
+            "local worker {identity} is not an enrolled computer"
+        ))),
+        [_] => Err(BackupError::Cmd(format!(
+            "local worker {identity} has an empty canonical name"
+        ))),
+        _ => Err(BackupError::Cmd(format!(
+            "local worker identity {identity} is ambiguous"
+        ))),
+    }
+}
+
+async fn canonical_receipt_host_by_name(
     pool: &PgPool,
     local_worker_name: &str,
 ) -> Result<(Uuid, String), BackupError> {
@@ -2325,15 +2351,23 @@ async fn canonical_receipt_host(
     .bind(local_worker_name)
     .fetch_all(pool)
     .await?;
-    match rows.as_slice() {
-        [(id, name)] => Ok((*id, name.clone())),
-        [] => Err(BackupError::Cmd(format!(
-            "local worker {local_worker_name:?} is not an enrolled computer"
-        ))),
-        _ => Err(BackupError::Cmd(format!(
-            "local worker identity {local_worker_name:?} is ambiguous"
-        ))),
-    }
+    require_unique_canonical_receipt_host(rows, &format!("name {local_worker_name:?}"))
+}
+
+async fn canonical_receipt_host_by_id(
+    pool: &PgPool,
+    computer_id: Uuid,
+) -> Result<(Uuid, String), BackupError> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name
+           FROM computers
+          WHERE id = $1
+          ORDER BY id",
+    )
+    .bind(computer_id)
+    .fetch_all(pool)
+    .await?;
+    require_unique_canonical_receipt_host(rows, &format!("id {computer_id}"))
 }
 
 async fn load_backup_identity(pool: &PgPool) -> Result<age::x25519::Identity, BackupError> {
@@ -2377,9 +2411,29 @@ pub async fn record_backup_distribution_receipt(
     enqueue_checksum: &str,
     backup_root: Option<&Path>,
 ) -> Result<BackupReceiptReport, BackupError> {
+    let (computer_id, canonical_host) =
+        canonical_receipt_host_by_name(pool, local_worker_name).await?;
+    record_backup_distribution_receipt_for_host(
+        pool,
+        computer_id,
+        &canonical_host,
+        backup_id,
+        enqueue_checksum,
+        backup_root,
+    )
+    .await
+}
+
+async fn record_backup_distribution_receipt_for_host(
+    pool: &PgPool,
+    computer_id: Uuid,
+    canonical_host: &str,
+    backup_id: Uuid,
+    enqueue_checksum: &str,
+    backup_root: Option<&Path>,
+) -> Result<BackupReceiptReport, BackupError> {
     validate_expected_sha256(enqueue_checksum)?;
     let enqueue_checksum = enqueue_checksum.to_ascii_lowercase();
-    let (computer_id, canonical_host) = canonical_receipt_host(pool, local_worker_name).await?;
     let catalog: Option<(String, String, String, i64)> = sqlx::query_as(
         "SELECT database_kind, file_name, checksum_sha256, size_bytes
            FROM backups
@@ -2438,7 +2492,7 @@ pub async fn record_backup_distribution_receipt(
         &enqueue_checksum,
         &host_key,
         computer_id,
-        &canonical_host,
+        canonical_host,
         &evidence.observed_sha256,
         catalog_size,
         BACKUP_RECEIPT_VERSION,
@@ -2457,7 +2511,7 @@ pub async fn record_backup_distribution_receipt(
     Ok(BackupReceiptReport {
         backup_id,
         computer_id,
-        host: canonical_host,
+        host: canonical_host.to_string(),
         expected_checksum: enqueue_checksum,
         observed_checksum: evidence.observed_sha256,
         verified_at,
@@ -2472,9 +2526,15 @@ fn existing_receipt_is_current(
     canonical_host: &str,
     expected_checksum: &str,
     expected_size: i64,
+    expected_database_kind: &str,
+    expected_file_name: &str,
     now: chrono::DateTime<Utc>,
 ) -> bool {
-    if validate_expected_sha256(expected_checksum).is_err() || expected_size <= 0 {
+    if validate_expected_sha256(expected_checksum).is_err()
+        || expected_size <= 0
+        || !is_known_backup_kind(expected_database_kind)
+        || validate_backup_component("file_name", expected_file_name).is_err()
+    {
         return false;
     }
     let backup_id_string = backup_id.to_string();
@@ -2494,7 +2554,18 @@ fn existing_receipt_is_current(
             .get("computer_id")
             .and_then(serde_json::Value::as_str)
             != Some(computer_id_string.as_str())
-        || receipt.get("host").and_then(serde_json::Value::as_str) != Some(canonical_host)
+        || !receipt
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|host| host.eq_ignore_ascii_case(canonical_host))
+        || receipt
+            .get("database_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_database_kind)
+        || receipt
+            .get("file_name")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_file_name)
         || receipt.get("checksum").and_then(serde_json::Value::as_str) != Some("ok")
         || receipt.get("decrypt").and_then(serde_json::Value::as_str) != Some("ok")
         || receipt
@@ -3295,6 +3366,8 @@ mod tests {
                         "age_format": true,
                         "evidence_tier": "checksum_decrypt",
                         "size_bytes": 8192,
+                        "database_kind": "postgres",
+                        "file_name": "pg-exact.tar.gz.age",
                         "run_id": Uuid::new_v4(),
                         "observed_at": verified_at,
                         "last_ok": verified_at,
@@ -3308,9 +3381,33 @@ mod tests {
             &fresh,
             backup_id,
             computer_id,
+            "LILY",
+            &checksum,
+            8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            backup_id,
+            computer_id,
             "lily",
             &checksum,
             8192,
+            "redis",
+            "pg-exact.tar.gz.age",
+            now,
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            backup_id,
+            computer_id,
+            "lily",
+            &checksum,
+            8192,
+            "postgres",
+            "pg-renamed.tar.gz.age",
             now,
         ));
         assert!(!existing_receipt_is_current(
@@ -3320,6 +3417,8 @@ mod tests {
             "rihanna",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         assert!(!existing_receipt_is_current(
@@ -3329,6 +3428,8 @@ mod tests {
             "lily",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         assert!(!existing_receipt_is_current(
@@ -3338,6 +3439,8 @@ mod tests {
             "lily",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         assert!(existing_receipt_is_current(
@@ -3347,6 +3450,8 @@ mod tests {
             "lily",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         assert!(!existing_receipt_is_current(
@@ -3356,6 +3461,8 @@ mod tests {
             "lily",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         let mut incomplete = fresh.clone();
@@ -3370,6 +3477,8 @@ mod tests {
             "lily",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         assert!(!existing_receipt_is_current(
@@ -3379,10 +3488,40 @@ mod tests {
             "lily",
             &checksum,
             4096,
+            "postgres",
+            "pg-exact.tar.gz.age",
             now,
         ));
         assert_eq!(RECEIPT_RECONCILE_BATCH_SIZE, 5);
         assert!(RECEIPT_RECONCILE_SCAN_LIMIT >= RECEIPT_RECONCILE_BATCH_SIZE as i64);
+    }
+
+    #[test]
+    fn canonical_receipt_host_resolution_is_unique_and_fail_closed() {
+        let computer_id = Uuid::new_v4();
+        assert_eq!(
+            require_unique_canonical_receipt_host(
+                vec![(computer_id, "Vinny".into())],
+                "id under test",
+            )
+            .unwrap(),
+            (computer_id, "Vinny".into())
+        );
+        assert!(require_unique_canonical_receipt_host(Vec::new(), "missing").is_err());
+        assert!(
+            require_unique_canonical_receipt_host(
+                vec![
+                    (computer_id, "Vinny".into()),
+                    (Uuid::new_v4(), "VINNY".into()),
+                ],
+                "ambiguous name",
+            )
+            .is_err()
+        );
+        assert!(
+            require_unique_canonical_receipt_host(vec![(computer_id, "  ".into())], "blank")
+                .is_err()
+        );
     }
 
     #[cfg(unix)]

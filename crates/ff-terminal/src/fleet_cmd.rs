@@ -966,6 +966,8 @@ fn validate_remote_backup_receipt(
     canonical_node: &str,
     expected_checksum: &str,
     expected_size: i64,
+    expected_database_kind: &str,
+    expected_file_name: &str,
     backup_created_at: chrono::DateTime<chrono::Utc>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> std::result::Result<(), String> {
@@ -1012,8 +1014,14 @@ fn validate_remote_backup_receipt(
     if receipt_computer_id != expected_computer_id {
         return Err("receipt is bound to another computer id".into());
     }
-    if string("host")? != canonical_node {
+    if !string("host")?.eq_ignore_ascii_case(canonical_node) {
         return Err("receipt host does not match the canonical enrolled name".into());
+    }
+    if string("database_kind")? != expected_database_kind {
+        return Err("receipt is bound to another database kind".into());
+    }
+    if string("file_name")? != expected_file_name {
+        return Err("receipt is bound to another backup file".into());
     }
 
     let tier = string("evidence_tier")?;
@@ -1087,6 +1095,24 @@ fn validate_remote_backup_receipt(
     Ok(())
 }
 
+fn require_unique_remote_drill_target(
+    requested_node: &str,
+    matches: Vec<(uuid::Uuid, String)>,
+) -> std::result::Result<(uuid::Uuid, String), String> {
+    match matches.as_slice() {
+        [(id, name)] if !name.trim().is_empty() => Ok((*id, name.clone())),
+        [] => Err(format!(
+            "remote drill target {requested_node:?} is not an enrolled computer"
+        )),
+        [_] => Err(format!(
+            "remote drill target {requested_node:?} has an empty canonical name"
+        )),
+        _ => Err(format!(
+            "remote drill target {requested_node:?} is ambiguous under case-insensitive matching"
+        )),
+    }
+}
+
 /// Enqueue a restore-drill on a remote fleet computer via the deferred-task
 /// queue, then poll `backup_drills` for that node's result. Backing
 /// `ff fleet db drill --on <node>`: proves the backup fanned out to `<node>`
@@ -1102,22 +1128,24 @@ async fn enqueue_remote_drill(
     println!(
         "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (from={me}, backup={backup_id}, run={run_id})"
     );
-    let (target_computer_id, canonical_node): (uuid::Uuid, String) =
-        sqlx::query_as("SELECT id, name FROM computers WHERE LOWER(name)=LOWER($1)")
-            .bind(node)
-            .fetch_optional(pool)
-            .await?
-            .ok_or_else(|| {
-                anyhow::anyhow!("remote drill target {node:?} is not an enrolled computer")
-            })?;
-    let (checksum, size_bytes, created_at, distribution_status, database_kind): (
+    let target_matches: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM computers WHERE LOWER(name)=LOWER($1) ORDER BY id",
+    )
+    .bind(node)
+    .fetch_all(pool)
+    .await?;
+    let (target_computer_id, canonical_node) =
+        require_unique_remote_drill_target(node, target_matches).map_err(anyhow::Error::msg)?;
+    let (checksum, size_bytes, created_at, distribution_status, database_kind, file_name): (
         String,
         i64,
         chrono::DateTime<chrono::Utc>,
         serde_json::Value,
         String,
+        String,
     ) = sqlx::query_as(
-        "SELECT checksum_sha256, size_bytes, created_at, distribution_status, database_kind
+        "SELECT checksum_sha256, size_bytes, created_at, distribution_status, database_kind,
+                file_name
            FROM backups
           WHERE id=$1 AND database_kind IN ('postgres', 'falkordb')",
     )
@@ -1136,6 +1164,8 @@ async fn enqueue_remote_drill(
         &canonical_node,
         &checksum,
         size_bytes,
+        &database_kind,
+        &file_name,
         created_at,
         chrono::Utc::now(),
     )
@@ -1263,6 +1293,8 @@ mod exact_restore_drill_tests {
                     "expected_checksum": checksum,
                     "observed_checksum": checksum,
                     "size_bytes": 8192,
+                    "database_kind": "postgres",
+                    "file_name": "pg-exact.tar.gz.age",
                     "decrypt": "ok",
                     "age_format": true,
                 }
@@ -1282,9 +1314,11 @@ mod exact_restore_drill_tests {
             &status,
             backup_id,
             computer_id,
-            "priya",
+            "PRIYA",
             &checksum.to_ascii_uppercase(),
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created,
             now,
         )
@@ -1297,6 +1331,34 @@ mod exact_restore_drill_tests {
             "priya",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
+            created,
+            now,
+        )
+        .is_err());
+        assert!(validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            8192,
+            "falkordb",
+            "pg-exact.tar.gz.age",
+            created,
+            now,
+        )
+        .is_err());
+        assert!(validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            8192,
+            "postgres",
+            "pg-renamed.tar.gz.age",
             created,
             now,
         )
@@ -1308,6 +1370,8 @@ mod exact_restore_drill_tests {
             "vinny",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created,
             now,
         )
@@ -1319,6 +1383,8 @@ mod exact_restore_drill_tests {
             "priya",
             "different",
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created,
             now,
         )
@@ -1336,10 +1402,35 @@ mod exact_restore_drill_tests {
             "priya",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created,
             now,
         )
         .is_err());
+    }
+
+    #[test]
+    fn remote_drill_target_resolution_rejects_zero_or_ambiguous_case_matches() {
+        let computer_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            require_unique_remote_drill_target(
+                "priya",
+                vec![(computer_id, "Priya".into())],
+            )
+            .unwrap(),
+            (computer_id, "Priya".into())
+        );
+        assert!(require_unique_remote_drill_target("missing", Vec::new()).is_err());
+        let error = require_unique_remote_drill_target(
+            "priya",
+            vec![
+                (computer_id, "Priya".into()),
+                (uuid::Uuid::new_v4(), "PRIYA".into()),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"));
     }
 
     #[test]
@@ -1370,6 +1461,8 @@ mod exact_restore_drill_tests {
                 "priya",
                 &checksum,
                 8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
                 created,
                 now,
             )
@@ -1390,6 +1483,8 @@ mod exact_restore_drill_tests {
             "priya",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created - chrono::Duration::days(2),
             now,
         )
@@ -1405,6 +1500,8 @@ mod exact_restore_drill_tests {
             "priya",
             &checksum,
             8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created,
             now,
         )
@@ -1416,6 +1513,8 @@ mod exact_restore_drill_tests {
             "priya",
             &checksum,
             4096,
+            "postgres",
+            "pg-exact.tar.gz.age",
             created,
             now,
         )
