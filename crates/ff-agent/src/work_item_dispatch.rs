@@ -7711,10 +7711,14 @@ mod tests {
                 .execute(&pool)
                 .await
                 .expect("insert test project");
+            // `computers` is the stable compatibility projection in both the
+            // reviewed legacy roster and the unified `fleet_nodes` layout.
+            // Fresh databases intentionally do not replay quarantined V280,
+            // so tests must not require the unified base table to exist.
             sqlx::query(
-                "INSERT INTO fleet_nodes
-                    (id, name, primary_ip, ip, os_family, ssh_user)
-                 VALUES ($1, $2, $3, $3, 'linux', 'test')",
+                "INSERT INTO computers
+                    (id, name, primary_ip, os_family, ssh_user)
+                 VALUES ($1, $2, $3, 'linux', 'test')",
             )
             .bind(computer_id)
             .bind(format!("dispatch-review-gate-{suffix}"))
