@@ -727,6 +727,12 @@ async fn load_model_with_authority(
         None => (ServingMode::Chat, false),
     };
 
+    // Ace's reviewed Gemma MLX directory is content-addressed as a complete
+    // ten-file artifact, not merely by its model weight. Reverify that exact
+    // manifest immediately before constructing the launcher so drift after an
+    // import or library scan can never reach `mlx_lm.server`.
+    verify_model_artifact_authority(&lib.catalog_id, &lib.file_path).await?;
+
     // Capable chat models default to the agent serving profile so the endpoint
     // is router/autoscaler-eligible (they require usable_agent_ctx >= 32768).
     let agent = resolve_agent_profile(opts.agent_profile, mode, tool_calling, opts.parallel);
@@ -1383,6 +1389,19 @@ async fn load_model_with_authority(
         );
     }
     result
+}
+
+async fn verify_model_artifact_authority(catalog_id: &str, file_path: &str) -> Result<(), String> {
+    if catalog_id != crate::ace_mlx_import::CATALOG_ID {
+        return Ok(());
+    }
+    let path = PathBuf::from(file_path);
+    tokio::task::spawn_blocking(move || {
+        crate::ace_mlx_import::verify_installed_ace_gemma4_mlx(&path)
+            .map_err(|error| format!("exact Ace Gemma 4 artifact verification failed: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("exact Ace Gemma 4 verification worker failed: {error}"))?
 }
 
 /// Hard fallback cap for a live append log. The 30-second metrics scraper
@@ -3728,6 +3747,26 @@ mod tests {
         assert!(!llama_props_report_rocm(&serde_json::json!({
             "system_info": "threads = 16 | ROCm support unavailable |"
         })));
+    }
+
+    #[tokio::test]
+    async fn ace_gemma_load_requires_the_exact_installed_manifest() {
+        assert!(
+            verify_model_artifact_authority("unrelated-catalog", "/definitely/missing")
+                .await
+                .is_ok(),
+            "unrelated catalog entries retain their existing runtime path"
+        );
+        let error = verify_model_artifact_authority(
+            crate::ace_mlx_import::CATALOG_ID,
+            "/definitely/not-the-fixed-ace-model-path",
+        )
+        .await
+        .expect_err("Ace Gemma must fail closed before launch when its exact artifact is absent");
+        assert!(
+            error.contains("exact Ace Gemma 4 artifact verification failed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
