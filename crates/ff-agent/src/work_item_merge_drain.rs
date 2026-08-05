@@ -83,6 +83,13 @@ fn terminal_pr_action(state: Option<&str>) -> Option<TerminalPrAction> {
     }
 }
 
+/// The periodic reconciler owns an item while it is awaiting review, and it
+/// also owns a terminal item whose matching queue receipt was left active by
+/// an out-of-band merge/close race.  All other terminal rows are immutable.
+fn orphaned_review_candidate(status: &str, has_active_receipt: bool) -> bool {
+    status == "in_review" || (has_active_receipt && matches!(status, "merged" | "cancelled"))
+}
+
 pub async fn evaluate_merge_queue(
     pg: &PgPool,
     unknown_defers: &mut HashMap<Uuid, u32>,
@@ -1683,23 +1690,47 @@ async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
 /// forever and the queue/ETA never reflects that they actually shipped.
 ///
 /// Bounded (25 rows/pass) and leader-gated by the caller. Best-effort: a `gh`
-/// failure for one PR is logged and skipped — it never aborts the pass. Only
-/// rows that are still `in_review` at UPDATE time are flipped (guards against a
-/// racing drain that already claimed the row).
+/// failure for one PR is logged and skipped — it never aborts the pass. Item
+/// and receipt updates share one transaction and retain status predicates, so
+/// a racing drain becomes an idempotent no-op. Terminal items are candidates
+/// only when their own queue receipt is still active.
 async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor) -> Result<usize> {
-    let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, pr_url FROM work_items \
-         WHERE status = 'in_review' AND pr_url IS NOT NULL AND pr_url LIKE '%github.com%' \
-         ORDER BY COALESCE(started_at, created_at) ASC LIMIT 25",
+    let rows: Vec<(uuid::Uuid, String, String, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT w.id, w.pr_url, w.status, q.id \
+           FROM work_items w \
+           LEFT JOIN LATERAL ( \
+               SELECT mq.id \
+                 FROM work_item_merge_queue mq \
+                WHERE mq.work_item_id = w.id \
+                  AND mq.status IN ('queued', 'ci_running', 'mergeable') \
+                ORDER BY mq.position ASC \
+                LIMIT 1 \
+           ) q ON TRUE \
+          WHERE w.pr_url IS NOT NULL \
+            AND w.pr_url LIKE '%github.com%' \
+            AND (w.status = 'in_review' \
+                 OR (w.status IN ('merged', 'cancelled') AND q.id IS NOT NULL)) \
+          ORDER BY COALESCE(w.started_at, w.created_at) ASC \
+          LIMIT 25",
     )
     .fetch_all(pg)
     .await
-    .context("query in_review work_items for reconcile")?;
+    .context("query out-of-band review reconciliation candidates")?;
 
     let mut reconciled = 0usize;
-    for (id, pr_url) in rows {
+    for (id, pr_url, item_status, active_queue_id) in rows {
+        debug_assert!(orphaned_review_candidate(
+            &item_status,
+            active_queue_id.is_some()
+        ));
         let mut cmd = gh_cmd().await;
-        cmd.args(["pr", "view", &pr_url, "--json", "state,mergedAt"]);
+        cmd.args([
+            "pr",
+            "view",
+            &pr_url,
+            "--json",
+            "state,mergedAt,mergeCommit,mergedBy",
+        ]);
         let out = match cmd.output().await {
             Ok(o) if o.status.success() => o,
             Ok(o) => {
@@ -1718,27 +1749,122 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
                 continue;
             }
         };
-        let merged = v.get("mergedAt").and_then(|m| m.as_str()).is_some();
+        let merged_at = v
+            .get("mergedAt")
+            .and_then(|m| m.as_str())
+            .map(str::to_owned);
         let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
-        let new_status = if merged {
-            "merged"
-        } else if state.eq_ignore_ascii_case("CLOSED") {
-            "cancelled"
+        let action = if merged_at.is_some() {
+            Some(TerminalPrAction::MarkMerged)
         } else {
-            continue; // still OPEN — nothing to reconcile
+            terminal_pr_action(Some(state))
         };
-        let affected = sqlx::query(
-            "UPDATE work_items SET status = $2, \
-             completed_at = COALESCE(completed_at, NOW()), last_error = NULL \
-             WHERE id = $1 AND status = 'in_review'",
-        )
-        .bind(id)
-        .bind(new_status)
-        .execute(pg)
-        .await
-        .context("reconcile update work_item status")?
-        .rows_affected();
-        if affected > 0 {
+        let Some(action) = action else {
+            continue;
+        };
+        let merge_commit_sha = v
+            .get("mergeCommit")
+            .and_then(|commit| commit.get("oid"))
+            .and_then(|oid| oid.as_str())
+            .map(str::to_owned);
+        let merged_by = v
+            .get("mergedBy")
+            .and_then(|actor| actor.get("login"))
+            .and_then(|login| login.as_str())
+            .map(str::to_owned);
+
+        let mut tx = pg.begin().await.context("begin out-of-band reconcile")?;
+        let (new_status, work_item_affected, receipt_affected) = match action {
+            TerminalPrAction::MarkMerged => {
+                let work_item_affected = sqlx::query(
+                    "UPDATE work_items \
+                        SET status = 'merged', \
+                            completed_at = COALESCE(completed_at, $2::timestamptz, NOW()), \
+                            last_error = NULL \
+                      WHERE id = $1 AND status = 'in_review'",
+                )
+                .bind(id)
+                .bind(merged_at.as_deref())
+                .execute(&mut *tx)
+                .await
+                .context("reconcile merged work_item")?
+                .rows_affected();
+                let receipt_affected = if let Some(queue_id) = active_queue_id {
+                    sqlx::query(
+                        "UPDATE work_item_merge_queue \
+                            SET status = 'merged', \
+                                merged_at = COALESCE(merged_at, $3::timestamptz, NOW()), \
+                                failed_at = NULL, failure_reason = NULL \
+                          WHERE id = $1 AND work_item_id = $2 \
+                            AND status IN ('queued', 'ci_running', 'mergeable')",
+                    )
+                    .bind(queue_id)
+                    .bind(id)
+                    .bind(merged_at.as_deref())
+                    .execute(&mut *tx)
+                    .await
+                    .context("reconcile merged queue receipt")?
+                    .rows_affected()
+                } else {
+                    0
+                };
+                if work_item_affected + receipt_affected > 0 {
+                    sqlx::query(
+                        "INSERT INTO work_item_provenance \
+                             (work_item_id, merged_by, merged_at) \
+                         VALUES ($1, $2, COALESCE($3::timestamptz, NOW())) \
+                         ON CONFLICT (work_item_id) DO UPDATE SET \
+                             merged_by = EXCLUDED.merged_by, \
+                             merged_at = EXCLUDED.merged_at, updated_at = NOW()",
+                    )
+                    .bind(id)
+                    .bind(merged_by.as_deref().unwrap_or("out-of-band-reconcile"))
+                    .bind(merged_at.as_deref())
+                    .execute(&mut *tx)
+                    .await
+                    .context("record out-of-band merge provenance")?;
+                }
+                ("merged", work_item_affected, receipt_affected)
+            }
+            TerminalPrAction::FailClosed => {
+                let work_item_affected = sqlx::query(
+                    "UPDATE work_items \
+                        SET status = 'cancelled', \
+                            completed_at = COALESCE(completed_at, NOW()), \
+                            last_error = NULL \
+                      WHERE id = $1 AND status = 'in_review'",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .context("reconcile closed work_item")?
+                .rows_affected();
+                let receipt_affected = if let Some(queue_id) = active_queue_id {
+                    sqlx::query(
+                        "UPDATE work_item_merge_queue \
+                            SET status = 'failed', \
+                                failed_at = COALESCE(failed_at, NOW()), \
+                                failure_reason = COALESCE( \
+                                    failure_reason, \
+                                    'PR closed unmerged (out-of-band)') \
+                          WHERE id = $1 AND work_item_id = $2 \
+                            AND status IN ('queued', 'ci_running', 'mergeable')",
+                    )
+                    .bind(queue_id)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("reconcile closed queue receipt")?
+                    .rows_affected()
+                } else {
+                    0
+                };
+                ("cancelled", work_item_affected, receipt_affected)
+            }
+        };
+        tx.commit().await.context("commit out-of-band reconcile")?;
+
+        if work_item_affected + receipt_affected > 0 {
             info!(work_item = %id, pr = %pr_url, status = new_status, "reconcile: flipped orphaned in_review");
             auditor.record(
                 ReconciliationAction::StatusReconciled,
@@ -1747,14 +1873,18 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
                 serde_json::json!({
                     "pr_url": pr_url,
                     "work_item_id": id.to_string(),
+                    "previous_item_status": item_status,
                     "new_status": new_status,
+                    "queue_id": active_queue_id.map(|queue_id| queue_id.to_string()),
+                    "work_item_updated": work_item_affected == 1,
+                    "queue_receipt_updated": receipt_affected == 1,
+                    "merge_commit_sha": merge_commit_sha,
+                    "merged_by": merged_by,
+                    "merged_at": merged_at,
                 }),
             );
             reconciled += 1;
         } else {
-            // A racing drain (or the merge path itself) already flipped this
-            // row between our SELECT and UPDATE — the duplicate flip was
-            // skipped by the `status = 'in_review'` guard.
             auditor.record(
                 ReconciliationAction::DuplicateSkipped,
                 &id.to_string(),
@@ -1765,6 +1895,7 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
                     "skipped": "orphaned_review_flip",
                     "cause": "row_claimed_by_racing_drain",
                     "intended_status": new_status,
+                    "queue_id": active_queue_id.map(|queue_id| queue_id.to_string()),
                 }),
             );
         }
@@ -1877,9 +2008,9 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 mod tests {
     use super::{
         PrMergeState, PrReviewVerdict, TerminalPrAction, github_actions_run_id,
-        is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
-        parse_review_verdict, pr_is_draft_from_json, served_by_480b, terminal_pr_action,
-        update_branch_api_path,
+        is_semantic_merge_compile_failure, orphaned_review_candidate, parse_merge_state,
+        parse_review_response, parse_review_verdict, pr_is_draft_from_json, served_by_480b,
+        terminal_pr_action, update_branch_api_path,
     };
 
     #[test]
@@ -1903,6 +2034,19 @@ mod tests {
         assert_eq!(terminal_pr_action(Some("OPEN")), None);
         assert_eq!(terminal_pr_action(Some("whatever")), None);
         assert_eq!(terminal_pr_action(None), None);
+    }
+
+    #[test]
+    fn orphaned_review_candidates_include_only_owned_or_split_receipts() {
+        assert!(orphaned_review_candidate("in_review", false));
+        assert!(orphaned_review_candidate("in_review", true));
+        assert!(orphaned_review_candidate("merged", true));
+        assert!(orphaned_review_candidate("cancelled", true));
+
+        assert!(!orphaned_review_candidate("merged", false));
+        assert!(!orphaned_review_candidate("cancelled", false));
+        assert!(!orphaned_review_candidate("ready", true));
+        assert!(!orphaned_review_candidate("failed", true));
     }
 
     #[test]
