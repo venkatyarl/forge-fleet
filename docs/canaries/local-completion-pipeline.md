@@ -60,4 +60,4 @@ fn my_db_test() {
 
 ---
 
-**Canary Marker**: <!-- 2026-07-28T21:14:23Z --> Local completion pipeline canary: one-line UTC timestamped marker validating the scheduler-driven local completion pipeline end-to-end; purpose is to confirm every pipeline stage executes and records lineage before merge.
+**Canary Marker**: <!-- 2025-06-18T12:34:56Z --> Local completion pipeline canary: one-line UTC timestamped marker validating the scheduler-driven local completion pipeline end-to-end; purpose is to confirm every pipeline stage executes and records lineage before merge.
