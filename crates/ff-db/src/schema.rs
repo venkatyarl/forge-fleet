@@ -13369,6 +13369,153 @@ CREATE TRIGGER release_artifact_custody_refresh_only
     FOR EACH ROW EXECUTE FUNCTION enforce_release_custody_refresh_only();
 "#;
 
+/// v292: authorize James's exact llama.cpp served-model spelling.
+///
+/// The resolver accepts aliases only when they are attached to the exact
+/// runtime/artifact variant in catalog authority. This migration refuses to
+/// guess through catalog drift: it locks and validates the one reviewed row,
+/// accepts only the absent state or the exact final state, preserves every
+/// existing variant key and array position, and verifies the computed result.
+pub const SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS: &str = r#"
+DO $v292_james_qwen_served_alias$
+DECLARE
+    target_catalog_id CONSTANT TEXT := 'qwen3-vl-30b-a3b';
+    target_runtime CONSTANT TEXT := 'llama.cpp';
+    target_hf_repo CONSTANT TEXT := 'Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF';
+    target_quant CONSTANT TEXT := 'Q4_K_M';
+    exact_aliases CONSTANT JSONB := '["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]'::jsonb;
+    catalog_row_count BIGINT;
+    matching_variant_count BIGINT;
+    alias_field_count BIGINT;
+    matching_ordinal BIGINT;
+    original_variants JSONB;
+    expected_variants JSONB;
+    final_variants JSONB;
+    matching_aliases JSONB;
+    updated_rows BIGINT;
+BEGIN
+    SELECT count(*)
+      INTO catalog_row_count
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF catalog_row_count <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 expected exactly one qwen3-vl-30b-a3b catalog row',
+            DETAIL = format('found %s rows', catalog_row_count);
+    END IF;
+
+    SELECT variants
+      INTO original_variants
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id
+       FOR UPDATE;
+
+    IF jsonb_typeof(original_variants) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'v292 qwen3-vl-30b-a3b variants must be a JSON array';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements(original_variants) AS item(value)
+         WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'object'
+    ) THEN
+        RAISE EXCEPTION 'v292 qwen3-vl-30b-a3b variants must contain only JSON objects';
+    END IF;
+
+    SELECT count(*), min(item.ordinality)
+      INTO matching_variant_count, matching_ordinal
+      FROM jsonb_array_elements(original_variants)
+           WITH ORDINALITY AS item(value, ordinality)
+     WHERE item.value->>'runtime' = target_runtime
+       AND item.value->>'hf_repo' = target_hf_repo
+       AND item.value->>'quant' = target_quant;
+    IF matching_variant_count <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 expected exactly one reviewed qwen3-vl llama.cpp variant',
+            DETAIL = format('found %s exact variants', matching_variant_count);
+    END IF;
+
+    SELECT count(*) FILTER (WHERE item.value ? 'served_model_aliases')
+      INTO alias_field_count
+      FROM jsonb_array_elements(original_variants)
+           WITH ORDINALITY AS item(value, ordinality);
+    SELECT item.value->'served_model_aliases'
+      INTO matching_aliases
+      FROM jsonb_array_elements(original_variants)
+           WITH ORDINALITY AS item(value, ordinality)
+     WHERE item.ordinality = matching_ordinal;
+
+    IF alias_field_count = 0 THEN
+        SELECT jsonb_agg(
+                   CASE
+                       WHEN item.ordinality = matching_ordinal
+                       THEN jsonb_set(
+                           item.value,
+                           '{served_model_aliases}',
+                           exact_aliases,
+                           true
+                       )
+                       ELSE item.value
+                   END
+                   ORDER BY item.ordinality
+               )
+          INTO expected_variants
+          FROM jsonb_array_elements(original_variants)
+               WITH ORDINALITY AS item(value, ordinality);
+    ELSIF alias_field_count = 1 AND matching_aliases = exact_aliases THEN
+        expected_variants := original_variants;
+    ELSE
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 found unreviewed served-model alias state',
+            DETAIL = format(
+                'alias fields=%s matching alias=%s',
+                alias_field_count,
+                COALESCE(matching_aliases::text, '<absent>')
+            );
+    END IF;
+
+    IF original_variants IS DISTINCT FROM expected_variants THEN
+        UPDATE fleet_model_catalog
+           SET variants = expected_variants
+         WHERE id = target_catalog_id
+           AND variants = original_variants;
+        GET DIAGNOSTICS updated_rows = ROW_COUNT;
+        IF updated_rows <> 1 THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v292 failed to update exactly one locked catalog row',
+                DETAIL = format('updated %s rows', updated_rows);
+        END IF;
+    END IF;
+
+    SELECT variants
+      INTO final_variants
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF final_variants IS DISTINCT FROM expected_variants THEN
+        RAISE EXCEPTION 'v292 postcondition failed: catalog variants differ from reviewed result';
+    END IF;
+
+    SELECT count(*) FILTER (
+               WHERE item.value->>'runtime' = target_runtime
+                 AND item.value->>'hf_repo' = target_hf_repo
+                 AND item.value->>'quant' = target_quant
+                 AND item.value->'served_model_aliases' = exact_aliases
+           ),
+           count(*) FILTER (WHERE item.value ? 'served_model_aliases')
+      INTO matching_variant_count, alias_field_count
+      FROM jsonb_array_elements(final_variants) AS item(value);
+    IF matching_variant_count <> 1 OR alias_field_count <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 postcondition failed: exact alias authority is not unique',
+            DETAIL = format(
+                'exact variants=%s alias fields=%s',
+                matching_variant_count,
+                alias_field_count
+            );
+    END IF;
+END
+$v292_james_qwen_served_alias$;
+"#;
+
 /// Squashed Postgres bootstrap through migration v161.
 ///
 /// The incremental 7→161 migration chain cannot replay cleanly on a fresh empty

@@ -1309,6 +1309,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "release_artifact_custody",
         sql: schema::SCHEMA_V291_RELEASE_ARTIFACT_CUSTODY,
     },
+    PgMigration {
+        version: 292,
+        name: "james_qwen_served_model_alias",
+        sql: schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS,
+    },
 ];
 
 /// Fail closed unless the enrollment authority table is exactly the reviewed
@@ -1821,6 +1826,42 @@ mod tests {
     }
 
     #[test]
+    fn v292_is_exact_fail_closed_james_alias_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 292)
+            .expect("v292 must be appended after v291");
+        assert_eq!(migration.name, "james_qwen_served_model_alias");
+        for required in [
+            "FOR UPDATE",
+            "jsonb_typeof(original_variants) IS DISTINCT FROM 'array'",
+            "matching_variant_count <> 1",
+            "alias_field_count = 0",
+            "alias_field_count = 1 AND matching_aliases = exact_aliases",
+            "WITH ORDINALITY",
+            "ORDER BY item.ordinality",
+            "variants = original_variants",
+            "final_variants IS DISTINCT FROM expected_variants",
+            "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf",
+        ] {
+            assert!(migration.sql.contains(required), "v292 missing {required}");
+        }
+        for forbidden in ["ILIKE", "LOWER(", "regexp_replace", "translate("] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v292 must not use fuzzy identity matching through {forbidden}"
+            );
+        }
+        assert_eq!(
+            PG_MIGRATIONS
+                .iter()
+                .position(|migration| migration.version == 292),
+            PG_MIGRATIONS.len().checked_sub(1),
+            "v292 must remain the final forward migration"
+        );
+    }
+
+    #[test]
     fn v271_has_cloud_fixes_local_acceptance_artifact() {
         let migration = PG_MIGRATIONS
             .iter()
@@ -2030,6 +2071,319 @@ mod tests {
             .await
             .expect("drop temp db");
         admin.close().await;
+    }
+
+    async fn prepare_v292_catalog_table(pool: &PgPool) {
+        let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+            .fetch_one(pool)
+            .await
+            .expect("read disposable postgres version");
+        let server_major = server_version_num
+            .parse::<u32>()
+            .expect("server_version_num must be numeric")
+            / 10_000;
+        assert_eq!(server_major, 16, "V292 must be proven on PostgreSQL 16");
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_model_catalog (\
+                 id TEXT PRIMARY KEY,\
+                 variants JSONB\
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create minimal V292 catalog authority");
+    }
+
+    async fn seed_v292_catalog(pool: &PgPool, variants: &serde_json::Value) {
+        sqlx::query("DELETE FROM fleet_model_catalog")
+            .execute(pool)
+            .await
+            .expect("reset V292 catalog fixture");
+        sqlx::query("INSERT INTO fleet_model_catalog (id, variants) VALUES ($1, $2)")
+            .bind("qwen3-vl-30b-a3b")
+            .bind(variants)
+            .execute(pool)
+            .await
+            .expect("seed V292 catalog fixture");
+    }
+
+    async fn v292_catalog_variants(pool: &PgPool) -> serde_json::Value {
+        sqlx::query_scalar("SELECT variants FROM fleet_model_catalog WHERE id = 'qwen3-vl-30b-a3b'")
+            .fetch_one(pool)
+            .await
+            .expect("read V292 catalog fixture")
+    }
+
+    async fn v292_rejection(pool: &PgPool) -> String {
+        sqlx::raw_sql(schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS)
+            .execute(pool)
+            .await
+            .expect_err("V292 fixture drift must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v292_adds_exact_alias_preserves_variants_and_is_idempotent_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let original = serde_json::json!([
+            {
+                "runtime": "mlx",
+                "quant": "4bit",
+                "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+                "size_gb": 18.0,
+                "metadata": {"keep": [1, 2, 3]}
+            },
+            {
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "size_gb": 18.0,
+                "context_window": 131072
+            },
+            {
+                "runtime": "vllm",
+                "quant": "fp16",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+                "size_gb": 60.0
+            }
+        ]);
+        seed_v292_catalog(&pool, &original).await;
+
+        sqlx::raw_sql(schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS)
+            .execute(&pool)
+            .await
+            .expect("V292 must add the reviewed exact alias");
+        let after_add = v292_catalog_variants(&pool).await;
+        assert_eq!(after_add[0], original[0], "first variant must be unchanged");
+        assert_eq!(after_add[2], original[2], "last variant must be unchanged");
+        let mut expected_target = original[1].clone();
+        expected_target["served_model_aliases"] =
+            serde_json::json!(["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]);
+        assert_eq!(
+            after_add[1], expected_target,
+            "target must retain all prior keys and gain only the exact alias"
+        );
+        assert_eq!(after_add.as_array().unwrap().len(), 3);
+
+        sqlx::raw_sql(schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS)
+            .execute(&pool)
+            .await
+            .expect("exact reviewed V292 end state must be an idempotent no-op");
+        assert_eq!(v292_catalog_variants(&pool).await, after_add);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_fresh_v161_bootstrap_converges_to_exact_alias_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+            .fetch_one(&pool)
+            .await
+            .expect("read disposable postgres version");
+        assert_eq!(
+            server_version_num.parse::<u32>().unwrap() / 10_000,
+            16,
+            "V292 must be proven on PostgreSQL 16"
+        );
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh V161 bootstrap plus forward migrations must converge");
+        assert_eq!(final_version, 292);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 292")
+                .fetch_one(&pool)
+                .await
+                .expect("V292 must be durably recorded");
+        assert_eq!(migration_name, "james_qwen_served_model_alias");
+        let exact_alias_variants: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)
+              FROM fleet_model_catalog catalog,
+                   jsonb_array_elements(catalog.variants) variant
+             WHERE catalog.id = 'qwen3-vl-30b-a3b'
+               AND variant->>'runtime' = 'llama.cpp'
+               AND variant->>'hf_repo' = 'Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF'
+               AND variant->>'quant' = 'Q4_K_M'
+               AND variant->'served_model_aliases'
+                   = '["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]'::jsonb
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read exact V292 bootstrap authority");
+        assert_eq!(exact_alias_variants, 1);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_missing_catalog_row_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+
+        let error = v292_rejection(&pool).await;
+        assert!(
+            error.contains("expected exactly one qwen3-vl-30b-a3b catalog row"),
+            "unexpected missing-row error: {error}"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM fleet_model_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_malformed_or_wrong_variant_selector_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let cases = [
+            serde_json::json!({"not": "an array"}),
+            serde_json::json!([42]),
+            serde_json::json!([{
+                "runtime": "vllm",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF"
+            }]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "other/Qwen3-VL-30B-A3B-Instruct-GGUF"
+            }]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q5_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF"
+            }]),
+        ];
+        for variants in cases {
+            seed_v292_catalog(&pool, &variants).await;
+            let error = v292_rejection(&pool).await;
+            assert!(
+                error.contains("variants must")
+                    || error.contains("expected exactly one reviewed qwen3-vl llama.cpp variant"),
+                "unexpected wrong-variant error: {error}"
+            );
+            assert_eq!(v292_catalog_variants(&pool).await, variants);
+        }
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_duplicate_exact_variant_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let exact = serde_json::json!({
+            "runtime": "llama.cpp",
+            "quant": "Q4_K_M",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+            "size_gb": 18.0
+        });
+        let variants = serde_json::json!([exact, exact]);
+        seed_v292_catalog(&pool, &variants).await;
+
+        let error = v292_rejection(&pool).await;
+        assert!(
+            error.contains("expected exactly one reviewed qwen3-vl llama.cpp variant"),
+            "unexpected duplicate error: {error}"
+        );
+        assert_eq!(v292_catalog_variants(&pool).await, variants);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_every_preexisting_alias_drift_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let exact = serde_json::json!({
+            "runtime": "llama.cpp",
+            "quant": "Q4_K_M",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+            "size_gb": 18.0
+        });
+        let other = serde_json::json!({
+            "runtime": "mlx",
+            "quant": "4bit",
+            "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit"
+        });
+        let drift_cases = [
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "served_model_aliases": []
+            }]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "served_model_aliases": [
+                    "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf",
+                    "extra.gguf"
+                ]
+            }]),
+            serde_json::json!([
+                exact,
+                {
+                    "runtime": "mlx",
+                    "quant": "4bit",
+                    "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+                    "served_model_aliases": ["unreviewed-mlx-alias"]
+                }
+            ]),
+            serde_json::json!([
+                {
+                    "runtime": "llama.cpp",
+                    "quant": "Q4_K_M",
+                    "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                    "served_model_aliases": [
+                        "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"
+                    ]
+                },
+                {
+                    "runtime": "mlx",
+                    "quant": "4bit",
+                    "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+                    "served_model_aliases": ["unreviewed-mlx-alias"]
+                }
+            ]),
+            serde_json::json!([other, {
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "served_model_aliases": null
+            }]),
+        ];
+        for variants in drift_cases {
+            seed_v292_catalog(&pool, &variants).await;
+            let error = v292_rejection(&pool).await;
+            assert!(
+                error.contains("unreviewed served-model alias state"),
+                "unexpected alias-drift error: {error}"
+            );
+            assert_eq!(v292_catalog_variants(&pool).await, variants);
+        }
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 
     async fn reset_enrollment_authority_to_original_v289(pool: &PgPool) {
