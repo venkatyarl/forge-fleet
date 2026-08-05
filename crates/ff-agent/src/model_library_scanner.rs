@@ -193,14 +193,22 @@ pub async fn scan_local_library(
 /// Classify a top-level directory, descending one level for known directories
 /// that group models by runtime/vendor rather than representing a model.
 fn classify_top_level_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Vec<Discovered> {
-    let is_vendor_dir = path
+    let vendor_runtime = path
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case("llama-cpp"));
+        .and_then(|name| {
+            if name.eq_ignore_ascii_case("llama-cpp") {
+                Some(None)
+            } else if name.eq_ignore_ascii_case("mlx") {
+                Some(Some("mlx"))
+            } else {
+                None
+            }
+        });
 
-    if !is_vendor_dir {
+    let Some(runtime_hint) = vendor_runtime else {
         return classify_dir(path, catalog).into_iter().collect();
-    }
+    };
 
     std::fs::read_dir(path)
         .into_iter()
@@ -211,7 +219,7 @@ fn classify_top_level_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Ve
                 .file_type()
                 .ok()
                 .filter(|file_type| file_type.is_dir())
-                .and_then(|_| classify_dir(&entry.path(), catalog))
+                .and_then(|_| classify_dir_with_runtime_hint(&entry.path(), catalog, runtime_hint))
         })
         .collect()
 }
@@ -262,6 +270,21 @@ fn classify_file(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disc
 ///
 /// Returns `None` for unrecognised directories.
 fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Discovered> {
+    classify_dir_with_runtime_hint(path, catalog, None)
+}
+
+/// Classify one model directory, optionally forcing the runtime declared by
+/// an explicit vendor parent such as `~/models/mlx`.
+///
+/// The hint is deliberately structural rather than host-derived: scans and
+/// their tests may run on Linux even when the artifact is destined for an
+/// Apple-Silicon node. Only the exact `mlx` vendor directory supplies this
+/// hint; ordinary HF directories preserve the existing OS/name heuristic.
+fn classify_dir_with_runtime_hint(
+    path: &Path,
+    catalog: &[ff_db::ModelCatalogRow],
+    runtime_hint: Option<&str>,
+) -> Option<Discovered> {
     let dir_name = path.file_name()?.to_string_lossy().to_string();
     let lower = dir_name.to_lowercase();
 
@@ -300,16 +323,28 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
         // (HF-format dir served by mlx_lm.server) to show up as runtime=vllm
         // — which then blocked `ff model delete` with a false "active
         // deployment" check (deployment was on a different runtime).
-        let runtime = if lower.ends_with("-mlx")
-            || lower.ends_with("-4bit")
-            || lower.contains("mlx")
-            || std::env::consts::OS == "macos"
+        let runtime = runtime_hint.map(str::to_owned).unwrap_or_else(|| {
+            if lower.ends_with("-mlx")
+                || lower.ends_with("-4bit")
+                || lower.contains("mlx")
+                || std::env::consts::OS == "macos"
+            {
+                "mlx"
+            } else {
+                "vllm"
+            }
+            .to_string()
+        });
+        if runtime == "mlx"
+            && let Err(reason) = validate_mlx_hf_dir(path, &safetensor_paths, has_index)
         {
-            "mlx"
-        } else {
-            "vllm"
+            tracing::warn!(
+                path = %path.display(),
+                %reason,
+                "skipping incomplete or unsafe MLX model directory"
+            );
+            return None;
         }
-        .to_string();
         let quant = extract_hf_quant(&lower);
         let total_size: u64 = safetensor_paths
             .iter()
@@ -396,6 +431,139 @@ fn classify_dir(path: &Path, catalog: &[ff_db::ModelCatalogRow]) -> Option<Disco
     }
 
     None
+}
+
+/// Validate the minimum local artifact contract needed by `mlx_lm.server`.
+///
+/// This check is intentionally limited to directories classified as MLX so
+/// existing vLLM and llama.cpp scans do not change. Invalid artifacts skip one
+/// directory rather than aborting the whole scan. An optional safetensors
+/// index is treated as authority when present: every referenced shard must be
+/// a non-empty, contained `.safetensors` file. Indexless single-file MLX repos
+/// remain valid.
+fn validate_mlx_hf_dir(
+    path: &Path,
+    safetensor_paths: &[PathBuf],
+    has_index: bool,
+) -> Result<(), String> {
+    let config = read_json_object(&path.join("config.json"), "config.json")?;
+    let has_model_type = config
+        .get("model_type")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty());
+    let has_architecture = config
+        .get("architectures")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str().is_some_and(|value| !value.trim().is_empty()))
+        });
+    if !has_model_type && !has_architecture {
+        return Err("config.json has no model_type or architecture identity".to_string());
+    }
+
+    read_json_object(&path.join("tokenizer_config.json"), "tokenizer_config.json")?;
+    let has_tokenizer = ["tokenizer.json", "tokenizer.model", "spiece.model"]
+        .into_iter()
+        .any(|name| nonempty_file(&path.join(name)));
+    if !has_tokenizer {
+        return Err("no non-empty tokenizer artifact found".to_string());
+    }
+
+    if safetensor_paths.is_empty() {
+        return Err("no safetensors weights found".to_string());
+    }
+    if let Some(empty) = safetensor_paths
+        .iter()
+        .find(|weight| !nonempty_file(weight))
+    {
+        return Err(format!(
+            "weight file is missing or empty: {}",
+            empty.display()
+        ));
+    }
+
+    if has_index {
+        validate_safetensors_index(path)?;
+    }
+    Ok(())
+}
+
+fn read_json_object(path: &Path, label: &str) -> Result<serde_json::Value, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {label}: {e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| format!("parse {label}: {e}"))?;
+    if !value.is_object() {
+        return Err(format!("{label} is not a JSON object"));
+    }
+    Ok(value)
+}
+
+fn nonempty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+}
+
+fn validate_safetensors_index(model_root: &Path) -> Result<(), String> {
+    use std::path::Component;
+
+    let index = read_json_object(
+        &model_root.join("model.safetensors.index.json"),
+        "model.safetensors.index.json",
+    )?;
+    let weight_map = index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .filter(|map| !map.is_empty())
+        .ok_or_else(|| "safetensors index has no non-empty weight_map".to_string())?;
+    let canonical_root =
+        std::fs::canonicalize(model_root).map_err(|e| format!("canonicalize model root: {e}"))?;
+    let mut shards = std::collections::BTreeSet::new();
+    for value in weight_map.values() {
+        let relative = value
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "safetensors index contains an empty shard path".to_string())?;
+        let relative_path = Path::new(relative);
+        if relative_path.is_absolute()
+            || relative_path.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(format!("unsafe safetensors shard path: {relative}"));
+        }
+        if !relative_path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("safetensors"))
+        {
+            return Err(format!(
+                "index references a non-safetensors file: {relative}"
+            ));
+        }
+        shards.insert(relative.to_string());
+    }
+
+    for relative in shards {
+        let shard = model_root.join(&relative);
+        if !nonempty_file(&shard) {
+            return Err(format!(
+                "indexed shard is missing or empty: {}",
+                shard.display()
+            ));
+        }
+        let canonical_shard = std::fs::canonicalize(&shard)
+            .map_err(|e| format!("canonicalize indexed shard {}: {e}", shard.display()))?;
+        if !canonical_shard.starts_with(&canonical_root) {
+            return Err(format!(
+                "indexed shard escapes model directory: {}",
+                shard.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Strip a case-insensitive extension from a filename.
@@ -667,6 +835,29 @@ mod tests {
         row
     }
 
+    fn write_valid_mlx_model(path: &Path, with_index: bool) {
+        std::fs::create_dir_all(path).unwrap();
+        std::fs::write(
+            path.join("config.json"),
+            br#"{"model_type":"qwen3","architectures":["Qwen3ForCausalLM"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            br#"{"tokenizer_class":"Qwen2Tokenizer"}"#,
+        )
+        .unwrap();
+        std::fs::write(path.join("tokenizer.json"), br#"{"version":"1.0"}"#).unwrap();
+        std::fs::write(path.join("model.safetensors"), b"weights").unwrap();
+        if with_index {
+            std::fs::write(
+                path.join("model.safetensors.index.json"),
+                br#"{"weight_map":{"model.embed_tokens.weight":"model.safetensors"}}"#,
+            )
+            .unwrap();
+        }
+    }
+
     #[test]
     fn match_catalog_prefers_longer_id() {
         let cat = vec![
@@ -795,5 +986,121 @@ mod tests {
         assert_eq!(discovered[0].catalog_id, "qwen3-coder-480b");
         assert_eq!(discovered[0].file_path, model.to_string_lossy());
         assert_eq!(discovered[0].runtime, "llama.cpp");
+    }
+
+    #[test]
+    fn mlx_vendor_dir_forces_runtime_and_matches_ace_catalog_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let vendor = temp.path().join("mlx");
+        let model = vendor.join("qwen3-4b-instruct-2507-4bit-7494131");
+        write_valid_mlx_model(&model, true);
+        let catalog = vec![row_with_variants(
+            "qwen3-4b-instruct-2507",
+            "Qwen3-4B-Instruct-2507",
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M"
+            }]),
+        )];
+
+        let discovered = classify_top_level_dir(&vendor, &catalog);
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].catalog_id, "qwen3-4b-instruct-2507");
+        assert_eq!(discovered[0].runtime, "mlx");
+        assert_eq!(discovered[0].quant.as_deref(), Some("4bit"));
+        assert_eq!(discovered[0].file_path, model.to_string_lossy());
+        assert_eq!(discovered[0].size_bytes, 7);
+    }
+
+    #[test]
+    fn mlx_vendor_runtime_hint_does_not_depend_on_child_name_or_build_os() {
+        let temp = tempfile::tempdir().unwrap();
+        let vendor = temp.path().join("MLX");
+        let model = vendor.join("qwen3-4b-instruct-2507");
+        write_valid_mlx_model(&model, false);
+
+        let discovered = classify_top_level_dir(
+            &vendor,
+            &[row("qwen3-4b-instruct-2507", "Qwen3-4B-Instruct-2507")],
+        );
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].runtime, "mlx");
+        assert_eq!(discovered[0].quant, None);
+    }
+
+    #[test]
+    fn mlx_indexless_single_file_repo_is_valid() {
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("model-4bit");
+        write_valid_mlx_model(&model, false);
+
+        let discovered = classify_dir_with_runtime_hint(&model, &[], Some("mlx"));
+
+        assert!(discovered.is_some());
+        assert_eq!(discovered.unwrap().size_bytes, 7);
+    }
+
+    #[test]
+    fn mlx_invalid_config_or_missing_tokenizer_is_skipped_per_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let malformed = temp.path().join("malformed");
+        write_valid_mlx_model(&malformed, false);
+        std::fs::write(malformed.join("config.json"), b"not-json").unwrap();
+        assert!(classify_dir_with_runtime_hint(&malformed, &[], Some("mlx")).is_none());
+
+        let no_tokenizer = temp.path().join("no-tokenizer");
+        write_valid_mlx_model(&no_tokenizer, false);
+        std::fs::remove_file(no_tokenizer.join("tokenizer.json")).unwrap();
+        assert!(classify_dir_with_runtime_hint(&no_tokenizer, &[], Some("mlx")).is_none());
+
+        let valid = temp.path().join("still-valid");
+        write_valid_mlx_model(&valid, false);
+        assert!(classify_dir_with_runtime_hint(&valid, &[], Some("mlx")).is_some());
+    }
+
+    #[test]
+    fn mlx_index_rejects_traversal_missing_and_empty_shards() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let traversal = temp.path().join("traversal");
+        write_valid_mlx_model(&traversal, true);
+        std::fs::write(
+            traversal.join("model.safetensors.index.json"),
+            br#"{"weight_map":{"x":"../outside.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(classify_dir_with_runtime_hint(&traversal, &[], Some("mlx")).is_none());
+
+        let missing = temp.path().join("missing");
+        write_valid_mlx_model(&missing, true);
+        std::fs::write(
+            missing.join("model.safetensors.index.json"),
+            br#"{"weight_map":{"x":"missing.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(classify_dir_with_runtime_hint(&missing, &[], Some("mlx")).is_none());
+
+        let empty = temp.path().join("empty");
+        write_valid_mlx_model(&empty, true);
+        std::fs::write(empty.join("model.safetensors"), b"").unwrap();
+        assert!(classify_dir_with_runtime_hint(&empty, &[], Some("mlx")).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mlx_index_rejects_a_symlinked_shard_that_escapes_the_model_dir() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let model = temp.path().join("model");
+        write_valid_mlx_model(&model, true);
+        let outside = temp.path().join("outside.safetensors");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::fs::remove_file(model.join("model.safetensors")).unwrap();
+        symlink(&outside, model.join("model.safetensors")).unwrap();
+
+        assert!(classify_dir_with_runtime_hint(&model, &[], Some("mlx")).is_none());
     }
 }

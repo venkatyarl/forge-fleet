@@ -888,15 +888,16 @@ async fn load_model_with_authority(
             }
             // mlx_lm.server expects the MODEL to be either an HF repo id or a local dir
             // with config/weights. We use the local dir.
-            let args = vec![
+            let (program, mut args) = mlx_server_launcher()?;
+            args.extend([
                 "--model".into(),
                 lib.file_path.clone(),
                 "--host".into(),
                 "0.0.0.0".into(),
                 "--port".into(),
                 port.to_string(),
-            ];
-            ("mlx_lm.server".to_string(), args, "mlx")
+            ]);
+            (program, args, "mlx")
         }
         "vllm" => {
             if mode != ServingMode::Chat {
@@ -1964,6 +1965,38 @@ fn llama_server_binary() -> String {
     }
     // Fallback: rely on PATH.
     "llama-server".to_string()
+}
+
+/// Resolve the MLX HTTP launcher without assuming pip installed its console
+/// script into the current process's PATH.
+///
+/// Prefer the historical `mlx_lm.server` entrypoint when present. A regular
+/// user-site install may expose the Python package without placing that script
+/// on PATH (the layout observed on Ace); in that case `python3 -m
+/// mlx_lm.server` is the same server and retains the command-line identity the
+/// process reconciler already recognises. Missing both launchers is reported
+/// before spawn with a stable error code.
+fn mlx_server_launcher() -> Result<(String, Vec<String>), String> {
+    resolve_mlx_server_launcher(
+        crate::cli_executor::which_on_path("mlx_lm.server"),
+        crate::cli_executor::which_on_path("python3"),
+    )
+}
+
+fn resolve_mlx_server_launcher(
+    standalone: Option<String>,
+    python3: Option<String>,
+) -> Result<(String, Vec<String>), String> {
+    if let Some(program) = standalone {
+        return Ok((program, Vec::new()));
+    }
+    if let Some(program) = python3 {
+        return Ok((program, vec!["-m".to_string(), "mlx_lm.server".to_string()]));
+    }
+    Err(
+        "MLX_LAUNCHER_NOT_FOUND: neither mlx_lm.server nor python3 is available in PATH or known binary directories"
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3354,6 +3387,35 @@ mod tests {
         // Non-tool models get nothing — --jinja buys them nothing and a bad
         // embedded template could refuse to launch.
         assert!(llamacpp_chat_flags(false).is_empty());
+    }
+
+    #[test]
+    fn mlx_launcher_prefers_the_existing_console_entrypoint() {
+        let resolved = resolve_mlx_server_launcher(
+            Some("/opt/mlx/bin/mlx_lm.server".to_string()),
+            Some("/usr/bin/python3".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved.0, "/opt/mlx/bin/mlx_lm.server");
+        assert!(resolved.1.is_empty());
+    }
+
+    #[test]
+    fn mlx_launcher_falls_back_to_the_importable_python_module() {
+        let resolved =
+            resolve_mlx_server_launcher(None, Some("/opt/homebrew/bin/python3".to_string()))
+                .unwrap();
+
+        assert_eq!(resolved.0, "/opt/homebrew/bin/python3");
+        assert_eq!(resolved.1, ["-m", "mlx_lm.server"]);
+    }
+
+    #[test]
+    fn mlx_launcher_fails_before_spawn_when_no_launcher_exists() {
+        let error = resolve_mlx_server_launcher(None, None).unwrap_err();
+
+        assert!(error.starts_with("MLX_LAUNCHER_NOT_FOUND:"));
     }
 
     #[test]
