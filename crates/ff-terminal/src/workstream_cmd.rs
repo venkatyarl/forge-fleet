@@ -717,6 +717,14 @@ mod tests {
     }
 
     #[test]
+    fn claude_marker_env_detection() {
+        assert_eq!(
+            tool_from_env_markers(&env_with(&[("CLAUDECODE", "1")])),
+            Some("claude".to_string())
+        );
+    }
+
+    #[test]
     fn codex_session_id_identifies_codex() {
         assert_eq!(
             tool_from_env_markers(&env_with(&[("CODEX_SESSION_ID", "c1")])),
