@@ -3,11 +3,13 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::future::Future;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use sqlx::PgPool;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tracing::{error, warn};
 use uuid::Uuid;
 
@@ -21,6 +23,11 @@ const SKIPPED_COMPUTER_STATUSES: [&str; 3] = ["offline", "reserved", "decommissi
 /// eligible computers this permits seven simultaneous probes while preventing
 /// a full N×(N-1) scan from flooding a small node's sshd.
 const PAIRWISE_MESH_MAX_IN_FLIGHT: usize = 8;
+const PAIRWISE_MESH_TRANSIENT_COOLDOWN: Duration = Duration::from_secs(30);
+const PAIRWISE_MESH_SCAN_DEADLINE: Duration = Duration::from_secs(15 * 60);
+const PAIRWISE_MESH_MAX_TRANSIENT_RETRIES: u8 = 1;
+const MESH_SSH_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MESH_SCAN_DEADLINE_ERROR: &str = "mesh scan deadline exceeded before probe completed";
 
 /// Emergency kill switch for the autonomous leader SSH mesh-repair producer.
 ///
@@ -247,6 +254,34 @@ struct MeshProbe {
     dst_ip: String,
 }
 
+#[derive(Debug, Clone)]
+struct ScheduledMeshProbe {
+    probe: MeshProbe,
+    transient_retries: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MeshSchedulePolicy {
+    max_in_flight: usize,
+    transient_cooldown: Duration,
+    scan_deadline: Duration,
+    max_transient_retries: u8,
+}
+
+const PAIRWISE_MESH_SCHEDULE_POLICY: MeshSchedulePolicy = MeshSchedulePolicy {
+    max_in_flight: PAIRWISE_MESH_MAX_IN_FLIGHT,
+    transient_cooldown: PAIRWISE_MESH_TRANSIENT_COOLDOWN,
+    scan_deadline: PAIRWISE_MESH_SCAN_DEADLINE,
+    max_transient_retries: PAIRWISE_MESH_MAX_TRANSIENT_RETRIES,
+};
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum TransientFailureScope {
+    Source,
+    Destination,
+    Both,
+}
+
 /// Canonical runtime-only mesh endpoints that an operator explicitly excluded.
 /// The set is never persisted; callers must pass it through the current run.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
@@ -421,10 +456,16 @@ fn mesh_probe_plan(nodes: &[ff_db::FleetNodeRow], scope: &MeshCheckScope) -> Vec
 /// of each probe. This is stricter than a destination-only cap: because the
 /// outer SSH hop also lands on `src`, a small computer is protected whether it
 /// appears as source or destination. Independent, node-disjoint edges still
-/// run concurrently up to `max_in_flight`.
+/// run concurrently up to the global cap.
+///
+/// A transient SSH pre-auth failure opens a short endpoint-scoped circuit
+/// breaker. The failed edge is retried once after the cooldown; if that
+/// half-open attempt also fails, other incident edges remain deferred for one
+/// more cooldown instead of immediately hammering the same sshd. The scan-wide
+/// deadline makes both retries and cooldowns operationally bounded.
 async fn run_bounded_mesh_probes<F, Fut>(
     probes: Vec<MeshProbe>,
-    max_in_flight: usize,
+    policy: MeshSchedulePolicy,
     run_probe: F,
 ) -> Vec<MeshCell>
 where
@@ -433,41 +474,207 @@ where
 {
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    let mut pending: VecDeque<MeshProbe> = probes.into();
+    let mut pending: VecDeque<ScheduledMeshProbe> = probes
+        .into_iter()
+        .map(|probe| ScheduledMeshProbe {
+            probe,
+            transient_retries: 0,
+        })
+        .collect();
     let mut active_nodes = BTreeSet::new();
+    let mut active_probes = BTreeMap::new();
+    let mut endpoint_cooldowns = BTreeMap::<String, Instant>::new();
     let mut in_flight = FuturesUnordered::new();
     let mut cells = Vec::with_capacity(pending.len());
-    let max_in_flight = max_in_flight.max(1);
+    let max_in_flight = policy.max_in_flight.max(1);
+    let deadline = Instant::now() + policy.scan_deadline;
+    let mut deadline_expired = false;
 
     while !pending.is_empty() || !in_flight.is_empty() {
+        if Instant::now() >= deadline {
+            deadline_expired = true;
+            break;
+        }
+
         while in_flight.len() < max_in_flight {
-            let Some(index) = pending.iter().position(|probe| {
-                !active_nodes.contains(&probe.src) && !active_nodes.contains(&probe.dst)
+            let now = Instant::now();
+            let Some(index) = pending.iter().position(|scheduled| {
+                let probe = &scheduled.probe;
+                !active_nodes.contains(&probe.src)
+                    && !active_nodes.contains(&probe.dst)
+                    && endpoint_ready(&endpoint_cooldowns, &probe.src, now)
+                    && endpoint_ready(&endpoint_cooldowns, &probe.dst, now)
             }) else {
                 break;
             };
-            let probe = pending
+            let scheduled = pending
                 .remove(index)
                 .expect("selected mesh probe index remains valid");
+            let probe = &scheduled.probe;
             let src = probe.src.clone();
             let dst = probe.dst.clone();
             active_nodes.insert(src.clone());
             active_nodes.insert(dst.clone());
-            let future = run_probe(probe);
-            in_flight.push(async move { (src, dst, future.await) });
+            active_probes.insert((src.clone(), dst.clone()), probe.clone());
+            let future = run_probe(probe.clone());
+            in_flight.push(async move { (src, dst, scheduled, future.await) });
         }
 
-        let Some((src, dst, cell)) = in_flight.next().await else {
+        if in_flight.is_empty() {
+            let Some(wake_at) = pending
+                .iter()
+                .map(|scheduled| {
+                    probe_ready_at(&endpoint_cooldowns, &scheduled.probe, Instant::now())
+                })
+                .min()
+            else {
+                break;
+            };
+            tokio::time::sleep_until(wake_at.min(deadline)).await;
+            continue;
+        }
+
+        let next = match timeout(
+            deadline.saturating_duration_since(Instant::now()),
+            in_flight.next(),
+        )
+        .await
+        {
+            Ok(next) => next,
+            Err(_) => {
+                deadline_expired = true;
+                break;
+            }
+        };
+        let Some((src, dst, mut scheduled, cell)) = next else {
             debug_assert!(pending.is_empty());
             break;
         };
         active_nodes.remove(&src);
         active_nodes.remove(&dst);
+        active_probes.remove(&(src, dst));
+
+        if let Some(scope) = transient_mesh_failure_scope(&cell) {
+            let cooldown_until = Instant::now() + policy.transient_cooldown;
+            apply_endpoint_cooldown(
+                &mut endpoint_cooldowns,
+                &scheduled.probe,
+                scope,
+                cooldown_until,
+            );
+            if scheduled.transient_retries < policy.max_transient_retries {
+                scheduled.transient_retries += 1;
+                // The same edge is the single half-open probe when its
+                // endpoint cooldown expires; keep it ahead of other incident
+                // edges that were already pending.
+                pending.push_front(scheduled);
+                continue;
+            }
+        }
         cells.push(cell);
+    }
+
+    if deadline_expired {
+        // Dropping these futures drops the owned probe Command. Its
+        // kill_on_drop guard closes the outer SSH connection; the command
+        // timeout path also explicitly kills and reaps before returning.
+        drop(in_flight);
+        let mut unfinished = BTreeMap::<(String, String), MeshProbe>::new();
+        for scheduled in pending {
+            unfinished.insert(
+                (scheduled.probe.src.clone(), scheduled.probe.dst.clone()),
+                scheduled.probe,
+            );
+        }
+        unfinished.extend(active_probes);
+        cells.extend(unfinished.into_values().map(mesh_deadline_cell));
     }
 
     cells.sort_by(|a, b| (&a.src, &a.dst).cmp(&(&b.src, &b.dst)));
     cells
+}
+
+fn endpoint_ready(cooldowns: &BTreeMap<String, Instant>, endpoint: &str, now: Instant) -> bool {
+    cooldowns
+        .get(endpoint)
+        .map(|ready_at| *ready_at <= now)
+        .unwrap_or(true)
+}
+
+fn probe_ready_at(
+    cooldowns: &BTreeMap<String, Instant>,
+    probe: &MeshProbe,
+    now: Instant,
+) -> Instant {
+    let src = cooldowns.get(&probe.src).copied().unwrap_or(now);
+    let dst = cooldowns.get(&probe.dst).copied().unwrap_or(now);
+    src.max(dst)
+}
+
+fn apply_endpoint_cooldown(
+    cooldowns: &mut BTreeMap<String, Instant>,
+    probe: &MeshProbe,
+    scope: TransientFailureScope,
+    ready_at: Instant,
+) {
+    let mut apply = |endpoint: &str| {
+        cooldowns
+            .entry(endpoint.to_string())
+            .and_modify(|current| *current = (*current).max(ready_at))
+            .or_insert(ready_at);
+    };
+    match scope {
+        TransientFailureScope::Source => apply(&probe.src),
+        TransientFailureScope::Destination => apply(&probe.dst),
+        TransientFailureScope::Both => {
+            apply(&probe.src);
+            apply(&probe.dst);
+        }
+    }
+}
+
+fn transient_mesh_failure_scope(cell: &MeshCell) -> Option<TransientFailureScope> {
+    if cell.status == "ok" {
+        return None;
+    }
+    let error = cell.last_error.as_deref()?.to_ascii_lowercase();
+    if error.trim() == "timeout" {
+        // The scan-wide timeout can fire during either the outer or nested SSH
+        // handshake, before the remote marker is collected.
+        return Some(TransientFailureScope::Both);
+    }
+    let is_transient_preauth = [
+        "banner exchange",
+        "kex_exchange_identification",
+        "ssh_exchange_identification",
+        "connection timed out",
+        "connection reset",
+        "connection closed by",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle));
+    if !is_transient_preauth {
+        return None;
+    }
+    // A remote marker proves the outer hop reached src and ran the nested
+    // probe, so its transient failure belongs to dst. Without it, the outer
+    // source hop failed before the remote shell completed.
+    Some(if cell.ping_ok.is_some() {
+        TransientFailureScope::Destination
+    } else {
+        TransientFailureScope::Source
+    })
+}
+
+fn mesh_deadline_cell(probe: MeshProbe) -> MeshCell {
+    MeshCell {
+        src: probe.src,
+        dst: probe.dst,
+        status: "failed".into(),
+        last_error: Some(MESH_SCAN_DEADLINE_ERROR.into()),
+        ping_ok: None,
+        ssh_ok: false,
+    }
 }
 
 async fn pairwise_ssh_check_inner(
@@ -476,16 +683,37 @@ async fn pairwise_ssh_check_inner(
     scope: &MeshCheckScope,
 ) -> Result<MeshMatrix, String> {
     let probes = mesh_probe_plan(nodes, scope);
-    let cells = run_bounded_mesh_probes(probes, PAIRWISE_MESH_MAX_IN_FLIGHT, |probe| async move {
-        let cell = probe_pair(
-            probe.src,
-            probe.src_user,
-            probe.src_ip,
-            probe.dst,
-            probe.dst_user,
-            probe.dst_ip,
-        )
+    let cells =
+        run_bounded_mesh_probes(probes, PAIRWISE_MESH_SCHEDULE_POLICY, |probe| async move {
+            let cell = probe_pair(
+                probe.src,
+                probe.src_user,
+                probe.src_ip,
+                probe.dst,
+                probe.dst_user,
+                probe.dst_ip,
+            )
+            .await;
+            let _ = ff_db::pg_upsert_mesh_probe(
+                pool,
+                &cell.src,
+                &cell.dst,
+                &cell.status,
+                cell.last_error.as_deref(),
+                cell.ping_ok,
+                Some(cell.ssh_ok),
+            )
+            .await;
+            cell
+        })
         .await;
+
+    // Deadline cells never ran through the probe closure, so persist their
+    // bounded-scan failure explicitly instead of leaving stale success rows.
+    for cell in cells
+        .iter()
+        .filter(|cell| cell.last_error.as_deref() == Some(MESH_SCAN_DEADLINE_ERROR))
+    {
         let _ = ff_db::pg_upsert_mesh_probe(
             pool,
             &cell.src,
@@ -496,14 +724,93 @@ async fn pairwise_ssh_check_inner(
             Some(cell.ssh_ok),
         )
         .await;
-        cell
-    })
-    .await;
+    }
 
     Ok(MeshMatrix {
         cells,
         checked_at: chrono::Utc::now(),
     })
+}
+
+async fn read_child_pipe<R>(mut pipe: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+async fn join_child_pipe(
+    task: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+) -> std::io::Result<Vec<u8>> {
+    task.await
+        .map_err(|error| std::io::Error::other(format!("SSH pipe reader task failed: {error}")))?
+}
+
+/// Run one SSH process with cancellation that owns the process lifecycle.
+///
+/// Tokio's timeout only cancels the Rust future. Without `kill_on_drop`, the
+/// SSH child survives and its remote shell/nested SSH session can occupy an
+/// sshd pre-auth slot until LoginGraceTime. On timeout, kill and reap the child
+/// before releasing the scheduler's endpoint reservations.
+async fn output_with_hard_timeout(
+    mut command: Command,
+    limit: Duration,
+) -> std::io::Result<Option<Output>> {
+    command
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("SSH stdout pipe unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("SSH stderr pipe unavailable"))?;
+    let stdout_task = tokio::spawn(read_child_pipe(stdout));
+    let stderr_task = tokio::spawn(read_child_pipe(stderr));
+
+    let status = match timeout(limit, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            let _ = timeout(MESH_SSH_REAP_TIMEOUT, child.wait()).await;
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(error);
+        }
+        Err(_) => {
+            if let Err(error) = child.start_kill() {
+                warn!(%error, "timed-out mesh SSH child could not be killed");
+            }
+            match timeout(MESH_SSH_REAP_TIMEOUT, child.wait()).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    warn!(%error, "timed-out mesh SSH child could not be reaped");
+                }
+                Err(_) => {
+                    warn!("timed-out mesh SSH child exceeded bounded reap timeout");
+                }
+            }
+            stdout_task.abort();
+            stderr_task.abort();
+            let _ = stdout_task.await;
+            let _ = stderr_task.await;
+            return Ok(None);
+        }
+    };
+
+    let stdout = join_child_pipe(stdout_task).await?;
+    let stderr = join_child_pipe(stderr_task).await?;
+    Ok(Some(Output {
+        status,
+        stdout,
+        stderr,
+    }))
 }
 
 async fn probe_pair(
@@ -523,24 +830,19 @@ async fn probe_pair(
          ssh {ssh_bypass} -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
          {dst_user}@{dst_ip} true; s=$?; printf '__FF_MESH__%s:%s\\n' \"$p\" \"$s\"; exit \"$s\""
     );
-    let result = timeout(
-        Duration::from_secs(12),
-        Command::new("ssh")
-            .args(crate::ssh_opts::ssh_bypass_args())
-            .args([
-                "-o",
-                "ConnectTimeout=5",
-                "-o",
-                "StrictHostKeyChecking=accept-new",
-                &format!("{src_user}@{src_ip}"),
-                &inner,
-            ])
-            .output(),
-    )
-    .await;
+    let mut command = Command::new("ssh");
+    command.args(crate::ssh_opts::ssh_bypass_args()).args([
+        "-o",
+        "ConnectTimeout=5",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        &format!("{src_user}@{src_ip}"),
+        &inner,
+    ]);
+    let result = output_with_hard_timeout(command, Duration::from_secs(12)).await;
 
     match result {
-        Ok(Ok(out)) if out.status.success() => MeshCell {
+        Ok(Some(out)) if out.status.success() => MeshCell {
             ping_ok: parse_remote_probe_marker(&out.stdout).map(|(ping, _)| ping),
             ssh_ok: true,
             src,
@@ -548,7 +850,7 @@ async fn probe_pair(
             status: "ok".into(),
             last_error: None,
         },
-        Ok(Ok(out)) => MeshCell {
+        Ok(Some(out)) => MeshCell {
             ping_ok: parse_remote_probe_marker(&out.stdout).map(|(ping, _)| ping),
             ssh_ok: false,
             src,
@@ -564,7 +866,7 @@ async fn probe_pair(
                     .collect::<String>()
             )),
         },
-        Ok(Err(e)) => MeshCell {
+        Err(e) => MeshCell {
             ping_ok: None,
             ssh_ok: false,
             src,
@@ -572,7 +874,7 @@ async fn probe_pair(
             status: "failed".into(),
             last_error: Some(format!("spawn: {e}")),
         },
-        Err(_) => MeshCell {
+        Ok(None) => MeshCell {
             ping_ok: None,
             ssh_ok: false,
             src,
@@ -1406,7 +1708,13 @@ mod tests {
         // degenerating to a fleet-wide serial scan.
         let first_wave = Arc::new(tokio::sync::Barrier::new(3));
 
-        let run = run_bounded_mesh_probes(probes, PAIRWISE_MESH_MAX_IN_FLIGHT, |probe| {
+        let policy = MeshSchedulePolicy {
+            max_in_flight: PAIRWISE_MESH_MAX_IN_FLIGHT,
+            transient_cooldown: Duration::ZERO,
+            scan_deadline: Duration::from_secs(1),
+            max_transient_retries: 0,
+        };
+        let run = run_bounded_mesh_probes(probes, policy, |probe| {
             let active_by_node = Arc::clone(&active_by_node);
             let active_total = Arc::clone(&active_total);
             let max_total = Arc::clone(&max_total);
@@ -1469,6 +1777,250 @@ mod tests {
                 .values()
                 .all(|count| *count == 0)
         );
+    }
+
+    fn scheduled_test_probe(src: &str, dst: &str) -> MeshProbe {
+        MeshProbe {
+            src: src.into(),
+            src_user: "user".into(),
+            src_ip: "127.0.0.1".into(),
+            dst: dst.into(),
+            dst_user: "user".into(),
+            dst_ip: "127.0.0.1".into(),
+        }
+    }
+
+    fn scheduled_test_cell(
+        probe: MeshProbe,
+        status: &str,
+        last_error: Option<&str>,
+        ping_ok: Option<bool>,
+    ) -> MeshCell {
+        MeshCell {
+            src: probe.src,
+            dst: probe.dst,
+            status: status.into(),
+            last_error: last_error.map(str::to_string),
+            ping_ok,
+            ssh_ok: status == "ok",
+        }
+    }
+
+    #[test]
+    fn transient_failures_are_scoped_to_the_observed_ssh_hop() {
+        let destination_banner = scheduled_test_cell(
+            scheduled_test_probe("a", "b"),
+            "failed",
+            Some("exit 255: Connection timed out during banner exchange"),
+            Some(true),
+        );
+        assert_eq!(
+            transient_mesh_failure_scope(&destination_banner),
+            Some(TransientFailureScope::Destination)
+        );
+
+        let source_banner = scheduled_test_cell(
+            scheduled_test_probe("a", "b"),
+            "failed",
+            Some("exit 255: kex_exchange_identification: Connection closed by remote host"),
+            None,
+        );
+        assert_eq!(
+            transient_mesh_failure_scope(&source_banner),
+            Some(TransientFailureScope::Source)
+        );
+
+        let ambiguous_timeout = scheduled_test_cell(
+            scheduled_test_probe("a", "b"),
+            "failed",
+            Some("timeout"),
+            None,
+        );
+        assert_eq!(
+            transient_mesh_failure_scope(&ambiguous_timeout),
+            Some(TransientFailureScope::Both)
+        );
+
+        let auth_failure = scheduled_test_cell(
+            scheduled_test_probe("a", "b"),
+            "failed",
+            Some("exit 255: Permission denied (publickey)"),
+            None,
+        );
+        assert_eq!(transient_mesh_failure_scope(&auth_failure), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_endpoint_recovers_through_one_half_open_retry() {
+        use std::sync::{Arc, Mutex};
+
+        let started_at = Instant::now();
+        let starts = Arc::new(Mutex::new(
+            BTreeMap::<(String, String), Vec<Duration>>::new(),
+        ));
+        let probes = vec![
+            scheduled_test_probe("a", "b"),
+            scheduled_test_probe("a", "c"),
+            scheduled_test_probe("d", "e"),
+        ];
+        let policy = MeshSchedulePolicy {
+            max_in_flight: 8,
+            transient_cooldown: Duration::from_secs(30),
+            scan_deadline: Duration::from_secs(5 * 60),
+            max_transient_retries: 1,
+        };
+
+        let cells = run_bounded_mesh_probes(probes, policy, {
+            let starts = Arc::clone(&starts);
+            move |probe| {
+                let starts = Arc::clone(&starts);
+                async move {
+                    let is_first_ab_attempt = {
+                        let mut starts = starts.lock().expect("start record lock");
+                        let edge_starts = starts
+                            .entry((probe.src.clone(), probe.dst.clone()))
+                            .or_default();
+                        edge_starts.push(Instant::now().duration_since(started_at));
+                        probe.src == "a" && probe.dst == "b" && edge_starts.len() == 1
+                    };
+                    if is_first_ab_attempt {
+                        scheduled_test_cell(probe, "failed", Some("timeout"), None)
+                    } else {
+                        scheduled_test_cell(probe, "ok", None, Some(true))
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(cells.len(), 3);
+        let starts = starts.lock().expect("start record lock");
+        assert_eq!(
+            starts.get(&("a".into(), "b".into())).unwrap(),
+            &[Duration::ZERO, Duration::from_secs(30)]
+        );
+        assert_eq!(
+            starts.get(&("a".into(), "c".into())).unwrap(),
+            &[Duration::from_secs(30)],
+            "a recovered endpoint may serve the next edge after its half-open success"
+        );
+        assert_eq!(
+            starts.get(&("d".into(), "e".into())).unwrap(),
+            &[Duration::ZERO],
+            "node-disjoint work must continue while a and b cool down"
+        );
+        assert_eq!(
+            cells
+                .iter()
+                .find(|cell| cell.src == "a" && cell.dst == "b")
+                .map(|cell| cell.status.as_str()),
+            Some("ok")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_failure_neither_retries_nor_opens_endpoint_breaker() {
+        use std::sync::{Arc, Mutex};
+
+        let started_at = Instant::now();
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let probes = vec![
+            scheduled_test_probe("a", "b"),
+            scheduled_test_probe("a", "c"),
+        ];
+        let policy = MeshSchedulePolicy {
+            max_in_flight: 8,
+            transient_cooldown: Duration::from_secs(30),
+            scan_deadline: Duration::from_secs(60),
+            max_transient_retries: 1,
+        };
+        let cells = run_bounded_mesh_probes(probes, policy, {
+            let starts = Arc::clone(&starts);
+            move |probe| {
+                let starts = Arc::clone(&starts);
+                async move {
+                    starts
+                        .lock()
+                        .expect("start record lock")
+                        .push((probe.dst.clone(), Instant::now().duration_since(started_at)));
+                    if probe.dst == "b" {
+                        scheduled_test_cell(
+                            probe,
+                            "failed",
+                            Some("exit 255: Permission denied (publickey)"),
+                            None,
+                        )
+                    } else {
+                        scheduled_test_cell(probe, "ok", None, Some(true))
+                    }
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(cells.len(), 2);
+        assert_eq!(
+            starts.lock().expect("start record lock").as_slice(),
+            &[("b".into(), Duration::ZERO), ("c".into(), Duration::ZERO)]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn scan_deadline_bounds_cooldown_and_reports_unfinished_edge() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let policy = MeshSchedulePolicy {
+            max_in_flight: 1,
+            transient_cooldown: Duration::from_secs(30),
+            scan_deadline: Duration::from_secs(10),
+            max_transient_retries: 1,
+        };
+        let cells = run_bounded_mesh_probes(vec![scheduled_test_probe("a", "b")], policy, {
+            let attempts = Arc::clone(&attempts);
+            move |probe| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async move { scheduled_test_cell(probe, "failed", Some("timeout"), None) }
+            }
+        })
+        .await;
+
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(
+            cells[0].last_error.as_deref(),
+            Some(MESH_SCAN_DEADLINE_ERROR)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn hard_timeout_kills_and_reaps_child_before_returning() {
+        let pid_file = std::env::temp_dir().join(format!("ff-mesh-timeout-{}.pid", Uuid::new_v4()));
+        let script = format!(
+            "printf '%s' \"$$\" > {}; exec sleep 30",
+            shell_escape_single(pid_file.to_string_lossy().as_ref())
+        );
+        let mut command = Command::new("sh");
+        command.args(["-c", &script]);
+
+        let result = output_with_hard_timeout(command, Duration::from_millis(250))
+            .await
+            .expect("local child should spawn");
+        assert!(result.is_none(), "sleeping child must hit the hard timeout");
+
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("child wrote pid")
+            .trim()
+            .to_string();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "timed-out child {pid} still exists after helper returned"
+        );
+        let _ = std::fs::remove_file(pid_file);
     }
 
     #[test]
