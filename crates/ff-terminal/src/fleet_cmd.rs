@@ -1134,12 +1134,11 @@ async fn enqueue_remote_drill(
     println!(
         "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (from={me}, backup={backup_id}, run={run_id})"
     );
-    let target_matches: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, name FROM computers WHERE LOWER(name)=LOWER($1) ORDER BY id",
-    )
-    .bind(node)
-    .fetch_all(pool)
-    .await?;
+    let target_matches: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM computers WHERE LOWER(name)=LOWER($1) ORDER BY id")
+            .bind(node)
+            .fetch_all(pool)
+            .await?;
     let (target_computer_id, canonical_node) =
         require_unique_remote_drill_target(node, target_matches).map_err(anyhow::Error::msg)?;
     let (checksum, size_bytes, created_at, distribution_status, database_kind, file_name): (
@@ -1330,101 +1329,110 @@ mod exact_restore_drill_tests {
         )
         .unwrap();
 
-        assert!(validate_remote_backup_receipt(
-            &status,
-            backup_id,
-            uuid::Uuid::new_v4(),
-            "priya",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
-        assert!(validate_remote_backup_receipt(
-            &status,
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            8192,
-            "falkordb",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
-        assert!(validate_remote_backup_receipt(
-            &status,
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-renamed.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
-        assert!(validate_remote_backup_receipt(
-            &status,
-            backup_id,
-            computer_id,
-            "vinny",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
-        assert!(validate_remote_backup_receipt(
-            &status,
-            backup_id,
-            computer_id,
-            "priya",
-            "different",
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
-        assert!(validate_remote_backup_receipt(
-            &receipt(
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                uuid::Uuid::new_v4(),
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
                 backup_id,
                 computer_id,
                 "priya",
                 &checksum,
-                created - chrono::Duration::seconds(1),
-            ),
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
+                8192,
+                "falkordb",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-renamed.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "vinny",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "priya",
+                "different",
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &receipt(
+                    backup_id,
+                    computer_id,
+                    "priya",
+                    &checksum,
+                    created - chrono::Duration::seconds(1),
+                ),
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn remote_drill_target_resolution_rejects_zero_or_ambiguous_case_matches() {
         let computer_id = uuid::Uuid::new_v4();
         assert_eq!(
-            require_unique_remote_drill_target(
-                "priya",
-                vec![(computer_id, "Priya".into())],
-            )
-            .unwrap(),
+            require_unique_remote_drill_target("priya", vec![(computer_id, "Priya".into())],)
+                .unwrap(),
             (computer_id, "Priya".into())
         );
         assert!(require_unique_remote_drill_target("missing", Vec::new()).is_err());
@@ -1460,8 +1468,52 @@ mod exact_restore_drill_tests {
                 "age_format": false
             }}}),
         ] {
-            assert!(validate_remote_backup_receipt(
-                &status,
+            assert!(
+                validate_remote_backup_receipt(
+                    &status,
+                    backup_id,
+                    computer_id,
+                    "priya",
+                    &checksum,
+                    8192,
+                    "postgres",
+                    "pg-exact.tar.gz.age",
+                    created,
+                    now,
+                )
+                .is_err()
+            );
+        }
+
+        let stale = receipt(
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            now - chrono::Duration::seconds(ff_agent::ha::backup::BACKUP_RECEIPT_MAX_AGE_SECS + 1),
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &stale,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created - chrono::Duration::days(2),
+                now,
+            )
+            .is_err()
+        );
+
+        let mut forged = receipt(backup_id, computer_id, "priya", &checksum, now);
+        forged["hosts"][computer_id.to_string()]["backup_id"] =
+            serde_json::json!(uuid::Uuid::new_v4());
+        assert!(
+            validate_remote_backup_receipt(
+                &forged,
                 backup_id,
                 computer_id,
                 "priya",
@@ -1472,59 +1524,23 @@ mod exact_restore_drill_tests {
                 created,
                 now,
             )
-            .is_err());
-        }
-
-        let stale = receipt(
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            now - chrono::Duration::seconds(ff_agent::ha::backup::BACKUP_RECEIPT_MAX_AGE_SECS + 1),
+            .is_err()
         );
-        assert!(validate_remote_backup_receipt(
-            &stale,
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created - chrono::Duration::days(2),
-            now,
-        )
-        .is_err());
-
-        let mut forged = receipt(backup_id, computer_id, "priya", &checksum, now);
-        forged["hosts"][computer_id.to_string()]["backup_id"] =
-            serde_json::json!(uuid::Uuid::new_v4());
-        assert!(validate_remote_backup_receipt(
-            &forged,
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
-        assert!(validate_remote_backup_receipt(
-            &receipt(backup_id, computer_id, "priya", &checksum, now),
-            backup_id,
-            computer_id,
-            "priya",
-            &checksum,
-            4096,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            created,
-            now,
-        )
-        .is_err());
+        assert!(
+            validate_remote_backup_receipt(
+                &receipt(backup_id, computer_id, "priya", &checksum, now),
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                4096,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
     }
 
     #[test]

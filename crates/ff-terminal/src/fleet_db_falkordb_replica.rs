@@ -6,7 +6,7 @@
 //! registers topology only after exact replication, graph, write-rejection,
 //! container, firewall, and restart proofs all pass.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -20,7 +20,7 @@ use crate::fleet_db_redis_replica::{
     docker_output, primary_identity, redis_config_value, redis_connection, redis_info,
 };
 use crate::{
-    shell_escape_single, whoami_tag, FleetDbFalkordbReplicaCommand, CYAN, GREEN, RESET, YELLOW,
+    CYAN, FleetDbFalkordbReplicaCommand, GREEN, RESET, YELLOW, shell_escape_single, whoami_tag,
 };
 
 const PRIMARY_NAME: &str = "priya";
@@ -3307,15 +3307,19 @@ mod tests {
                 primary_port: PRIMARY_PORT,
             }
         );
-        assert!(authorize_target_direct_primary(
-            "SOPHIE", &target, &primary, canonical, &firewall, &route,
-        )
-        .is_ok());
-        for wrong in ["sophie-worker", "priya", "adele", ""] {
-            assert!(authorize_target_direct_primary(
-                wrong, &target, &primary, canonical, &firewall, &route,
+        assert!(
+            authorize_target_direct_primary(
+                "SOPHIE", &target, &primary, canonical, &firewall, &route,
             )
-            .is_err());
+            .is_ok()
+        );
+        for wrong in ["sophie-worker", "priya", "adele", ""] {
+            assert!(
+                authorize_target_direct_primary(
+                    wrong, &target, &primary, canonical, &firewall, &route,
+                )
+                .is_err()
+            );
         }
 
         for bad_authority in [
@@ -3329,64 +3333,78 @@ mod tests {
             "redis://192.168.5.104:63379?x=1",
             "redis://192.168.5.104:63379/#fragment",
         ] {
-            assert!(authorize_target_direct_primary(
-                "sophie",
-                &target,
-                &primary,
-                bad_authority,
-                &firewall,
-                &route,
-            )
-            .is_err());
+            assert!(
+                authorize_target_direct_primary(
+                    "sophie",
+                    &target,
+                    &primary,
+                    bad_authority,
+                    &firewall,
+                    &route,
+                )
+                .is_err()
+            );
         }
 
         let mut changed = firewall.clone();
         changed.target_id = Uuid::from_u128(99);
-        assert!(authorize_target_direct_primary(
-            "sophie", &target, &primary, canonical, &changed, &route,
-        )
-        .is_err());
+        assert!(
+            authorize_target_direct_primary(
+                "sophie", &target, &primary, canonical, &changed, &route,
+            )
+            .is_err()
+        );
         let mut changed = firewall.clone();
         changed.primary_id = Uuid::from_u128(99);
-        assert!(authorize_target_direct_primary(
-            "sophie", &target, &primary, canonical, &changed, &route,
-        )
-        .is_err());
+        assert!(
+            authorize_target_direct_primary(
+                "sophie", &target, &primary, canonical, &changed, &route,
+            )
+            .is_err()
+        );
         let mut changed = firewall.clone();
         changed.primary_port = 6379;
-        assert!(authorize_target_direct_primary(
-            "sophie", &target, &primary, canonical, &changed, &route,
-        )
-        .is_err());
+        assert!(
+            authorize_target_direct_primary(
+                "sophie", &target, &primary, canonical, &changed, &route,
+            )
+            .is_err()
+        );
         let mut changed = firewall;
         changed.ipv4_target_allow = false;
-        assert!(authorize_target_direct_primary(
-            "sophie", &target, &primary, canonical, &changed, &route,
-        )
-        .is_err());
+        assert!(
+            authorize_target_direct_primary(
+                "sophie", &target, &primary, canonical, &changed, &route,
+            )
+            .is_err()
+        );
 
         let mut changed = route.clone();
         changed.source_ip = "192.168.5.102".into();
-        assert!(authorize_target_direct_primary(
-            "sophie",
-            &target,
-            &primary,
-            canonical,
-            &firewall_evidence(&target, &primary),
-            &changed,
-        )
-        .is_err());
+        assert!(
+            authorize_target_direct_primary(
+                "sophie",
+                &target,
+                &primary,
+                canonical,
+                &firewall_evidence(&target, &primary),
+                &changed,
+            )
+            .is_err()
+        );
         let mut changed = route;
         changed.tcp_reachable = false;
-        assert!(authorize_target_direct_primary(
-            "sophie",
-            &target,
-            &primary,
-            canonical,
-            &firewall_evidence(&target, &primary),
-            &changed,
-        )
-        .is_err());
+        assert!(
+            authorize_target_direct_primary(
+                "sophie",
+                &target,
+                &primary,
+                canonical,
+                &firewall_evidence(&target, &primary),
+                &changed,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3468,19 +3486,23 @@ mod tests {
             assert!(args.iter().any(|arg| arg == exact), "missing {exact}");
         }
         assert!(args.windows(2).any(|pair| pair == ["-p", "22"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| { pair == ["-L", "127.0.0.1:45678:127.0.0.1:63379"] }));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-o", "IdentityAgent=none"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| { pair == ["-L", "127.0.0.1:45678:127.0.0.1:63379"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "IdentityAgent=none"])
+        );
         assert!(args.windows(2).any(|pair| pair == ["-o", "BatchMode=yes"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-o", "IdentitiesOnly=yes"]));
-        assert!(args
-            .windows(2)
-            .any(|pair| pair == ["-i", "~/.ssh/id_ed25519"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-o", "IdentitiesOnly=yes"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-i", "~/.ssh/id_ed25519"])
+        );
         assert_eq!(args.last().map(String::as_str), Some("priya@192.168.5.104"));
 
         assert!(command.as_std().get_envs().any(|(key, value)| {
@@ -3611,11 +3633,13 @@ mod tests {
             format!("IMAGE={image_id}\nIMAGE_REPO_DIGESTS=[\"{FALKORDB_IMAGE}\"]\nIMAGE_USER=\n");
         assert_eq!(parse_image_evidence(&raw).unwrap().image_id, image_id);
         assert!(parse_image_evidence(&raw.replace(FALKORDB_IMAGE, "falkordb:latest")).is_err());
-        assert!(parse_image_evidence(&raw.replace(
-            &format!("[\"{FALKORDB_IMAGE}\"]"),
-            &format!("[\"{FALKORDB_IMAGE}\",\"{FALKORDB_IMAGE}\"]"),
-        ))
-        .is_err());
+        assert!(
+            parse_image_evidence(&raw.replace(
+                &format!("[\"{FALKORDB_IMAGE}\"]"),
+                &format!("[\"{FALKORDB_IMAGE}\",\"{FALKORDB_IMAGE}\"]"),
+            ))
+            .is_err()
+        );
         assert!(
             parse_image_evidence(&raw.replace(&format!("[\"{FALKORDB_IMAGE}\"]"), "[]",)).is_err()
         );
@@ -3647,32 +3671,38 @@ mod tests {
         plan.material.target_state = TargetState::ExactHealthy {
             image_id: plan.material.target_image_id.clone(),
         };
-        assert!(validate_status_topology(
-            "replica",
-            "running",
-            Some(plan.material.backup.backup_id),
-            &plan,
-        )
-        .is_ok());
+        assert!(
+            validate_status_topology(
+                "replica",
+                "running",
+                Some(plan.material.backup.backup_id),
+                &plan,
+            )
+            .is_ok()
+        );
         assert!(
             validate_status_topology("replica", "running", Some(Uuid::from_u128(999)), &plan,)
                 .is_err()
         );
-        assert!(validate_status_topology(
-            "replica",
-            "failed",
-            Some(plan.material.backup.backup_id),
-            &plan,
-        )
-        .is_err());
+        assert!(
+            validate_status_topology(
+                "replica",
+                "failed",
+                Some(plan.material.backup.backup_id),
+                &plan,
+            )
+            .is_err()
+        );
         plan.material.target_state = TargetState::Absent;
-        assert!(validate_status_topology(
-            "replica",
-            "running",
-            Some(plan.material.backup.backup_id),
-            &plan,
-        )
-        .is_err());
+        assert!(
+            validate_status_topology(
+                "replica",
+                "running",
+                Some(plan.material.backup.backup_id),
+                &plan,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3799,41 +3829,51 @@ mod tests {
         );
         restore_receipt(&production_detail, &"a".repeat(64)).unwrap();
         assert!(restore_receipt(&detail, &"c".repeat(64)).is_err());
-        assert!(restore_receipt(
-            &detail.replace(
-                &format!("sha256:{}", "b".repeat(64)),
-                &format!("sha256:{}", "c".repeat(64)),
-            ),
-            &"a".repeat(64),
-        )
-        .is_ok());
-        assert!(restore_receipt(
-            &detail.replace(
-                &format!("sha256:{}", "b".repeat(64)),
-                "sha256:NOT-CANONICAL",
-            ),
-            &"a".repeat(64),
-        )
-        .is_err());
-        assert!(restore_receipt(
-            &detail.replace(FALKORDB_IMAGE, "falkordb:latest"),
-            &"a".repeat(64),
-        )
-        .is_err());
+        assert!(
+            restore_receipt(
+                &detail.replace(
+                    &format!("sha256:{}", "b".repeat(64)),
+                    &format!("sha256:{}", "c".repeat(64)),
+                ),
+                &"a".repeat(64),
+            )
+            .is_ok()
+        );
+        assert!(
+            restore_receipt(
+                &detail.replace(
+                    &format!("sha256:{}", "b".repeat(64)),
+                    "sha256:NOT-CANONICAL",
+                ),
+                &"a".repeat(64),
+            )
+            .is_err()
+        );
+        assert!(
+            restore_receipt(
+                &detail.replace(FALKORDB_IMAGE, "falkordb:latest"),
+                &"a".repeat(64),
+            )
+            .is_err()
+        );
         assert!(restore_receipt(&format!("prefixed {detail}"), &"a".repeat(64),).is_err());
         assert!(
             restore_receipt(&format!("{detail}; receipt={receipt}"), &"a".repeat(64),).is_err()
         );
-        assert!(restore_receipt(
-            &detail.replace("\"proof\":", "\"proof\":\"duplicate\",\"proof\":"),
-            &"a".repeat(64),
-        )
-        .is_err());
-        assert!(restore_receipt(
-            &detail.replace("\"proof\":", "\"unknown\":true,\"proof\":"),
-            &"a".repeat(64),
-        )
-        .is_err());
+        assert!(
+            restore_receipt(
+                &detail.replace("\"proof\":", "\"proof\":\"duplicate\",\"proof\":"),
+                &"a".repeat(64),
+            )
+            .is_err()
+        );
+        assert!(
+            restore_receipt(
+                &detail.replace("\"proof\":", "\"unknown\":true,\"proof\":"),
+                &"a".repeat(64),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -3867,54 +3907,68 @@ mod tests {
             "{status}\nSERVICE_AFTER=network-online.target docker.service\nSERVICE_REQUIRES=docker.service\nSERVICE_PARTOF=docker.service\n"
         );
         validate_firewall_attestation(&raw, &target, &primary).unwrap();
-        assert!(validate_firewall_attestation(
-            &raw.replace("192.168.5.103", "192.168.5.199"),
-            &target,
-            &primary
-        )
-        .is_err());
-        assert!(validate_firewall_attestation(
-            &raw.replace("SERVICE_PARTOF=docker.service", "SERVICE_PARTOF="),
-            &target,
-            &primary
-        )
-        .is_err());
-        assert!(validate_firewall_attestation(
-            &raw.replace("\"allow_v4_position\":1", "\"allow_v4_position\":3"),
-            &target,
-            &primary
-        )
-        .is_err());
-        assert!(validate_firewall_attestation(
-            &raw.replace("\"unit_active\":true", "\"unit_active\":false"),
-            &target,
-            &primary
-        )
-        .is_err());
-        assert!(validate_firewall_attestation(
-            &raw.replace(
-                "\"deny_v6_forward_position\":1",
-                "\"deny_v6_forward_position\":2"
-            ),
-            &target,
-            &primary
-        )
-        .is_err());
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace("192.168.5.103", "192.168.5.199"),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace("SERVICE_PARTOF=docker.service", "SERVICE_PARTOF="),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace("\"allow_v4_position\":1", "\"allow_v4_position\":3"),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace("\"unit_active\":true", "\"unit_active\":false"),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace(
+                    "\"deny_v6_forward_position\":1",
+                    "\"deny_v6_forward_position\":2"
+                ),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
         assert!(
             validate_firewall_attestation(&format!("garbage{raw}"), &target, &primary).is_err()
         );
-        assert!(validate_firewall_attestation(
-            &raw.replace("\"ok\":true", "\"extra\":true,\"ok\":true"),
-            &target,
-            &primary
-        )
-        .is_err());
-        assert!(validate_firewall_attestation(
-            &raw.replace("\"ok\":true", "\"ok\":true,\"ok\":true"),
-            &target,
-            &primary
-        )
-        .is_err());
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace("\"ok\":true", "\"extra\":true,\"ok\":true"),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
+        assert!(
+            validate_firewall_attestation(
+                &raw.replace("\"ok\":true", "\"ok\":true,\"ok\":true"),
+                &target,
+                &primary
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4046,44 +4100,54 @@ mod tests {
         let mut wrong_primary = direct_command;
         wrong_primary[5] = "192.168.5.199".into();
         assert_invalid_command(wrong_primary);
-        assert!(validate_existing_container(
-            &fingerprint.replace("--bind 127.0.0.1", "--bind 0.0.0.0"),
-            &image_id,
-            "",
-            "192.168.5.104"
-        )
-        .is_err());
-        assert!(validate_existing_container(
-            &fingerprint.replace(
-                "replica-serve-stale-data no",
-                "replica-serve-stale-data yes"
-            ),
-            &image_id,
-            "",
-            "192.168.5.104"
-        )
-        .is_err());
-        assert!(validate_existing_container(
-            &fingerprint.replacen("|true|[\"ALL\"]", "|false|[\"ALL\"]", 1),
-            &image_id,
-            "",
-            "192.168.5.104"
-        )
-        .is_err());
-        assert!(validate_existing_container(
-            &fingerprint.replace("[\"ALL\"]", "[]"),
-            &image_id,
-            "",
-            "192.168.5.104"
-        )
-        .is_err());
-        assert!(validate_existing_container(
-            &fingerprint.replace(FALKORDB_IMAGE, "falkordb/falkordb:latest"),
-            &image_id,
-            "",
-            "192.168.5.104"
-        )
-        .is_err());
+        assert!(
+            validate_existing_container(
+                &fingerprint.replace("--bind 127.0.0.1", "--bind 0.0.0.0"),
+                &image_id,
+                "",
+                "192.168.5.104"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_existing_container(
+                &fingerprint.replace(
+                    "replica-serve-stale-data no",
+                    "replica-serve-stale-data yes"
+                ),
+                &image_id,
+                "",
+                "192.168.5.104"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_existing_container(
+                &fingerprint.replacen("|true|[\"ALL\"]", "|false|[\"ALL\"]", 1),
+                &image_id,
+                "",
+                "192.168.5.104"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_existing_container(
+                &fingerprint.replace("[\"ALL\"]", "[]"),
+                &image_id,
+                "",
+                "192.168.5.104"
+            )
+            .is_err()
+        );
+        assert!(
+            validate_existing_container(
+                &fingerprint.replace(FALKORDB_IMAGE, "falkordb/falkordb:latest"),
+                &image_id,
+                "",
+                "192.168.5.104"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4200,15 +4264,17 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(enqueue_lifecycle_action(
-            &pool,
-            &target,
-            "apply",
-            "plan-1",
-            "different-command".into(),
-        )
-        .await
-        .is_err());
+        assert!(
+            enqueue_lifecycle_action(
+                &pool,
+                &target,
+                "apply",
+                "plan-1",
+                "different-command".into(),
+            )
+            .await
+            .is_err()
+        );
         sqlx::query("UPDATE fleet_tasks SET status='completed' WHERE id=$1")
             .bind(first)
             .execute(&pool)

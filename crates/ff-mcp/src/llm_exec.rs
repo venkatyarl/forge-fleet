@@ -853,7 +853,9 @@ impl GatewayLlmExec {
             .enumerate()
             .filter(|(_, candidate)| match role {
                 AttemptRole::Completion => {
-                    snapshot.generation_eligible.contains(&candidate.deployment_id)
+                    snapshot
+                        .generation_eligible
+                        .contains(&candidate.deployment_id)
                         && candidate.tool_calling
                         && !is_independent_judge(candidate)
                         && candidate.tier >= i32::from(requested_tier)
@@ -875,10 +877,10 @@ impl GatewayLlmExec {
                     "canonical route snapshot has no independent {INDEPENDENT_JUDGE_FAMILY}-family judge"
                 ),
             };
-            return Err(self.remember_failure(role, ExecutionFailure::new(
-                FailureReasonCode::Unavailable,
-                message,
-            )));
+            return Err(self.remember_failure(
+                role,
+                ExecutionFailure::new(FailureReasonCode::Unavailable, message),
+            ));
         }
         let mut attempted = self
             .failed_ids
@@ -1623,10 +1625,7 @@ mod tests {
         exec.complete(1, "write code", 256, Duration::from_secs(5))
             .await
             .unwrap();
-        assert_eq!(
-            *transport.seen.lock().unwrap(),
-            vec![Uuid::from_u128(47)]
-        );
+        assert_eq!(*transport.seen.lock().unwrap(), vec![Uuid::from_u128(47)]);
         assert_eq!(exec.evidence().attempts[0].catalog_tier, 2);
     }
 
@@ -1737,11 +1736,7 @@ mod tests {
     #[tokio::test]
     async fn judge_escalate_uses_independent_judge_and_types_terminal_failures() {
         let (success, _, success_transport) = executor(
-            vec![
-                candidate(50),
-                candidate_at_tier(51, 3),
-                judge_candidate(52),
-            ],
+            vec![candidate(50), candidate_at_tier(51, 3), judge_candidate(52)],
             vec![
                 FakeReply::Payload(valid("answer")),
                 FakeReply::Payload(valid("9")),
@@ -1766,11 +1761,7 @@ mod tests {
         );
 
         let (unparseable, _, _) = executor(
-            vec![
-                candidate(53),
-                candidate_at_tier(54, 3),
-                judge_candidate(55),
-            ],
+            vec![candidate(53), candidate_at_tier(54, 3), judge_candidate(55)],
             vec![
                 FakeReply::Payload(valid("first")),
                 FakeReply::Payload(valid("not a score")),
@@ -1946,11 +1937,7 @@ mod tests {
     #[tokio::test]
     async fn cascade_final_semantic_validator_fails_closed() {
         let (exec, _, _) = executor(
-            vec![
-                candidate(8),
-                candidate_at_tier(9, 3),
-                judge_candidate(108),
-            ],
+            vec![candidate(8), candidate_at_tier(9, 3), judge_candidate(108)],
             vec![
                 FakeReply::Payload(valid("not json one")),
                 FakeReply::Payload(valid("5")),
@@ -2238,10 +2225,7 @@ mod tests {
         };
         let defaults = LocalRoutePolicy::from_config(&timeouts, None).unwrap();
         assert_eq!(defaults.total_timeout, Duration::from_millis(105_000));
-        assert_eq!(
-            defaults.max_attempt_timeout,
-            Duration::from_millis(90_000)
-        );
+        assert_eq!(defaults.max_attempt_timeout, Duration::from_millis(90_000));
 
         let clamped = LocalRoutePolicy::from_config(
             &timeouts,

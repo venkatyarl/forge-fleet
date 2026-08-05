@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use ff_core::llm_completion_policy::{
-    apply_completion_policy, validate_completion_response, CompletionBudget, WorkloadClass,
+    CompletionBudget, WorkloadClass, apply_completion_policy, validate_completion_response,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

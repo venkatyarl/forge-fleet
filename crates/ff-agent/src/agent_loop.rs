@@ -1960,7 +1960,7 @@ fn strip_whole_code_fence(text: &str) -> Option<&str> {
 fn final_answer(
     message: &ToolChatMessage,
 ) -> Result<String, ff_core::llm_completion_policy::CompletionValidationError> {
-    use ff_core::llm_completion_policy::{sanitize_public_content, CompletionValidationError};
+    use ff_core::llm_completion_policy::{CompletionValidationError, sanitize_public_content};
 
     let content = message
         .text_content()
@@ -2329,8 +2329,8 @@ mod commit_back_provenance_tests {
 #[cfg(test)]
 mod router_empty_tests {
     use super::{
-        final_answer, first_response_choice, response_message, strict_legacy_text_tool_calls,
-        validate_assistant_turn, ValidatedAssistantTurn,
+        ValidatedAssistantTurn, final_answer, first_response_choice, response_message,
+        strict_legacy_text_tool_calls, validate_assistant_turn,
     };
     use ff_api::tool_calling::{
         FunctionCall, ToolCall, ToolChatChoice, ToolChatCompletionResponse, ToolChatMessage,
@@ -2435,17 +2435,21 @@ mod router_empty_tests {
     #[test]
     fn rejects_missing_and_length_finish_reasons() {
         let missing = choice(Some(ToolChatMessage::assistant("answer")), None);
-        assert!(validate_assistant_turn(&missing)
-            .unwrap_err()
-            .contains("missing or null finish_reason"));
+        assert!(
+            validate_assistant_turn(&missing)
+                .unwrap_err()
+                .contains("missing or null finish_reason")
+        );
 
         let length = choice(
             Some(ToolChatMessage::assistant("partial answer")),
             Some("length"),
         );
-        assert!(validate_assistant_turn(&length)
-            .unwrap_err()
-            .contains("truncated"));
+        assert!(
+            validate_assistant_turn(&length)
+                .unwrap_err()
+                .contains("truncated")
+        );
     }
 
     #[test]
@@ -2470,9 +2474,11 @@ mod router_empty_tests {
             Some(ToolChatMessage::assistant("answer")),
             Some("tool_calls"),
         );
-        assert!(validate_assistant_turn(&absent)
-            .unwrap_err()
-            .contains("without structured tool calls"));
+        assert!(
+            validate_assistant_turn(&absent)
+                .unwrap_err()
+                .contains("without structured tool calls")
+        );
     }
 
     #[test]
@@ -2553,9 +2559,11 @@ mod router_empty_tests {
             },
         }]);
         let structured_stop = choice(Some(structured_message), Some("stop"));
-        assert!(validate_assistant_turn(&structured_stop)
-            .unwrap_err()
-            .contains("stop with structured tool calls"));
+        assert!(
+            validate_assistant_turn(&structured_stop)
+                .unwrap_err()
+                .contains("stop with structured tool calls")
+        );
 
         let text_stop = choice(
             Some(ToolChatMessage::assistant(

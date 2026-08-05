@@ -2608,10 +2608,7 @@ fn existing_receipt_is_current(
             .get("database_kind")
             .and_then(serde_json::Value::as_str)
             != Some(expected_database_kind)
-        || receipt
-            .get("file_name")
-            .and_then(serde_json::Value::as_str)
-            != Some(expected_file_name)
+        || receipt.get("file_name").and_then(serde_json::Value::as_str) != Some(expected_file_name)
         || receipt.get("checksum").and_then(serde_json::Value::as_str) != Some("ok")
         || receipt.get("decrypt").and_then(serde_json::Value::as_str) != Some("ok")
         || receipt
@@ -3841,13 +3838,15 @@ mod tests {
         let file = std::fs::File::open(archive.join(WAL_SEGMENT_A)).unwrap();
         let mut file_state = unix_custody_state(&file.metadata().unwrap());
         file_state.uid = file_state.uid.wrapping_add(1);
-        assert!(validate_wal_entry_custody(
-            WAL_SEGMENT_A,
-            PostgresWalArchiveEntryKind::Segment,
-            file_state,
-            directory_state,
-        )
-        .is_err());
+        assert!(
+            validate_wal_entry_custody(
+                WAL_SEGMENT_A,
+                PostgresWalArchiveEntryKind::Segment,
+                file_state,
+                directory_state,
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use ff_core::llm_completion_policy::{
-    apply_completion_policy, sanitize_public_content, validate_completion_response,
-    CompletionBudget, WorkloadClass,
+    CompletionBudget, WorkloadClass, apply_completion_policy, sanitize_public_content,
+    validate_completion_response,
 };
 use futures::StreamExt;
 use serde_json::{Value, json};
@@ -611,10 +611,12 @@ mod tests {
         let mut missing = StreamAccumulator::default();
         missing.consume(r#"{"choices":[{"delta":{"content":"partial"}}]}"#);
         missing.consume("[DONE]");
-        assert!(missing
-            .into_completion()
-            .unwrap_err()
-            .contains("without finish_reason stop"));
+        assert!(
+            missing
+                .into_completion()
+                .unwrap_err()
+                .contains("without finish_reason stop")
+        );
 
         for reason in ["length", "content_filter", "tool_calls"] {
             let mut rejected = StreamAccumulator::default();

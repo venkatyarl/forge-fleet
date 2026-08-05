@@ -5712,23 +5712,27 @@ mod tests {
             supply.general_endpoints[0].catalog_id.as_deref(),
             Some("near")
         );
-        assert!(supply
-            .code_endpoints
-            .iter()
-            .chain(&supply.general_endpoints)
-            .all(|row| !matches!(
-                row.catalog_id.as_deref(),
-                Some("retired-code" | "retired-general" | "inactive-code")
-            )));
+        assert!(
+            supply
+                .code_endpoints
+                .iter()
+                .chain(&supply.general_endpoints)
+                .all(|row| !matches!(
+                    row.catalog_id.as_deref(),
+                    Some("retired-code" | "retired-general" | "inactive-code")
+                ))
+        );
 
         let readiness = pg_agent_readiness(&pool, None)
             .await
             .expect("read readiness");
         assert_eq!(readiness.len(), 2);
         assert_eq!(readiness.iter().filter(|row| row.is_code).count(), 1);
-        assert!(readiness
-            .iter()
-            .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code));
+        assert!(
+            readiness
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code)
+        );
         assert!(readiness.iter().all(|row| !matches!(
             row.catalog_id.as_deref(),
             Some("retired-code" | "retired-general" | "inactive-code")
@@ -5739,9 +5743,11 @@ mod tests {
             .expect("read reprofile candidates");
         assert_eq!(reprofile.len(), 2);
         assert_eq!(reprofile.iter().filter(|row| row.is_code).count(), 1);
-        assert!(reprofile
-            .iter()
-            .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code));
+        assert!(
+            reprofile
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code)
+        );
         assert!(reprofile.iter().all(|row| !matches!(
             row.catalog_id.as_deref(),
             Some("retired-code" | "retired-general" | "inactive-code")
@@ -7395,21 +7401,23 @@ mod tests {
         assert_eq!(status, "failed");
         assert!(error.unwrap().contains("terminal status failed"));
 
-        assert!(pg_enqueue_deferred_dependent(
-            &pool,
-            "bad dependency",
-            "backup_receipt",
-            &serde_json::json!({}),
-            "now",
-            &serde_json::json!({}),
-            Some("lily"),
-            &serde_json::json!([]),
-            Some("test"),
-            Some(1),
-            "not-a-uuid",
-        )
-        .await
-        .is_err());
+        assert!(
+            pg_enqueue_deferred_dependent(
+                &pool,
+                "bad dependency",
+                "backup_receipt",
+                &serde_json::json!({}),
+                "now",
+                &serde_json::json!({}),
+                Some("lily"),
+                &serde_json::json!([]),
+                Some("test"),
+                Some(1),
+                "not-a-uuid",
+            )
+            .await
+            .is_err()
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
@@ -7475,10 +7483,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(status["hosts"][&lily_key]["host"], "lily");
-        assert_eq!(
-            status["hosts"][&lily_key]["database_kind"],
-            "postgres"
-        );
+        assert_eq!(status["hosts"][&lily_key]["database_kind"], "postgres");
         assert_eq!(
             status["hosts"][&lily_key]["file_name"],
             "pg-exact.tar.gz.age"
@@ -13230,15 +13235,9 @@ mod jira_claim_guard_tests {
                 .unwrap()
         );
         assert!(
-            !pg_assign_work_item(
-                &pool,
-                stale_metadata_child,
-                sub_agent_id,
-                computer_id,
-                600,
-            )
-            .await
-            .unwrap()
+            !pg_assign_work_item(&pool, stale_metadata_child, sub_agent_id, computer_id, 600,)
+                .await
+                .unwrap()
         );
         assert!(
             pg_assign_work_item(&pool, bound_child, sub_agent_id, computer_id, 600)
