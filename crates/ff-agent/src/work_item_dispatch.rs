@@ -186,6 +186,40 @@ struct WorktreeRecord {
     task_branch: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingPrCandidate {
+    url: String,
+    state: String,
+    base_ref_name: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    is_cross_repository: bool,
+    head_repository_owner: Option<ExistingPrOwner>,
+    head_repository: Option<ExistingPrRepository>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct ExistingPrOwner {
+    login: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingPrRepository {
+    name_with_owner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExistingPrAdoption {
+    candidate: ExistingPrCandidate,
+    builder: String,
+    builder_computer: String,
+    builder_port: Option<i32>,
+    builder_attribution: Option<RoutedModelAttribution>,
+    authoritative_repo: String,
+}
+
 #[derive(Debug, Default)]
 struct WorkItemDispatchResult {
     sweep_warnings: Vec<String>,
@@ -1227,6 +1261,102 @@ async fn dispatch_one(
         worktree.worktree_path.clone(),
     );
 
+    // A retry whose prior build reached an open PR but could not obtain an
+    // independent reviewer must not rebuild and force-push the same change.
+    // Adoption is deliberately narrow and fail-closed: every durable and live
+    // GitHub identity is checked before the prior exact head is inspected.
+    if let Some(adoption) = discover_existing_pr_adoption(&pg, &item, &worktree).await? {
+        checkout_existing_pr_head(&worktree, &adoption.candidate.head_ref_oid)?;
+        let review = match run_in_place_review(
+            &pg,
+            &item,
+            &worktree,
+            &adoption.builder,
+            adoption.builder_attribution.as_ref(),
+        )
+        .await
+        {
+            Ok(review) => review,
+            Err(error) => {
+                requeue_or_fail(
+                    &pg,
+                    &item,
+                    &format!("in-place review unavailable: {error:#}"),
+                )
+                .await?;
+                let sweep_warnings = post_phase.finish();
+                return Ok(WorkItemDispatchResult { sweep_warnings });
+            }
+        };
+        if !review.approved {
+            let reason = format!(
+                "in-place review rejected by {}: {}",
+                review.reviewer, review.reason
+            );
+            record_review_rejection(
+                &pg,
+                &item,
+                &worktree,
+                &adoption.candidate.head_ref_oid,
+                &adoption.candidate.url,
+                &adoption.builder,
+                &review,
+            )
+            .await?;
+            requeue_or_fail(&pg, &item, &reason).await?;
+            let sweep_warnings = post_phase.finish();
+            return Ok(WorkItemDispatchResult { sweep_warnings });
+        }
+
+        // Re-read both GitHub and the remote ref immediately before custody
+        // handoff. A force-push or PR edit during review invalidates adoption.
+        let still_exact = discover_existing_pr_adoption(&pg, &item, &worktree)
+            .await?
+            .is_some_and(|current| current == adoption);
+        if still_exact {
+            let sweep_warnings = post_phase.finish_without_cleanup();
+            let advanced = mark_ready_for_review(
+                &pg,
+                &item,
+                &worktree,
+                ReadyForReviewEvidence {
+                    head_sha: &adoption.candidate.head_ref_oid,
+                    pr_url: &adoption.candidate.url,
+                    builder: &adoption.builder,
+                    builder_attribution: adoption.builder_attribution.as_ref(),
+                    builder_computer: Some(&adoption.builder_computer),
+                    builder_port: adoption.builder_port,
+                    review: Some(&review),
+                },
+            )
+            .await?;
+            if !advanced {
+                info!(
+                    work_item_id = %item.work_item_id,
+                    "work_item_dispatch: ignoring stale adopted PR after item or lease changed"
+                );
+                return Ok(WorkItemDispatchResult { sweep_warnings });
+            }
+            if normalized_cloud_backend(&adoption.builder).is_none() {
+                mark_local_retest_passed(&pg, item.work_item_id).await?;
+            }
+            info!(
+                work_item_id = %item.work_item_id,
+                repo = %adoption.authoritative_repo,
+                pr = %adoption.candidate.url,
+                head_sha = %adoption.candidate.head_ref_oid,
+                "work_item_dispatch: adopted exact existing PR after fresh independent review"
+            );
+            return Ok(WorkItemDispatchResult { sweep_warnings });
+        }
+
+        warn!(
+            work_item_id = %item.work_item_id,
+            "work_item_dispatch: existing PR changed during review; restoring fresh task branch"
+        );
+        reset_task_branch_to_base(&worktree)?;
+    }
+
     let started = std::time::Instant::now();
     let dispatch_full = run_ff_dispatch(&pg, &item, &worktree).await;
 
@@ -1605,6 +1735,8 @@ async fn dispatch_one(
             pr_url: &pr_url,
             builder: &backend_used,
             builder_attribution: builder_attribution.as_ref(),
+            builder_computer: None,
+            builder_port: None,
             review: Some(&review),
         },
     )
@@ -2305,18 +2437,24 @@ struct ReadyForReviewEvidence<'a> {
     pr_url: &'a str,
     builder: &'a str,
     builder_attribution: Option<&'a RoutedModelAttribution>,
+    builder_computer: Option<&'a str>,
+    builder_port: Option<i32>,
     review: Option<&'a ReviewOutcome>,
 }
 
 impl ReadyForReviewEvidence<'_> {
     fn builder_computer(&self) -> Option<&str> {
-        self.builder_attribution
-            .map(|attribution| attribution.worker_name.as_str())
+        self.builder_computer.or_else(|| {
+            self.builder_attribution
+                .map(|attribution| attribution.worker_name.as_str())
+        })
     }
 
     fn builder_port(&self) -> Option<i32> {
-        self.builder_attribution
-            .and_then(|attribution| route_endpoint_port(&attribution.endpoint))
+        self.builder_port.or_else(|| {
+            self.builder_attribution
+                .and_then(|attribution| route_endpoint_port(&attribution.endpoint))
+        })
     }
 }
 
@@ -2466,7 +2604,7 @@ async fn mark_ready_for_review(
               reviewer_lane = EXCLUDED.reviewer_lane,
               pr_url = EXCLUDED.pr_url,
               pr_created_at = COALESCE(work_item_provenance.pr_created_at, EXCLUDED.pr_created_at),
-              pr_created_by = EXCLUDED.pr_created_by,
+              pr_created_by = COALESCE(work_item_provenance.pr_created_by, EXCLUDED.pr_created_by),
               updated_at = NOW()"#,
     )
     .bind(item.work_item_id)
@@ -4716,6 +4854,322 @@ const LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS: usize = 2000;
 /// self-heal sweep requeues — so classification can't drift between the two.
 fn retry_error_is_actionable(err: &str) -> bool {
     !crate::self_heal::error_is_transient(err)
+}
+
+fn infrastructure_review_retry(attempts: i32, last_error: Option<&str>) -> bool {
+    if attempts <= 0 {
+        return false;
+    }
+    let Some(error) = last_error.map(str::trim) else {
+        return false;
+    };
+    let error = error
+        .strip_prefix("[attempt ")
+        .and_then(|rest| rest.split_once("] ").map(|(_, detail)| detail))
+        .unwrap_or(error);
+    error.starts_with("in-place review unavailable:")
+}
+
+fn stored_builder_provenance_complete(builder: &str, computer: &str, pr_url: &str) -> bool {
+    !builder.trim().is_empty() && !computer.trim().is_empty() && !pr_url.trim().is_empty()
+}
+
+fn validate_existing_pr_candidates(
+    candidates: Vec<ExistingPrCandidate>,
+    authoritative_repo: &str,
+    authoritative_owner: &str,
+    task_branch: &str,
+    base_branch: &str,
+    expected_pr_url: &str,
+    remote_head: &str,
+) -> std::result::Result<ExistingPrCandidate, String> {
+    if candidates.len() != 1 {
+        return Err(format!(
+            "expected exactly one open PR for {task_branch}, found {}",
+            candidates.len()
+        ));
+    }
+    let candidate = candidates.into_iter().next().expect("length checked");
+    let head_owner = candidate
+        .head_repository_owner
+        .as_ref()
+        .map(|owner| owner.login.as_str());
+    let head_repo = candidate
+        .head_repository
+        .as_ref()
+        .map(|repo| repo.name_with_owner.as_str());
+    if !candidate.state.eq_ignore_ascii_case("open")
+        || candidate.is_cross_repository
+        || candidate.head_ref_name != task_branch
+        || candidate.base_ref_name != base_branch
+        || head_owner != Some(authoritative_owner)
+        || head_repo != Some(authoritative_repo)
+        || candidate.url.trim_end_matches('/') != expected_pr_url.trim_end_matches('/')
+        || candidate.head_ref_oid != remote_head
+        || candidate.head_ref_oid.len() != 40
+        || !candidate
+            .head_ref_oid
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("existing PR identity/base/head/provenance does not match".to_string());
+    }
+    Ok(candidate)
+}
+
+async fn load_existing_pr_builder(
+    pg: &PgPool,
+    work_item_id: Uuid,
+) -> Result<
+    Option<(
+        String,
+        String,
+        Option<i32>,
+        String,
+        Option<RoutedModelAttribution>,
+    )>,
+> {
+    let Some(row) = sqlx::query(
+        "SELECT builder_model, builder_computer, builder_port, pr_url \
+           FROM work_item_provenance WHERE work_item_id = $1",
+    )
+    .bind(work_item_id)
+    .fetch_optional(pg)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let builder: Option<String> = row.try_get("builder_model")?;
+    let computer: Option<String> = row.try_get("builder_computer")?;
+    let port: Option<i32> = row.try_get("builder_port")?;
+    let pr_url: Option<String> = row.try_get("pr_url")?;
+    let Some((builder, computer, pr_url)) = builder
+        .zip(computer)
+        .zip(pr_url)
+        .map(|((builder, computer), pr_url)| (builder, computer, pr_url))
+    else {
+        return Ok(None);
+    };
+    if !stored_builder_provenance_complete(&builder, &computer, &pr_url) {
+        return Ok(None);
+    }
+
+    let attribution = if should_try_cloud_reviewers(&builder) {
+        None
+    } else {
+        let Some(interaction) = sqlx::query(
+            "SELECT engine, route_decision, worker_name, endpoint \
+               FROM ff_interactions \
+              WHERE work_item_id = $1 AND purpose = 'build' AND outcome = 'success' \
+                AND engine = $2 AND worker_name = $3 \
+              ORDER BY ts DESC LIMIT 1",
+        )
+        .bind(work_item_id)
+        .bind(&builder)
+        .bind(&computer)
+        .fetch_optional(pg)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let route: serde_json::Value = interaction.try_get("route_decision")?;
+        let deployment_id = route
+            .get("deployment_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| Uuid::parse_str(value).ok());
+        let endpoint = route
+            .get("endpoint")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                interaction
+                    .try_get::<Option<String>, _>("endpoint")
+                    .ok()
+                    .flatten()
+            });
+        let worker_name = route
+            .get("worker_name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| {
+                interaction
+                    .try_get::<Option<String>, _>("worker_name")
+                    .ok()
+                    .flatten()
+            });
+        let model = route
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let Some(attribution) = deployment_id.zip(endpoint).zip(worker_name).zip(model).map(
+            |(((deployment_id, endpoint), worker_name), model)| RoutedModelAttribution {
+                deployment_id,
+                endpoint,
+                worker_name,
+                catalog_id: route
+                    .get("catalog_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                model,
+            },
+        ) else {
+            return Ok(None);
+        };
+        let Ok((label, routed_port)) = validate_local_routed_attribution(&attribution) else {
+            return Ok(None);
+        };
+        if !label.eq_ignore_ascii_case(&builder)
+            || !attribution.worker_name.eq_ignore_ascii_case(&computer)
+            || port.is_some_and(|expected| expected != routed_port)
+        {
+            return Ok(None);
+        }
+        Some(attribution)
+    };
+    Ok(Some((builder, computer, port, pr_url, attribution)))
+}
+
+fn remote_branch_head(repo_path: &Path, task_branch: &str) -> Result<String> {
+    let reference = format!("refs/heads/{task_branch}");
+    let output = run_git(
+        repo_path,
+        ["ls-remote", "--heads", "origin", &reference],
+        Duration::from_secs(60),
+    )?;
+    let lines = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if lines.len() != 1 {
+        bail!(
+            "expected one remote head for {task_branch}, found {}",
+            lines.len()
+        );
+    }
+    lines[0]
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .filter(|sha| sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow!("remote head for {task_branch} is not a full commit SHA"))
+}
+
+async fn discover_existing_pr_adoption(
+    pg: &PgPool,
+    item: &AssignedWorkItem,
+    worktree: &WorktreeRecord,
+) -> Result<Option<ExistingPrAdoption>> {
+    if !infrastructure_review_retry(item.attempts, item.last_error.as_deref())
+        || worktree.task_branch != task_branch_name(&item.title, item.work_item_id)
+    {
+        return Ok(None);
+    }
+    let Some(repo_url) = item.repo_url.as_deref() else {
+        return Ok(None);
+    };
+    let Some((owner, repo)) = crate::project_github_sync::parse_owner_repo(repo_url) else {
+        return Ok(None);
+    };
+    let authoritative_repo = format!("{owner}/{repo}");
+    let origin = run_git(
+        &item.repo_path,
+        ["remote", "get-url", "--push", "origin"],
+        Duration::from_secs(30),
+    );
+    let Ok(origin) = origin else {
+        return Ok(None);
+    };
+    let origin = String::from_utf8_lossy(&origin.stdout).trim().to_string();
+    if crate::project_github_sync::parse_owner_repo(&origin) != Some((owner.clone(), repo.clone()))
+    {
+        return Ok(None);
+    }
+    let Some((builder, builder_computer, builder_port, pr_url, builder_attribution)) =
+        load_existing_pr_builder(pg, item.work_item_id).await?
+    else {
+        return Ok(None);
+    };
+    let Ok(remote_head) = remote_branch_head(&item.repo_path, &worktree.task_branch) else {
+        return Ok(None);
+    };
+
+    let mut command = Command::new("gh");
+    command.current_dir(&worktree.worktree_path).args([
+        "pr",
+        "list",
+        "--repo",
+        &authoritative_repo,
+        "--state",
+        "open",
+        "--head",
+        &worktree.task_branch,
+        "--limit",
+        "10",
+        "--json",
+        "url,state,baseRefName,headRefName,headRefOid,isCrossRepository,headRepositoryOwner,headRepository",
+    ]);
+    if let Some(token) = crate::fleet_info::fetch_secret("github_gh_token").await {
+        command.env("GH_TOKEN", token);
+    }
+    let Ok(output) = run_command_timeout(command, Duration::from_secs(60)) else {
+        return Ok(None);
+    };
+    let Ok(candidates) = serde_json::from_slice::<Vec<ExistingPrCandidate>>(&output.stdout) else {
+        return Ok(None);
+    };
+    let Ok(candidate) = validate_existing_pr_candidates(
+        candidates,
+        &authoritative_repo,
+        &owner,
+        &worktree.task_branch,
+        &worktree.base_branch,
+        &pr_url,
+        &remote_head,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(ExistingPrAdoption {
+        candidate,
+        builder,
+        builder_computer,
+        builder_port,
+        builder_attribution,
+        authoritative_repo,
+    }))
+}
+
+fn checkout_existing_pr_head(worktree: &WorktreeRecord, head_sha: &str) -> Result<()> {
+    let remote_ref = format!(
+        "+refs/heads/{}:refs/remotes/origin/{}",
+        worktree.task_branch, worktree.task_branch
+    );
+    run_git(
+        &worktree.worktree_path,
+        ["fetch", "--no-tags", "origin", &remote_ref],
+        Duration::from_secs(120),
+    )?;
+    run_git(
+        &worktree.worktree_path,
+        ["reset", "--hard", head_sha],
+        Duration::from_secs(30),
+    )?;
+    if git_head_sha(&worktree.worktree_path)? != head_sha {
+        bail!("adopted worktree HEAD does not match validated PR head");
+    }
+    Ok(())
+}
+
+fn reset_task_branch_to_base(worktree: &WorktreeRecord) -> Result<()> {
+    // Re-enter the exact same full-clean checkout path used for an ordinary
+    // fresh build. `reset --hard` alone would preserve untracked files a
+    // misbehaving reviewer may have written into the slot clone.
+    checkout_clone_for_build(
+        &worktree.worktree_path,
+        &worktree.base_branch,
+        &worktree.task_branch,
+        None,
+    )
 }
 
 fn dispatch_prompt(item: &AssignedWorkItem) -> String {
@@ -8393,7 +8847,8 @@ pub fn spawn_worktree_reaper(
 #[cfg(test)]
 mod tests {
     use super::{
-        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
+        AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, ExistingPrAdoption,
+        ExistingPrCandidate, ExistingPrOwner, ExistingPrRepository, LANE15_480B_PERMITS,
         LocalReviewerSeparation, ReadyForReviewEvidence, ReviewAdjudication, ReviewerStat,
         WorktreeRecord, adjudicate_review_candidate, affected_crate_manifests, agent_output_tail,
         backend_failed_without_output, builder_excludes_480b, canonical_route_endpoint,
@@ -8401,18 +8856,19 @@ mod tests {
         classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
         complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
         dispatch_budget_for_host, dispatch_interaction_outcome, dispatch_interaction_route,
-        dispatch_prompt, dispatch_request_meta, expand_home, is_build_timeout,
-        legacy_acceptance_sql, local_failure_diagnosis_for, local_failure_diagnosis_for_attempt,
-        local_reviewer_separation, mark_local_retest_failed, mark_local_retest_passed,
-        mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
-        parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
-        quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
-        repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
-        reviewer_family, rewrite_github_host_alias, route_endpoint_port, same_model_family,
-        should_attempt_lane15, should_try_cloud_reviewers, status_output_is_clean,
+        dispatch_prompt, dispatch_request_meta, expand_home, infrastructure_review_retry,
+        is_build_timeout, legacy_acceptance_sql, local_failure_diagnosis_for,
+        local_failure_diagnosis_for_attempt, local_reviewer_separation, mark_local_retest_failed,
+        mark_local_retest_passed, mark_ready_for_review, mirror_repo_url, normalized_cloud_backend,
+        order_cloud_reviewers, parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis,
+        primary_or_default_backend, quick_empty_success_is_provider_failure,
+        record_cloud_rescue_local_failure_diagnosis, repo_cache_path, repo_slug,
+        resolve_dispatch_repo_binding, retry_error_is_actionable, reviewer_family,
+        rewrite_github_host_alias, route_endpoint_port, same_model_family, should_attempt_lane15,
+        should_try_cloud_reviewers, status_output_is_clean, stored_builder_provenance_complete,
         synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
-        try_acquire_lane15_480b_permit, use_local_lane, validate_local_routed_attribution,
-        validate_manifest_fields,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_existing_pr_candidates,
+        validate_local_routed_attribution, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::{Path, PathBuf};
@@ -8724,6 +9180,8 @@ mod tests {
                     pr_url: &format!("https://example.invalid/pr/{work_item_id}"),
                     builder: "codex",
                     builder_attribution: None,
+                    builder_computer: None,
+                    builder_port: None,
                     review: None,
                 },
             )
@@ -9266,6 +9724,8 @@ mod tests {
             pr_url: "https://example.invalid/pr/1",
             builder: "local:qwen3-coder-30b",
             builder_attribution: Some(&attribution),
+            builder_computer: None,
+            builder_port: None,
             review: None,
         };
         assert_eq!(local.builder_computer(), Some("sia"));
@@ -10342,6 +10802,141 @@ mod tests {
                 "task error should be injected: {task}"
             );
         }
+    }
+
+    #[test]
+    fn existing_pr_adoption_is_limited_to_infrastructure_review_retries() {
+        assert!(infrastructure_review_retry(
+            1,
+            Some("[attempt 1] in-place review unavailable: router timed out")
+        ));
+        assert!(infrastructure_review_retry(
+            4,
+            Some("in-place review unavailable: no independent reviewer")
+        ));
+        assert!(!infrastructure_review_retry(
+            1,
+            Some("[attempt 1] in-place review rejected by kimi: unsafe change")
+        ));
+        assert!(!infrastructure_review_retry(
+            1,
+            Some("[attempt 1] self-verify failed before opening PR")
+        ));
+        assert!(!infrastructure_review_retry(
+            0,
+            Some("in-place review unavailable: router timed out")
+        ));
+        assert!(stored_builder_provenance_complete(
+            "local:glm-4.5-air",
+            "thalia",
+            "https://github.com/venkatyarl/forge-fleet/pull/1597"
+        ));
+        assert!(!stored_builder_provenance_complete(
+            "",
+            "thalia",
+            "https://github.com/venkatyarl/forge-fleet/pull/1597"
+        ));
+        assert!(!stored_builder_provenance_complete(
+            "local:glm-4.5-air",
+            "",
+            "https://github.com/venkatyarl/forge-fleet/pull/1597"
+        ));
+        assert!(!stored_builder_provenance_complete(
+            "local:glm-4.5-air",
+            "thalia",
+            ""
+        ));
+    }
+
+    fn matching_existing_pr() -> ExistingPrCandidate {
+        ExistingPrCandidate {
+            url: "https://github.com/venkatyarl/forge-fleet/pull/1597".to_string(),
+            state: "OPEN".to_string(),
+            base_ref_name: "main".to_string(),
+            head_ref_name: "wi/exact".to_string(),
+            head_ref_oid: "7fb8f0cf1fea1a83a0c65948a0be271dc5d3ed70".to_string(),
+            is_cross_repository: false,
+            head_repository_owner: Some(ExistingPrOwner {
+                login: "venkatyarl".to_string(),
+            }),
+            head_repository: Some(ExistingPrRepository {
+                name_with_owner: "venkatyarl/forge-fleet".to_string(),
+            }),
+        }
+    }
+
+    fn validate_matching_existing_pr(candidates: Vec<ExistingPrCandidate>) -> bool {
+        validate_existing_pr_candidates(
+            candidates,
+            "venkatyarl/forge-fleet",
+            "venkatyarl",
+            "wi/exact",
+            "main",
+            "https://github.com/venkatyarl/forge-fleet/pull/1597",
+            "7fb8f0cf1fea1a83a0c65948a0be271dc5d3ed70",
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn existing_pr_validation_requires_one_exact_authoritative_head() {
+        assert!(validate_matching_existing_pr(vec![matching_existing_pr()]));
+        assert!(!validate_matching_existing_pr(Vec::new()));
+        assert!(!validate_matching_existing_pr(vec![
+            matching_existing_pr(),
+            matching_existing_pr(),
+        ]));
+
+        let mut wrong_base = matching_existing_pr();
+        wrong_base.base_ref_name = "recovery".to_string();
+        assert!(!validate_matching_existing_pr(vec![wrong_base]));
+
+        let mut closed = matching_existing_pr();
+        closed.state = "CLOSED".to_string();
+        assert!(!validate_matching_existing_pr(vec![closed]));
+
+        let mut moved_head = matching_existing_pr();
+        moved_head.head_ref_oid = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        assert!(!validate_matching_existing_pr(vec![moved_head]));
+
+        let mut wrong_owner = matching_existing_pr();
+        wrong_owner.is_cross_repository = true;
+        wrong_owner.head_repository_owner = Some(ExistingPrOwner {
+            login: "attacker".to_string(),
+        });
+        assert!(!validate_matching_existing_pr(vec![wrong_owner]));
+
+        let mut missing_repository = matching_existing_pr();
+        missing_repository.head_repository = None;
+        assert!(!validate_matching_existing_pr(vec![missing_repository]));
+
+        let mut wrong_repository = matching_existing_pr();
+        wrong_repository.head_repository = Some(ExistingPrRepository {
+            name_with_owner: "venkatyarl/not-forge-fleet".to_string(),
+        });
+        assert!(!validate_matching_existing_pr(vec![wrong_repository]));
+
+        let mut malformed_head = matching_existing_pr();
+        malformed_head.head_ref_oid = "not-a-sha".to_string();
+        assert!(!validate_matching_existing_pr(vec![malformed_head]));
+
+        let adoption = ExistingPrAdoption {
+            candidate: matching_existing_pr(),
+            builder: "local:glm-4.5-air".to_string(),
+            builder_computer: "thalia".to_string(),
+            builder_port: Some(55000),
+            builder_attribution: Some(routed_attribution(
+                Uuid::new_v4(),
+                "http://192.168.5.122:55000",
+                "thalia",
+                Some("glm-4.5-air"),
+                "glm-4.5-air",
+            )),
+            authoritative_repo: "venkatyarl/forge-fleet".to_string(),
+        };
+        let mut changed_provenance = adoption.clone();
+        changed_provenance.builder_computer = "other-node".to_string();
+        assert_ne!(adoption, changed_provenance);
     }
     use super::{
         is_dispatch_authority_error, run_command_capture, run_command_capture_cancellable,
