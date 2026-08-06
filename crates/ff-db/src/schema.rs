@@ -12257,6 +12257,7 @@ CREATE TABLE IF NOT EXISTS fleet_log_digest (
 ///   - `purpose` — coarse tag for what the turn was FOR (build | review |
 ///     decompose | research | council | dreamer | ...), orthogonal to
 ///     `channel` (which records WHERE the turn came from).
+///
 /// Backfill is intentionally not required — old rows stay NULL.
 pub const SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING: &str = r#"
 ALTER TABLE ff_interactions
@@ -14389,6 +14390,87 @@ WHERE jsonb_typeof(fleet_model_catalog.preferred_workloads) = 'array'
              ) AS workload(value)
        WHERE lower(workload.value) = 'code'
   );
+"#;
+
+/// v297: permit one exact, lease-fenced operator rollback claim after a
+/// completed V295 rollout while preserving terminal evidence immutability.
+///
+/// The runtime claim remains a single CAS update. This guard change admits
+/// only `succeeded -> rolling_back`, clears the terminal timestamp, rotates a
+/// live lease, and leaves every identity field and lease duration unchanged.
+/// All other terminal mutations remain forbidden.
+pub const SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK: &str = r#"
+CREATE OR REPLACE FUNCTION release_rollout_transaction_update_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_transaction_update_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'rollout transaction evidence cannot be deleted';
+    END IF;
+
+    IF OLD.state = 'succeeded' THEN
+        IF NEW.state = 'rolling_back'
+           AND OLD.completed_at IS NOT NULL
+           AND NEW.completed_at IS NULL
+           AND NEW.id = OLD.id
+           AND NEW.request_id = OLD.request_id
+           AND NEW.authority_id = OLD.authority_id
+           AND NEW.expected_target_count = OLD.expected_target_count
+           AND NEW.created_at = OLD.created_at
+           AND NEW.lease_seconds = OLD.lease_seconds
+           AND NEW.cas_revision = OLD.cas_revision + 1
+           AND NEW.lease_token <> OLD.lease_token
+           AND NEW.lease_owner ~ '^[A-Za-z0-9._@-]{1,128}$'
+           AND NEW.lease_expires_at > clock_timestamp()
+        THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'succeeded rollout permits only one exact post-success rollback claim';
+    END IF;
+
+    IF OLD.state IN ('failed', 'rolled_back', 'cancelled') THEN
+        RAISE EXCEPTION 'terminal rollout transaction evidence is immutable';
+    END IF;
+    IF NEW.id <> OLD.id
+       OR NEW.request_id <> OLD.request_id
+       OR NEW.authority_id <> OLD.authority_id
+       OR NEW.expected_target_count <> OLD.expected_target_count
+       OR NEW.created_at <> OLD.created_at
+       OR NEW.lease_seconds <> OLD.lease_seconds
+       OR NEW.cas_revision <> OLD.cas_revision + 1
+    THEN
+        RAISE EXCEPTION 'rollout transaction identity/CAS drift';
+    END IF;
+    IF NEW.lease_token = OLD.lease_token THEN
+        IF OLD.lease_expires_at <= clock_timestamp() THEN
+            RAISE EXCEPTION 'expired rollout lease cannot renew or mutate state';
+        END IF;
+        IF NEW.lease_owner <> OLD.lease_owner
+           OR NEW.lease_expires_at < OLD.lease_expires_at
+        THEN
+            RAISE EXCEPTION 'rollout lease renewal drift';
+        END IF;
+    ELSIF NEW.state <> OLD.state
+          OR NEW.completed_at IS DISTINCT FROM OLD.completed_at
+          OR OLD.lease_expires_at > clock_timestamp()
+          OR OLD.state NOT IN ('planned', 'running', 'rolling_back')
+    THEN
+        RAISE EXCEPTION 'rollout lease takeover requires an expired active lease';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state = 'planned' AND NEW.state IN ('running', 'failed', 'cancelled')) OR
+        (OLD.state = 'running' AND NEW.state IN ('rolling_back', 'succeeded', 'failed', 'cancelled')) OR
+        (OLD.state = 'rolling_back' AND NEW.state IN ('rolled_back', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid rollout transaction state transition';
+    END IF;
+    RETURN NEW;
+END
+$release_rollout_transaction_update_guard$;
+
+COMMENT ON FUNCTION release_rollout_transaction_update_guard() IS
+    'V297: terminal evidence is immutable except one exact CAS+lease-fenced succeeded-to-rolling_back claim.';
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

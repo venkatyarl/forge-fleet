@@ -598,6 +598,46 @@ pub async fn pg_cas_release_rollout_transaction_state(
     Ok(row.as_ref().map(transaction_from_row))
 }
 
+/// Atomically claim a completed successful rollout for explicit operator
+/// rollback. This is deliberately separate from the active-state CAS API:
+/// terminal rows have no borrowable live lease, so the winning claimant must
+/// rotate a fresh lease in the same `succeeded -> rolling_back` transition.
+///
+/// The expected revision is the concurrency fence. V297's trigger independently
+/// audits the same identity, completion, CAS, lease-rotation, and live-expiry
+/// invariants. A stale, repeated, unsafe-terminal, or concurrent losing claim
+/// returns `None`; the one-active-rollout index rejects conflicting live work.
+pub async fn pg_claim_succeeded_release_rollout_rollback(
+    pool: &PgPool,
+    transaction_id: Uuid,
+    expected_revision: i64,
+    lease_owner: &str,
+) -> Result<Option<ReleaseRolloutTransactionRow>> {
+    if expected_revision < 0 || !canonical_operator(lease_owner) {
+        return Err(DbError::ArtifactIntegrity(
+            "post-success rollback claim fence or lease owner is invalid".to_string(),
+        ));
+    }
+    let row = sqlx::query(
+        "UPDATE release_rollout_transactions
+            SET state = 'rolling_back', completed_at = NULL,
+                lease_token = gen_random_uuid(), lease_owner = $3,
+                lease_expires_at = clock_timestamp() + make_interval(secs => lease_seconds),
+                cas_revision = cas_revision + 1
+          WHERE id = $1 AND cas_revision = $2
+            AND state = 'succeeded' AND completed_at IS NOT NULL
+            AND lease_seconds BETWEEN 30 AND 3600
+          RETURNING id, request_id, authority_id, state, lease_token, lease_owner,
+                    lease_expires_at, lease_seconds, cas_revision, expected_target_count",
+    )
+    .bind(transaction_id)
+    .bind(expected_revision)
+    .bind(lease_owner)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(transaction_from_row))
+}
+
 /// CAS one per-target state while the exact parent lease is live.
 #[allow(clippy::too_many_arguments)]
 pub async fn pg_cas_release_rollout_target_state(

@@ -1328,6 +1328,11 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "devstral_code_capability_authority",
         sql: schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY,
     },
+    PgMigration {
+        version: 297,
+        name: "release_rollout_post_success_rollback",
+        sql: schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK,
+    },
 ];
 
 /// Explicit-only migrations are structurally unreachable from
@@ -1402,16 +1407,20 @@ const REVIEWED_LEDGER_ONLY_VERSIONS: &[u32] = &[234, 236, 246, 260, 270, 280];
 
 const RELEASE_ROLLOUT_AUTHORITY_MIGRATION: u32 = 295;
 const DEVSTRAL_CODE_CAPABILITY_MIGRATION: u32 = 296;
+const RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK_MIGRATION: u32 = 297;
 
-pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 = DEVSTRAL_CODE_CAPABILITY_MIGRATION;
+pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 =
+    RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK_MIGRATION;
 pub const LATEST_EXPLICIT_POSTGRES_MIGRATION: u32 = 295;
 
 fn automatic_migration_prerequisites_satisfied(
     migration_version: u32,
     applied_versions: &BTreeSet<u32>,
 ) -> bool {
-    migration_version != DEVSTRAL_CODE_CAPABILITY_MIGRATION
-        || applied_versions.contains(&RELEASE_ROLLOUT_AUTHORITY_MIGRATION)
+    !matches!(
+        migration_version,
+        DEVSTRAL_CODE_CAPABILITY_MIGRATION | RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK_MIGRATION
+    ) || applied_versions.contains(&RELEASE_ROLLOUT_AUTHORITY_MIGRATION)
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -2451,13 +2460,12 @@ pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigratio
         if *version > BOOTSTRAP_BASELINE_VERSION
             && *version <= current_version
             && !applied_versions.contains(version)
+            && (*version != 247 || !reviewed_v247_repair_pending)
         {
-            if *version != 247 || !reviewed_v247_repair_pending {
-                drift.push(format!(
-                    "v{version} ({}) is missing below current v{current_version}",
-                    expected.name
-                ));
-            }
+            drift.push(format!(
+                "v{version} ({}) is missing below current v{current_version}",
+                expected.name
+            ));
         }
     }
 
@@ -2838,10 +2846,10 @@ mod tests {
     }
 
     #[test]
-    fn v295_remains_explicit_only_and_v296_waits_for_it() {
-        assert_eq!(LATEST_AUTOMATIC_POSTGRES_MIGRATION, 296);
+    fn v295_remains_explicit_only_and_v296_v297_wait_for_it() {
+        assert_eq!(LATEST_AUTOMATIC_POSTGRES_MIGRATION, 297);
         assert_eq!(LATEST_EXPLICIT_POSTGRES_MIGRATION, 295);
-        assert_eq!(PG_MIGRATIONS.last().unwrap().version, 296);
+        assert_eq!(PG_MIGRATIONS.last().unwrap().version, 297);
         assert!(
             PG_MIGRATIONS
                 .iter()
@@ -2858,13 +2866,35 @@ mod tests {
         assert!(migration.sql.contains("INSERT INTO fleet_model_catalog"));
         assert!(!migration.sql.contains("INSERT INTO model_catalog"));
         assert!(!migration.sql.contains("UPDATE model_catalog"));
+        let rollback_migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 297)
+            .expect("V297 must be registered");
+        assert_eq!(
+            rollback_migration.name,
+            "release_rollout_post_success_rollback"
+        );
+        assert!(rollback_migration.sql.contains("OLD.state = 'succeeded'"));
+        assert!(
+            rollback_migration
+                .sql
+                .contains("NEW.state = 'rolling_back'")
+        );
 
         assert!(!automatic_migration_prerequisites_satisfied(
             296,
             &BTreeSet::new()
         ));
+        assert!(!automatic_migration_prerequisites_satisfied(
+            297,
+            &BTreeSet::new()
+        ));
         assert!(automatic_migration_prerequisites_satisfied(
             296,
+            &BTreeSet::from([295])
+        ));
+        assert!(automatic_migration_prerequisites_satisfied(
+            297,
             &BTreeSet::from([295])
         ));
         assert!(automatic_migration_prerequisites_satisfied(
@@ -2898,7 +2928,7 @@ mod tests {
             RolloutAuthorityRegistrationOutcome, RolloutTargetAuthority,
             RolloutTransactionBeginOutcome, pg_begin_release_rollout,
             pg_cas_release_rollout_target_state, pg_cas_release_rollout_transaction_state,
-            pg_register_release_rollout_authority,
+            pg_claim_succeeded_release_rollout_rollback, pg_register_release_rollout_authority,
         };
 
         const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
@@ -3009,13 +3039,13 @@ mod tests {
 
         let advanced = run_postgres_migrations(&pool)
             .await
-            .expect("automatic V296 must follow recorded explicit V295");
-        assert_eq!(advanced, 296);
+            .expect("automatic V296/V297 must follow recorded explicit V295");
+        assert_eq!(advanced, 297);
         let replay_after_v296 =
             apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
                 .await
                 .expect("exact V295 replay must remain idempotent after V296");
-        assert_eq!(replay_after_v296.current_version, 296);
+        assert_eq!(replay_after_v296.current_version, 297);
         assert!(
             apply_explicit_postgres_migrations(
                 &pool,
@@ -3224,6 +3254,252 @@ mod tests {
         .unwrap()
         .expect("exact parent CAS");
         assert_eq!(running.cas_revision, 1);
+
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            begun.transaction.id,
+            TARGET_ID,
+            running.lease_token,
+            target.cas_revision,
+            "installing",
+            "verifying",
+            Some("{\"phase\":\"rollback_proof\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target verifying CAS");
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            begun.transaction.id,
+            TARGET_ID,
+            running.lease_token,
+            target.cas_revision,
+            "verifying",
+            "succeeded",
+            Some("{\"phase\":\"succeeded\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target succeeded CAS");
+        let succeeded = pg_cas_release_rollout_transaction_state(
+            &pool,
+            begun.transaction.id,
+            running.lease_token,
+            running.cas_revision,
+            "running",
+            "succeeded",
+        )
+        .await
+        .unwrap()
+        .expect("parent succeeded CAS");
+
+        let unrotated_token = sqlx::query(
+            "UPDATE release_rollout_transactions
+                SET state = 'rolling_back', completed_at = NULL,
+                    lease_owner = 'rollback@test-malformed',
+                    lease_expires_at = clock_timestamp() + interval '30 seconds',
+                    cas_revision = cas_revision + 1
+              WHERE id = $1",
+        )
+        .bind(succeeded.id)
+        .execute(&pool)
+        .await;
+        assert!(
+            unrotated_token.is_err(),
+            "V297 must reject a succeeded rollback claim that does not rotate its lease token"
+        );
+        let retained_completion = sqlx::query(
+            "UPDATE release_rollout_transactions
+                SET state = 'rolling_back', lease_token = gen_random_uuid(),
+                    lease_owner = 'rollback@test-malformed',
+                    lease_expires_at = clock_timestamp() + interval '30 seconds',
+                    cas_revision = cas_revision + 1
+              WHERE id = $1",
+        )
+        .bind(succeeded.id)
+        .execute(&pool)
+        .await;
+        assert!(
+            retained_completion.is_err(),
+            "V297 must reject a succeeded rollback claim that retains completed_at"
+        );
+        let unchanged_after_malformed_claims: (String, i64, uuid::Uuid, bool) = sqlx::query_as(
+            "SELECT state, cas_revision, lease_token, completed_at IS NOT NULL
+                   FROM release_rollout_transactions
+                  WHERE id = $1",
+        )
+        .bind(succeeded.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged_after_malformed_claims,
+            (
+                "succeeded".to_string(),
+                succeeded.cas_revision,
+                succeeded.lease_token,
+                true,
+            ),
+            "malformed trigger attempts must make zero writes"
+        );
+
+        let claim_a = pg_claim_succeeded_release_rollout_rollback(
+            &pool,
+            succeeded.id,
+            succeeded.cas_revision,
+            "rollback@test-a",
+        );
+        let claim_b = pg_claim_succeeded_release_rollout_rollback(
+            &pool,
+            succeeded.id,
+            succeeded.cas_revision,
+            "rollback@test-b",
+        );
+        let (claim_a, claim_b) = tokio::join!(claim_a, claim_b);
+        let (claim_a, claim_b) = (claim_a.unwrap(), claim_b.unwrap());
+        let claimed = match (claim_a, claim_b) {
+            (Some(claimed), None) | (None, Some(claimed)) => claimed,
+            other => panic!("exactly one concurrent rollback claim must win: {other:?}"),
+        };
+        assert_eq!(claimed.state, "rolling_back");
+        assert_eq!(claimed.cas_revision, succeeded.cas_revision + 1);
+        assert_ne!(claimed.lease_token, succeeded.lease_token);
+        assert!(claimed.lease_expires_at > chrono::Utc::now());
+        let completed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT completed_at FROM release_rollout_transactions WHERE id = $1",
+        )
+        .bind(claimed.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(completed_at.is_none());
+
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            claimed.id,
+            TARGET_ID,
+            claimed.lease_token,
+            target.cas_revision,
+            "succeeded",
+            "rolling_back",
+            Some("{\"phase\":\"rolling_back\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target rollback claim CAS");
+        let _target = pg_cas_release_rollout_target_state(
+            &pool,
+            claimed.id,
+            TARGET_ID,
+            claimed.lease_token,
+            target.cas_revision,
+            "rolling_back",
+            "rolled_back",
+            Some("{\"phase\":\"rolled_back\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target rolled-back CAS");
+        let rolled_back = pg_cas_release_rollout_transaction_state(
+            &pool,
+            claimed.id,
+            claimed.lease_token,
+            claimed.cas_revision,
+            "rolling_back",
+            "rolled_back",
+        )
+        .await
+        .unwrap()
+        .expect("parent rolled-back CAS");
+        assert!(
+            pg_claim_succeeded_release_rollout_rollback(
+                &pool,
+                rolled_back.id,
+                rolled_back.cas_revision,
+                "rollback@test",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a completed rollback must refuse a second claim"
+        );
+
+        let cancelled = pg_begin_release_rollout(
+            &pool,
+            Uuid::new_v4(),
+            authority.authority.id,
+            "test@v295",
+            30,
+        )
+        .await
+        .unwrap()
+        .transaction;
+        let cancelled = pg_cas_release_rollout_transaction_state(
+            &pool,
+            cancelled.id,
+            cancelled.lease_token,
+            cancelled.cas_revision,
+            "planned",
+            "cancelled",
+        )
+        .await
+        .unwrap()
+        .expect("cancel fixture");
+        assert!(
+            pg_claim_succeeded_release_rollout_rollback(
+                &pool,
+                cancelled.id,
+                cancelled.cas_revision,
+                "rollback@test",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let failed = pg_begin_release_rollout(
+            &pool,
+            Uuid::new_v4(),
+            authority.authority.id,
+            "test@v295",
+            30,
+        )
+        .await
+        .unwrap()
+        .transaction;
+        let failed = pg_cas_release_rollout_transaction_state(
+            &pool,
+            failed.id,
+            failed.lease_token,
+            failed.cas_revision,
+            "planned",
+            "running",
+        )
+        .await
+        .unwrap()
+        .expect("failed fixture running CAS");
+        let failed = pg_cas_release_rollout_transaction_state(
+            &pool,
+            failed.id,
+            failed.lease_token,
+            failed.cas_revision,
+            "running",
+            "failed",
+        )
+        .await
+        .unwrap()
+        .expect("failed fixture terminal CAS");
+        assert!(
+            pg_claim_succeeded_release_rollout_rollback(
+                &pool,
+                failed.id,
+                failed.cas_revision,
+                "rollback@test",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
 
         sqlx::query("DROP INDEX release_rollout_one_active_transaction")
             .execute(&pool)
@@ -4764,7 +5040,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v296_waits_for_v295_then_seeds_and_repairs_devstral_idempotently_on_pg16() {
+    async fn v296_v297_wait_for_v295_then_apply_in_order_on_pg16() {
         let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
             return;
         };
@@ -4797,14 +5073,23 @@ mod tests {
         .expect("record reviewed V295 prerequisite fixture");
         let final_version = run_postgres_migrations(&pool)
             .await
-            .expect("V296 must run once explicit V295 is recorded");
-        assert_eq!(final_version, 296);
+            .expect("V296/V297 must run once explicit V295 is recorded");
+        assert_eq!(final_version, 297);
         let migration_name: String =
             sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 296")
                 .fetch_one(&pool)
                 .await
                 .expect("V296 must be durably recorded");
         assert_eq!(migration_name, "devstral_code_capability_authority");
+        let rollback_migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 297")
+                .fetch_one(&pool)
+                .await
+                .expect("V297 must be durably recorded");
+        assert_eq!(
+            rollback_migration_name,
+            "release_rollout_post_success_rollback"
+        );
 
         let seeded: serde_json::Value = sqlx::query_scalar(
             "SELECT to_jsonb(catalog) - 'updated_at' \

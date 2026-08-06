@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ff_db::rollout_authority::pg_claim_succeeded_release_rollout_rollback;
 use ff_db::{
     FORBIDDEN_VINNY_ID, PgPool, ReleaseArtifactRow, ReleaseRolloutAuthoritySpec,
     ReleaseRolloutTransactionRow, RolloutArtifactAuthority, RolloutAuthorityRegistration,
@@ -221,6 +222,10 @@ pub trait ReleaseRolloutDatabase: Send + Sync {
         transaction: &ReleaseRolloutTransactionRow,
     ) -> Result<Option<ReleaseRolloutTransactionRow>>;
     async fn take_over(
+        &self,
+        transaction: &ReleaseRolloutTransactionRow,
+    ) -> Result<Option<ReleaseRolloutTransactionRow>>;
+    async fn claim_succeeded_rollback(
         &self,
         transaction: &ReleaseRolloutTransactionRow,
     ) -> Result<Option<ReleaseRolloutTransactionRow>>;
@@ -454,6 +459,19 @@ impl ReleaseRolloutDatabase for PgReleaseRolloutDatabase<'_> {
         transaction: &ReleaseRolloutTransactionRow,
     ) -> Result<Option<ReleaseRolloutTransactionRow>> {
         Ok(pg_take_over_release_rollout_lease(
+            self.pool,
+            transaction.id,
+            transaction.cas_revision,
+            LEASE_OWNER,
+        )
+        .await?)
+    }
+
+    async fn claim_succeeded_rollback(
+        &self,
+        transaction: &ReleaseRolloutTransactionRow,
+    ) -> Result<Option<ReleaseRolloutTransactionRow>> {
+        Ok(pg_claim_succeeded_release_rollout_rollback(
             self.pool,
             transaction.id,
             transaction.cas_revision,
@@ -905,6 +923,88 @@ fn validate_status_invariants(targets: &[RolloutTargetState]) -> Result<()> {
     Ok(())
 }
 
+fn validate_post_success_rollback_preconditions(
+    status: &RolloutStatus,
+    config: &RolloutCoordinatorConfig,
+) -> Result<()> {
+    validate_source_commit(&status.source_commit)?;
+    validate_status_invariants(&status.targets)?;
+    if status.transaction.state != "succeeded"
+        || status.transaction.expected_target_count as usize != status.targets.len()
+    {
+        return Err(ReleaseRolloutError::Refused(
+            "post-success rollback requires one complete succeeded transaction".into(),
+        ));
+    }
+    for target in &status.targets {
+        if target.state != "succeeded" {
+            return Err(ReleaseRolloutError::Refused(format!(
+                "post-success rollback target {} is not succeeded",
+                target.target.endpoint.computer_name
+            )));
+        }
+        validate_target_material(&target.target, &status.source_commit)?;
+        let evidence = parse_evidence(target)?;
+        if evidence.phase != "succeeded" || evidence.error.is_some() || evidence.rollback.is_some()
+        {
+            return Err(ReleaseRolloutError::Refused(format!(
+                "post-success rollback target {} has unsafe terminal evidence",
+                target.target.endpoint.computer_name
+            )));
+        }
+        let candidate = evidence.candidate.as_ref().ok_or_else(|| {
+            ReleaseRolloutError::Refused(format!(
+                "post-success rollback target {} lacks its durable candidate",
+                target.target.endpoint.computer_name
+            ))
+        })?;
+        validate_candidate(candidate, status.transaction.id, &target.target)?;
+        let activation = evidence.activation.as_ref().ok_or_else(|| {
+            ReleaseRolloutError::Refused(format!(
+                "post-success rollback target {} lacks its activation receipt",
+                target.target.endpoint.computer_name
+            ))
+        })?;
+        validate_activation(
+            activation,
+            status.transaction.id,
+            &target.target,
+            &status.source_commit,
+        )?;
+        let rollback_proof = evidence.rollback_proof.as_ref().ok_or_else(|| {
+            ReleaseRolloutError::Refused(format!(
+                "post-success rollback target {} lacks its rollback proof",
+                target.target.endpoint.computer_name
+            ))
+        })?;
+        validate_rollback_proof(
+            rollback_proof,
+            status.transaction.id,
+            &target.target,
+            &status.source_commit,
+        )?;
+        let health = evidence.health.as_ref().ok_or_else(|| {
+            ReleaseRolloutError::Refused(format!(
+                "post-success rollback target {} lacks its health/bake evidence",
+                target.target.endpoint.computer_name
+            ))
+        })?;
+        let bake = if target.target.target_ordinal < ROLLOUT_CANARIES.len() as u32 {
+            config.canary_bake
+        } else {
+            config.remaining_bake
+        };
+        validate_health(
+            health,
+            status.transaction.id,
+            &target.target,
+            &status.source_commit,
+            bake,
+        )?;
+    }
+    Ok(())
+}
+
 pub struct ReleaseRolloutCoordinator<'a, D, T> {
     database: &'a D,
     transport: &'a T,
@@ -1010,6 +1110,34 @@ where
     }
 
     pub async fn rollback(&self, transaction_id: Uuid) -> Result<RolloutStatus> {
+        let mut initial = self.status(transaction_id).await?;
+        match initial.transaction.state.as_str() {
+            "succeeded" => {
+                // Completed target evidence is immutable until this exact
+                // claim wins. Validate the entire rollback authority before
+                // the single succeeded -> rolling_back database write.
+                validate_post_success_rollback_preconditions(&initial, &self.config)?;
+                let Some(claimed) = self
+                    .database
+                    .claim_succeeded_rollback(&initial.transaction)
+                    .await?
+                else {
+                    return Err(ReleaseRolloutError::Refused(
+                        "post-success rollback was already claimed or its CAS fence drifted".into(),
+                    ));
+                };
+                initial.transaction = claimed;
+                return self.drive_rollback(initial).await;
+            }
+            "failed" | "rolled_back" | "cancelled" => {
+                return Err(ReleaseRolloutError::Refused(format!(
+                    "cannot request rollback from terminal state {}",
+                    initial.transaction.state
+                )));
+            }
+            _ => {}
+        }
+
         let mut status = self.acquire_status(transaction_id, true, None).await?;
         match status.transaction.state.as_str() {
             "planned" => {
@@ -1049,9 +1177,8 @@ where
                 self.drive_rollback(status).await
             }
             "rolling_back" => self.drive_rollback(status).await,
-            "succeeded" | "rolled_back" | "cancelled" => Ok(status),
             state => Err(ReleaseRolloutError::Refused(format!(
-                "cannot request rollback from terminal state {state}"
+                "cannot request rollback from state {state}"
             ))),
         }
     }
@@ -2332,6 +2459,8 @@ mod tests {
         renew_count: usize,
         transition_on_renew_to: Option<String>,
         fail_next_target_cas: bool,
+        fail_target_cas_to: Option<String>,
+        claim_calls: usize,
     }
 
     impl FakeDb {
@@ -2343,6 +2472,8 @@ mod tests {
                     renew_count: 0,
                     transition_on_renew_to: None,
                     fail_next_target_cas: false,
+                    fail_target_cas_to: None,
+                    claim_calls: 0,
                 })),
             }
         }
@@ -2362,6 +2493,10 @@ mod tests {
 
         fn renew_count(&self) -> usize {
             self.inner.lock().unwrap().renew_count
+        }
+
+        fn claim_calls(&self) -> usize {
+            self.inner.lock().unwrap().claim_calls
         }
     }
 
@@ -2437,6 +2572,12 @@ mod tests {
             unreachable!()
         }
         async fn take_over(
+            &self,
+            _transaction: &ReleaseRolloutTransactionRow,
+        ) -> Result<Option<ReleaseRolloutTransactionRow>> {
+            unreachable!()
+        }
+        async fn claim_succeeded_rollback(
             &self,
             _transaction: &ReleaseRolloutTransactionRow,
         ) -> Result<Option<ReleaseRolloutTransactionRow>> {
@@ -2534,6 +2675,25 @@ mod tests {
             Ok(Some(state.status.transaction.clone()))
         }
 
+        async fn claim_succeeded_rollback(
+            &self,
+            transaction: &ReleaseRolloutTransactionRow,
+        ) -> Result<Option<ReleaseRolloutTransactionRow>> {
+            let mut state = self.inner.lock().unwrap();
+            state.claim_calls += 1;
+            if state.status.transaction.state != "succeeded"
+                || state.status.transaction.cas_revision != transaction.cas_revision
+            {
+                return Ok(None);
+            }
+            state.status.transaction.state = "rolling_back".into();
+            state.status.transaction.cas_revision += 1;
+            state.status.transaction.lease_token = Uuid::new_v4();
+            state.status.transaction.lease_owner = LEASE_OWNER.into();
+            state.status.transaction.lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(2);
+            Ok(Some(state.status.transaction.clone()))
+        }
+
         async fn cas_transaction(
             &self,
             transaction: &ReleaseRolloutTransactionRow,
@@ -2563,6 +2723,10 @@ mod tests {
             let mut state = self.inner.lock().unwrap();
             if state.fail_next_target_cas {
                 state.fail_next_target_cas = false;
+                return Ok(false);
+            }
+            if state.fail_target_cas_to.as_deref() == Some(new_state) {
+                state.fail_target_cas_to = None;
                 return Ok(false);
             }
             if state.status.transaction.lease_token != transaction.lease_token {
@@ -2622,6 +2786,7 @@ mod tests {
         lose_activation_response_once: bool,
         fail_health_for: Option<String>,
         fail_rollback_for: Option<String>,
+        rollback_effects: BTreeSet<String>,
     }
 
     #[derive(Clone, Default)]
@@ -2640,6 +2805,16 @@ mod tests {
                 .unwrap()
                 .calls
                 .push(format!("{operation}:{}", target.endpoint.computer_name));
+        }
+
+        fn rollback_effect_count(&self, computer_name: &str) -> usize {
+            usize::from(
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .rollback_effects
+                    .contains(computer_name),
+            )
         }
     }
 
@@ -2747,6 +2922,11 @@ mod tests {
                     "injected rollback failure".into(),
                 ));
             }
+            self.inner
+                .lock()
+                .unwrap()
+                .rollback_effects
+                .insert(target.endpoint.computer_name.clone());
             Ok(ReleaseRollbackReceipt {
                 transaction_id: candidate.transaction_id,
                 replaced_source_commit: SOURCE.into(),
@@ -2764,10 +2944,32 @@ mod tests {
     }
 
     fn evidence_with_activation(id: Uuid, target: &RolloutTarget) -> String {
+        let candidate = candidate_from_target(id, target).unwrap();
         serde_json::to_string(&TargetEvidence {
             phase: "succeeded".into(),
-            candidate: Some(candidate_from_target(id, target).unwrap()),
+            candidate: Some(candidate),
             activation: Some(activation_receipt(id, target)),
+            rollback_proof: Some(ReleaseRollbackProof {
+                transaction_id: id,
+                source_commit: SOURCE.into(),
+                prior_release_identity:
+                    crate::release_artifact_activation::PriorReleaseIdentity::LegacyReported {
+                        short_sha: "12345678".into(),
+                    },
+                computer_id: target.endpoint.computer_id,
+                computer_name: target.endpoint.computer_name.clone(),
+                manifest_sha256: "3".repeat(64),
+                activation_receipt_sha256: "4".repeat(64),
+                verified_at: Utc::now(),
+            }),
+            health: Some(HealthBakeEvidence {
+                transaction_id: id,
+                computer_id: target.endpoint.computer_id,
+                computer_name: target.endpoint.computer_name.clone(),
+                source_commit: SOURCE.into(),
+                bake_seconds: 0,
+                verified_at: Utc::now(),
+            }),
             ..Default::default()
         })
         .unwrap()
@@ -2829,6 +3031,12 @@ mod tests {
         }
     }
 
+    fn succeeded_status() -> RolloutStatus {
+        let mut state = status(&["succeeded", "succeeded", "succeeded", "succeeded"]);
+        state.transaction.state = "succeeded".into();
+        state
+    }
+
     fn fast_config() -> RolloutCoordinatorConfig {
         RolloutCoordinatorConfig {
             lease_seconds: 120,
@@ -2836,6 +3044,126 @@ mod tests {
             canary_bake: Duration::ZERO,
             remaining_bake: Duration::ZERO,
         }
+    }
+
+    #[tokio::test]
+    async fn operator_post_success_rollback_claims_once_and_reverses_exact_order() {
+        let state = succeeded_status();
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        let result = coordinator.rollback(id).await.unwrap();
+
+        assert_eq!(result.transaction.state, "rolled_back");
+        assert_eq!(db.claim_calls(), 1);
+        let rollbacks = transport
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("rollback:"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rollbacks,
+            [
+                "rollback:logan",
+                "rollback:ace",
+                "rollback:lily",
+                "rollback:beyonce"
+            ]
+        );
+        assert!(matches!(
+            coordinator.rollback(id).await,
+            Err(ReleaseRolloutError::Refused(message))
+                if message.contains("terminal state rolled_back")
+        ));
+        assert_eq!(db.claim_calls(), 1, "repeated rollback must not reclaim");
+    }
+
+    #[tokio::test]
+    async fn post_success_missing_evidence_refuses_before_claim_or_transport() {
+        let mut state = succeeded_status();
+        state.targets[3].detail = None;
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.rollback(id).await,
+            Err(ReleaseRolloutError::Refused(_))
+        ));
+        assert_eq!(db.claim_calls(), 0);
+        assert_eq!(db.state().transaction.state, "succeeded");
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_success_rollback_crash_resume_replays_without_duplicate_effect() {
+        let state = succeeded_status();
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        db.inner.lock().unwrap().fail_target_cas_to = Some("rolled_back".into());
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.rollback(id).await,
+            Err(ReleaseRolloutError::LeaseLost(message))
+                if message == "rollback receipt CAS"
+        ));
+        assert_eq!(db.state().transaction.state, "rolling_back");
+        assert_eq!(db.state().targets[3].state, "rolling_back");
+        assert_eq!(transport.rollback_effect_count("logan"), 1);
+
+        db.expire_lease();
+        let resumed = coordinator.resume(id).await.unwrap();
+        assert_eq!(resumed.transaction.state, "rolled_back");
+        for name in ["beyonce", "lily", "ace", "logan"] {
+            assert_eq!(
+                transport.rollback_effect_count(name),
+                1,
+                "deterministic local rollback replay must not duplicate its effect"
+            );
+        }
+        assert_eq!(db.claim_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn operator_rollback_refuses_unsafe_terminal_states_without_claim() {
+        for terminal in ["failed", "rolled_back", "cancelled"] {
+            let mut state = succeeded_status();
+            state.transaction.state = terminal.into();
+            let id = state.transaction.id;
+            let db = FakeDb::new(state);
+            let transport = FakeTransport::default();
+            let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+            assert!(matches!(
+                coordinator.rollback(id).await,
+                Err(ReleaseRolloutError::Refused(message))
+                    if message.contains(terminal)
+            ));
+            assert_eq!(db.claim_calls(), 0);
+            assert!(transport.calls().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn post_success_rollback_refuses_vinny_before_claim() {
+        let mut state = succeeded_status();
+        state.targets[2].target.endpoint.computer_name = "vinny".into();
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.rollback(id).await,
+            Err(ReleaseRolloutError::Refused(message))
+                if message.contains("Vinny")
+        ));
+        assert_eq!(db.claim_calls(), 0);
+        assert!(transport.calls().is_empty());
     }
 
     #[tokio::test]
