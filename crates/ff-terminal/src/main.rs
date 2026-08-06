@@ -3047,14 +3047,15 @@ pub enum WorkstreamCommand {
         #[arg(long)]
         session: Option<String>,
     },
-    /// Report working state into the project's workstream: update the shared
-    /// summary/focus and append a timestamped note to the activity log.
+    /// Report client-owned working state: update focus and append a timestamped
+    /// note. The leader derives the shared working summary.
     Report {
         /// Which CLI is reporting. Auto-detected when omitted (see `attach`).
         #[arg(long)]
         tool: Option<String>,
-        /// Replace the shared "what's happening now" summary.
-        #[arg(long)]
+        /// Deprecated compatibility flag. Working summaries are leader-derived
+        /// and any supplied value is rejected.
+        #[arg(long, hide = true)]
         summary: Option<String>,
         /// Replace the current focus (the one thing in flight).
         #[arg(long)]
@@ -9419,6 +9420,53 @@ mod pm_bind_repo_cli_tests {
             .expect("spawn parser test")
             .join()
             .expect("parser test panicked");
+    }
+}
+
+#[cfg(test)]
+mod workstream_cli_tests {
+    use super::{Cli, Command, WorkstreamCommand};
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn client_summary_flag_is_hidden_but_legacy_invocations_parse_for_rejection() {
+        let (help, parsed) = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut root = Cli::command();
+                let help = root
+                    .find_subcommand_mut("workstream")
+                    .expect("workstream command")
+                    .find_subcommand_mut("report")
+                    .expect("workstream report command")
+                    .render_long_help()
+                    .to_string();
+                let parsed = Cli::try_parse_from([
+                    "ff",
+                    "workstream",
+                    "report",
+                    "--summary",
+                    "legacy client summary",
+                ])
+                .expect("hidden compatibility flag should still parse");
+                (help, parsed)
+            })
+            .expect("spawn workstream parser test")
+            .join()
+            .expect("workstream parser test panicked");
+
+        assert!(!help.contains("--summary"));
+        assert!(help.contains("--focus"));
+        assert!(help.contains("--note"));
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Workstream {
+                command: WorkstreamCommand::Report {
+                    summary: Some(summary),
+                    ..
+                }
+            }) if summary == "legacy client summary"
+        ));
     }
 }
 
