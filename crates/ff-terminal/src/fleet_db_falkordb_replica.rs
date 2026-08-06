@@ -4207,13 +4207,17 @@ mod tests {
         {
             Ok(url) => url,
             Err(_) => {
-                let config_text = tokio::fs::read_to_string(
-                    dirs::home_dir()
-                        .expect("home directory")
-                        .join(".forgefleet/fleet.toml"),
-                )
-                .await
-                .expect("read fleet config for session-local PostgreSQL test");
+                let config_path = dirs::home_dir()
+                    .expect("home directory")
+                    .join(".forgefleet/fleet.toml");
+                let config_text = match tokio::fs::read_to_string(&config_path).await {
+                    Ok(text) => text,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                    Err(error) => panic!(
+                        "read fleet config for session-local PostgreSQL test at {}: {error}",
+                        config_path.display()
+                    ),
+                };
                 let config: ff_core::config::FleetConfig =
                     toml::from_str(&config_text).expect("parse fleet config");
                 config.database.url
