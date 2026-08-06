@@ -42,8 +42,8 @@ const PERSISTED_SNAPSHOT_TTL_SECS: u64 = 3600;
 /// of the bind values, so replaying the same beat converges to the same row.
 const UPSERT_COMPUTER_ROW_SQL: &str = "INSERT INTO computers (\
     id, name, primary_ip, all_ips, cpu_cores, total_ram_gb, total_disk_gb, \
-    gpu_kind, gpu_count, gpu_total_vram_gb, has_gpu, os_family, ssh_user, last_seen_at\
-) VALUES ($1, $2, $10, $3::jsonb, $4, $5, $6, $7, $8, $9, ($8 > 0), $11, $12, NOW()) \
+    gpu_kind, gpu_count, gpu_total_vram_gb, has_gpu, os_family, ssh_user, mac_addresses, last_seen_at\
+) VALUES ($1, $2, $10, $3::jsonb, $4, $5, $6, $7, $8, $9, ($8 > 0), $11, $12, $13::jsonb, NOW()) \
 ON CONFLICT (id) DO UPDATE SET \
     last_seen_at = EXCLUDED.last_seen_at, \
     primary_ip = EXCLUDED.primary_ip, \
@@ -54,7 +54,39 @@ ON CONFLICT (id) DO UPDATE SET \
     gpu_kind = EXCLUDED.gpu_kind, \
     gpu_count = EXCLUDED.gpu_count, \
     gpu_total_vram_gb = EXCLUDED.gpu_total_vram_gb, \
-    has_gpu = EXCLUDED.has_gpu";
+    has_gpu = EXCLUDED.has_gpu, \
+    mac_addresses = CASE WHEN jsonb_array_length(EXCLUDED.mac_addresses) > 0 \
+        THEN EXCLUDED.mac_addresses ELSE computers.mac_addresses END";
+
+async fn upsert_computer_row<'e, E>(
+    executor: E,
+    computer_id: Uuid,
+    beat: &PulseBeatV2,
+    all_ips_json: &str,
+    os_family: &str,
+    ssh_user: &str,
+) -> Result<(), MaterializerError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
+    sqlx::query(UPSERT_COMPUTER_ROW_SQL)
+        .bind(computer_id)
+        .bind(&beat.computer_name)
+        .bind(all_ips_json)
+        .bind(beat.hardware.cpu_cores)
+        .bind(beat.hardware.ram_gb)
+        .bind(beat.hardware.disk_gb)
+        .bind(&beat.capabilities.gpu_kind)
+        .bind(beat.capabilities.gpu_count)
+        .bind(beat.capabilities.gpu_total_vram_gb)
+        .bind(&beat.network.primary_ip)
+        .bind(os_family)
+        .bind(ssh_user)
+        .bind(serde_json::to_string(&beat.network.mac_addresses)?)
+        .execute(executor)
+        .await?;
+    Ok(())
+}
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -106,6 +138,8 @@ pub(crate) struct PersistedSnapshot {
     pub computer_name: String,
     pub status: String,
     pub all_ips_json: String,
+    #[serde(default)]
+    pub mac_addresses: Vec<String>,
     pub hardware: PersistedHardware,
     pub capabilities: PersistedCapabilities,
     pub installed_software: Vec<PersistedSoftware>,
@@ -255,6 +289,7 @@ impl PersistedSnapshot {
                 "online".to_string()
             },
             all_ips_json,
+            mac_addresses: beat.network.mac_addresses.clone(),
             hardware,
             capabilities,
             installed_software,
@@ -432,7 +467,7 @@ impl Materializer {
         // Q1: look up computer row
         let row = sqlx::query(
             "SELECT id, status, primary_ip, all_ips::text AS all_ips_text, cpu_cores, \
-             total_ram_gb, total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb \
+             total_ram_gb, total_disk_gb, gpu_kind, gpu_count, gpu_total_vram_gb, mac_addresses \
              , os_family, ssh_user \
              FROM computers WHERE name = $1",
         )
@@ -453,6 +488,10 @@ impl Materializer {
         let prev_gpu_kind: Option<String> = row.try_get("gpu_kind").ok();
         let prev_gpu_count: Option<i32> = row.try_get("gpu_count").ok();
         let prev_gpu_total_vram_gb: Option<f64> = row.try_get("gpu_total_vram_gb").ok();
+        let prev_mac_addresses: Vec<String> = row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("mac_addresses")
+            .map(|value| value.0)
+            .unwrap_or_default();
         let os_family: String = row.try_get("os_family")?;
         let ssh_user: String = row.try_get("ssh_user")?;
 
@@ -572,8 +611,15 @@ impl Materializer {
             || prev_gpu_total_vram_gb != beat.capabilities.gpu_total_vram_gb;
         let primary_ip_differ =
             prev_primary_ip.as_deref() != Some(beat.network.primary_ip.as_str());
-        let persistent_row_differ =
-            persistent_fields_changed(ips_differ, hw_differ, cap_differ, primary_ip_differ);
+        let mac_addresses_differ = !beat.network.mac_addresses.is_empty()
+            && prev_mac_addresses != beat.network.mac_addresses;
+        let persistent_row_differ = persistent_fields_changed(
+            ips_differ,
+            hw_differ,
+            cap_differ,
+            primary_ip_differ,
+            mac_addresses_differ,
+        );
 
         // Fast path: if both cached and durable state match exactly AND no
         // status transition, only update last_seen_at.
@@ -671,21 +717,15 @@ impl Materializer {
                     "materializer: updating computers row with empty persistent value(s)"
                 );
             }
-            sqlx::query(UPSERT_COMPUTER_ROW_SQL)
-                .bind(computer_id)
-                .bind(&beat.computer_name)
-                .bind(new_ips_json)
-                .bind(beat.hardware.cpu_cores)
-                .bind(beat.hardware.ram_gb)
-                .bind(beat.hardware.disk_gb)
-                .bind(&beat.capabilities.gpu_kind)
-                .bind(beat.capabilities.gpu_count)
-                .bind(beat.capabilities.gpu_total_vram_gb)
-                .bind(&beat.network.primary_ip)
-                .bind(&os_family)
-                .bind(&ssh_user)
-                .execute(&self.pg)
-                .await?;
+            upsert_computer_row(
+                &self.pg,
+                computer_id,
+                beat,
+                new_ips_json,
+                &os_family,
+                &ssh_user,
+            )
+            .await?;
             report.wrote_computer_row = persistent_row_differ;
         }
 
@@ -1597,8 +1637,9 @@ fn persistent_fields_changed(
     hw_differ: bool,
     cap_differ: bool,
     primary_ip_differ: bool,
+    mac_addresses_differ: bool,
 ) -> bool {
-    ips_differ || hw_differ || cap_differ || primary_ip_differ
+    ips_differ || hw_differ || cap_differ || primary_ip_differ || mac_addresses_differ
 }
 
 fn can_use_last_seen_fast_path(
@@ -1699,6 +1740,7 @@ mod tests {
         b.network = NetworkInfo {
             primary_ip: "10.0.0.1".to_string(),
             all_ips: vec![],
+            mac_addresses: vec![],
         };
         b.hardware = HardwareInfo {
             cpu_cores: 8,
@@ -1959,7 +2001,7 @@ mod tests {
         // write even when IPs/hardware/capabilities are otherwise identical.
         // Regression guard for the aura wifi→ethernet freeze + the 9/15
         // fleet_workers.ip drift.
-        assert!(persistent_fields_changed(false, false, false, true));
+        assert!(persistent_fields_changed(false, false, false, true, false));
     }
 
     #[test]
@@ -2014,7 +2056,9 @@ mod tests {
 
     #[test]
     fn no_rewrite_when_nothing_changed() {
-        assert!(!persistent_fields_changed(false, false, false, false));
+        assert!(!persistent_fields_changed(
+            false, false, false, false, false
+        ));
     }
 
     #[test]
@@ -2063,10 +2107,101 @@ mod tests {
 
     #[test]
     fn any_single_drift_signal_forces_a_rewrite() {
-        assert!(persistent_fields_changed(true, false, false, false)); // ips
-        assert!(persistent_fields_changed(false, true, false, false)); // hardware
-        assert!(persistent_fields_changed(false, false, true, false)); // capabilities
-        assert!(persistent_fields_changed(false, false, false, true)); // primary_ip
+        assert!(persistent_fields_changed(true, false, false, false, false)); // ips
+        assert!(persistent_fields_changed(false, true, false, false, false)); // hardware
+        assert!(persistent_fields_changed(false, false, true, false, false)); // capabilities
+        assert!(persistent_fields_changed(false, false, false, true, false)); // primary_ip
+        assert!(persistent_fields_changed(false, false, false, false, true)); // MACs
+    }
+
+    #[test]
+    fn mac_inventory_populates_converges_and_empty_old_beats_preserve() {
+        assert!(UPSERT_COMPUTER_ROW_SQL.contains("jsonb_array_length(EXCLUDED.mac_addresses) > 0"));
+        assert!(UPSERT_COMPUTER_ROW_SQL.contains("ELSE computers.mac_addresses"));
+
+        let mut beat = beat_online("thalia");
+        beat.network.mac_addresses = vec!["aa:bb:cc:dd:ee:fe".into()];
+        let initial = PersistedSnapshot::from_beat(&beat);
+        assert_eq!(initial.mac_addresses, beat.network.mac_addresses);
+
+        beat.network.mac_addresses = vec!["02:11:22:33:44:66".into()];
+        let updated = PersistedSnapshot::from_beat(&beat);
+        assert_ne!(initial, updated);
+
+        beat.network.mac_addresses.clear();
+        assert!(PersistedSnapshot::from_beat(&beat).mac_addresses.is_empty());
+        assert!(!persistent_fields_changed(
+            false, false, false, false, false
+        ));
+    }
+
+    #[tokio::test]
+    async fn db_mac_inventory_upsert_populates_converges_and_preserves() {
+        let Some(url) = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .ok()
+            .or_else(|| std::env::var("FORGEFLEET_DATABASE_URL").ok())
+        else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.expect("connect test db");
+        let mut tx = pool.begin().await.expect("begin isolated transaction");
+        sqlx::query(
+            "CREATE TEMP TABLE computers (\
+                id uuid PRIMARY KEY, name text NOT NULL, primary_ip text, all_ips jsonb NOT NULL, \
+                cpu_cores integer, total_ram_gb double precision, total_disk_gb double precision, \
+                gpu_kind text, gpu_count integer, gpu_total_vram_gb double precision, has_gpu boolean, \
+                os_family text, ssh_user text, mac_addresses jsonb NOT NULL, last_seen_at timestamptz\
+            ) ON COMMIT DROP",
+        )
+        .execute(&mut *tx)
+        .await
+        .expect("create disposable computers table");
+
+        let computer_id = Uuid::new_v4();
+        let mut beat = beat_online("mac-upsert-test");
+        let all_ips_json = serde_json::to_string(&beat.network.all_ips).unwrap();
+        async fn read_macs(
+            tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+            computer_id: Uuid,
+        ) -> Result<serde_json::Value, sqlx::Error> {
+            sqlx::query_scalar::<_, serde_json::Value>(
+                "SELECT mac_addresses FROM computers WHERE id = $1",
+            )
+            .bind(computer_id)
+            .fetch_one(&mut **tx)
+            .await
+        }
+
+        beat.network.mac_addresses = vec!["aa:bb:cc:dd:ee:fe".into()];
+        upsert_computer_row(&mut *tx, computer_id, &beat, &all_ips_json, "linux", "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_macs(&mut tx, computer_id).await.unwrap(),
+            serde_json::json!(["aa:bb:cc:dd:ee:fe"])
+        );
+
+        beat.network.mac_addresses = vec!["02:11:22:33:44:66".into()];
+        upsert_computer_row(&mut *tx, computer_id, &beat, &all_ips_json, "linux", "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_macs(&mut tx, computer_id).await.unwrap(),
+            serde_json::json!(["02:11:22:33:44:66"])
+        );
+
+        beat.network.mac_addresses.clear();
+        upsert_computer_row(&mut *tx, computer_id, &beat, &all_ips_json, "linux", "test")
+            .await
+            .unwrap();
+        assert_eq!(
+            read_macs(&mut tx, computer_id).await.unwrap(),
+            serde_json::json!(["02:11:22:33:44:66"])
+        );
+
+        tx.rollback()
+            .await
+            .expect("rollback disposable table and row");
     }
 
     #[test]
