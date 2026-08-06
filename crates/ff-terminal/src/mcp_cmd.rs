@@ -490,7 +490,7 @@ fn replace_codex_section(
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&block);
+        out.push_str(block);
         out
     } else {
         let mut out = existing.to_string();

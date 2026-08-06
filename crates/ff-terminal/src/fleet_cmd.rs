@@ -4922,7 +4922,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     );
                     println!("  new fingerprint: {}", report.new_fingerprint);
                     if let Some(old) = &report.old_fingerprint {
-                        println!("  old fingerprint: {}", old);
+                        println!("  old fingerprint: {old}");
                     }
                     println!(
                         "  peers reached: {} / failed: {}",
@@ -5845,7 +5845,7 @@ async fn handoff_deploy_leader(
                 .num_seconds()
                 <= 45
         {
-            eprintln!("{GREEN}✓ leadership transferred to '{}'{RESET}", successor);
+            eprintln!("{GREEN}✓ leadership transferred to '{successor}'{RESET}");
             return Ok(Some((current.member_name, successor)));
         }
         if tokio::time::Instant::now() >= deadline {
@@ -6139,10 +6139,9 @@ fn deploy_playbook(
         ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
          cd \"{src}\" && \
          {git_sync} && \
-         {web_build} && \
+         {WEB_BUILD_STEP} && \
          {cargo_build} && \
-         {install_restart}",
-        web_build = WEB_BUILD_STEP,
+         {install_restart}"
     )
 }
 

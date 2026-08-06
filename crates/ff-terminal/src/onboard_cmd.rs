@@ -406,9 +406,9 @@ async fn issue_enrollment(
     OsRng.fill_bytes(&mut *random);
     let token = Zeroizing::new(format!(
         "{TOKEN_PREFIX}{}",
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&*random)
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(*random)
     ));
-    let token_hash: [u8; 32] = Sha256::digest(&*random).into();
+    let token_hash: [u8; 32] = Sha256::digest(*random).into();
     let created_by = format!(
         "{}@{}",
         std::env::var("USER").unwrap_or_else(|_| "ff-onboard".to_owned()),

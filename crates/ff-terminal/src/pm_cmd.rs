@@ -1013,14 +1013,14 @@ async fn close_work_item(
     });
     let already_idempotent = matching_event
         && target_status == source_status
-        && commit.map_or(true, |requested| {
+        && commit.is_none_or(|requested| {
             existing_commit
                 .as_deref()
                 .is_some_and(|existing| existing.trim() == requested)
         })
         && last_error
             .as_deref()
-            .map_or(true, |error| error.trim().is_empty())
+            .is_none_or(|error| error.trim().is_empty())
         && (!verified || existing_verified != 0)
         && (!deploy_verified || existing_deploy_verified != 0);
     if already_idempotent {
