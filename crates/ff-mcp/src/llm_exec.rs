@@ -26,10 +26,11 @@ use uuid::Uuid;
 /// required and an absent key keeps conservative defaults.
 pub const LOCAL_ROUTE_POLICY_KEY: &str = "ff_mcp.local_route_policy.v1";
 
-/// Keep the server's absolute deadline 15 seconds below the observed
-/// 120-second MCP client request envelope. This margin lets us return typed
+/// Keep the server's absolute deadline 15 seconds below the installed
+/// 180-second MCP client request envelope. This margin lets us return typed
 /// failure evidence instead of having the client tear down the transport first.
-const SERVER_HARD_TOTAL_TIMEOUT_MS: u64 = 105_000;
+pub(crate) const MCP_CLIENT_TIMEOUT_MS: u64 = 180_000;
+pub(crate) const SERVER_HARD_TOTAL_TIMEOUT_MS: u64 = 165_000;
 const SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS: u64 = 90_000;
 const DEFAULT_TOTAL_TIMEOUT_MS: u64 = SERVER_HARD_TOTAL_TIMEOUT_MS;
 const DEFAULT_MIN_START_BUDGET_MS: u64 = 5_000;
@@ -151,6 +152,18 @@ impl LocalRoutePolicy {
         self.max_attempt_timeout = self
             .max_attempt_timeout
             .min(Duration::from_millis(SERVER_HARD_MAX_ATTEMPT_TIMEOUT_MS));
+    }
+
+    pub(crate) fn cap_total_timeout_at(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let remaining = deadline
+            .checked_duration_since(now)
+            .ok_or_else(|| "local route execution deadline already elapsed".to_string())?;
+        self.total_timeout = self.total_timeout.min(remaining);
+        self.validate()
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -704,7 +717,9 @@ fn is_independent_judge(candidate: &RouteCandidate) -> bool {
 }
 
 /// Compute the next attempt's entire budget from one caller-owned deadline.
-/// No attempt starts unless the configured minimum remains.
+/// No attempt starts with a shortened budget: a retry that cannot receive its
+/// normal tier/request ceiling is predictably doomed and only delays a typed
+/// failure until the outer MCP deadline.
 pub fn remaining_attempt_budget(
     now: Instant,
     deadline: Instant,
@@ -714,10 +729,11 @@ pub fn remaining_attempt_budget(
     max_attempt: Duration,
 ) -> Option<Duration> {
     let remaining = deadline.checked_duration_since(now)?;
-    if remaining < min_start {
+    let attempt_budget = tier_cap.min(requested_cap).min(max_attempt);
+    if remaining < min_start || remaining < attempt_budget {
         return None;
     }
-    Some(remaining.min(tier_cap).min(requested_cap).min(max_attempt))
+    Some(attempt_budget)
 }
 
 /// Request-scoped strategy executor. All state below (snapshot, failed IDs,
@@ -773,6 +789,38 @@ impl GatewayLlmExec {
             last_failure: Mutex::new(None),
             role_failures: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn new_with_deadline(
+        pool: sqlx::PgPool,
+        workload: WorkloadClass,
+        completion_ceiling: Option<CompletionBudget>,
+        mut policy: LocalRoutePolicy,
+        deadline: Instant,
+    ) -> Result<Self, String> {
+        policy.enforce_server_ceilings();
+        policy.cap_total_timeout_at(Instant::now(), deadline)?;
+        let clock: Arc<dyn MonotonicClock> = Arc::new(SystemClock);
+        let started_at = clock.now();
+        Ok(Self {
+            source: Arc::new(PgCandidateSource { pool }),
+            transport: Arc::new(HttpCompletionTransport {
+                client: reqwest::Client::new(),
+            }),
+            reservations: Arc::clone(&PROCESS_LOCAL_RESERVATIONS),
+            clock,
+            workload,
+            completion_ceiling,
+            policy,
+            started_at,
+            deadline,
+            snapshot: tokio::sync::OnceCell::new(),
+            ledger: Mutex::new(Vec::new()),
+            failed_ids: Mutex::new(HashSet::new()),
+            winner: Mutex::new(None),
+            last_failure: Mutex::new(None),
+            role_failures: Mutex::new(HashMap::new()),
+        })
     }
 
     fn stage_budget(&self, requested: u32) -> Result<CompletionBudget, String> {
@@ -1488,6 +1536,87 @@ mod tests {
             ),
             None
         );
+        assert_eq!(
+            remaining_attempt_budget(
+                now,
+                now + Duration::from_secs(45),
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(90),
+            ),
+            None,
+            "never start a tier-2 retry with only a partial 45-second budget"
+        );
+    }
+
+    #[test]
+    fn installed_mcp_envelope_admits_two_full_tier2_attempts_not_a_partial_third() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(SERVER_HARD_TOTAL_TIMEOUT_MS);
+        let tier2 = Duration::from_secs(60);
+        assert_eq!(
+            remaining_attempt_budget(
+                now,
+                deadline,
+                Duration::from_secs(5),
+                tier2,
+                tier2,
+                Duration::from_secs(90),
+            ),
+            Some(tier2)
+        );
+        assert_eq!(
+            remaining_attempt_budget(
+                now + tier2,
+                deadline,
+                Duration::from_secs(5),
+                tier2,
+                tier2,
+                Duration::from_secs(90),
+            ),
+            Some(tier2)
+        );
+        assert_eq!(
+            remaining_attempt_budget(
+                now + tier2 + tier2,
+                deadline,
+                Duration::from_secs(5),
+                tier2,
+                tier2,
+                Duration::from_secs(90),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn handler_preflight_consumes_the_same_budget_and_cannot_admit_a_partial_retry() {
+        let request_start = Instant::now();
+        // The handler reserves two seconds for bounded persistence and one
+        // second to construct the response inside its 165-second envelope.
+        let execution_deadline = request_start
+            + Duration::from_millis(SERVER_HARD_TOTAL_TIMEOUT_MS)
+            - Duration::from_secs(3);
+        let after_preflight = request_start + Duration::from_secs(103);
+        let mut policy = test_policy();
+        policy.total_timeout = Duration::from_millis(SERVER_HARD_TOTAL_TIMEOUT_MS);
+        policy
+            .cap_total_timeout_at(after_preflight, execution_deadline)
+            .expect("preflight should leave a positive execution budget");
+        assert_eq!(policy.total_timeout, Duration::from_secs(59));
+        assert_eq!(
+            remaining_attempt_budget(
+                after_preflight,
+                execution_deadline,
+                Duration::from_secs(5),
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                Duration::from_secs(90),
+            ),
+            None,
+            "pre-handler work must not be ignored when admitting another attempt"
+        );
     }
 
     #[tokio::test]
@@ -1904,11 +2033,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cascade_uses_one_absolute_deadline_across_generation_and_judge() {
+    async fn cascade_refuses_partial_attempt_at_one_absolute_deadline() {
         let clock = FakeClock::new();
         let mut policy = test_policy();
         policy.total_timeout = Duration::from_millis(1_500);
         policy.min_start_budget = Duration::from_millis(50);
+        policy.max_attempt_timeout = Duration::from_millis(700);
+        policy.tier_timeouts = [Duration::from_millis(700); 4];
         let (exec, source, _) = executor(
             vec![candidate(6), candidate(7), judge_candidate(106)],
             vec![
@@ -1930,7 +2061,7 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(failure.reason_code, FailureReasonCode::DeadlineExceeded);
-        assert_eq!(failure.execution.attempts.len(), 3);
+        assert_eq!(failure.execution.attempts.len(), 2);
         assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2224,7 +2355,7 @@ mod tests {
             tier4: None,
         };
         let defaults = LocalRoutePolicy::from_config(&timeouts, None).unwrap();
-        assert_eq!(defaults.total_timeout, Duration::from_millis(105_000));
+        assert_eq!(defaults.total_timeout, Duration::from_millis(165_000));
         assert_eq!(defaults.max_attempt_timeout, Duration::from_millis(90_000));
 
         let clamped = LocalRoutePolicy::from_config(
@@ -2269,7 +2400,7 @@ mod tests {
 
         let invalid = LocalRoutePolicy::from_config(
             &timeouts,
-            Some(r#"{"total_timeout_ms":999999,"min_start_budget_ms":110000}"#),
+            Some(r#"{"total_timeout_ms":999999,"min_start_budget_ms":170000}"#),
         )
         .unwrap_err();
         assert!(invalid.contains("min_start_budget_ms exceeds total_timeout_ms"));

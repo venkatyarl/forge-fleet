@@ -12,7 +12,7 @@
 //! exposed on the CLI.
 
 use anyhow::{Context, Result};
-use tokio::process::Command;
+use ff_ssh::{RemoteExecutor, SshNodeConfig};
 
 const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
@@ -47,39 +47,33 @@ pub async fn handle_ssh(
     // responsible for quoting anything with shell metacharacters
     // (`ff ssh ace \"ps aux | grep mlx\"`).
     let remote_cmd = command.join(" ");
-    let remote_cmd = if sudo {
-        format!("sudo -n {remote_cmd}")
-    } else {
-        remote_cmd
-    };
-
     let target = format!("{ssh_user}@{ip}");
     if !json {
         eprintln!("{CYAN}▶ ff ssh{RESET} {DIM}{target}{RESET}");
         eprintln!("{DIM}  $ {remote_cmd}{RESET}");
     }
 
-    let connect_timeout = timeout.clamp(5, 30);
-    let started = std::time::Instant::now();
-    let out = Command::new("ssh")
-        .args([
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            &format!("ConnectTimeout={connect_timeout}"),
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            &target,
-            &remote_cmd,
-        ])
-        .output()
+    let node = SshNodeConfig {
+        name: worker.clone(),
+        host: ip.clone(),
+        port: 22,
+        username: ssh_user.clone(),
+        key_path: None,
+        password: None,
+        alternate_ips: Vec::new(),
+        batch_mode: true,
+        connect_timeout_secs: Some(timeout.clamp(5, 30)),
+        known_hosts_path: None,
+    };
+    let result = RemoteExecutor::new(timeout.max(1), true)
+        .run_on_node(node, remote_cmd.clone(), sudo)
         .await
-        .map_err(|e| anyhow::anyhow!("spawn ssh: {e}"))?;
+        .map_err(|error| anyhow::anyhow!("SSH execution failed: {error}"))?;
 
-    let duration_ms = started.elapsed().as_millis();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let exit_code = out.status.code();
+    let duration_ms = result.duration_ms;
+    let stdout = result.stdout;
+    let stderr = result.stderr;
+    let exit_code = result.exit_code;
 
     if json {
         let v = serde_json::json!({
@@ -87,7 +81,7 @@ pub async fn handle_ssh(
             "host": ip,
             "user": ssh_user,
             "command": remote_cmd,
-            "success": out.status.success(),
+            "success": result.success,
             "exit_code": exit_code,
             "duration_ms": duration_ms,
             "stdout": stdout,
@@ -104,7 +98,7 @@ pub async fn handle_ssh(
         if !stderr.trim().is_empty() {
             eprint!("{stderr}");
         }
-        if out.status.success() {
+        if result.success {
             eprintln!("{GREEN}✓ exit 0{RESET} {DIM}({duration_ms}ms){RESET}");
         } else {
             eprintln!(
@@ -117,7 +111,7 @@ pub async fn handle_ssh(
     }
 
     // Propagate the remote exit status so scripts can branch on it.
-    if !out.status.success() {
+    if !result.success {
         std::process::exit(exit_code.unwrap_or(1));
     }
     Ok(())
