@@ -2506,6 +2506,7 @@ const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Hard cap on a 480B ring review (matches the merge drain's budget).
 const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(300);
+const REVIEW_LOCAL_CONFIRM_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Budget for the `cargo test` run whose output is fed to the reviewer. The
 /// per-slot CARGO_TARGET_DIR is warm from the build, so this is incremental.
@@ -2548,6 +2549,68 @@ fn same_model_family(builder: &str, reviewer: &str) -> bool {
     builder == reviewer
         || builder.ends_with(&format!(":{reviewer}"))
         || builder.starts_with(&format!("{reviewer}:"))
+}
+
+fn reviewer_family(identity: &str) -> String {
+    let identity = identity.trim().to_ascii_lowercase();
+    for family in [
+        "qwen", "glm", "devstral", "claude", "codex", "kimi", "gemini", "grok",
+    ] {
+        if identity.contains(family) {
+            return family.to_string();
+        }
+    }
+    identity
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewAdjudication {
+    Approve(String),
+    Reject(String),
+    AwaitConfirmation(String),
+}
+
+fn adjudicate_review_candidate(
+    first_rejection: Option<(&str, &str)>,
+    candidate_reviewer: &str,
+    candidate_approved: bool,
+    candidate_reason: &str,
+) -> ReviewAdjudication {
+    let Some((first_reviewer, first_reason)) = first_rejection else {
+        return if candidate_approved {
+            ReviewAdjudication::Approve(candidate_reason.to_string())
+        } else {
+            ReviewAdjudication::AwaitConfirmation(format!(
+                "unconfirmed rejection by {candidate_reviewer}: {candidate_reason}"
+            ))
+        };
+    };
+
+    let first_family = reviewer_family(first_reviewer);
+    let candidate_family = reviewer_family(candidate_reviewer);
+    if first_family.is_empty() || candidate_family.is_empty() || first_family == candidate_family {
+        return ReviewAdjudication::AwaitConfirmation(format!(
+            "rejection by {first_reviewer} remains unconfirmed; \
+             {candidate_reviewer} is not a distinct reviewer family"
+        ));
+    }
+
+    if candidate_approved {
+        ReviewAdjudication::Approve(format!(
+            "{candidate_reviewer} overturned {first_reviewer} rejection \
+             ({first_reason}): {candidate_reason}"
+        ))
+    } else {
+        ReviewAdjudication::Reject(format!(
+            "{first_reviewer}: {first_reason}; confirmed by \
+             {candidate_reviewer}: {candidate_reason}"
+        ))
+    }
 }
 
 /// Router endpoint identity used for separation and durable port attribution.
@@ -2666,6 +2729,7 @@ fn local_reviewer_separation(
 async fn resolve_distinct_local_review_target(
     pg: &PgPool,
     builder: &RoutedModelAttribution,
+    additional_excluded: Option<&RoutedModelAttribution>,
 ) -> Result<crate::fleet_oneshot::ResolvedFleetTarget> {
     validate_local_routed_attribution(builder)
         .context("local builder attribution is incomplete")?;
@@ -2673,11 +2737,29 @@ async fn resolve_distinct_local_review_target(
         .ok_or_else(|| anyhow!("local builder endpoint is not canonicalizable"))?;
     let builder_model = canonical_routed_model(builder.catalog_id.as_deref(), &builder.model)
         .ok_or_else(|| anyhow!("local builder model identity is not canonicalizable"))?;
+    let additional_identity = if let Some(excluded) = additional_excluded {
+        validate_local_routed_attribution(excluded)
+            .context("additional local reviewer exclusion is incomplete")?;
+        Some((
+            excluded.deployment_id,
+            excluded.worker_name.clone(),
+            canonical_routed_model(excluded.catalog_id.as_deref(), &excluded.model)
+                .ok_or_else(|| anyhow!("additional exclusion model is not canonicalizable"))?,
+            canonical_route_endpoint(&excluded.endpoint)
+                .ok_or_else(|| anyhow!("additional exclusion endpoint is not canonicalizable"))?,
+        ))
+    } else {
+        None
+    };
+    let mut exclude_hosts = vec![builder.worker_name.clone()];
+    if let Some((_, worker, _, _)) = additional_identity.as_ref() {
+        exclude_hosts.push(worker.clone());
+    }
     let filter = RouteFilter {
         workload: Some("code".to_string()),
         require_tool_calling: false,
         min_ctx: None,
-        exclude_hosts: vec![builder.worker_name.clone()],
+        exclude_hosts,
         max_health_age_sec: Some(180),
         prefer_least_loaded: true,
         limit: 64,
@@ -2701,6 +2783,14 @@ async fn resolve_distinct_local_review_target(
         {
             continue;
         }
+        if let Some((deployment_id, _, model, endpoint)) = additional_identity.as_ref()
+            && (candidate.deployment_id == *deployment_id
+                || candidate_model.as_deref() == Some(model.as_str())
+                || canonical_route_endpoint(&candidate.endpoint).as_deref()
+                    == Some(endpoint.as_str()))
+        {
+            continue;
+        }
         match crate::fleet_oneshot::resolve_candidate_target(
             pg,
             &candidate,
@@ -2720,6 +2810,66 @@ async fn resolve_distinct_local_review_target(
             builder.endpoint
         )
     }))
+}
+
+async fn confirm_local_rejection_with_distinct_model(
+    pg: &PgPool,
+    work_item_id: Uuid,
+    prompt: &str,
+    builder: Option<&RoutedModelAttribution>,
+    first_reviewer: &RoutedModelAttribution,
+) -> Result<ReviewOutcome> {
+    let target = if let Some(builder) = builder {
+        resolve_distinct_local_review_target(pg, builder, Some(first_reviewer)).await?
+    } else {
+        resolve_distinct_local_review_target(pg, first_reviewer, None).await?
+    };
+    let started_at = chrono::Utc::now();
+    let resp = crate::fleet_oneshot::fleet_oneshot_for_ctx_with_target(
+        pg,
+        prompt,
+        None,
+        Some(REVIEW_LOCAL_CONFIRM_TIMEOUT),
+        Some("code"),
+        None,
+        None,
+        4096,
+        Some(&target),
+    )
+    .await
+    .context("cross-family local rejection confirmation")?;
+    if let Some(builder) = builder
+        && local_reviewer_separation(Some(builder), &resp) != LocalReviewerSeparation::Distinct
+    {
+        bail!("rejection confirmer is not independent of the local builder");
+    }
+    if local_reviewer_separation(Some(first_reviewer), &resp) != LocalReviewerSeparation::Distinct {
+        bail!("rejection confirmer is not independent of the first reviewer");
+    }
+
+    let attribution = RoutedModelAttribution::from(&resp);
+    let (reviewer, reviewer_port) = validate_local_routed_attribution(&attribution)
+        .context("rejection confirmer returned incomplete routed identity")?;
+    record_review_interaction(
+        pg,
+        work_item_id,
+        &reviewer,
+        prompt,
+        &resp.text,
+        i32::try_from(resp.latency_ms).ok(),
+        Some(&resp),
+    )
+    .await;
+    let (approved, reason) = crate::work_item_merge_drain::parse_review_response(&resp.text);
+    Ok(ReviewOutcome {
+        reviewer,
+        reviewer_computer: Some(resp.worker_name),
+        reviewer_port: Some(reviewer_port),
+        approved,
+        reason,
+        started_at,
+        completed_at: chrono::Utc::now(),
+    })
 }
 
 /// Observed per-reviewer review history (recent window), read from the same
@@ -2809,6 +2959,8 @@ async fn run_in_place_review(
     builder_attribution: Option<&RoutedModelAttribution>,
 ) -> Result<ReviewOutcome> {
     let prompt = build_review_prompt(item, worktree).await;
+    let mut first_rejection: Option<(String, String)> = None;
+    let mut last_confirmation_issue: Option<String> = None;
 
     if !builder_excludes_480b(builder) {
         if let Ok(permit) = GATE_480B.try_acquire() {
@@ -2817,7 +2969,7 @@ async fn run_in_place_review(
             drop(permit);
             match verdict {
                 Ok((approved, reason, reviewer, reviewer_computer, reviewer_port)) => {
-                    return Ok(ReviewOutcome {
+                    let mut outcome = ReviewOutcome {
                         reviewer,
                         reviewer_computer: Some(reviewer_computer),
                         reviewer_port,
@@ -2825,7 +2977,25 @@ async fn run_in_place_review(
                         reason,
                         started_at,
                         completed_at: chrono::Utc::now(),
-                    });
+                    };
+                    match adjudicate_review_candidate(
+                        None,
+                        &outcome.reviewer,
+                        outcome.approved,
+                        &outcome.reason,
+                    ) {
+                        ReviewAdjudication::Approve(reason) => {
+                            outcome.reason = reason;
+                            return Ok(outcome);
+                        }
+                        ReviewAdjudication::Reject(_) => {
+                            unreachable!("first verdict cannot be confirmed")
+                        }
+                        ReviewAdjudication::AwaitConfirmation(reason) => {
+                            first_rejection = Some((outcome.reviewer, outcome.reason));
+                            last_confirmation_issue = Some(reason);
+                        }
+                    }
                 }
                 Err(e) => warn!(
                     work_item_id = %item.work_item_id,
@@ -2884,7 +3054,7 @@ async fn run_in_place_review(
                 .await;
                 let (approved, reason) =
                     crate::work_item_merge_drain::parse_review_response(&res.stdout);
-                return Ok(ReviewOutcome {
+                let mut outcome = ReviewOutcome {
                     reviewer: backend,
                     reviewer_computer: Some(item.computer_name.clone()),
                     reviewer_port: None,
@@ -2892,7 +3062,31 @@ async fn run_in_place_review(
                     reason,
                     started_at,
                     completed_at: chrono::Utc::now(),
-                });
+                };
+                match adjudicate_review_candidate(
+                    first_rejection
+                        .as_ref()
+                        .map(|(reviewer, reason)| (reviewer.as_str(), reason.as_str())),
+                    &outcome.reviewer,
+                    outcome.approved,
+                    &outcome.reason,
+                ) {
+                    ReviewAdjudication::Approve(reason) => {
+                        outcome.approved = true;
+                        outcome.reason = reason;
+                        return Ok(outcome);
+                    }
+                    ReviewAdjudication::Reject(reason) => {
+                        outcome.approved = false;
+                        outcome.reason = reason;
+                        return Ok(outcome);
+                    }
+                    ReviewAdjudication::AwaitConfirmation(reason) => {
+                        first_rejection.get_or_insert((outcome.reviewer, outcome.reason));
+                        last_confirmation_issue = Some(reason);
+                        continue;
+                    }
+                }
             }
             Ok(res) => {
                 let e = anyhow!(
@@ -2926,6 +3120,7 @@ async fn run_in_place_review(
                         "local builder is missing actual routed identity; refusing local review"
                     )
                 })?,
+                None,
             )
             .await?,
         )
@@ -2982,7 +3177,7 @@ async fn run_in_place_review(
                 work_item_id = %item.work_item_id, reviewer = %resp.worker_name,
                 "work_item_dispatch: in-place review via fleet-local LLM (480b+cloud unavailable)"
             );
-            return Ok(ReviewOutcome {
+            let mut outcome = ReviewOutcome {
                 reviewer,
                 reviewer_computer: Some(resp.worker_name.clone()),
                 reviewer_port: Some(reviewer_port),
@@ -2990,7 +3185,66 @@ async fn run_in_place_review(
                 reason,
                 started_at,
                 completed_at: chrono::Utc::now(),
-            });
+            };
+            match adjudicate_review_candidate(
+                first_rejection
+                    .as_ref()
+                    .map(|(reviewer, reason)| (reviewer.as_str(), reason.as_str())),
+                &outcome.reviewer,
+                outcome.approved,
+                &outcome.reason,
+            ) {
+                ReviewAdjudication::Approve(reason) => {
+                    outcome.approved = true;
+                    outcome.reason = reason;
+                    return Ok(outcome);
+                }
+                ReviewAdjudication::Reject(reason) => {
+                    outcome.approved = false;
+                    outcome.reason = reason;
+                    return Ok(outcome);
+                }
+                ReviewAdjudication::AwaitConfirmation(_) => {
+                    first_rejection.get_or_insert((outcome.reviewer, outcome.reason));
+                    match confirm_local_rejection_with_distinct_model(
+                        pg,
+                        item.work_item_id,
+                        &prompt,
+                        builder_attribution,
+                        &reviewer_attribution,
+                    )
+                    .await
+                    {
+                        Ok(mut confirmer) => match adjudicate_review_candidate(
+                            first_rejection
+                                .as_ref()
+                                .map(|(reviewer, reason)| (reviewer.as_str(), reason.as_str())),
+                            &confirmer.reviewer,
+                            confirmer.approved,
+                            &confirmer.reason,
+                        ) {
+                            ReviewAdjudication::Approve(reason) => {
+                                confirmer.approved = true;
+                                confirmer.reason = reason;
+                                return Ok(confirmer);
+                            }
+                            ReviewAdjudication::Reject(reason) => {
+                                confirmer.approved = false;
+                                confirmer.reason = reason;
+                                return Ok(confirmer);
+                            }
+                            ReviewAdjudication::AwaitConfirmation(reason) => {
+                                last_confirmation_issue = Some(reason);
+                            }
+                        },
+                        Err(error) => {
+                            last_confirmation_issue = Some(format!(
+                                "cross-family local confirmation unavailable: {error:#}"
+                            ));
+                        }
+                    }
+                }
+            }
         }
         ff_pulse::lane_1_5::LlmHealthGate::Unhealthy(reason) => {
             warn!(
@@ -2999,6 +3253,15 @@ async fn run_in_place_review(
                 "work_item_dispatch: fleet-local reviewer failed Lane-1.5 health gate"
             );
         }
+    }
+    if let Some((reviewer, reason)) = first_rejection {
+        return Err(anyhow!(
+            "review held: unconfirmed rejection by {reviewer}: {reason}; no actionable rejection recorded{}",
+            last_confirmation_issue
+                .as_deref()
+                .map(|issue| format!("; {issue}"))
+                .unwrap_or_default()
+        ));
     }
     Err(last_err.unwrap_or_else(|| anyhow!("no in-place review backend available")))
 }
@@ -8071,24 +8334,24 @@ pub fn spawn_worktree_reaper(
 mod tests {
     use super::{
         AssignedWorkItem, DISPATCH_HOUSE_RULES, DispatchOutcome, LANE15_480B_PERMITS,
-        LocalReviewerSeparation, ReadyForReviewEvidence, ReviewerStat, WorktreeRecord,
-        affected_crate_manifests, agent_output_tail, backend_failed_without_output,
-        builder_excludes_480b, canonical_route_endpoint, canonical_routed_model,
-        check_dispatch_prerequisites, classify_completed_output, classify_dispatch_outcome,
-        collect_leftover_tmp_output, command_display, complexity_at_least_moderate,
-        contains_file_line_citation, default_clone_path, dispatch_budget_for_host,
-        dispatch_interaction_outcome, dispatch_interaction_route, dispatch_prompt,
-        dispatch_request_meta, expand_home, is_build_timeout, legacy_acceptance_sql,
-        local_failure_diagnosis_for, local_failure_diagnosis_for_attempt,
+        LocalReviewerSeparation, ReadyForReviewEvidence, ReviewAdjudication, ReviewerStat,
+        WorktreeRecord, adjudicate_review_candidate, affected_crate_manifests, agent_output_tail,
+        backend_failed_without_output, builder_excludes_480b, canonical_route_endpoint,
+        canonical_routed_model, check_dispatch_prerequisites, classify_completed_output,
+        classify_dispatch_outcome, collect_leftover_tmp_output, command_display,
+        complexity_at_least_moderate, contains_file_line_citation, default_clone_path,
+        dispatch_budget_for_host, dispatch_interaction_outcome, dispatch_interaction_route,
+        dispatch_prompt, dispatch_request_meta, expand_home, is_build_timeout,
+        legacy_acceptance_sql, local_failure_diagnosis_for, local_failure_diagnosis_for_attempt,
         local_reviewer_separation, mark_local_retest_failed, mark_local_retest_passed,
         mark_ready_for_review, mirror_repo_url, normalized_cloud_backend, order_cloud_reviewers,
         parse_cli_tokens, parse_cloud_produced_local_failure_diagnosis, primary_or_default_backend,
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
         repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
-        rewrite_github_host_alias, route_endpoint_port, same_model_family, should_attempt_lane15,
-        status_output_is_clean, synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
-        try_acquire_lane15_480b_permit, use_local_lane, validate_local_routed_attribution,
-        validate_manifest_fields,
+        reviewer_family, rewrite_github_host_alias, route_endpoint_port, same_model_family,
+        should_attempt_lane15, status_output_is_clean, synthetic_output, task_failed_alert_text,
+        task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
+        validate_local_routed_attribution, validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::{Path, PathBuf};
@@ -8760,6 +9023,52 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn review_rejection_requires_a_distinct_family_confirmation() {
+        assert_eq!(reviewer_family("local:Qwen3-Coder-30B@Sia"), "qwen");
+        assert_eq!(reviewer_family("local:zai-org_GLM-4.5-Air@Thalia"), "glm");
+
+        assert!(matches!(
+            adjudicate_review_candidate(None, "local:qwen@sia", false, "bad signature"),
+            ReviewAdjudication::AwaitConfirmation(reason)
+                if reason.contains("unconfirmed rejection")
+        ));
+        assert!(matches!(
+            adjudicate_review_candidate(
+                Some(("local:qwen@sia", "bad signature")),
+                "local:glm@thalia",
+                true,
+                "diff matches the task"
+            ),
+            ReviewAdjudication::Approve(reason)
+                if reason.contains("overturned")
+                    && reason.contains("qwen")
+                    && reason.contains("glm")
+        ));
+        assert!(matches!(
+            adjudicate_review_candidate(
+                Some(("local:qwen@sia", "missing test")),
+                "kimi",
+                false,
+                "test is absent"
+            ),
+            ReviewAdjudication::Reject(reason)
+                if reason.contains("confirmed by")
+                    && reason.contains("missing test")
+                    && reason.contains("test is absent")
+        ));
+        assert!(matches!(
+            adjudicate_review_candidate(
+                Some(("local:qwen@sia", "bad signature")),
+                "local:qwen@rihanna",
+                true,
+                "looks correct"
+            ),
+            ReviewAdjudication::AwaitConfirmation(reason)
+                if reason.contains("not a distinct reviewer family")
+        ));
     }
 
     #[test]
