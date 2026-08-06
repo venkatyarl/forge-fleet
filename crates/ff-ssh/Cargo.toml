@@ -16,3 +16,4 @@ tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 ff-core = { path = "../ff-core" }
+libc = "0.2"

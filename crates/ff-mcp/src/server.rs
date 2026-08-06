@@ -352,6 +352,12 @@ impl Default for McpServer {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
+
+    fn process_env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn make_request(method: &str, params: Option<Value>) -> JsonRpcRequest {
         JsonRpcRequest {
@@ -513,5 +519,80 @@ mod tests {
             .handle_request(make_request("notifications/cancelled", None))
             .await;
         assert!(resp.is_none());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn timed_out_ssh_does_not_close_mcp_session() {
+        // pm_board is intentionally a live-Postgres handler. Exercise the
+        // transport sequence everywhere, but only require a successful board
+        // payload when the repository's DB-test contract provides a database.
+        let has_database = std::env::var("FORGEFLEET_POSTGRES_URL").is_ok()
+            || std::env::var("FORGEFLEET_DATABASE_URL").is_ok();
+
+        let _guard = process_env_lock().lock().expect("environment test lock");
+        let dir = std::env::temp_dir().join(format!("ff-mcp-fake-ssh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("create fake ssh directory");
+        let ssh = dir.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nsleep 30 & wait\n").expect("write fake ssh");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755))
+                .expect("make fake ssh executable");
+        }
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", dir.display(), old_path.to_string_lossy());
+        // SAFETY: serialized current-thread test restores PATH before returning.
+        unsafe { std::env::set_var("PATH", &new_path) };
+
+        let server = McpServer::new();
+        let timeout_response = server
+            .handle_request(make_request(
+                "tools/call",
+                Some(json!({
+                    "name": "fleet_ssh",
+                    "arguments": {
+                        "node": "127.0.0.1",
+                        "username": "test",
+                        "command": "long model load",
+                        "timeout": 1
+                    }
+                })),
+            ))
+            .await
+            .expect("timeout returns a JSON-RPC response");
+        let timeout_error = timeout_response.error.expect("timeout is a tool error");
+        assert!(
+            timeout_error
+                .data
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("MCP transport remains available"))
+        );
+
+        let board = server
+            .handle_request(make_request(
+                "tools/call",
+                Some(json!({ "name": "pm_board", "arguments": { "limit": 1 } })),
+            ))
+            .await
+            .expect("same session returns pm_board response");
+        if has_database {
+            assert!(board.result.is_some(), "pm_board failed: {:?}", board.error);
+        } else {
+            assert!(board.result.is_some() || board.error.is_some());
+        }
+
+        let status = server
+            .handle_request(make_request(
+                "tools/call",
+                Some(json!({ "name": "fleet_status", "arguments": { "refresh": false } })),
+            ))
+            .await
+            .expect("same session returns fleet_status response");
+        assert!(status.result.is_some() || status.error.is_some());
+
+        // SAFETY: restore the serialized process environment before cleanup.
+        unsafe { std::env::set_var("PATH", old_path) };
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
