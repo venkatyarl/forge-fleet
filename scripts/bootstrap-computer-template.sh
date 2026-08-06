@@ -1070,6 +1070,15 @@ else
   report "verify" failed "gateway not healthy after 30s — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleetd; linux: systemctl --user status forgefleetd"
 fi
 
+# The MCP listener is a SEPARATE supervised service (launchd/systemd) — the
+# gateway can be healthy while MCP is down, which silently breaks every
+# desktop-CLI integration (vinny 2026-08-06: Claude Desktop 'disconnected').
+if curl -fsS -m 4 "http://127.0.0.1:50001/mcp/health" 2>/dev/null | grep -q '^ok'; then
+  report "verify_mcp" ok "mcp listener healthy on 127.0.0.1:50001"
+else
+  report "verify_mcp" failed "mcp listener not answering on 127.0.0.1:50001 — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleet-mcp; linux: systemctl --user status forgefleet-mcp"
+fi
+
 # A mid-run network flip (subnet/VLAN change — e.g. Wi-Fi re-enabled on a
 # laptop) silently kills report POSTs from here on. Detect and say it OUT
 # LOUD locally, because the report itself may not reach the leader.

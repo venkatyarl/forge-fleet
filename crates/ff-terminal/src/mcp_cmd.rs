@@ -414,11 +414,51 @@ fn upsert_mcp_server_stdio_bridge(
     server_url: &str,
     dry_run: bool,
 ) -> Result<()> {
+    // GUI apps launch with a stripped PATH (no /opt/homebrew/bin on macOS),
+    // so a bare `npx` fails to resolve AND npx's own `#!/usr/bin/env node`
+    // shebang can't find node — the server shows "disconnected" either way
+    // (vinny, Claude Desktop, 2026-08-06). Resolve the absolute npx path AND
+    // pin an explicit env.PATH covering the Node bin dir.
+    let npx = resolve_gui_binary("npx");
     let entry = json!({
-        "command": "npx",
+        "command": npx,
         "args": ["-y", "mcp-remote", server_url, "--transport", "http-only"],
+        "env": { "PATH": gui_path() },
     });
     upsert_mcp_entry(path, server_name, entry, dry_run)
+}
+
+/// PATH string for GUI-launched processes: the well-known binary dirs GUI
+/// apps miss (homebrew, local) plus the system defaults.
+fn gui_path() -> String {
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+}
+
+/// Resolve a binary for GUI-launched contexts (desktop apps get a minimal
+/// PATH): prefer the well-known absolute locations, fall back to PATH lookup,
+/// and only then to the bare name.
+fn resolve_gui_binary(name: &str) -> String {
+    let well_known = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/opt/bin",
+    ];
+    for dir in well_known {
+        let candidate = format!("{dir}/{name}");
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = format!("{dir}/{name}");
+            if std::path::Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+    }
+    name.to_string()
 }
 
 /// Insert/replace `mcpServers.<server_name>` with `entry` in a JSON config,
