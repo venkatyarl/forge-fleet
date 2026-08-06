@@ -1271,15 +1271,11 @@ impl BackupOrchestrator {
     pub async fn prune_all_local(&self) {
         // Fail-open to the SOURCE (larger) depth on a lookup error so a
         // transient DB blip can never cause over-deletion of replicas.
-        let leader = self.i_am_leader().await.unwrap_or(true);
         for kind in ["postgres", "redis", "falkordb"] {
             let cfg = load_backup_config(&self.pg, kind)
                 .await
                 .unwrap_or_else(|| BackupKindConfig::default_for(kind));
-            let am_source = match cfg.source_host.as_deref() {
-                Some(h) => h.eq_ignore_ascii_case(&self.my_node_name),
-                None => leader,
-            };
+            let am_source = self.is_backup_source(&cfg).await.unwrap_or(true);
             // The source keeps at least the DB-catalog depth so neither the
             // count NOR the age prune can orphan a `backups` row; peers hold
             // only a few disaster-recovery replicas (replica depth is disk
@@ -1302,7 +1298,7 @@ impl BackupOrchestrator {
         let wal_cfg = load_backup_config(&self.pg, "postgres_wal")
             .await
             .unwrap_or_else(|| BackupKindConfig::default_for("postgres_wal"));
-        let wal_source = leader;
+        let wal_source = self.is_backup_source(&wal_cfg).await.unwrap_or(true);
         let wal_keep = if wal_source {
             wal_cfg.retention_count.max(1) as usize
         } else {
@@ -1326,7 +1322,6 @@ impl BackupOrchestrator {
     /// Check this node's OWN backup directory and fire/resolve one durable alert
     /// per stale `(node, kind)`. Runs on every daemon, not just the leader.
     pub async fn check_local_backup_freshness(&self) {
-        let leader = self.i_am_leader().await.unwrap_or(false);
         for kind in ["postgres", "postgres_wal", "redis", "falkordb"] {
             let cfg = load_backup_config(&self.pg, kind)
                 .await
@@ -1335,7 +1330,7 @@ impl BackupOrchestrator {
                 self.resolve_stale_local_backup_alert(kind).await;
                 continue;
             }
-            match self.expected_to_hold_backup(kind, &cfg, leader).await {
+            match self.expected_to_hold_backup(kind, &cfg).await {
                 Ok(true) => {}
                 Ok(false) => {
                     self.resolve_stale_local_backup_alert(kind).await;
@@ -1380,12 +1375,8 @@ impl BackupOrchestrator {
         &self,
         kind: &str,
         cfg: &BackupKindConfig,
-        leader: bool,
     ) -> Result<bool, BackupError> {
-        let am_source = match cfg.source_host.as_deref() {
-            Some(h) => h.eq_ignore_ascii_case(&self.my_node_name),
-            None => leader,
-        };
+        let am_source = self.is_backup_source(cfg).await?;
         if am_source {
             return Ok(true);
         }
@@ -1396,34 +1387,24 @@ impl BackupOrchestrator {
                 .any(|h| h.eq_ignore_ascii_case(&self.my_node_name)));
         }
 
-        let expected: Vec<String> = if let Some(source_host) = cfg.source_host.as_deref() {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.name <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(source_host)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
+        // Match enqueue_distribution exactly: when destinations are selected
+        // automatically, exclude the node that produced the backup, not the
+        // fleet leader (the two are intentionally independent authorities).
+        let source_host = resolve_backup_source_host_for_config(&self.pg, cfg)
             .await?
-        } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> (
-                        SELECT computer_id FROM fleet_leader_state LIMIT 1
-                    )
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $1",
-            )
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
-        };
+            .ok_or_else(|| BackupError::Cmd(format!("no backup source authority for {kind}")))?;
+        let expected: Vec<String> = sqlx::query_scalar::<_, String>(
+            "SELECT c.name
+               FROM computers c
+              WHERE lower(c.name) <> lower($1)
+                AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
+              ORDER BY c.last_seen_at DESC NULLS LAST, c.name
+              LIMIT $2",
+        )
+        .bind(source_host)
+        .bind(OFFSITE_DEST_COUNT)
+        .fetch_all(&self.pg)
+        .await?;
 
         debug!(
             kind,
