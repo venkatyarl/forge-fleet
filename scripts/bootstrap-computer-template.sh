@@ -735,10 +735,20 @@ ENROLL_PAYLOAD="$(cat <<EOF
 EOF
 )"
 
-ENROLL_RESP="$(curl -fsS -m 30 -X POST \
+# Capture the HTTP status + body so a rejection tells us WHY (invalid token
+# vs transport vs server error) — with -f the body was silently discarded
+# and every failure looked identical (vinny onboarding, 2026-08-04).
+ENROLL_RESP="$(curl -sS -m 30 -X POST \
   -H "Content-Type: application/json" \
   --data "$ENROLL_PAYLOAD" \
-  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP request failed"
+  -w '\n%{http_code}' \
+  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP transport failed"
+ENROLL_STATUS="$(printf '%s' "$ENROLL_RESP" | tail -1)"
+ENROLL_RESP="$(printf '%s' "$ENROLL_RESP" | sed '$d')"
+case "$ENROLL_STATUS" in
+  2*) ;;
+  *) die "self-enroll rejected (HTTP $ENROLL_STATUS): $ENROLL_RESP" ;;
+esac
 
 say "Enrolled: $ENROLL_RESP"
 report "enroll" ok
