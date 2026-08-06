@@ -40,6 +40,10 @@ pub const ROLLOUT_CANARIES: [&str; 4] = ["beyonce", "lily", "ace", "logan"];
 pub const MAX_ROLLOUT_TARGETS: usize = 64;
 const LEASE_OWNER: &str = "ff-artifact-rollout";
 const DEFAULT_LEASE_SECONDS: i32 = 120;
+const MISSING_WORKER_STATUS: &str = "__missing_worker_registry_row__";
+const DEFAULT_RESTART_REGISTRY_GRACE: Duration = Duration::from_secs(45);
+const DEFAULT_RESTART_REGISTRY_POLL: Duration = Duration::from_secs(1);
+const DEFAULT_RESTART_REGISTRY_LEASE_MARGIN: Duration = Duration::from_secs(5);
 const RUN_CANDIDATE_SCRIPT: &str = r#"set -eu
 tx=$1; expected_sha=$2; expected_size=$3; platform=$4; provided_candidate=$5; shift 5
 base="$HOME/.forgefleet/release-rollout/candidates/$tx"
@@ -232,6 +236,9 @@ pub struct RolloutCoordinatorConfig {
     pub lease_renew_interval: Duration,
     pub canary_bake: Duration,
     pub remaining_bake: Duration,
+    pub restart_registry_grace: Duration,
+    pub restart_registry_poll: Duration,
+    pub restart_registry_lease_margin: Duration,
 }
 
 impl Default for RolloutCoordinatorConfig {
@@ -241,6 +248,9 @@ impl Default for RolloutCoordinatorConfig {
             lease_renew_interval: Duration::from_secs(30),
             canary_bake: Duration::from_secs(60),
             remaining_bake: Duration::from_secs(15),
+            restart_registry_grace: DEFAULT_RESTART_REGISTRY_GRACE,
+            restart_registry_poll: DEFAULT_RESTART_REGISTRY_POLL,
+            restart_registry_lease_margin: DEFAULT_RESTART_REGISTRY_LEASE_MARGIN,
         }
     }
 }
@@ -614,10 +624,11 @@ async fn load_pg_status(pool: &PgPool, transaction_id: Uuid) -> Result<Option<Ro
         "SELECT state.computer_id, state.computer_name, state.target_ordinal,
                 state.target_triple, state.artifact_version, state.state,
                 state.cas_revision, state.detail, c.primary_ip, c.ssh_user,
-                c.ssh_port, c.status AS computer_status, fw.status AS worker_status
+                c.ssh_port, c.status AS computer_status,
+                COALESCE(fw.status, '__missing_worker_registry_row__') AS worker_status
            FROM release_rollout_target_states state
            JOIN computers c ON c.id = state.computer_id AND c.name = state.computer_name
-           JOIN fleet_workers fw ON fw.name = c.name
+           LEFT JOIN fleet_workers fw ON fw.name = c.name
           WHERE state.transaction_id = $1
           ORDER BY state.target_ordinal",
     )
@@ -638,12 +649,12 @@ async fn load_pg_status(pool: &PgPool, transaction_id: Uuid) -> Result<Option<Ro
                 custody.holder_name_at_registration, custody.relative_path,
                 custody.first_verified_at, origin.primary_ip, origin.ssh_user,
                 origin.ssh_port, origin.status AS computer_status,
-                fw.status AS worker_status
+                COALESCE(fw.status, '__missing_worker_registry_row__') AS worker_status
            FROM release_rollout_authority_artifacts exact
            JOIN release_artifacts artifact ON artifact.id = exact.artifact_id
            JOIN release_artifact_custody custody ON custody.artifact_id = artifact.id
            JOIN computers origin ON origin.id = custody.computer_id
-           JOIN fleet_workers fw ON fw.name = origin.name
+           LEFT JOIN fleet_workers fw ON fw.name = origin.name
           WHERE exact.authority_id = $1
           ORDER BY exact.computer_id, artifact.artifact_name,
                    custody.first_verified_at, custody.computer_id",
@@ -1001,19 +1012,112 @@ fn resolve_requested_roster(
     Ok((selected, extras))
 }
 
-fn validate_live_target_readiness(status: &RolloutStatus) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveRegistryReadiness {
+    Ready,
+    RetryableRestartMismatch,
+}
+
+fn registry_status_is_live(status: &str) -> bool {
+    matches!(status, "active" | "online")
+}
+
+fn classify_live_target_readiness(status: &RolloutStatus) -> Result<LiveRegistryReadiness> {
+    validate_source_commit(&status.source_commit)?;
+    validate_status_invariants(&status.targets)?;
+    if status.transaction.expected_target_count as usize != status.targets.len() {
+        return Err(ReleaseRolloutError::Refused(
+            "rollout target state set is partial".into(),
+        ));
+    }
+    for target in &status.targets {
+        validate_target_material(&target.target, &status.source_commit)?;
+    }
+
+    let mut mismatched = Vec::new();
     for target in &status.targets {
         let endpoint = &target.target.endpoint;
-        if !matches!(endpoint.computer_status.as_str(), "active" | "online")
-            || !matches!(endpoint.worker_status.as_str(), "active" | "online")
-        {
-            return Err(ReleaseRolloutError::Refused(format!(
-                "sealed target {} is not active in both live registries",
-                endpoint.computer_name
-            )));
+        let computer_live = registry_status_is_live(&endpoint.computer_status);
+        let worker_live = endpoint.worker_status != MISSING_WORKER_STATUS
+            && registry_status_is_live(&endpoint.worker_status);
+        match (computer_live, worker_live) {
+            (true, true) => {}
+            (false, false) => {
+                return Err(ReleaseRolloutError::Refused(format!(
+                    "sealed target {} is offline in both live registries",
+                    endpoint.computer_name
+                )));
+            }
+            _ => mismatched.push(target),
         }
     }
-    Ok(())
+    if mismatched.is_empty() {
+        return Ok(LiveRegistryReadiness::Ready);
+    }
+    if mismatched.len() != 1 || status.transaction.state != "running" {
+        return Err(ReleaseRolloutError::Refused(
+            "registry mismatch is not a single running post-restart target".into(),
+        ));
+    }
+
+    let active = status
+        .targets
+        .iter()
+        .filter(|target| {
+            matches!(
+                target.state.as_str(),
+                "installing" | "verifying" | "rolling_back"
+            )
+        })
+        .collect::<Vec<_>>();
+    let target = mismatched[0];
+    if active.len() != 1
+        || active[0].target.endpoint.computer_id != target.target.endpoint.computer_id
+        || target.state != "verifying"
+    {
+        return Err(ReleaseRolloutError::Refused(
+            "registry mismatch is outside the single verifying restart phase".into(),
+        ));
+    }
+
+    let evidence = parse_evidence(target)?;
+    if evidence.phase != "rollback_proof"
+        || evidence.error.is_some()
+        || evidence.rollback_proof.is_some()
+        || evidence.health.is_some()
+        || evidence.rollback.is_some()
+    {
+        return Err(ReleaseRolloutError::Refused(
+            "verifying restart evidence phase drifted".into(),
+        ));
+    }
+    let candidate = evidence.candidate.as_ref().ok_or_else(|| {
+        ReleaseRolloutError::Refused(
+            "verifying restart target lacks durable exact candidate receipt".into(),
+        )
+    })?;
+    validate_candidate(candidate, status.transaction.id, &target.target)?;
+    let activation = evidence.activation.as_ref().ok_or_else(|| {
+        ReleaseRolloutError::Refused(
+            "verifying restart target lacks durable activation receipt".into(),
+        )
+    })?;
+    validate_activation(
+        activation,
+        status.transaction.id,
+        &target.target,
+        &status.source_commit,
+    )?;
+    Ok(LiveRegistryReadiness::RetryableRestartMismatch)
+}
+
+fn validate_live_target_readiness(status: &RolloutStatus) -> Result<()> {
+    match classify_live_target_readiness(status)? {
+        LiveRegistryReadiness::Ready => Ok(()),
+        LiveRegistryReadiness::RetryableRestartMismatch => Err(ReleaseRolloutError::Refused(
+            "sealed verifying target is still reconciling live registries".into(),
+        )),
+    }
 }
 
 fn validate_status_invariants(targets: &[RolloutTargetState]) -> Result<()> {
@@ -1386,6 +1490,82 @@ where
         }
     }
 
+    async fn wait_for_restart_registry_reconciliation(
+        &self,
+        mut status: RolloutStatus,
+        owned_lease: bool,
+    ) -> Result<RolloutStatus> {
+        let lease_token = status.transaction.lease_token;
+        let grace = self
+            .config
+            .restart_registry_grace
+            .min(DEFAULT_RESTART_REGISTRY_GRACE);
+        let mut lease_limited = false;
+        let wait_for = if owned_lease {
+            let lease_margin = self
+                .config
+                .restart_registry_lease_margin
+                .max(DEFAULT_RESTART_REGISTRY_LEASE_MARGIN);
+            let remaining = (status.transaction.lease_expires_at - Utc::now())
+                .to_std()
+                .unwrap_or(Duration::ZERO)
+                .saturating_sub(lease_margin);
+            lease_limited = remaining < grace;
+            grace.min(remaining)
+        } else {
+            grace
+        };
+        if wait_for.is_zero() {
+            return Err(if lease_limited {
+                ReleaseRolloutError::LeaseLost(
+                    "restart registry grace reached the lease safety margin".into(),
+                )
+            } else {
+                ReleaseRolloutError::Refused(
+                    "restart registries did not reconcile within the bounded grace".into(),
+                )
+            });
+        }
+
+        let deadline = tokio::time::Instant::now() + wait_for;
+        let poll = self
+            .config
+            .restart_registry_poll
+            .min(DEFAULT_RESTART_REGISTRY_POLL)
+            .max(Duration::from_millis(1));
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return Err(if lease_limited {
+                    ReleaseRolloutError::LeaseLost(
+                        "restart registry grace reached the lease safety margin".into(),
+                    )
+                } else {
+                    ReleaseRolloutError::Refused(
+                        "restart registries did not reconcile within the bounded grace".into(),
+                    )
+                });
+            }
+            tokio::time::sleep(poll.min(deadline - now)).await;
+            status = self.status(status.transaction.id).await?;
+
+            if status.transaction.lease_token != lease_token {
+                return Err(ReleaseRolloutError::LeaseLost(
+                    "restart registry grace lease identity".into(),
+                ));
+            }
+            if !owned_lease && status.transaction.lease_expires_at > Utc::now() {
+                return Err(ReleaseRolloutError::LeaseLost(
+                    "another foreground coordinator acquired the restart grace lease".into(),
+                ));
+            }
+            match classify_live_target_readiness(&status)? {
+                LiveRegistryReadiness::Ready => return Ok(status),
+                LiveRegistryReadiness::RetryableRestartMismatch => {}
+            }
+        }
+    }
+
     async fn acquire_status(
         &self,
         transaction_id: Uuid,
@@ -1393,6 +1573,22 @@ where
         owned_lease: Option<Uuid>,
     ) -> Result<RolloutStatus> {
         let mut status = self.status(transaction_id).await?;
+        if classify_live_target_readiness(&status)?
+            == LiveRegistryReadiness::RetryableRestartMismatch
+        {
+            let owns_lease = owned_lease.is_some_and(|token| {
+                token == status.transaction.lease_token
+                    && status.transaction.lease_expires_at > Utc::now()
+            });
+            if !owns_lease && status.transaction.lease_expires_at > Utc::now() {
+                return Err(ReleaseRolloutError::LeaseLost(
+                    "another foreground coordinator owns the live lease".into(),
+                ));
+            }
+            status = self
+                .wait_for_restart_registry_reconciliation(status, owns_lease)
+                .await?;
+        }
         if matches!(
             status.transaction.state.as_str(),
             "succeeded" | "failed" | "rolled_back" | "cancelled"
@@ -1459,20 +1655,34 @@ where
 
     async fn refresh_and_renew(
         &self,
-        transaction_id: Uuid,
+        transaction: &ReleaseRolloutTransactionRow,
         expected_state: &str,
     ) -> Result<RolloutStatus> {
-        let mut status = self.status(transaction_id).await?;
+        let mut status = self.status(transaction.id).await?;
         if status.transaction.state != expected_state {
             return Ok(status);
         }
-        validate_live_target_readiness(&status)?;
+        if status.transaction.lease_token != transaction.lease_token {
+            return Err(ReleaseRolloutError::LeaseLost(format!(
+                "{expected_state} loop lease identity"
+            )));
+        }
+        if classify_live_target_readiness(&status)?
+            == LiveRegistryReadiness::RetryableRestartMismatch
+        {
+            status = self
+                .wait_for_restart_registry_reconciliation(status, true)
+                .await?;
+            if status.transaction.state != expected_state {
+                return Ok(status);
+            }
+        }
         let lease_token = status.transaction.lease_token;
         let Some(renewed) = self.database.renew(&status.transaction).await? else {
             // A same-token parent transition may have won the revision CAS.
             // Adopt that authoritative state; every other renewal failure is
             // a lost fence and must stop before selecting or mutating a target.
-            let latest = self.status(transaction_id).await?;
+            let latest = self.status(transaction.id).await?;
             if latest.transaction.lease_token == lease_token
                 && latest.transaction.state != expected_state
             {
@@ -1489,7 +1699,7 @@ where
     async fn drive_running(&self, mut status: RolloutStatus) -> Result<RolloutStatus> {
         loop {
             status = self
-                .refresh_and_renew(status.transaction.id, "running")
+                .refresh_and_renew(&status.transaction, "running")
                 .await?;
             match status.transaction.state.as_str() {
                 "running" => {}
@@ -1770,7 +1980,7 @@ where
     async fn drive_rollback(&self, mut status: RolloutStatus) -> Result<RolloutStatus> {
         loop {
             status = self
-                .refresh_and_renew(status.transaction.id, "rolling_back")
+                .refresh_and_renew(&status.transaction, "rolling_back")
                 .await?;
             if status.transaction.state != "rolling_back" {
                 return Ok(status);
@@ -2729,6 +2939,10 @@ mod tests {
         fail_next_target_cas: bool,
         fail_target_cas_to: Option<String>,
         claim_calls: usize,
+        status_calls: usize,
+        registry_ready_after_status_calls: Option<usize>,
+        foreign_lease_after_status_calls: Option<usize>,
+        mutations_during_registry_mismatch: usize,
     }
 
     impl FakeDb {
@@ -2742,6 +2956,10 @@ mod tests {
                     fail_next_target_cas: false,
                     fail_target_cas_to: None,
                     claim_calls: 0,
+                    status_calls: 0,
+                    registry_ready_after_status_calls: None,
+                    foreign_lease_after_status_calls: None,
+                    mutations_during_registry_mismatch: 0,
                 })),
             }
         }
@@ -2763,9 +2981,35 @@ mod tests {
             self.inner.lock().unwrap().renew_count
         }
 
+        fn status_calls(&self) -> usize {
+            self.inner.lock().unwrap().status_calls
+        }
+
         fn claim_calls(&self) -> usize {
             self.inner.lock().unwrap().claim_calls
         }
+
+        fn reconcile_registry_after_status_calls(&self, calls: usize) {
+            self.inner.lock().unwrap().registry_ready_after_status_calls = Some(calls);
+        }
+
+        fn mutations_during_registry_mismatch(&self) -> usize {
+            self.inner
+                .lock()
+                .unwrap()
+                .mutations_during_registry_mismatch
+        }
+
+        fn acquire_foreign_lease_after_status_calls(&self, calls: usize) {
+            self.inner.lock().unwrap().foreign_lease_after_status_calls = Some(calls);
+        }
+    }
+
+    fn fake_registry_mismatch(status: &RolloutStatus) -> bool {
+        status.targets.iter().any(|target| {
+            registry_status_is_live(&target.target.endpoint.computer_status)
+                != registry_status_is_live(&target.target.endpoint.worker_status)
+        })
     }
 
     #[derive(Clone)]
@@ -2920,7 +3164,27 @@ mod tests {
         }
 
         async fn status(&self, transaction_id: Uuid) -> Result<Option<RolloutStatus>> {
-            let state = self.inner.lock().unwrap();
+            let mut state = self.inner.lock().unwrap();
+            state.status_calls += 1;
+            if state
+                .registry_ready_after_status_calls
+                .is_some_and(|calls| state.status_calls >= calls)
+            {
+                for target in &mut state.status.targets {
+                    target.target.endpoint.computer_status = "online".into();
+                    target.target.endpoint.worker_status = "online".into();
+                }
+                state.registry_ready_after_status_calls = None;
+            }
+            if state
+                .foreign_lease_after_status_calls
+                .is_some_and(|calls| state.status_calls >= calls)
+            {
+                state.status.transaction.lease_token = Uuid::new_v4();
+                state.status.transaction.lease_expires_at =
+                    Utc::now() + chrono::TimeDelta::minutes(2);
+                state.foreign_lease_after_status_calls = None;
+            }
             Ok((state.status.transaction.id == transaction_id).then(|| state.status.clone()))
         }
 
@@ -2938,6 +3202,9 @@ mod tests {
             transaction: &ReleaseRolloutTransactionRow,
         ) -> Result<Option<ReleaseRolloutTransactionRow>> {
             let mut state = self.inner.lock().unwrap();
+            if fake_registry_mismatch(&state.status) {
+                state.mutations_during_registry_mismatch += 1;
+            }
             state.renew_count += 1;
             if let Some(new_state) = state.transition_on_renew_to.take() {
                 state.status.transaction.state = new_state;
@@ -2960,6 +3227,9 @@ mod tests {
             transaction: &ReleaseRolloutTransactionRow,
         ) -> Result<Option<ReleaseRolloutTransactionRow>> {
             let mut state = self.inner.lock().unwrap();
+            if fake_registry_mismatch(&state.status) {
+                state.mutations_during_registry_mismatch += 1;
+            }
             if state.status.transaction.cas_revision != transaction.cas_revision
                 || state.status.transaction.lease_expires_at > Utc::now()
             {
@@ -2976,6 +3246,9 @@ mod tests {
             transaction: &ReleaseRolloutTransactionRow,
         ) -> Result<Option<ReleaseRolloutTransactionRow>> {
             let mut state = self.inner.lock().unwrap();
+            if fake_registry_mismatch(&state.status) {
+                state.mutations_during_registry_mismatch += 1;
+            }
             state.claim_calls += 1;
             if state.status.transaction.state != "succeeded"
                 || state.status.transaction.cas_revision != transaction.cas_revision
@@ -2997,6 +3270,9 @@ mod tests {
             new_state: &str,
         ) -> Result<Option<ReleaseRolloutTransactionRow>> {
             let mut state = self.inner.lock().unwrap();
+            if fake_registry_mismatch(&state.status) {
+                state.mutations_during_registry_mismatch += 1;
+            }
             if state.status.transaction.lease_token != transaction.lease_token
                 || state.status.transaction.cas_revision != transaction.cas_revision
                 || state.status.transaction.state != expected_state
@@ -3017,6 +3293,9 @@ mod tests {
             detail: Option<&str>,
         ) -> Result<bool> {
             let mut state = self.inner.lock().unwrap();
+            if fake_registry_mismatch(&state.status) {
+                state.mutations_during_registry_mismatch += 1;
+            }
             if state.fail_next_target_cas {
                 state.fail_next_target_cas = false;
                 return Ok(false);
@@ -3296,6 +3575,16 @@ mod tests {
         .unwrap()
     }
 
+    fn evidence_awaiting_verification(id: Uuid, target: &RolloutTarget) -> String {
+        serde_json::to_string(&TargetEvidence {
+            phase: "rollback_proof".into(),
+            candidate: Some(candidate_from_target(id, target).unwrap()),
+            activation: Some(activation_receipt(id, target)),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
     fn status(states: &[&str]) -> RolloutStatus {
         let id = Uuid::new_v4();
         let names = ["beyonce", "lily", "ace", "logan"];
@@ -3314,7 +3603,8 @@ mod tests {
                         })
                         .unwrap(),
                     ),
-                    "verifying" | "succeeded" | "failed" | "rolling_back" => {
+                    "verifying" => Some(evidence_awaiting_verification(id, &target)),
+                    "succeeded" | "failed" | "rolling_back" => {
                         Some(evidence_with_activation(id, &target))
                     }
                     "rolled_back" | "skipped" => Some(
@@ -3364,6 +3654,9 @@ mod tests {
             lease_renew_interval: Duration::from_secs(60),
             canary_bake: Duration::ZERO,
             remaining_bake: Duration::ZERO,
+            restart_registry_grace: Duration::from_millis(20),
+            restart_registry_poll: Duration::from_millis(1),
+            restart_registry_lease_margin: Duration::from_millis(5),
         }
     }
 
@@ -3826,10 +4119,209 @@ mod tests {
         assert!(matches!(
             coordinator.resume(id).await,
             Err(ReleaseRolloutError::Refused(message))
-                if message.contains("not active in both live registries")
+                if message.contains("outside the single verifying restart phase")
         ));
         assert_eq!(db.state().transaction, before);
         assert_eq!(db.renew_count(), 0);
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert!(transport.calls().is_empty());
+    }
+
+    #[test]
+    fn restart_registry_classifier_is_narrow_and_fail_closed() {
+        let ready = status(&["verifying"]);
+        assert_eq!(
+            classify_live_target_readiness(&ready).unwrap(),
+            LiveRegistryReadiness::Ready
+        );
+
+        let mut retryable = ready.clone();
+        retryable.targets[0].target.endpoint.worker_status = "offline".into();
+        assert_eq!(
+            classify_live_target_readiness(&retryable).unwrap(),
+            LiveRegistryReadiness::RetryableRestartMismatch
+        );
+        retryable.targets[0].target.endpoint.worker_status = MISSING_WORKER_STATUS.into();
+        assert_eq!(
+            classify_live_target_readiness(&retryable).unwrap(),
+            LiveRegistryReadiness::RetryableRestartMismatch
+        );
+
+        let mut both_offline = retryable.clone();
+        both_offline.targets[0].target.endpoint.computer_status = "offline".into();
+        assert!(matches!(
+            classify_live_target_readiness(&both_offline),
+            Err(ReleaseRolloutError::Refused(message)) if message.contains("offline in both")
+        ));
+
+        let mut wrong_phase = status(&["installing"]);
+        wrong_phase.targets[0].target.endpoint.worker_status = "offline".into();
+        assert!(classify_live_target_readiness(&wrong_phase).is_err());
+
+        let mut multiple_active = status(&["verifying", "installing"]);
+        multiple_active.targets[0].target.endpoint.worker_status = "offline".into();
+        assert!(matches!(
+            classify_live_target_readiness(&multiple_active),
+            Err(ReleaseRolloutError::Refused(message)) if message.contains("more than one")
+        ));
+
+        let mut material_drift = retryable.clone();
+        material_drift.targets[0].target.artifacts[0]
+            .artifact
+            .sha256 = "0".repeat(64);
+        assert!(classify_live_target_readiness(&material_drift).is_err());
+
+        let mut receipt_drift = retryable;
+        let mut evidence = parse_evidence(&receipt_drift.targets[0]).unwrap();
+        evidence.activation.as_mut().unwrap().computer_name = "other".into();
+        receipt_drift.targets[0].detail = Some(serde_json::to_string(&evidence).unwrap());
+        assert!(classify_live_target_readiness(&receipt_drift).is_err());
+    }
+
+    #[tokio::test]
+    async fn expired_resume_polls_status_only_then_takes_over_after_registry_convergence() {
+        let mut state = status(&["verifying"]);
+        state.targets[0].target.endpoint.worker_status = MISSING_WORKER_STATUS.into();
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        db.reconcile_registry_after_status_calls(2);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        let result = coordinator.resume(id).await.unwrap();
+
+        assert_eq!(result.transaction.state, "succeeded");
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert_eq!(
+            &transport.calls()[..2],
+            ["prove_rollback:beyonce", "health_bake:beyonce"]
+        );
+    }
+
+    #[tokio::test]
+    async fn verifying_restart_grace_timeout_performs_no_mutation_or_transport() {
+        let mut state = status(&["verifying"]);
+        state.targets[0].target.endpoint.computer_status = "offline".into();
+        let before = state.clone();
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let mut config = fast_config();
+        config.restart_registry_grace = Duration::from_millis(2);
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, config);
+
+        assert!(matches!(
+            coordinator.resume(id).await,
+            Err(ReleaseRolloutError::Refused(message))
+                if message.contains("bounded grace")
+        ));
+        assert_eq!(db.state(), before);
+        assert_eq!(db.renew_count(), 0);
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_verifying_restart_zero_margin_is_clamped_to_five_seconds() {
+        let mut state = status(&["verifying"]);
+        state.targets[0].target.endpoint.worker_status = "offline".into();
+        state.transaction.lease_expires_at = Utc::now() + chrono::TimeDelta::seconds(4);
+        let id = state.transaction.id;
+        let token = state.transaction.lease_token;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let mut config = fast_config();
+        config.restart_registry_lease_margin = Duration::ZERO;
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, config);
+
+        assert!(matches!(
+            coordinator.drive(id, false, Some(token)).await,
+            Err(ReleaseRolloutError::LeaseLost(message))
+                if message.contains("lease safety margin")
+        ));
+        assert_eq!(db.status_calls(), 1, "the unsafe margin must not poll");
+        assert_eq!(db.renew_count(), 0);
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn owned_live_verifying_restart_reconciles_before_one_renewal_and_progress() {
+        let mut state = status(&["verifying"]);
+        state.targets[0].target.endpoint.worker_status = MISSING_WORKER_STATUS.into();
+        state.transaction.lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(2);
+        let original = state.transaction.clone();
+        let db = FakeDb::new(state);
+        db.reconcile_registry_after_status_calls(3);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        let refreshed = coordinator
+            .refresh_and_renew(&original, "running")
+            .await
+            .unwrap();
+
+        assert_eq!(db.status_calls(), 3);
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert_eq!(db.renew_count(), 1);
+        assert!(transport.calls().is_empty());
+        assert_eq!(refreshed.transaction.lease_token, original.lease_token);
+        assert_eq!(
+            refreshed.transaction.cas_revision,
+            original.cas_revision + 1
+        );
+        assert_eq!(refreshed.targets[0].state, "verifying");
+        assert_eq!(
+            classify_live_target_readiness(&refreshed).unwrap(),
+            LiveRegistryReadiness::Ready
+        );
+
+        let completed = coordinator.drive_running(refreshed).await.unwrap();
+        assert_eq!(completed.transaction.state, "succeeded");
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert_eq!(
+            &transport.calls()[..2],
+            ["prove_rollback:beyonce", "health_bake:beyonce"]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_foreign_lease_restart_mismatch_refuses_without_poll_or_mutation() {
+        let mut state = status(&["verifying"]);
+        state.targets[0].target.endpoint.worker_status = "offline".into();
+        state.transaction.lease_expires_at = Utc::now() + chrono::TimeDelta::minutes(2);
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.resume(id).await,
+            Err(ReleaseRolloutError::LeaseLost(message))
+                if message.contains("another foreground coordinator")
+        ));
+        assert_eq!(db.renew_count(), 0);
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn foreign_takeover_during_restart_poll_stops_without_mutation_or_transport() {
+        let mut state = status(&["verifying"]);
+        state.targets[0].target.endpoint.worker_status = "offline".into();
+        let id = state.transaction.id;
+        let db = FakeDb::new(state);
+        db.acquire_foreign_lease_after_status_calls(2);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.resume(id).await,
+            Err(ReleaseRolloutError::LeaseLost(message))
+                if message.contains("restart registry grace lease identity")
+        ));
+        assert_eq!(db.renew_count(), 0);
+        assert_eq!(db.mutations_during_registry_mismatch(), 0);
         assert!(transport.calls().is_empty());
     }
 
