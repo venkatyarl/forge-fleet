@@ -9,16 +9,19 @@
 //! remain up; Pulse beats continue, so host-death alerts never fire and the
 //! failover manager's ODOWN gate never trips.
 
+use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::time::Duration;
 
 use sqlx::{PgPool, Row};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::pg_failover::{
-    ReplicaHost, lsn_lag_bytes, parse_pg_lsn, probe_replica_host, replica_probe_healthy,
+    ReplicaHost, ReplicaProbe, lsn_lag_bytes, parse_pg_lsn, probe_replica_host,
+    replica_probe_healthy,
 };
 
 /// The alert policy seeded by migration V179.
@@ -26,6 +29,14 @@ const POLICY_NAME: &str = "postgres_replica_dead";
 
 /// How often the replica health check runs.
 pub const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Promotion eligibility deliberately uses a much tighter 256 KiB limit. The
+/// operational monitor only treats lag as an outage signal when it is grossly
+/// excessive; promotion still re-evaluates the strict threshold independently.
+const MAX_OPERATIONAL_LAG_BYTES: i64 = 64 * 1024 * 1024;
+const MAX_OPERATIONAL_EVIDENCE_AGE_SECS: i64 = 300;
+const UNHEALTHY_SAMPLES_TO_DEGRADE: u8 = 3;
+const HEALTHY_SAMPLES_TO_RECOVER: u8 = 3;
 
 /// A registered Postgres replica as read from the DB.
 #[derive(Debug, Clone)]
@@ -42,6 +53,133 @@ pub struct DeadReplica {
     pub computer_id: Uuid,
     pub name: String,
     pub primary_ip: String,
+    pub reason: ReplicaUnhealthyReason,
+    pub lag_bytes: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicaUnhealthyReason {
+    ProbeFailed,
+    NotInRecovery,
+    NotReadOnly,
+    NotStreaming,
+    MissingReplayLsn,
+    MissingReplayAge,
+    InvalidReplayAge(i64),
+    StaleReplay(i64),
+    MissingReceiverAge,
+    InvalidReceiverAge(i64),
+    StaleReceiver(i64),
+    MissingLag,
+    InvalidLag(i64),
+    ExcessiveLag(i64),
+}
+
+impl fmt::Display for ReplicaUnhealthyReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProbeFailed => write!(f, "probe failed"),
+            Self::NotInRecovery => write!(f, "pg_is_in_recovery=false"),
+            Self::NotReadOnly => write!(f, "transaction_read_only=false"),
+            Self::NotStreaming => write!(f, "wal receiver not streaming"),
+            Self::MissingReplayLsn => write!(f, "replay LSN missing or invalid"),
+            Self::MissingReplayAge => write!(f, "replay age missing"),
+            Self::InvalidReplayAge(age) => write!(f, "replay age is negative ({age}s)"),
+            Self::StaleReplay(age) => write!(f, "replay stale ({age}s)"),
+            Self::MissingReceiverAge => write!(f, "receiver age missing"),
+            Self::InvalidReceiverAge(age) => write!(f, "receiver age is negative ({age}s)"),
+            Self::StaleReceiver(age) => write!(f, "receiver stale ({age}s)"),
+            Self::MissingLag => write!(f, "primary/replay lag unavailable"),
+            Self::InvalidLag(lag) => write!(f, "lag is negative ({lag} bytes)"),
+            Self::ExcessiveLag(lag) => write!(f, "lag exceeds operational limit ({lag} bytes)"),
+        }
+    }
+}
+
+fn operational_replica_health(
+    probe: Option<&ReplicaProbe>,
+    lag_bytes: Option<i64>,
+) -> Result<(), ReplicaUnhealthyReason> {
+    let probe = probe.ok_or(ReplicaUnhealthyReason::ProbeFailed)?;
+    if !probe.in_recovery {
+        return Err(ReplicaUnhealthyReason::NotInRecovery);
+    }
+    if !probe.read_only {
+        return Err(ReplicaUnhealthyReason::NotReadOnly);
+    }
+    if !probe.streaming {
+        return Err(ReplicaUnhealthyReason::NotStreaming);
+    }
+    if probe.replay_lsn.is_none() {
+        return Err(ReplicaUnhealthyReason::MissingReplayLsn);
+    }
+    match probe.replay_age_seconds {
+        None => return Err(ReplicaUnhealthyReason::MissingReplayAge),
+        Some(age) if age < 0 => return Err(ReplicaUnhealthyReason::InvalidReplayAge(age)),
+        Some(age) if age > MAX_OPERATIONAL_EVIDENCE_AGE_SECS => {
+            return Err(ReplicaUnhealthyReason::StaleReplay(age));
+        }
+        Some(_) => {}
+    }
+    match probe.receiver_age_seconds {
+        None => return Err(ReplicaUnhealthyReason::MissingReceiverAge),
+        Some(age) if age < 0 => return Err(ReplicaUnhealthyReason::InvalidReceiverAge(age)),
+        Some(age) if age > MAX_OPERATIONAL_EVIDENCE_AGE_SECS => {
+            return Err(ReplicaUnhealthyReason::StaleReceiver(age));
+        }
+        Some(_) => {}
+    }
+    match lag_bytes {
+        None => Err(ReplicaUnhealthyReason::MissingLag),
+        Some(lag) if lag < 0 => Err(ReplicaUnhealthyReason::InvalidLag(lag)),
+        Some(lag) if lag > MAX_OPERATIONAL_LAG_BYTES => {
+            Err(ReplicaUnhealthyReason::ExcessiveLag(lag))
+        }
+        Some(_) => Ok(()),
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReplicaHealthState {
+    consecutive_healthy: u8,
+    consecutive_unhealthy: u8,
+    degraded: bool,
+    last_failure: Option<ReplicaUnhealthyReason>,
+}
+
+impl ReplicaHealthState {
+    fn record_sample(&mut self, result: Result<(), ReplicaUnhealthyReason>) {
+        match result {
+            Ok(()) => {
+                self.consecutive_unhealthy = 0;
+                self.consecutive_healthy = self.consecutive_healthy.saturating_add(1);
+                if self.degraded && self.consecutive_healthy >= HEALTHY_SAMPLES_TO_RECOVER {
+                    self.degraded = false;
+                    self.last_failure = None;
+                }
+            }
+            Err(reason) => {
+                self.consecutive_healthy = 0;
+                self.consecutive_unhealthy = self.consecutive_unhealthy.saturating_add(1);
+                self.last_failure = Some(reason);
+                if !self.degraded && self.consecutive_unhealthy >= UNHEALTHY_SAMPLES_TO_DEGRADE {
+                    self.degraded = true;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ReplicaResult {
+    row: ReplicaRow,
+    healthy: bool,
+    reason: Option<ReplicaUnhealthyReason>,
+    lag_bytes: Option<i64>,
+}
+
+fn prune_health_state(states: &mut HashMap<Uuid, ReplicaHealthState>, active_ids: &HashSet<Uuid>) {
+    states.retain(|computer_id, _| active_ids.contains(computer_id));
 }
 
 /// What to do with the alert state after evaluating one tick.
@@ -56,26 +194,35 @@ pub enum AlertAction {
     NoOp,
 }
 
-/// Pure transition logic: given the current set of dead replicas and whether
-/// an unresolved alert event already exists, decide the alert action.
-pub fn decide_alert_action(current_dead: usize, has_unresolved_event: bool) -> AlertAction {
-    match (current_dead, has_unresolved_event) {
-        (0, true) => AlertAction::Resolve,
-        (0, false) => AlertAction::NoOp,
-        (_, false) => AlertAction::Fire,
-        (_, true) => AlertAction::NoOp,
+/// Pure transition logic: given the debounced dead replicas, open-event state,
+/// and configured cooldown, decide the alert action.
+pub fn decide_alert_action(
+    current_dead: usize,
+    has_unresolved_event: bool,
+    cooldown_active: bool,
+) -> AlertAction {
+    match (current_dead, has_unresolved_event, cooldown_active) {
+        (0, true, _) => AlertAction::Resolve,
+        (0, false, _) => AlertAction::NoOp,
+        (_, false, false) => AlertAction::Fire,
+        (_, false, true) | (_, true, _) => AlertAction::NoOp,
     }
 }
 
 /// Pure: which replicas are dead given probe results.
-pub fn dead_from_results(results: &[(ReplicaRow, bool)]) -> Vec<DeadReplica> {
+fn dead_from_results(results: &[ReplicaResult]) -> Vec<DeadReplica> {
     results
         .iter()
-        .filter(|(_, reachable)| !reachable)
-        .map(|(r, _)| DeadReplica {
-            computer_id: r.computer_id,
-            name: r.name.clone(),
-            primary_ip: r.primary_ip.clone(),
+        .filter(|result| !result.healthy)
+        .map(|result| DeadReplica {
+            computer_id: result.row.computer_id,
+            name: result.row.name.clone(),
+            primary_ip: result.row.primary_ip.clone(),
+            reason: result
+                .reason
+                .clone()
+                .unwrap_or(ReplicaUnhealthyReason::ProbeFailed),
+            lag_bytes: result.lag_bytes,
         })
         .collect()
 }
@@ -85,11 +232,16 @@ pub fn dead_from_results(results: &[(ReplicaRow, bool)]) -> Vec<DeadReplica> {
 pub struct ReplicaMonitorTick {
     pg: PgPool,
     my_name: String,
+    health_state: Mutex<HashMap<Uuid, ReplicaHealthState>>,
 }
 
 impl ReplicaMonitorTick {
     pub fn new(pg: PgPool, my_name: String) -> Self {
-        Self { pg, my_name }
+        Self {
+            pg,
+            my_name,
+            health_state: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Are we the live leader right now?
@@ -129,6 +281,11 @@ impl ReplicaMonitorTick {
     /// replicas so callers/tests can assert on the outcome.
     pub async fn run_once(&self) -> Result<Vec<DeadReplica>, sqlx::Error> {
         let replicas = self.list_postgres_replicas().await?;
+        let active_ids: HashSet<Uuid> = replicas.iter().map(|r| r.computer_id).collect();
+        {
+            let mut states = self.health_state.lock().await;
+            prune_health_state(&mut states, &active_ids);
+        }
         if replicas.is_empty() {
             debug!("replica_monitor: no postgres replicas registered");
             return Ok(Vec::new());
@@ -158,9 +315,19 @@ impl ReplicaMonitorTick {
             let lag_bytes = primary_lsn
                 .zip(probe.as_ref().and_then(|value| value.replay_lsn))
                 .and_then(|(primary, replay)| lsn_lag_bytes(primary, replay));
-            let healthy = probe
+            let operational_health = operational_replica_health(probe.as_ref(), lag_bytes);
+            let sample_healthy = operational_health.is_ok();
+            // Keep promotion readiness visible, but never use its deliberately
+            // strict 256 KiB lag gate as an operational outage signal.
+            let promotion_eligible = probe
                 .as_ref()
                 .is_some_and(|value| replica_probe_healthy(value, lag_bytes));
+            let (healthy, reason) = {
+                let mut states = self.health_state.lock().await;
+                let state = states.entry(r.computer_id).or_default();
+                state.record_sample(operational_health);
+                (!state.degraded, state.last_failure.clone())
+            };
             sqlx::query(
                 "UPDATE database_replicas
                     SET status = CASE
@@ -169,29 +336,54 @@ impl ReplicaMonitorTick {
                             ELSE 'degraded'
                         END,
                         lag_bytes = $2,
-                        last_sync_at = CASE WHEN $3 THEN NOW() ELSE last_sync_at END
+                        last_sync_at = CASE WHEN $4 THEN NOW() ELSE last_sync_at END
                   WHERE computer_id = $1 AND database_kind = 'postgres'
                     AND role = 'replica'",
             )
             .bind(r.computer_id)
             .bind(lag_bytes)
             .bind(healthy)
+            // Never refresh failover freshness evidence from an invalid raw
+            // sample, even during the alert's failure debounce window.
+            .bind(sample_healthy)
             .execute(&self.pg)
             .await?;
-            debug!(
-                replica = %r.name,
-                addr = %r.primary_ip,
+            if sample_healthy {
+                debug!(
+                    replica = %r.name,
+                    addr = %r.primary_ip,
+                    operationally_healthy = true,
+                    debounced_healthy = healthy,
+                    promotion_eligible,
+                    lag_bytes,
+                    "replica_monitor: deep-probed replica"
+                );
+            } else {
+                warn!(
+                    replica = %r.name,
+                    addr = %r.primary_ip,
+                    operationally_healthy = false,
+                    debounced_healthy = healthy,
+                    promotion_eligible,
+                    lag_bytes,
+                    reason = %reason.as_ref().expect("unhealthy sample records a reason"),
+                    "replica_monitor: deep probe evidence rejected"
+                );
+            }
+            results.push(ReplicaResult {
+                row: r.clone(),
                 healthy,
+                reason,
                 lag_bytes,
-                "replica_monitor: deep-probed replica"
-            );
-            results.push((r.clone(), healthy));
+            });
         }
 
         let dead = dead_from_results(&results);
 
-        let policy: Option<(Uuid, String, String)> = match sqlx::query_as(
-            "SELECT id, severity, channel FROM alert_policies WHERE name = $1 AND enabled = true",
+        let policy: Option<(Uuid, String, String, i32)> = match sqlx::query_as(
+            "SELECT id, severity, channel, cooldown_secs
+               FROM alert_policies
+              WHERE name = $1 AND enabled = true",
         )
         .bind(POLICY_NAME)
         .fetch_optional(&self.pg)
@@ -204,7 +396,7 @@ impl ReplicaMonitorTick {
             }
         };
 
-        let Some((policy_id, severity, channel)) = policy else {
+        let Some((policy_id, severity, channel, cooldown_secs)) = policy else {
             warn!(
                 dead = dead.len(),
                 "replica_monitor: {} replica(s) dead but alert policy '{}' missing/disabled — NOT alerting",
@@ -215,8 +407,13 @@ impl ReplicaMonitorTick {
         };
 
         let has_unresolved = self.has_unresolved_event(policy_id).await?;
+        let cooldown_active = if has_unresolved || dead.is_empty() {
+            false
+        } else {
+            self.cooldown_active(policy_id, cooldown_secs).await?
+        };
 
-        match decide_alert_action(dead.len(), has_unresolved) {
+        match decide_alert_action(dead.len(), has_unresolved, cooldown_active) {
             AlertAction::Fire => self.fire_alert(policy_id, &severity, &channel, &dead).await,
             AlertAction::Resolve => self.resolve_alert(policy_id).await,
             AlertAction::NoOp => {
@@ -224,6 +421,11 @@ impl ReplicaMonitorTick {
                     debug!(
                         checked = replicas.len(),
                         "replica_monitor: all replicas reachable"
+                    );
+                } else if cooldown_active {
+                    warn!(
+                        dead = dead.len(),
+                        cooldown_secs, "replica_monitor: alert suppressed by configured cooldown"
                     );
                 } else {
                     debug!(dead = dead.len(), "replica_monitor: alert already firing");
@@ -250,6 +452,28 @@ impl ReplicaMonitorTick {
         .await
     }
 
+    async fn cooldown_active(
+        &self,
+        policy_id: Uuid,
+        cooldown_secs: i32,
+    ) -> Result<bool, sqlx::Error> {
+        if cooldown_secs <= 0 {
+            return Ok(false);
+        }
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                SELECT 1 FROM alert_events
+                 WHERE policy_id = $1
+                   AND computer_id IS NULL
+                   AND fired_at >= NOW() - make_interval(secs => $2)
+            )",
+        )
+        .bind(policy_id)
+        .bind(cooldown_secs as f64)
+        .fetch_one(&self.pg)
+        .await
+    }
+
     /// Fire the `postgres_replica_dead` alert through the seeded policy's
     /// channel, then record the `alert_event` row.
     async fn fire_alert(
@@ -261,7 +485,17 @@ impl ReplicaMonitorTick {
     ) {
         let detail: Vec<String> = dead
             .iter()
-            .map(|d| format!("{} ({})", d.name, d.primary_ip))
+            .map(|d| {
+                format!(
+                    "{} ({}, reason={}, lag_bytes={})",
+                    d.name,
+                    d.primary_ip,
+                    d.reason,
+                    d.lag_bytes
+                        .map(|lag| lag.to_string())
+                        .unwrap_or_else(|| "unknown".into())
+                )
+            })
             .collect();
         let message = format!(
             "Postgres replica unhealthy: {} replica(s) failed recovery/streaming/freshness/lag evidence (detected by leader '{}'): {}",
@@ -329,6 +563,10 @@ impl ReplicaMonitorTick {
                 tokio::select! {
                     _ = ticker.tick() => {
                         if !self.is_live_leader().await {
+                            // A future leadership acquisition must build fresh
+                            // consecutive evidence instead of inheriting a
+                            // stale pre-handoff streak.
+                            self.health_state.lock().await.clear();
                             continue;
                         }
                         match self.run_once().await {
@@ -358,78 +596,188 @@ impl ReplicaMonitorTick {
 mod tests {
     use super::*;
 
+    fn healthy_probe() -> ReplicaProbe {
+        ReplicaProbe {
+            in_recovery: true,
+            read_only: true,
+            streaming: true,
+            replay_lsn: Some(1),
+            replay_lsn_text: Some("0/1".into()),
+            replay_age_seconds: Some(0),
+            receiver_age_seconds: Some(0),
+        }
+    }
+
+    fn row(id: Uuid, name: &str) -> ReplicaRow {
+        ReplicaRow {
+            computer_id: id,
+            name: name.into(),
+            primary_ip: "10.0.0.2".into(),
+            ssh_user: name.into(),
+        }
+    }
+
     #[test]
     fn decide_alert_action_transitions() {
-        // No dead, no unresolved -> NoOp
-        assert_eq!(decide_alert_action(0, false), AlertAction::NoOp);
-        // No dead, unresolved -> Resolve
-        assert_eq!(decide_alert_action(0, true), AlertAction::Resolve);
-        // Dead, no unresolved -> Fire
-        assert_eq!(decide_alert_action(2, false), AlertAction::Fire);
-        // Dead, unresolved -> NoOp (already firing)
-        assert_eq!(decide_alert_action(2, true), AlertAction::NoOp);
+        assert_eq!(decide_alert_action(0, false, false), AlertAction::NoOp);
+        assert_eq!(decide_alert_action(0, true, false), AlertAction::Resolve);
+        assert_eq!(decide_alert_action(2, false, false), AlertAction::Fire);
+        assert_eq!(decide_alert_action(2, true, false), AlertAction::NoOp);
+        assert_eq!(decide_alert_action(2, false, true), AlertAction::NoOp);
     }
 
     #[test]
-    fn dead_from_results_empty() {
-        assert!(dead_from_results(&[]).is_empty());
+    fn operational_health_accepts_async_burst_above_promotion_limit() {
+        // Deliberately above the 256 KiB promotion limit but below the
+        // separate 64 MiB operational outage limit.
+        assert_eq!(
+            operational_replica_health(Some(&healthy_probe()), Some(300 * 1024)),
+            Ok(())
+        );
     }
 
     #[test]
-    fn dead_from_results_mixed() {
-        let r1 = ReplicaRow {
-            computer_id: Uuid::nil(),
-            name: "r1".into(),
-            primary_ip: "10.0.0.2".into(),
-            ssh_user: "r1".into(),
-        };
-        let r2 = ReplicaRow {
-            computer_id: Uuid::nil(),
-            name: "r2".into(),
-            primary_ip: "10.0.0.3".into(),
-            ssh_user: "r2".into(),
-        };
-        let results = vec![(r1, true), (r2, false)];
+    fn operational_health_rejects_each_incomplete_or_unsafe_evidence_class() {
+        assert_eq!(
+            operational_replica_health(None, Some(0)),
+            Err(ReplicaUnhealthyReason::ProbeFailed)
+        );
+
+        let mut probe = healthy_probe();
+        probe.in_recovery = false;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::NotInRecovery)
+        );
+        let mut probe = healthy_probe();
+        probe.read_only = false;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::NotReadOnly)
+        );
+        let mut probe = healthy_probe();
+        probe.streaming = false;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::NotStreaming)
+        );
+        let mut probe = healthy_probe();
+        probe.replay_lsn = None;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::MissingReplayLsn)
+        );
+        let mut probe = healthy_probe();
+        probe.replay_age_seconds = None;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::MissingReplayAge)
+        );
+        let mut probe = healthy_probe();
+        probe.replay_age_seconds = Some(-1);
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::InvalidReplayAge(-1))
+        );
+        let mut probe = healthy_probe();
+        probe.replay_age_seconds = Some(301);
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::StaleReplay(301))
+        );
+        let mut probe = healthy_probe();
+        probe.receiver_age_seconds = None;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::MissingReceiverAge)
+        );
+        let mut probe = healthy_probe();
+        probe.receiver_age_seconds = Some(-1);
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::InvalidReceiverAge(-1))
+        );
+        let mut probe = healthy_probe();
+        probe.receiver_age_seconds = Some(301);
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::StaleReceiver(301))
+        );
+        assert_eq!(
+            operational_replica_health(Some(&healthy_probe()), None),
+            Err(ReplicaUnhealthyReason::MissingLag)
+        );
+        assert_eq!(
+            operational_replica_health(Some(&healthy_probe()), Some(-1)),
+            Err(ReplicaUnhealthyReason::InvalidLag(-1))
+        );
+        assert_eq!(
+            operational_replica_health(Some(&healthy_probe()), Some(MAX_OPERATIONAL_LAG_BYTES + 1)),
+            Err(ReplicaUnhealthyReason::ExcessiveLag(
+                MAX_OPERATIONAL_LAG_BYTES + 1
+            ))
+        );
+    }
+
+    #[test]
+    fn hysteresis_requires_three_failures_and_three_recoveries() {
+        let mut state = ReplicaHealthState::default();
+        for _ in 0..2 {
+            state.record_sample(Err(ReplicaUnhealthyReason::ProbeFailed));
+            assert!(!state.degraded);
+        }
+        state.record_sample(Err(ReplicaUnhealthyReason::ProbeFailed));
+        assert!(state.degraded);
+
+        for _ in 0..2 {
+            state.record_sample(Ok(()));
+            assert!(state.degraded);
+        }
+        state.record_sample(Ok(()));
+        assert!(!state.degraded);
+        assert_eq!(state.last_failure, None);
+    }
+
+    #[test]
+    fn opposite_sample_resets_the_pending_streak() {
+        let mut state = ReplicaHealthState::default();
+        state.record_sample(Err(ReplicaUnhealthyReason::ProbeFailed));
+        state.record_sample(Err(ReplicaUnhealthyReason::ProbeFailed));
+        state.record_sample(Ok(()));
+        state.record_sample(Err(ReplicaUnhealthyReason::ProbeFailed));
+        assert_eq!(state.consecutive_unhealthy, 1);
+        assert!(!state.degraded);
+    }
+
+    #[test]
+    fn dead_result_preserves_reason_and_lag() {
+        let id = Uuid::new_v4();
+        let results = vec![ReplicaResult {
+            row: row(id, "duncan"),
+            healthy: false,
+            reason: Some(ReplicaUnhealthyReason::ExcessiveLag(70_000_000)),
+            lag_bytes: Some(70_000_000),
+        }];
         let dead = dead_from_results(&results);
         assert_eq!(dead.len(), 1);
-        assert_eq!(dead[0].name, "r2");
-        assert_eq!(dead[0].primary_ip, "10.0.0.3");
+        assert_eq!(dead[0].computer_id, id);
+        assert_eq!(
+            dead[0].reason,
+            ReplicaUnhealthyReason::ExcessiveLag(70_000_000)
+        );
+        assert_eq!(dead[0].lag_bytes, Some(70_000_000));
     }
 
     #[test]
-    fn dead_from_results_all_healthy() {
-        let r1 = ReplicaRow {
-            computer_id: Uuid::nil(),
-            name: "r1".into(),
-            primary_ip: "10.0.0.2".into(),
-            ssh_user: "r1".into(),
-        };
-        let r2 = ReplicaRow {
-            computer_id: Uuid::nil(),
-            name: "r2".into(),
-            primary_ip: "10.0.0.3".into(),
-            ssh_user: "r2".into(),
-        };
-        let results = vec![(r1, true), (r2, true)];
-        assert!(dead_from_results(&results).is_empty());
-    }
-
-    #[test]
-    fn dead_from_results_both_dead() {
-        let r1 = ReplicaRow {
-            computer_id: Uuid::nil(),
-            name: "r1".into(),
-            primary_ip: "10.0.0.2".into(),
-            ssh_user: "r1".into(),
-        };
-        let r2 = ReplicaRow {
-            computer_id: Uuid::nil(),
-            name: "r2".into(),
-            primary_ip: "10.0.0.3".into(),
-            ssh_user: "r2".into(),
-        };
-        let results = vec![(r1, false), (r2, false)];
-        let dead = dead_from_results(&results);
-        assert_eq!(dead.len(), 2);
+    fn state_pruning_keeps_only_registered_replica_ids() {
+        let keep = Uuid::new_v4();
+        let remove = Uuid::new_v4();
+        let mut states = HashMap::from([
+            (keep, ReplicaHealthState::default()),
+            (remove, ReplicaHealthState::default()),
+        ]);
+        prune_health_state(&mut states, &HashSet::from([keep]));
+        assert_eq!(states.len(), 1);
+        assert!(states.contains_key(&keep));
     }
 }
