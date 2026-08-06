@@ -3889,7 +3889,14 @@ mod computer_reachability_tests {
         assert!(computer_reachable("127.0.0.1", port).await);
 
         drop(listener);
-        assert!(!computer_reachable("127.0.0.1", port).await);
+
+        let reserved_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let reserved_port = reserved_socket.local_addr().unwrap().port();
+
+        assert!(!computer_reachable("127.0.0.1", reserved_port).await);
     }
 }
 
