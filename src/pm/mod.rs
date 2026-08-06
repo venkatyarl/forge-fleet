@@ -194,8 +194,6 @@ pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) ->
 
     for (_, item) in ready {
         // New logic for pick score: apply blocked_by_count as a negative factor.
-        let age = now.signed_duration_since(item.created_at);
-        let age_hours = age.num_seconds() as f64 / 3600.0;
         let pick_score = compute_pick_score(item, now);
 
         if let Some(idx) = available
@@ -206,7 +204,7 @@ pub fn scheduler_tick(items: &[WorkItem], slots: &[Slot], now: DateTime<Utc>) ->
             assignments.push(Assignment {
                 item_id: item.id.clone(),
                 slot_id: slot.id.clone(),
-                pick_score: pick_score,
+                pick_score,
             });
         }
     }

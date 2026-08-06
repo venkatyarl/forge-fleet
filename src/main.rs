@@ -2228,7 +2228,7 @@ async fn drain_subsystem_tasks(
     let abort_handles: Vec<_> = tasks.iter().map(JoinHandle::abort_handle).collect();
     let mut joins = JoinSet::new();
     for task in tasks {
-        joins.spawn(async move { task.await });
+        joins.spawn(task);
     }
 
     let graceful_result = timeout(graceful_timeout, async {
