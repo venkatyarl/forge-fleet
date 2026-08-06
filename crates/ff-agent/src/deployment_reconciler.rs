@@ -16,7 +16,6 @@
 //! survives a missing process and this reconciler reads it.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Canonical inference ports per the fleet port registry ([[canonical-ports]]):
 /// llama.cpp / mlx slots are 55000-55010, vllm uses 51001 / 51003, ollama 11434.
@@ -245,11 +244,11 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             // adoption authority.
             // Path-consistency, not strict library-id equality: a model can
             // legitimately have BOTH a directory library row and a file row
-            // inside it (scanner artifacts), and `match_library_to_path`
-            // prefers the exact-file row while the deployment references the
-            // directory row — id equality then rejects our own process
-            // forever. Compare the deployment's library path against the live
-            // process's model path the same way `unload_model` does.
+            // inside it (scanner artifacts), while the deployment references
+            // the directory row — choosing another matching row would reject
+            // our own process forever. Compare the deployment's persisted
+            // library path against the live process's model path the same way
+            // `unload_model` does.
             let existing_lib_path = existing
                 .library_id
                 .as_deref()
@@ -779,35 +778,6 @@ async fn list_deployments_with_desired_state(
     .map_err(|e| format!("list deployments: {e}"))
 }
 
-/// Pick the best-matching library row for a running process's model path.
-/// Returns (library_id, catalog_id) if we find one.
-fn match_library_to_path(
-    libs: &[ff_db::ModelLibraryRow],
-    model_path: &str,
-) -> (Option<String>, Option<String>) {
-    if let Some(exact) = libs.iter().find(|r| r.file_path == model_path) {
-        return (Some(exact.id.clone()), Some(exact.catalog_id.clone()));
-    }
-    // A deployment whose model path lives INSIDE a library directory matches
-    // that library. Use component-wise `Path::starts_with` ONLY — a byte-wise
-    // `str::starts_with` mis-attributes across models that merely share a string
-    // prefix (e.g. a deployment under ".../qwen3-coder-30b" byte-starts-with a
-    // ".../qwen3" library). Skip empty library paths, which `starts_with` would
-    // otherwise treat as a prefix of every path.
-    let path = Path::new(model_path);
-    if let Some(by_prefix) = libs
-        .iter()
-        .filter(|r| !r.file_path.is_empty())
-        .find(|r| path.starts_with(&r.file_path))
-    {
-        return (
-            Some(by_prefix.id.clone()),
-            Some(by_prefix.catalog_id.clone()),
-        );
-    }
-    (None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,39 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn match_library_exact_path_wins() {
-        let libs = vec![lib("id-a", "qwen3"), lib("id-b", "qwen3-coder-30b")];
-        let (lib_id, cat) = match_library_to_path(&libs, "/home/duncan/models/qwen3-coder-30b");
-        assert_eq!(lib_id.as_deref(), Some("id-b"));
-        assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
-    }
-
-    #[test]
-    fn match_library_dir_prefix_matches_weights_inside() {
-        // A deployment pointed at a file inside the library dir resolves to it.
-        let libs = vec![lib("id-b", "qwen3-coder-30b")];
-        let (lib_id, _) = match_library_to_path(
-            &libs,
-            "/home/duncan/models/qwen3-coder-30b/model-00001.safetensors",
-        );
-        assert_eq!(lib_id.as_deref(), Some("id-b"));
-    }
-
-    #[test]
-    fn match_library_does_not_confuse_string_prefix_models() {
-        // Regression: ".../qwen3-coder-30b/x" byte-starts-with the ".../qwen3"
-        // library path, but they are different models. Component-wise matching
-        // must resolve to qwen3-coder-30b, never qwen3 (listed first).
-        let libs = vec![lib("id-a", "qwen3"), lib("id-b", "qwen3-coder-30b")];
-        let (lib_id, cat) = match_library_to_path(
-            &libs,
-            "/home/duncan/models/qwen3-coder-30b/model.safetensors",
-        );
-        assert_eq!(lib_id.as_deref(), Some("id-b"));
-        assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
-    }
-
-    #[test]
     fn evict_deletes_row_only_on_owning_node() {
         // Owning node (case-insensitive, like the CLI --node comparison) may
         // delete the row after stopping the unit/listener.
@@ -999,21 +936,5 @@ mod tests {
         // A remote row is only retired — its own reconciler completes the
         // evict, so a still-running process is never re-adopted as 'active'.
         assert!(!evict_deletes_row("sia", "duncan"));
-    }
-
-    #[test]
-    fn match_library_empty_path_never_matches() {
-        if std::env::var("FORGEFLEET_POSTGRES_URL").is_err()
-            && std::env::var("FORGEFLEET_DATABASE_URL").is_err()
-        {
-            return;
-        }
-        let mut l = lib("id-empty", "weird");
-        l.file_path = String::new();
-        let libs = vec![l];
-        assert_eq!(
-            match_library_to_path(&libs, "/home/duncan/models/anything"),
-            (None, None)
-        );
     }
 }
