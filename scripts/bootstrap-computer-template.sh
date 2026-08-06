@@ -553,6 +553,37 @@ fi
 # missing so a fresh machine is fully usable, not just CLI-wired. The Codex
 # brew cask is the terminal CLI (already handled above) — OpenAI ships no
 # separate desktop app cask.
+
+# Migrate npm-global cloud CLIs to their native installers. npm-global
+# installs can't self-update when the global node_modules is root-owned
+# (adele, 2026-08) and the npm claude package is deprecated. The native
+# installers live in ~/.local and self-update; section 0 already puts
+# ~/.local/bin first in PATH so the native binary wins immediately.
+migrate_native() {
+  local tool="$1" url="$2"
+  local active
+  active="$(run_as_user bash -lc "command -v $tool" 2>/dev/null || true)"
+  [ -n "$active" ] || return 0
+  case "$active" in
+    "$USER_HOME/.local/bin/"*) return 0 ;;
+  esac
+  if run_as_user bash -lc "npm ls -g --depth=0 2>/dev/null | grep -qi $tool"; then
+    if run_as_user bash -lc "curl -fsSL $url | bash"; then
+      report "cli_migrate" ok "$tool migrated to native installer"
+    else
+      report "cli_migrate" warn "$tool native migration failed"
+    fi
+  fi
+}
+migrate_native claude https://claude.ai/install.sh
+migrate_native codex https://chatgpt.com/codex/install.sh
+
+# Desktop clients (macOS): install the desktop apps when missing so a fresh
+# machine is fully usable, not just CLI-wired. All three casks auto-update:
+#   claude  — Anthropic's Claude desktop
+#   kimi    — Moonshot's Kimi desktop
+#   chatgpt — OpenAI's desktop app; Codex's desktop mode lives here now (the
+#             standalone Codex desktop app was merged into it, July 2026)
 if [ "$OS_ID" = "macos" ]; then
   if [ ! -d "/Applications/Claude.app" ]; then
     run_as_user bash -lc 'brew install --cask claude' \
