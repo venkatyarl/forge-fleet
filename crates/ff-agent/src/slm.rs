@@ -188,7 +188,7 @@ fn validate_model(path: &Path) -> Result<(), String> {
 
 fn quantization_from_name(path: &Path) -> Option<String> {
     let name = path.file_stem()?.to_str()?.to_ascii_uppercase();
-    name.split(|ch: char| ch == '-' || ch == '.')
+    name.split(['-', '.'])
         .find(|part| {
             part.strip_prefix('Q')
                 .or_else(|| part.strip_prefix("IQ"))

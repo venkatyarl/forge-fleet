@@ -227,14 +227,11 @@ fn render_value(value: &Value, out: &mut String) {
         .get("message")
         .or_else(|| value.get("payload"))
         .unwrap_or(value);
-    let role = payload
-        .get("role")
-        .and_then(Value::as_str)
-        .or_else(|| match kind {
-            "user" => Some("user"),
-            "assistant" | "response_item" => Some("assistant"),
-            _ => None,
-        });
+    let role = payload.get("role").and_then(Value::as_str).or(match kind {
+        "user" => Some("user"),
+        "assistant" | "response_item" => Some("assistant"),
+        _ => None,
+    });
     if let Some(content) = payload.get("content").or_else(|| payload.get("text")) {
         let mut rendered = String::new();
         flatten_content(content, &mut rendered);
@@ -357,7 +354,10 @@ fn write_parts(target: &Path, markdown: &str) -> Result<()> {
             end -= 1;
         }
         let part_path = split_dir.join(format!("{stem}-{part}.md"));
-        atomic_write(&part_path, markdown[start..end].as_bytes())?;
+        let chunk = markdown
+            .get(start..end)
+            .expect("chunk bounds must remain on UTF-8 character boundaries");
+        atomic_write(&part_path, chunk.as_bytes())?;
         start = end;
         part += 1;
     }
@@ -485,5 +485,25 @@ mod tests {
         assert!(is_system_reminder(
             &serde_json::json!({"content":"<system-reminder>x"})
         ));
+    }
+
+    #[test]
+    fn split_parts_preserve_utf8_across_the_size_boundary() {
+        let dir = tempfile::tempdir().expect("temporary export directory");
+        let target = dir.path().join("session.md");
+        let markdown = format!("{}🚀tail", "a".repeat(PART_BYTES - 1));
+
+        write_parts(&target, &markdown).expect("split unicode export");
+
+        let mut parts = fs::read_dir(dir.path().join("session"))
+            .expect("split directory")
+            .map(|entry| entry.expect("split entry").path())
+            .collect::<Vec<_>>();
+        parts.sort();
+        let restored = parts
+            .iter()
+            .map(|path| fs::read_to_string(path).expect("valid UTF-8 split part"))
+            .collect::<String>();
+        assert_eq!(restored, markdown);
     }
 }

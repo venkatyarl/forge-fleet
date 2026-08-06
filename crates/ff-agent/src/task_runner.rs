@@ -49,7 +49,6 @@ fn shell_task_capabilities(command: &str, capabilities: &[String]) -> Vec<String
         .map(str::to_string)
         .collect();
     let first = command
-        .trim_start()
         .split_whitespace()
         .next()
         .unwrap_or_default()

@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Jira site configuration used when polling or transitioning issues.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct JiraConfig {
     /// JQL query that defines the monitored queue.
     pub queue_jql: String,
@@ -35,15 +35,6 @@ impl JiraConfig {
             "Jira project key must not be empty"
         );
         Ok(())
-    }
-}
-
-impl Default for JiraConfig {
-    fn default() -> Self {
-        Self {
-            queue_jql: String::new(),
-            project_key: String::new(),
-        }
     }
 }
 

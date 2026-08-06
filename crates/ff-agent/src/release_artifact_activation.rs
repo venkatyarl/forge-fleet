@@ -3586,7 +3586,7 @@ fn last_journal_state(path: &Path) -> Result<Option<String>> {
     raw.lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| serde_json::from_str::<JournalEvent>(line).map(|event| event.state))
-        .last()
+        .next_back()
         .transpose()
         .map_err(Into::into)
 }

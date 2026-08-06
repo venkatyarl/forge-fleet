@@ -45,6 +45,15 @@ trait DigestSender: Send + Sync {
 
 struct TelegramDigestSender;
 
+type DueDigestRow = (
+    String,
+    String,
+    String,
+    Option<Vec<u8>>,
+    Option<DateTime<Utc>>,
+    DateTime<Utc>,
+);
+
 #[async_trait]
 impl DigestSender for TelegramDigestSender {
     async fn send(
@@ -255,14 +264,7 @@ async fn run_once_with_sender(pg: &PgPool, sender: &dyn DigestSender) -> Result<
     // attempt, not to project_digest_configs.last_sent_at. `sending` is itself
     // permanently fail-closed after a crash; there is intentionally no timer
     // that can race an active multi-message Telegram delivery.
-    let due: Vec<(
-        String,
-        String,
-        String,
-        Option<Vec<u8>>,
-        Option<DateTime<Utc>>,
-        DateTime<Utc>,
-    )> = sqlx::query_as(
+    let due: Vec<DueDigestRow> = sqlx::query_as(
         "SELECT id, project_id, title, logo_png, last_sent_at, clock_timestamp() \
            FROM project_digest_configs c \
           WHERE (c.enabled AND (c.last_sent_at IS NULL \
@@ -383,7 +385,7 @@ async fn run_once_with_sender(pg: &PgPool, sender: &dyn DigestSender) -> Result<
         match outcome {
             crate::telegram::TelegramDigestOutcome::Acknowledged { messages } => {
                 let acknowledgement = serde_json::to_value(
-                    &messages
+                    messages
                         .iter()
                         .map(|message| {
                             serde_json::json!({
@@ -724,7 +726,7 @@ async fn build_project_digest_window(
     if !failures.is_empty() {
         msg.push_str("\n❌ Newly failed since last update (still failing):\n");
         for (title, reason) in &failures {
-            msg.push_str(&format!("• {} — {}\n", title, reason));
+            msg.push_str(&format!("• {title} — {reason}\n"));
         }
     }
 

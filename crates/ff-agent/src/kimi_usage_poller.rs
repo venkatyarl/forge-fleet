@@ -206,7 +206,7 @@ pub fn parse_kimi_usages(body: &str) -> Result<KimiBudgetUpdate> {
                 // Exhausted when nothing remains. Prefer the explicit
                 // `remaining`; fall back to limit-used if that's all we have.
                 let effective_remaining = remaining
-                    .or_else(|| match (limit, used) {
+                    .or(match (limit, used) {
                         (Some(l), Some(u)) => Some(l - u),
                         _ => None,
                     })

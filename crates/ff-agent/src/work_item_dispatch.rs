@@ -309,8 +309,7 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
                 }
                 Ok(Err(error)) => Err(error),
                 Err(_) => Err(anyhow!(
-                    "max-build-duration exceeded after {}s; build cancelled",
-                    MAX_BUILD_DURATION_SECS
+                    "max-build-duration exceeded after {MAX_BUILD_DURATION_SECS}s; build cancelled"
                 )),
             };
             if let Err(e) = result {
@@ -662,9 +661,9 @@ async fn assigned_work_items(
                 repo_url
                     .as_deref()
                     .map(|url| default_clone_path(r.get::<i32, _>("slot"), url))
-                    .or_else(|| local_bound_path.filter(&is_for_this_node))
-                    .or_else(|| metadata_repo_path.filter(&is_for_this_node))
-                    .or_else(|| bound_repo_path.filter(&is_for_this_node))
+                    .or_else(|| local_bound_path.filter(is_for_this_node))
+                    .or_else(|| metadata_repo_path.filter(is_for_this_node))
+                    .or_else(|| bound_repo_path.filter(is_for_this_node))
                     .unwrap_or_else(|| PathBuf::from(fallback_repo_path))
             };
             Ok(AssignedWorkItem {
@@ -1639,8 +1638,7 @@ fn parse_cloud_produced_local_failure_diagnosis(
         .context("local-failure diagnosis is missing a non-empty summary")?;
     if summary.chars().count() > LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS {
         bail!(
-            "local-failure diagnosis summary exceeds {} characters",
-            LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS
+            "local-failure diagnosis summary exceeds {LOCAL_FAILURE_DIAGNOSIS_MAX_CHARS} characters"
         );
     }
     Ok(CloudProducedLocalFailureDiagnosis {

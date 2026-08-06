@@ -1137,7 +1137,7 @@ fn named_function_range(
 }
 
 fn prioritize_named_function_range(
-    ranges: &mut Vec<(usize, usize)>,
+    ranges: &mut [(usize, usize)],
     lines: &[&str],
     identifiers: &[String],
     test_function: bool,
@@ -2074,7 +2074,7 @@ fn correction_context(repo_path: &Path, response: &str, edits: &[Edit]) -> Strin
             .saturating_sub(char_count(&header))
             .min(CODEGEN_CORRECTION_FILE_CHARS);
 
-        let abs = repo_path.join(&rel);
+        let abs = repo_path.join(rel);
         match fs::read_to_string(&abs) {
             Ok(content) => {
                 let (excerpt, truncated) =

@@ -284,20 +284,12 @@ impl SshKeyManager {
         let gen_cmd = format!(
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
              rm -f ~/.ssh/id_ed25519.new ~/.ssh/id_ed25519.new.pub && \
-             ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new -C '{user}@{name}-rotated' >/dev/null && \
-             cat ~/.ssh/id_ed25519.new.pub",
-            user = target_ssh_user,
-            name = target_name
+             ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new -C '{target_ssh_user}@{target_name}-rotated' >/dev/null && \
+             cat ~/.ssh/id_ed25519.new.pub"
         );
 
         let gen_output = self
-            .ssh_exec(
-                &target_ssh_user,
-                &target_host,
-                target_ssh_port,
-                &gen_cmd,
-                60,
-            )
+            .ssh_exec(&target_ssh_user, target_host, target_ssh_port, &gen_cmd, 60)
             .await?;
         let new_pubkey = gen_output.trim().to_string();
 
@@ -398,7 +390,7 @@ impl SshKeyManager {
             let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
 
             let peer_host = peer_ip.as_deref().unwrap_or(&peer_name);
-            let peer_dest = ssh_dest(&peer_ssh_user, &peer_host);
+            let peer_dest = ssh_dest(&peer_ssh_user, peer_host);
             let peer_port_args = ssh_port_args(peer_ssh_port);
 
             let verify_cmd = format!(
@@ -413,7 +405,7 @@ impl SshKeyManager {
                 match self
                     .ssh_exec(
                         &target_ssh_user,
-                        &target_host,
+                        target_host,
                         target_ssh_port,
                         &verify_cmd,
                         20,
@@ -441,19 +433,13 @@ impl SshKeyManager {
                         chmod 600 ~/.ssh/id_ed25519 && \
                         chmod 644 ~/.ssh/id_ed25519.pub && \
                         echo swapped";
-        self.ssh_exec(
-            &target_ssh_user,
-            &target_host,
-            target_ssh_port,
-            swap_cmd,
-            20,
-        )
-        .await
-        .map_err(|e| {
-            SshError::RotationAborted(format!(
-                "failed to swap new key into primary slot on {target_name}: {e}"
-            ))
-        })?;
+        self.ssh_exec(&target_ssh_user, target_host, target_ssh_port, swap_cmd, 20)
+            .await
+            .map_err(|e| {
+                SshError::RotationAborted(format!(
+                    "failed to swap new key into primary slot on {target_name}: {e}"
+                ))
+            })?;
 
         // 9. Scrub the old public key from every peer.
         if let Some((old_pubkey, old_fp)) = old_key {
@@ -512,7 +498,7 @@ impl SshKeyManager {
         if let Err(e) = self
             .ssh_exec(
                 &target_ssh_user,
-                &target_host,
+                target_host,
                 target_ssh_port,
                 cleanup_cmd,
                 15,

@@ -474,6 +474,15 @@ pub struct LoadResult {
     pub model_path: String,
 }
 
+type IncumbentDeploymentRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    String,
+);
+
 /// A running inference process detected on this host.
 #[derive(Debug, Clone)]
 pub struct RunningProcess {
@@ -622,14 +631,7 @@ async fn load_model_with_authority(
         let mut expected_deployment: Option<ExpectedDeployment> = None;
         // desired_state is durable placement intent. A stale health snapshot or
         // an unreachable endpoint is never permission to overwrite that intent.
-        let incumbent: Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            String,
-        )> = sqlx::query_as(
+        let incumbent: Option<IncumbentDeploymentRow> = sqlx::query_as(
             "SELECT id::text, library_id::text, catalog_id, pid,
                     process_start_marker, desired_state
                FROM fleet_model_deployments
@@ -2479,7 +2481,7 @@ pub(crate) fn process_start_marker(pid: u32) -> Option<String> {
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let after_comm = stat.rsplit_once(')')?.1.trim();
-        return after_comm.split_whitespace().nth(19).map(String::from);
+        after_comm.split_whitespace().nth(19).map(String::from)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -2984,7 +2986,7 @@ fn current_model_memlock_limit_bytes() -> u64 {
     if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
         return 0;
     }
-    bounded_model_memlock_bytes(limit.rlim_cur as u64, limit.rlim_max as u64)
+    bounded_model_memlock_bytes(limit.rlim_cur, limit.rlim_max)
 }
 
 #[cfg(not(unix))]

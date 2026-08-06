@@ -66,7 +66,9 @@ static MISSING_LIMIT_LOGGED: AtomicBool = AtomicBool::new(false);
 /// budget. `None` when the limit is missing/non-positive or the spend isn't a
 /// finite number (can't form a ratio).
 pub fn monthly_pct_from_spend(spent_usd: f64, monthly_limit_usd: f64) -> Option<i16> {
-    if !(monthly_limit_usd > 0.0) || !spent_usd.is_finite() {
+    if monthly_limit_usd.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+        || !spent_usd.is_finite()
+    {
         return None;
     }
     let pct = (spent_usd.max(0.0) / monthly_limit_usd * 100.0).round();
@@ -271,9 +273,7 @@ async fn poll_codex_usage_once_at(pool: &PgPool, now: DateTime<Utc>) -> Result<b
 
     let Ok(monthly_limit_usd) = limit_raw.trim().parse::<f64>() else {
         return Err(anyhow::anyhow!(
-            "codex usage poller: {} is not a number: {:?}",
-            MONTHLY_LIMIT_SECRET,
-            limit_raw
+            "codex usage poller: {MONTHLY_LIMIT_SECRET} is not a number: {limit_raw:?}"
         ));
     };
 
@@ -322,6 +322,8 @@ mod tests {
         // No/invalid limit → cannot form a ratio.
         assert_eq!(monthly_pct_from_spend(10.0, 0.0), None);
         assert_eq!(monthly_pct_from_spend(10.0, -1.0), None);
+        assert_eq!(monthly_pct_from_spend(10.0, f64::NAN), None);
+        assert_eq!(monthly_pct_from_spend(10.0, f64::INFINITY), Some(0));
         // Non-finite spend → None (never panics).
         assert_eq!(monthly_pct_from_spend(f64::NAN, 100.0), None);
         assert_eq!(monthly_pct_from_spend(f64::INFINITY, 100.0), None);
