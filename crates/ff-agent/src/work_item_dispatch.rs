@@ -1223,13 +1223,15 @@ async fn dispatch_one(
         &pg,
         &item,
         &worker_name,
-        &backend_used,
-        builder_attribution.as_ref(),
-        &dispatch_result,
-        dispatch_outcome,
-        deliverable_diff,
-        deliverable_commits,
-        started.elapsed(),
+        DispatchInteractionEvidence {
+            backend: &backend_used,
+            builder_attribution: builder_attribution.as_ref(),
+            result: &dispatch_result,
+            outcome: dispatch_outcome,
+            deliverable_diff,
+            deliverable_commits,
+            elapsed: started.elapsed(),
+        },
     )
     .await;
 
@@ -4487,18 +4489,31 @@ pub fn parse_cli_tokens(output: &str) -> i32 {
 /// Record a dispatch turn in `ff_interactions` (training data). Best-effort —
 /// never fails the dispatch. `ff cli` is a thin pass-through that doesn't log,
 /// so the dispatch logs its own request/response here.
+struct DispatchInteractionEvidence<'a> {
+    backend: &'a str,
+    builder_attribution: Option<&'a RoutedModelAttribution>,
+    result: &'a Result<Output>,
+    outcome: DispatchOutcome,
+    deliverable_diff: bool,
+    deliverable_commits: bool,
+    elapsed: Duration,
+}
+
 async fn record_dispatch_interaction(
     pg: &PgPool,
     item: &AssignedWorkItem,
     worker_name: &str,
-    backend: &str,
-    builder_attribution: Option<&RoutedModelAttribution>,
-    result: &Result<Output>,
-    dispatch_outcome: DispatchOutcome,
-    deliverable_diff: bool,
-    deliverable_commits: bool,
-    elapsed: Duration,
+    evidence: DispatchInteractionEvidence<'_>,
 ) {
+    let DispatchInteractionEvidence {
+        backend,
+        builder_attribution,
+        result,
+        outcome: dispatch_outcome,
+        deliverable_diff,
+        deliverable_commits,
+        elapsed,
+    } = evidence;
     let request_text = dispatch_prompt(item);
     let dispatch_outcome = if result.is_err() {
         DispatchOutcome::FailedNoDiff

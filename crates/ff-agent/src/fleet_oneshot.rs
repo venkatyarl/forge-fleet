@@ -56,6 +56,15 @@ pub struct FleetOneshot {
     pub tokens_out: i32,
 }
 
+#[derive(Clone, Copy)]
+struct CompletionDispatchRequest<'a> {
+    client: &'a reqwest::Client,
+    prompt: &'a str,
+    system: Option<&'a str>,
+    workload: WorkloadClass,
+    budget: CompletionBudget,
+}
+
 /// Why an endpoint/model pair was selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -749,19 +758,18 @@ pub async fn fleet_oneshot_for_ctx_with_target(
         .timeout(timeout.unwrap_or(Duration::from_secs(180)))
         .build()
         .map_err(|e| anyhow!("build http client: {e}"))?;
+    let dispatch_request = CompletionDispatchRequest {
+        client: &client,
+        prompt,
+        system,
+        workload: completion_workload,
+        budget: completion_budget,
+    };
 
     if let Some(target) = explicit_target {
         revalidate_explicit_target(pool, target, workload, false, min_ctx).await?;
         let _guard = InFlightGuard::acquire(&target.endpoint);
-        return dispatch_to_resolved_target(
-            target.clone(),
-            &client,
-            prompt,
-            system,
-            completion_workload,
-            completion_budget,
-        )
-        .await;
+        return dispatch_to_resolved_target(target.clone(), dispatch_request).await;
     }
 
     let ordered = resolve_route_candidates(pool, model_hint, workload, min_ctx).await?;
@@ -776,18 +784,7 @@ pub async fn fleet_oneshot_for_ctx_with_target(
             continue;
         };
         attempted = true;
-        match dispatch_to_candidate(
-            pool,
-            cand,
-            &client,
-            prompt,
-            model_hint,
-            system,
-            completion_workload,
-            completion_budget,
-        )
-        .await
-        {
+        match dispatch_to_candidate(pool, cand, dispatch_request).await {
             Ok(ok) => return Ok(ok),
             Err(e) => {
                 tracing::warn!(
@@ -808,18 +805,7 @@ pub async fn fleet_oneshot_for_ctx_with_target(
         );
         for cand in &ordered {
             let _guard = InFlightGuard::acquire(&cand.endpoint);
-            match dispatch_to_candidate(
-                pool,
-                cand,
-                &client,
-                prompt,
-                model_hint,
-                system,
-                completion_workload,
-                completion_budget,
-            )
-            .await
-            {
+            match dispatch_to_candidate(pool, cand, dispatch_request).await {
                 Ok(ok) => return Ok(ok),
                 Err(e) => {
                     tracing::warn!(
@@ -1146,26 +1132,24 @@ async fn resolve_route_candidates(
 async fn dispatch_to_candidate(
     pool: &PgPool,
     cand: &RouteCandidate,
-    client: &reqwest::Client,
-    prompt: &str,
-    _model_hint: Option<&str>,
-    system: Option<&str>,
-    workload: WorkloadClass,
-    budget: CompletionBudget,
+    request: CompletionDispatchRequest<'_>,
 ) -> anyhow::Result<FleetOneshot> {
     let target =
         resolve_candidate_target(pool, cand, ResolvedTargetProvenance::Auto, false).await?;
-    dispatch_to_resolved_target(target, client, prompt, system, workload, budget).await
+    dispatch_to_resolved_target(target, request).await
 }
 
 async fn dispatch_to_resolved_target(
     target: ResolvedFleetTarget,
-    client: &reqwest::Client,
-    prompt: &str,
-    system: Option<&str>,
-    workload: WorkloadClass,
-    budget: CompletionBudget,
+    request: CompletionDispatchRequest<'_>,
 ) -> anyhow::Result<FleetOneshot> {
+    let CompletionDispatchRequest {
+        client,
+        prompt,
+        system,
+        workload,
+        budget,
+    } = request;
     let target = attest_resolved_target(client, target, Duration::from_secs(5)).await?;
     enforce_dispatch_attestation(&target)?;
     let worker_name = target.worker_name.clone();

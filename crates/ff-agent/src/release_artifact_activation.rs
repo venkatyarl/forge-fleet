@@ -362,32 +362,23 @@ pub async fn activate_local_release_pair(
     let target_for_worker = target_triple.clone();
     let previous_for_worker = prior_release_identity.clone();
     let requested_transaction_id = request.transaction_id;
-    let transaction = tokio::task::spawn_blocking(move || match requested_transaction_id {
-        Some(transaction_id) => prepare_swap_and_restart_with_id(
-            transaction_id,
+    let transaction = tokio::task::spawn_blocking(move || {
+        let plan = ReleaseActivationPlan {
             pair,
-            identity_for_worker,
-            request_owned,
-            target_for_worker,
+            identity: identity_for_worker,
+            request: request_owned,
+            target_triple: target_for_worker,
             platform,
             ports,
             home,
-            previous_for_worker,
-            &SystemCommandRunner,
-            None,
-        ),
-        None => prepare_swap_and_restart(
-            pair,
-            identity_for_worker,
-            request_owned,
-            target_for_worker,
-            platform,
-            ports,
-            home,
-            previous_for_worker,
-            &SystemCommandRunner,
-            None,
-        ),
+            prior_release_identity: previous_for_worker,
+        };
+        match requested_transaction_id {
+            Some(transaction_id) => {
+                prepare_swap_and_restart_with_id(transaction_id, plan, &SystemCommandRunner, None)
+            }
+            None => prepare_swap_and_restart(plan, &SystemCommandRunner, None),
+        }
     })
     .await??;
 
@@ -1259,6 +1250,17 @@ struct CommandResult {
 
 struct SystemCommandRunner;
 
+struct ReleaseActivationPlan {
+    pair: Vec<ResolvedArtifact>,
+    identity: LocalComputerIdentity,
+    request: CanonicalReleaseIdentity,
+    target_triple: String,
+    platform: ServicePlatform,
+    ports: ServicePorts,
+    home: PathBuf,
+    prior_release_identity: PriorReleaseIdentity,
+}
+
 impl CommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<CommandResult> {
         let output = Command::new(program).args(args).output()?;
@@ -1271,19 +1273,20 @@ impl CommandRunner for SystemCommandRunner {
 }
 
 fn prepare_swap_and_restart(
-    pair: Vec<ResolvedArtifact>,
-    identity: LocalComputerIdentity,
-    request: CanonicalReleaseIdentity,
-    target_triple: String,
-    platform: ServicePlatform,
-    ports: ServicePorts,
-    home: PathBuf,
-    prior_release_identity: PriorReleaseIdentity,
+    plan: ReleaseActivationPlan,
     runner: &dyn CommandRunner,
     fail_after_installs: Option<usize>,
 ) -> Result<ActiveTransaction> {
-    prepare_swap_and_restart_with_id(
-        Uuid::new_v4(),
+    prepare_swap_and_restart_with_id(Uuid::new_v4(), plan, runner, fail_after_installs)
+}
+
+fn prepare_swap_and_restart_with_id(
+    transaction_id: Uuid,
+    plan: ReleaseActivationPlan,
+    runner: &dyn CommandRunner,
+    fail_after_installs: Option<usize>,
+) -> Result<ActiveTransaction> {
+    let ReleaseActivationPlan {
         pair,
         identity,
         request,
@@ -1292,25 +1295,7 @@ fn prepare_swap_and_restart(
         ports,
         home,
         prior_release_identity,
-        runner,
-        fail_after_installs,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn prepare_swap_and_restart_with_id(
-    transaction_id: Uuid,
-    pair: Vec<ResolvedArtifact>,
-    identity: LocalComputerIdentity,
-    request: CanonicalReleaseIdentity,
-    target_triple: String,
-    platform: ServicePlatform,
-    ports: ServicePorts,
-    home: PathBuf,
-    prior_release_identity: PriorReleaseIdentity,
-    runner: &dyn CommandRunner,
-    fail_after_installs: Option<usize>,
-) -> Result<ActiveTransaction> {
+    } = plan;
     let activation_dir = home.join(".forgefleet").join("release-activations");
     ensure_activation_directory(&activation_dir)?;
     let operation_lock = acquire_operation_lock(&activation_dir)?;
@@ -1368,20 +1353,24 @@ fn prepare_swap_and_restart_with_id(
         "ff",
         &ff_artifact.row,
         &mut ff_source,
-        local_dir,
-        local_bin.clone(),
-        "ff",
-        &local_ff_old,
+        StageInstallDestination {
+            dir: local_dir,
+            dir_path: local_bin.clone(),
+            name: "ff",
+            previous: &local_ff_old,
+        },
     )?);
     entries.push(stage_install_entry(
         transaction_id,
         "forgefleetd",
         &daemon_artifact.row,
         &mut daemon_source,
-        open_owned_dir(&local_bin)?,
-        local_bin.clone(),
-        "forgefleetd",
-        &daemon_old,
+        StageInstallDestination {
+            dir: open_owned_dir(&local_bin)?,
+            dir_path: local_bin.clone(),
+            name: "forgefleetd",
+            previous: &daemon_old,
+        },
     )?);
     if let Some((cargo_dir, cargo_old)) = cargo_destination {
         entries.push(stage_install_entry(
@@ -1389,10 +1378,12 @@ fn prepare_swap_and_restart_with_id(
             "ff",
             &ff_artifact.row,
             &mut ff_source,
-            cargo_dir,
-            cargo_bin,
-            "ff",
-            &cargo_old,
+            StageInstallDestination {
+                dir: cargo_dir,
+                dir_path: cargo_bin,
+                name: "ff",
+                previous: &cargo_old,
+            },
         )?);
     }
 
@@ -2736,18 +2727,28 @@ fn validate_regular_stat(
     Ok(())
 }
 
+struct StageInstallDestination<'a> {
+    dir: OwnedFd,
+    dir_path: PathBuf,
+    name: &'a str,
+    previous: &'a (u64, String),
+}
+
 fn stage_install_entry(
     transaction_id: Uuid,
     artifact_name: &str,
     row: &ReleaseArtifactRow,
     source: &mut OpenArtifact,
-    dir: OwnedFd,
-    dir_path: PathBuf,
-    destination: &str,
-    previous: &(u64, String),
+    destination: StageInstallDestination<'_>,
 ) -> Result<InstallEntry> {
-    let stage = format!(".{destination}.release-{transaction_id}.stage");
-    let backup = format!(".{destination}.release-{transaction_id}.rollback");
+    let StageInstallDestination {
+        dir,
+        dir_path,
+        name,
+        previous,
+    } = destination;
+    let stage = format!(".{name}.release-{transaction_id}.stage");
+    let backup = format!(".{name}.release-{transaction_id}.rollback");
     ensure_absent_at(dir.as_raw_fd(), OsStr::new(&stage))?;
     ensure_absent_at(dir.as_raw_fd(), OsStr::new(&backup))?;
     let stage_fd = open_new_file_at(dir.as_raw_fd(), OsStr::new(&stage), 0o600)?;
@@ -2809,7 +2810,7 @@ fn stage_install_entry(
         previous_size: previous.0,
         dir,
         dir_path,
-        destination: CString::new(destination).expect("fixed destination"),
+        destination: CString::new(name).expect("fixed destination"),
         stage: CString::new(stage).expect("UUID stage name"),
         backup: CString::new(backup).expect("UUID backup name"),
     })
@@ -4739,10 +4740,12 @@ mod tests {
             "ff",
             &valid,
             &mut opened,
-            open_owned_dir(&destination).unwrap(),
-            destination.clone(),
-            "ff",
-            &previous,
+            StageInstallDestination {
+                dir: open_owned_dir(&destination).unwrap(),
+                dir_path: destination.clone(),
+                name: "ff",
+                previous: &previous,
+            },
         )
         .unwrap();
         assert_eq!(
@@ -4760,10 +4763,12 @@ mod tests {
                 "ff",
                 &bad_digest,
                 &mut clean,
-                open_owned_dir(&destination).unwrap(),
-                destination.clone(),
-                "ff2",
-                &previous,
+                StageInstallDestination {
+                    dir: open_owned_dir(&destination).unwrap(),
+                    dir_path: destination.clone(),
+                    name: "ff2",
+                    previous: &previous,
+                },
             )
             .is_err()
         );
@@ -4776,10 +4781,12 @@ mod tests {
                 "ff",
                 &bad_size,
                 &mut clean,
-                open_owned_dir(&destination).unwrap(),
-                destination,
-                "ff3",
-                &previous,
+                StageInstallDestination {
+                    dir: open_owned_dir(&destination).unwrap(),
+                    dir_path: destination,
+                    name: "ff3",
+                    previous: &previous,
+                },
             )
             .is_err()
         );

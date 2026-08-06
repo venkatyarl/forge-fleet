@@ -92,6 +92,15 @@ pub struct SshKeyManager {
     pg: PgPool,
 }
 
+struct RemoveKeyRequest<'a> {
+    target: &'a str,
+    primary_ip: Option<&'a str>,
+    ssh_user: &'a str,
+    ssh_port: i32,
+    public_key: &'a str,
+    fingerprint: &'a str,
+}
+
 impl SshKeyManager {
     pub fn new(pg: PgPool) -> Self {
         Self { pg }
@@ -448,19 +457,17 @@ impl SshKeyManager {
                 let peer_ip: Option<String> = row.try_get("primary_ip").ok();
                 let peer_ssh_user: String = row.get("ssh_user");
                 let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
-                let peer_os_family: String = row.try_get("os_family").unwrap_or_default();
 
                 if let Some(t) = report.targets.iter_mut().find(|t| t.target == peer_name) {
                     match self
-                        .remove_key_on_target(
-                            &peer_name,
-                            peer_ip.as_deref(),
-                            &peer_ssh_user,
-                            peer_ssh_port,
-                            &peer_os_family,
-                            &old_pubkey,
-                            &old_fp,
-                        )
+                        .remove_key_on_target(RemoveKeyRequest {
+                            target: &peer_name,
+                            primary_ip: peer_ip.as_deref(),
+                            ssh_user: &peer_ssh_user,
+                            ssh_port: peer_ssh_port,
+                            public_key: &old_pubkey,
+                            fingerprint: &old_fp,
+                        })
                         .await
                     {
                         Ok(msg) => {
@@ -618,14 +625,16 @@ impl SshKeyManager {
     /// Remove `public_key` from `target`'s `authorized_keys`.
     async fn remove_key_on_target(
         &self,
-        target: &str,
-        primary_ip: Option<&str>,
-        ssh_user: &str,
-        ssh_port: i32,
-        _os_family: &str,
-        public_key: &str,
-        fingerprint: &str,
+        request: RemoveKeyRequest<'_>,
     ) -> Result<String, SshError> {
+        let RemoveKeyRequest {
+            target,
+            primary_ip,
+            ssh_user,
+            ssh_port,
+            public_key,
+            fingerprint,
+        } = request;
         let host = primary_ip.unwrap_or(target);
         let body = extract_key_body(public_key).unwrap_or_else(|| fingerprint.to_string());
         let remote_cmd = format!(
