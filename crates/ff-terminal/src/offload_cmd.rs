@@ -185,7 +185,7 @@ pub async fn handle_offload(
                 return Err(anyhow::anyhow!("attest offload target: {error}"));
             }
         };
-    if target.provenance.is_explicit() && target.attestation != EndpointAttestationState::Verified {
+    if target.provenance.is_pinned() && target.attestation != EndpointAttestationState::Verified {
         let error_text = format!(
             "explicit offload target {} could not be identity-attested ({:?})",
             target.endpoint, target.attestation
