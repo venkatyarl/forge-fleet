@@ -144,6 +144,8 @@ pub struct PulseBeatV2 {
 pub struct NetworkInfo {
     pub primary_ip: String,
     pub all_ips: Vec<Ip>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mac_addresses: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -480,6 +482,7 @@ impl PulseBeatV2 {
             network: NetworkInfo {
                 primary_ip: String::new(),
                 all_ips: Vec::new(),
+                mac_addresses: Vec::new(),
             },
             os: OsInfo::default(),
             build_sha: None,
@@ -568,11 +571,13 @@ mod tests {
 
     #[test]
     fn skeleton_roundtrips_through_json() {
-        let beat = PulseBeatV2::skeleton("marcus");
+        let mut beat = PulseBeatV2::skeleton("marcus");
+        beat.network.mac_addresses = vec!["02:11:22:33:44:55".to_string()];
         let json = serde_json::to_string(&beat).expect("serialize");
         let parsed: PulseBeatV2 = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed.computer_name, "marcus");
         assert_eq!(parsed.pulse_protocol_version, 2);
+        assert_eq!(parsed.network.mac_addresses, beat.network.mac_addresses);
     }
 
     /// Backward-compatibility guard: a beat serialized by an older daemon
@@ -656,6 +661,7 @@ mod tests {
             .expect("legacy beat schema must deserialize into current struct");
 
         assert_eq!(parsed.computer_name, "legacy-node");
+        assert!(parsed.network.mac_addresses.is_empty());
         assert_eq!(parsed.pulse_protocol_version, 2);
         assert_eq!(parsed.network.primary_ip, "10.0.0.1");
 
