@@ -503,22 +503,27 @@ esac
 # Install every supported cloud CLI as the target user, then materialize the
 # allowlisted centralized OAuth tokens at each CLI's canonical credential path.
 report "cloud_clis" running
+# Vendor-preferred installers ONLY — each self-updates; installing from the
+# wrong source (npm/brew when the vendor prefers a native script) breaks the
+# update path and strands the box on stale versions (operator directive
+# 2026-08-06):
+#   claude — native installer (npm package deprecated by Anthropic)
+#   codex  — native installer (npm/brew are alternates, script is preferred)
+#   kimi   — official install script (uv/pipx kimi-cli is NOT the same tool)
 if ! run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' \
     || die "Claude Code install failed"
 fi
 if ! run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
-  run_as_user bash -lc 'npm install -g @openai/codex' || die "Codex install failed"
-fi
-CODEX_BIN="$(run_as_user bash -lc 'npm prefix -g')/bin/codex"
-if [ -x "$CODEX_BIN" ]; then
-  run_as_user ln -sf "$CODEX_BIN" "$USER_HOME/.local/bin/codex"
+  run_as_user bash -lc 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' \
+    || die "Codex install failed"
 fi
 if ! run_as_user bash -lc 'command -v uv >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh' || die "uv install failed"
 fi
 if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
-  run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
+  run_as_user bash -lc 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash' \
+    || die "Kimi Code install failed"
 fi
 
 CLAUDE_CREDENTIALS="$(peek_secret anthropic.oauth_token.credentials)"
@@ -556,6 +561,10 @@ if [ "$OS_ID" = "macos" ]; then
   if [ ! -d "/Applications/Kimi.app" ]; then
     run_as_user bash -lc 'brew install --cask kimi' \
       || report "desktop_apps" warn "Kimi desktop cask install failed — install manually"
+  fi
+  if [ ! -d "/Applications/ChatGPT.app" ]; then
+    run_as_user bash -lc 'brew install --cask chatgpt' \
+      || report "desktop_apps" warn "ChatGPT desktop cask install failed — install manually"
   fi
   report "desktop_apps" ok "claude + kimi desktop present"
 fi
