@@ -46,6 +46,18 @@ fn is_terminal_task_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "canceled")
 }
 
+fn is_oauth_task(summary: &str) -> bool {
+    summary.starts_with("oauth-distribute/") || summary.starts_with("oauth-repush/")
+}
+
+fn redact_oauth_value(summary: &str, value: Value) -> Value {
+    if is_oauth_task(summary) {
+        json!({ "redacted": "oauth task details hidden" })
+    } else {
+        value
+    }
+}
+
 /// Derive a [`TaskErrorClass`] on the fly from an already-stored task row.
 ///
 /// Reads `stdout`/`stderr`/`exit` out of the result JSON (shape
@@ -202,7 +214,14 @@ pub async fn handle_tasks_list(
             let started_at: Option<chrono::DateTime<chrono::Utc>> = r.try_get("started_at").ok();
             let age_secs = (chrono::Utc::now() - created_at).num_seconds().max(0);
             let result: Option<Value> = r.try_get("result").ok();
-            let error: Option<String> = r.try_get("error").ok();
+            let error: Option<String> = if is_oauth_task(&summary) {
+                r.try_get::<Option<String>, _>("error")
+                    .ok()
+                    .flatten()
+                    .map(|_| "<redacted oauth error>".to_string())
+            } else {
+                r.try_get("error").ok()
+            };
             let err_class = classify_failed_task(&status, result.as_ref(), error.as_deref())
                 .map(|c| c.as_str().to_string());
             out.push(task_list_json_row(
@@ -266,7 +285,14 @@ pub async fn handle_tasks_list(
         // Compact error class — only populated for failed/cancelled rows,
         // derived on the fly from the stored result/error (no storage change).
         let result: Option<Value> = r.try_get("result").ok();
-        let error: Option<String> = r.try_get("error").ok();
+        let error: Option<String> = if is_oauth_task(&summary) {
+            r.try_get::<Option<String>, _>("error")
+                .ok()
+                .flatten()
+                .map(|_| "<redacted oauth error>".to_string())
+        } else {
+            r.try_get("error").ok()
+        };
         let err_class = classify_failed_task(&status, result.as_ref(), error.as_deref())
             .map(|c| c.as_str())
             .unwrap_or("");
@@ -384,12 +410,23 @@ pub async fn handle_tasks_get(pg: &PgPool, id: uuid::Uuid, json: bool, watch: bo
     let priority: i32 = r.try_get("priority")?;
     let parent: Option<uuid::Uuid> = r.try_get("parent_task_id").ok();
     let claimer: Option<String> = r.try_get("claimer_name").ok();
-    let payload: Value = r.try_get("payload")?;
+    let payload: Value = redact_oauth_value(&summary, r.try_get("payload")?);
     let caps: Value = r.try_get("requires_capability")?;
     let pct: Option<f32> = r.try_get("progress_pct").ok();
     let prog_msg: Option<String> = r.try_get("progress_message").ok();
-    let result: Option<Value> = r.try_get("result").ok();
-    let error: Option<String> = r.try_get("error").ok();
+    let result: Option<Value> = r
+        .try_get::<Option<Value>, _>("result")
+        .ok()
+        .flatten()
+        .map(|value| redact_oauth_value(&summary, value));
+    let error: Option<String> = if is_oauth_task(&summary) {
+        r.try_get::<Option<String>, _>("error")
+            .ok()
+            .flatten()
+            .map(|_| "<redacted oauth error>".to_string())
+    } else {
+        r.try_get("error").ok()
+    };
     let handoff_count: i32 = r.try_get("handoff_count")?;
     let handoff_reason: Option<String> = r.try_get("handoff_reason").ok();
     let created_at: chrono::DateTime<chrono::Utc> = r.try_get("created_at")?;
@@ -745,5 +782,15 @@ mod tests {
         assert!(out.contains("ff tasks list --status pending,running"));
         // No dry-run banner leaks into the real path.
         assert!(!out.contains("DRY RUN"));
+    }
+
+    #[test]
+    fn oauth_task_details_are_redacted_in_normal_status_output() {
+        let secret = "c2VjcmV0LWNyZWRlbnRpYWw=";
+        let value = json!({ "command": format!("printf {secret} | base64 -d") });
+        let redacted = redact_oauth_value("oauth-distribute/codex: target", value);
+        let rendered = serde_json::to_string(&redacted).unwrap();
+        assert!(!rendered.contains(secret));
+        assert!(rendered.contains("redacted"));
     }
 }

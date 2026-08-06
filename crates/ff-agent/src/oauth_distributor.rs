@@ -7,9 +7,9 @@
 //! 1. **Imports** (on the leader): reads the local file for one provider,
 //!    extracts the access token, stores it in `fleet_secrets` keyed by the
 //!    provider's `secret_key` (e.g. `anthropic.oauth_token`).
-//! 2. **Distributes**: pushes the entire credential file to every other
-//!    fleet member's matching path via the existing `fleet_tasks` shell
-//!    dispatcher (`pg_enqueue_shell_task` + base64 of the file payload).
+//! 2. **Distributes**: stores the credential document in the encrypted fleet
+//!    secret store and enqueues target-bound reference-only tasks. Credential
+//!    bytes never enter ordinary `fleet_tasks` payloads or output.
 //! 3. **Status**: reports per-provider whether the token is present,
 //!    decoded expiry, and last refresh time.
 //! 4. **RefreshWatch**: long-lived loop that polls the leader's cred files
@@ -24,16 +24,13 @@
 //! roadmap context.
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::Value;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
-
-use crate::task_runner::pg_enqueue_shell_task;
 
 /// One row in the OAuth provider catalog. Drives the import + distribute
 /// + status logic — provider-agnostic from a single source of truth.
@@ -170,7 +167,157 @@ pub struct ProviderStatus {
     pub cred_file_present: bool,
     pub cred_file_mtime_secs_ago: Option<u64>,
     pub token_in_secrets: bool,
-    pub token_preview: Option<String>,
+}
+
+const OAUTH_TASK_CLASS: &str = "oauth";
+const OAUTH_RECONCILE_LOCK: i64 = 0x4f41_5554_4851_5545;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct QueueReconcileReport {
+    pub pending_found: usize,
+    pub would_cancel: usize,
+    pub would_enqueue: usize,
+    pub preserved_active: usize,
+    pub preserved_terminal: usize,
+    pub applied: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PendingOauthRow {
+    id: uuid::Uuid,
+    task_class: Option<String>,
+    dedup_key: Option<String>,
+}
+
+fn plan_pending_rows(
+    rows: &[PendingOauthRow],
+    desired_keys: &std::collections::HashSet<&str>,
+) -> (std::collections::HashSet<String>, Vec<uuid::Uuid>) {
+    let mut keep = std::collections::HashSet::new();
+    let mut cancel = Vec::new();
+    for row in rows {
+        let valid = row.task_class.as_deref() == Some(OAUTH_TASK_CLASS)
+            && row
+                .dedup_key
+                .as_deref()
+                .is_some_and(|key| desired_keys.contains(key))
+            && row
+                .dedup_key
+                .as_ref()
+                .is_some_and(|key| keep.insert(key.clone()));
+        if !valid {
+            cancel.push(row.id);
+        }
+    }
+    (keep, cancel)
+}
+
+fn credential_token<'a>(provider: &OauthProvider, json: &'a Value) -> Option<&'a str> {
+    provider.token_fields.iter().find_map(|field| {
+        json.get(field)
+            .or_else(|| json.get("tokens").and_then(|v| v.get(field)))
+            .or_else(|| json.get("claudeAiOauth").and_then(|v| v.get(field)))
+            .and_then(Value::as_str)
+            .filter(|token| !token.trim().is_empty())
+    })
+}
+
+fn credential_expiry(json: &Value) -> Option<i64> {
+    ["expires_at", "expiresAt", "expiry", "expires"]
+        .into_iter()
+        .find_map(|field| {
+            json.get(field)
+                .or_else(|| json.get("tokens").and_then(|v| v.get(field)))
+                .or_else(|| json.get("claudeAiOauth").and_then(|v| v.get(field)))
+        })
+        .and_then(|value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_str().and_then(|v| v.parse().ok()))
+                .map(|value| {
+                    if value > 10_000_000_000 {
+                        value / 1000
+                    } else {
+                        value
+                    }
+                })
+                .or_else(|| {
+                    value.as_str().and_then(|v| {
+                        chrono::DateTime::parse_from_rfc3339(v)
+                            .ok()
+                            .map(|v| v.timestamp())
+                    })
+                })
+        })
+}
+
+fn validate_credential_document(provider: &OauthProvider, bytes: &[u8], now: i64) -> Result<Value> {
+    if bytes.is_empty() {
+        anyhow::bail!("{} credential document is empty", provider.name);
+    }
+    let json: Value = serde_json::from_slice(bytes)
+        .with_context(|| format!("parse {} credential document", provider.name))?;
+    credential_token(provider, &json).ok_or_else(|| {
+        anyhow!(
+            "{} credential document has no non-empty access token",
+            provider.name
+        )
+    })?;
+    if credential_expiry(&json).is_some_and(|expiry| expiry <= now) {
+        anyhow::bail!("{} credential document is expired", provider.name);
+    }
+    Ok(json)
+}
+
+fn validate_provider_authorization(
+    provider: &OauthProvider,
+    claude_setup: Option<&str>,
+) -> Result<()> {
+    if provider.name == "claude" && claude_setup.is_none_or(|value| value.trim().is_empty()) {
+        anyhow::bail!(
+            "claude.setup_token is absent; refusing to distribute a non-durable Claude session"
+        );
+    }
+    Ok(())
+}
+
+pub async fn validate_provider_credential(
+    pool: &PgPool,
+    provider: &OauthProvider,
+) -> Result<Vec<u8>> {
+    let bytes = read_leader_cred_bytes(provider).await?;
+    validate_credential_document(provider, &bytes, chrono::Utc::now().timestamp())?;
+    if provider.name == "claude" {
+        let setup = ff_db::pg_get_secret(pool, "claude.setup_token").await?;
+        validate_provider_authorization(provider, setup.as_deref())?;
+    }
+    Ok(bytes)
+}
+
+pub async fn validate_provider_for_distribution(
+    pool: &PgPool,
+    provider: &OauthProvider,
+) -> Result<Vec<u8>> {
+    let bytes = validate_provider_credential(pool, provider).await?;
+    // Claude's subscription CLI probe can rotate/churn the operator-owned
+    // OAuth session. The durable setup-token check above is the explicit
+    // authorization boundary for Claude distribution, so never invoke the
+    // CLI merely to validate a fanout.
+    if provider.name == "claude" {
+        return Ok(bytes);
+    }
+    let output =
+        crate::cli_executor::execute_cli(provider.name, "ping", &[], Some(Duration::from_secs(30)))
+            .await
+            .with_context(|| format!("probe {} credential", provider.name))?;
+    if output.exit_code != 0 || output.stdout.trim().is_empty() {
+        anyhow::bail!(
+            "{} credential probe was unauthorized or unusable (exit {})",
+            provider.name,
+            output.exit_code
+        );
+    }
+    Ok(bytes)
 }
 
 /// Read the leader's raw credential bytes for one provider.
@@ -304,138 +451,214 @@ pub async fn import_token(pool: &PgPool, provider: &OauthProvider) -> Result<()>
     Ok(())
 }
 
-/// Push the full credential file to every fleet member's matching path.
-///
-/// Uses base64 of the file contents and `pg_enqueue_shell_task` to fan
-/// out via the existing wave dispatcher. Each per-target task writes the
-/// decoded payload to the target's `<cred_path>` (with `mode 0600`) so
-/// the local CLI sees the same login the leader did. Members without
-/// the directory get it created (`mkdir -p`) before write.
+/// Reconcile one provider to one pending task per target. Task rows contain
+/// only a secret-store reference; the target resolves it immediately before
+/// installing the credential.
 pub async fn distribute_token(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
-    // Keychain-first (macOS claude) / file source — same resolver as
-    // `import_token`, so a macOS leader can fan out its Keychain-held claude
-    // creds instead of failing on a nonexistent `~/.claude/.credentials.json`.
-    let bytes = read_leader_cred_bytes(provider).await?;
-    let b64 = BASE64.encode(&bytes);
-
-    // Target list = every fleet member EXCEPT the leader (the leader's
-    // local copy is already authoritative). Members are looked up by
-    // primary_ip + ssh_user from the `computers` table.
-    let leader_id = ff_db::pg_get_current_leader(pool)
-        .await
-        .ok()
-        .flatten()
-        .map(|l| l.computer_id);
-
-    let rows = sqlx::query(
-        // 'online' is the live status the heartbeat materializer writes;
-        // ('ok','pending','maintenance') are legacy/transitional vocab kept
-        // for compat. Omitting 'online' made distribute resolve ZERO targets
-        // on a fleet whose members are all 'online' (silent enqueued=0).
-        "SELECT id, name, ssh_user, primary_ip
-           FROM computers
-          WHERE status IN ('online', 'ok', 'pending', 'maintenance')",
+    let bytes = validate_provider_for_distribution(pool, provider).await?;
+    let credentials = std::str::from_utf8(&bytes)
+        .with_context(|| format!("{} credential document is not UTF-8", provider.name))?;
+    ff_db::pg_set_secret(
+        pool,
+        &format!("{}.credentials", provider.secret_key),
+        credentials,
+        Some("OAuth credential document resolved only by target workers"),
+        Some("ff oauth distribute"),
     )
-    .fetch_all(pool)
-    .await
-    .context("list computers")?;
-
-    let mut enqueued = 0usize;
-    let leader_uuid = leader_id;
-    for row in rows {
-        use sqlx::Row;
-        let id: uuid::Uuid = row.get("id");
-        if Some(id) == leader_uuid {
-            continue;
-        }
-        let name: String = row.get("name");
-        let ssh_user: String = row.get("ssh_user");
-        let primary_ip: String = row.get("primary_ip");
-        // Bind the DB-sourced target IP + the (const) cred path to shell vars
-        // ONCE, then reference them QUOTED. This branch gates a local secret
-        // WRITE on an identity check, so `primary_ip` must not be able to
-        // misparse as grep options/pattern (hence `-- "$IP"`), and the path
-        // must survive spaces/metachars. `~` is pre-expanded to `$HOME` here so
-        // the quoted var still resolves (a quoted `~` would stay literal).
-        let cred_path_sh = provider
-            .cred_path
-            .strip_prefix("~/")
-            .map(|rest| format!("$HOME/{rest}"))
-            .unwrap_or_else(|| provider.cred_path.to_string());
-        // Escape single quotes so the `IP='…'` assignment is injection-proof
-        // even if the DB value ever contained one (POSIX: close-quote, escaped
-        // literal quote, reopen-quote). primary_ip is validated IP data today,
-        // but this write path handles a secret — belt and suspenders.
-        // Every DB-sourced value that reaches the shell is bound to a var via a
-        // single-quote-escaped assignment (POSIX close/escaped-quote/reopen) and
-        // referenced QUOTED — so no metacharacter in primary_ip / ssh_user /
-        // name can inject into this secret-write command. Const/base64 values
-        // (provider, cred_path, b64) are not attacker-influenced.
-        let sh_squote = |s: &str| s.replace('\'', "'\\''");
-        let primary_ip_sh = sh_squote(&primary_ip);
-        let ssh_user_sh = sh_squote(&ssh_user);
-        let target_sh = sh_squote(&name);
-        // The remote payload: write the cred file with a heredoc (no
-        // shell expansion of `$` inside the b64 blob), chmod 0600.
-        let cmd = format!(
-            "set -e\n\
-             IP='{primary_ip_sh}'\n\
-             SSH_USER='{ssh_user_sh}'\n\
-             TARGET='{target_sh}'\n\
-             CRED_PATH=\"{cred_path_sh}\"\n\
-             echo \"== distributing {provider} cred file to $TARGET ==\"\n\
-             __ff_local_ips() {{ (hostname -I 2>/dev/null; \
-                 ifconfig 2>/dev/null | awk '/inet /{{print $2}}') | tr ' ' '\\n'; }}\n\
-             if __ff_local_ips | grep -Fxq -- \"$IP\"; then\n\
-             echo '(on target — local write, no SSH)'\n\
-             mkdir -p \"$(dirname \"$CRED_PATH\")\"\n\
-             umask 077\n\
-             printf '%s' '{b64}' | base64 -d > \"$CRED_PATH\"\n\
-             chmod 600 \"$CRED_PATH\"\n\
-             echo distributed: $(stat -c %y \"$CRED_PATH\" 2>/dev/null || stat -f %Sm \"$CRED_PATH\")\n\
-             else\n\
-             ssh -T {ssh_bypass} -o StrictHostKeyChecking=accept-new \
-                 \"$SSH_USER@$IP\" bash -l <<'FF_OAUTH_EOF'\n\
-             mkdir -p \"$(dirname {cred_path})\"\n\
-             umask 077\n\
-             printf '%s' '{b64}' | base64 -d > {cred_path}\n\
-             chmod 600 {cred_path}\n\
-             echo distributed: $(stat -c %y {cred_path} 2>/dev/null || stat -f %Sm {cred_path})\n\
-             FF_OAUTH_EOF\n\
-             fi\n",
-            provider = provider.name,
-            primary_ip_sh = primary_ip_sh,
-            ssh_user_sh = ssh_user_sh,
-            target_sh = target_sh,
-            cred_path = provider.cred_path,
-            cred_path_sh = cred_path_sh,
-            b64 = b64,
-            ssh_bypass = crate::ssh_opts::SSH_AGENT_BYPASS,
-        );
-
-        pg_enqueue_shell_task(
-            pool,
-            &format!(
-                "oauth-distribute/{}: {} → {}",
-                provider.name, provider.name, name
-            ),
-            &cmd,
-            &[],
-            Some(&name),
-            None,
-            70,
-            None,
-        )
-        .await
-        .with_context(|| format!("enqueue distribute task for {name}"))?;
-        enqueued += 1;
-    }
-
+    .await?;
+    let report = reconcile_queue(pool, &[provider], &[provider], true).await?;
     info!(
         provider = provider.name,
-        enqueued, "OAuth distribute tasks enqueued"
+        enqueued = report.would_enqueue,
+        "OAuth queue reconciled"
     );
-    Ok(enqueued)
+    Ok(report.would_enqueue)
+}
+
+pub async fn install_secret_ref(pool: &PgPool, provider: &OauthProvider) -> Result<()> {
+    let secret_ref = format!("{}.credentials", provider.secret_key);
+    let task_id: uuid::Uuid = std::env::var("FF_FLEET_TASK_ID")
+        .context("install-ref is restricted to a running fleet task")?
+        .parse()
+        .context("invalid fleet task identity")?;
+    let node = std::env::var("FF_NODE").context("install-ref is missing worker identity")?;
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM fleet_tasks t
+            JOIN computers c ON c.id=t.claimed_by_computer_id
+            WHERE t.id=$1 AND t.status='running' AND t.task_class='oauth'
+              AND t.claimed_by_computer_id=t.preferred_computer_id
+              AND t.payload->>'secret_ref'=$2 AND c.name=$3
+        )",
+    )
+    .bind(task_id)
+    .bind(&secret_ref)
+    .bind(&node)
+    .fetch_one(pool)
+    .await?;
+    if !authorized {
+        anyhow::bail!("install-ref is not authorized for this worker task");
+    }
+    let credentials = ff_db::pg_get_secret(pool, &secret_ref)
+        .await?
+        .ok_or_else(|| anyhow!("credential reference is unavailable"))?;
+    validate_credential_document(
+        provider,
+        credentials.as_bytes(),
+        chrono::Utc::now().timestamp(),
+    )?;
+    let path = expand_home(provider.cred_path)
+        .ok_or_else(|| anyhow!("{} has no credential path", provider.name))?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let temporary = path.with_extension(format!("ff-oauth-{}", uuid::Uuid::new_v4()));
+    tokio::fs::write(&temporary, credentials.as_bytes()).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).await?;
+    }
+    tokio::fs::rename(&temporary, &path).await?;
+    info!(
+        provider = provider.name,
+        "installed OAuth credential from secret reference"
+    );
+    Ok(())
+}
+
+pub async fn reconcile_queue(
+    pool: &PgPool,
+    scope_providers: &[&OauthProvider],
+    enqueue_providers: &[&OauthProvider],
+    apply: bool,
+) -> Result<QueueReconcileReport> {
+    let leader_id = ff_db::pg_get_current_leader(pool)
+        .await?
+        .map(|leader| leader.computer_id);
+    let targets = sqlx::query(
+        "SELECT id, name FROM computers WHERE status IN ('online','ok','pending','maintenance') ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let desired: Vec<(uuid::Uuid, String, String, String)> = enqueue_providers
+        .iter()
+        .flat_map(|provider| {
+            targets.iter().filter_map(move |row| {
+                let id: uuid::Uuid = row.get("id");
+                (Some(id) != leader_id).then(|| {
+                    let name: String = row.get("name");
+                    let key = format!("oauth:{}:{id}", provider.name);
+                    (id, name, provider.name.to_string(), key)
+                })
+            })
+        })
+        .collect();
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(OAUTH_RECONCILE_LOCK)
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query(
+        "SELECT id, status, task_class, preferred_computer_id, payload, summary
+           FROM fleet_tasks
+          WHERE task_class = 'oauth'
+             OR summary LIKE 'oauth-distribute/%'
+             OR summary LIKE 'oauth-repush/%'
+          ORDER BY created_at, id",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut report = QueueReconcileReport {
+        applied: apply,
+        ..Default::default()
+    };
+    let desired_keys: std::collections::HashSet<&str> =
+        desired.iter().map(|(_, _, _, key)| key.as_str()).collect();
+    let mut pending = Vec::new();
+    let mut active_keys = std::collections::HashSet::new();
+    for row in rows {
+        let summary: String = row.get("summary");
+        let payload: Value = row.get("payload");
+        let in_scope = scope_providers.iter().any(|provider| {
+            summary.starts_with(&format!("oauth-distribute/{}", provider.name))
+                || summary.starts_with(&format!("oauth-repush/{}", provider.name))
+                || payload
+                    .get("dedup_key")
+                    .and_then(Value::as_str)
+                    .is_some_and(|key| key.starts_with(&format!("oauth:{}:", provider.name)))
+        });
+        if !in_scope {
+            continue;
+        }
+        let status: String = row.get("status");
+        if status == "pending" {
+            report.pending_found += 1;
+            pending.push(PendingOauthRow {
+                id: row.get("id"),
+                task_class: row.get("task_class"),
+                dedup_key: payload
+                    .get("dedup_key")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        } else if matches!(status.as_str(), "running" | "claimed" | "paused") {
+            report.preserved_active += 1;
+            if row.get::<Option<String>, _>("task_class").as_deref() == Some(OAUTH_TASK_CLASS)
+                && let Some(key) = payload.get("dedup_key").and_then(Value::as_str)
+                && desired_keys.contains(key)
+            {
+                active_keys.insert(key.to_string());
+            }
+        } else {
+            report.preserved_terminal += 1;
+        }
+    }
+    let (keep, cancel) = plan_pending_rows(&pending, &desired_keys);
+    report.would_cancel = cancel.len();
+    let missing: Vec<_> = desired
+        .iter()
+        .filter(|(_, _, _, key)| !keep.contains(key) && !active_keys.contains(key))
+        .collect();
+    report.would_enqueue = missing.len();
+
+    if apply {
+        if !cancel.is_empty() {
+            sqlx::query(
+                "UPDATE fleet_tasks SET status='cancelled', completed_at=NOW(), error='superseded by oauth queue reconciliation'
+                  WHERE id = ANY($1) AND status='pending'",
+            )
+            .bind(&cancel)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for (target_id, target_name, provider, key) in missing {
+            let secret_ref = format!(
+                "{}.credentials",
+                provider_by_name(provider).unwrap().secret_key
+            );
+            let payload = serde_json::json!({
+                "command": format!("ff oauth install-ref {provider}"),
+                "secret_ref": secret_ref,
+                "dedup_key": key,
+            });
+            sqlx::query(
+                "INSERT INTO fleet_tasks
+                    (task_type, summary, payload, priority, preferred_computer_id, task_class)
+                 VALUES ('shell', $1, $2, 70, $3, 'oauth')",
+            )
+            .bind(format!("oauth-distribute/{provider}: target {target_name}"))
+            .bind(payload)
+            .bind(target_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+    } else {
+        tx.rollback().await?;
+    }
+    Ok(report)
 }
 
 /// Per-provider snapshot of the leader's local state + fleet_secrets entry.
@@ -461,17 +684,11 @@ pub async fn status(pool: &PgPool) -> Result<Vec<ProviderStatus>> {
             .await
             .ok()
             .flatten();
-        let preview = token.as_deref().map(|t| {
-            let head: String = t.chars().take(8).collect();
-            format!("{head}…({} chars)", t.chars().count())
-        });
-
         out.push(ProviderStatus {
             name: p.name.to_string(),
             cred_file_present: cred_present,
             cred_file_mtime_secs_ago: mtime_ago,
             token_in_secrets: token.is_some(),
-            token_preview: preview,
         });
     }
     Ok(out)
@@ -509,6 +726,13 @@ pub async fn probe_all(pool: &PgPool) -> Vec<ProbeResult> {
 /// some CLIs rotate credentials before returning a non-zero diagnostic.
 pub async fn refresh_and_distribute(pool: &PgPool, provider: &OauthProvider) -> Result<usize> {
     let probe = probe_one(pool, provider).await;
+    if matches!(probe.status.as_str(), "unauthorized" | "forbidden") {
+        anyhow::bail!(
+            "{} credential was rejected as {}; refusing to enqueue distribution",
+            provider.name,
+            probe.status
+        );
+    }
     if probe.status != "ok" {
         warn!(provider = provider.name, status = %probe.status, detail = ?probe.message,
             "OAuth native refresh probe did not return cleanly; importing freshest credential anyway");
@@ -546,26 +770,60 @@ pub async fn validate_startup_and_request_repush(pool: &PgPool, worker_name: &st
         let Some(provider) = provider_by_name(name) else {
             continue;
         };
+        // A Claude follower must not trigger a repush without the operator's
+        // durable setup-token authorization, and probing Claude itself can
+        // churn that operator-owned OAuth session.
+        if provider.name == "claude" {
+            let setup = ff_db::pg_get_secret(pool, "claude.setup_token")
+                .await
+                .ok()
+                .flatten();
+            if validate_provider_authorization(provider, setup.as_deref()).is_err() {
+                continue;
+            }
+            continue;
+        }
         let probe = probe_one(pool, provider).await;
         if probe.status == "ok" {
             continue;
         }
-        let title = format!("oauth-repush/{} requested-by {worker_name}", provider.name);
-        let command = format!("ff oauth refresh {}", provider.name);
-        if let Err(error) = pg_enqueue_shell_task(
-            pool,
-            &title,
-            &command,
-            &[],
-            Some(&leader_name),
-            None,
-            90,
-            None,
+        let key = format!("oauth-repush:{}:{worker_name}", provider.name);
+        let payload = serde_json::json!({
+            "command": format!("ff oauth refresh {}", provider.name),
+            "dedup_key": key,
+        });
+        let result = sqlx::query(
+            "WITH lock AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(hashtext($4)::bigint)
+             )
+             INSERT INTO fleet_tasks
+                (task_type, summary, payload, priority, preferred_computer_id, task_class)
+             SELECT 'shell', $1, $2, 90, $3, 'oauth' FROM lock
+              WHERE NOT EXISTS (
+                SELECT 1 FROM fleet_tasks
+                 WHERE task_class='oauth'
+                   AND payload->>'dedup_key'=$4
+                   AND status IN ('pending','claimed','running')
+              )
+                AND NOT EXISTS (
+                SELECT 1 FROM fleet_tasks
+                 WHERE task_class='oauth'
+                   AND payload->>'dedup_key'=$4
+                   AND created_at > NOW() - INTERVAL '15 minutes'
+              )",
         )
-        .await
-        {
+        .bind(format!(
+            "oauth-repush/{} requested-by {worker_name}",
+            provider.name
+        ))
+        .bind(payload)
+        .bind(leader.computer_id)
+        .bind(&key)
+        .execute(pool)
+        .await;
+        if let Err(error) = result {
             warn!(provider = provider.name, %error, "failed to request OAuth re-push from leader");
-        } else {
+        } else if result.is_ok_and(|result| result.rows_affected() == 1) {
             warn!(provider = provider.name, status = %probe.status,
                 "startup OAuth validation failed; requested leader re-push");
         }
@@ -745,4 +1003,76 @@ pub fn spawn_refresh_watch(pool: PgPool, mut shutdown: watch::Receiver<bool>) ->
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_codex_document_is_accepted_without_exposing_token() {
+        let provider = provider_by_name("codex").unwrap();
+        let document = br#"{"tokens":{"access_token":"secret-codex","expires_at":4102444800}}"#;
+        let parsed = validate_credential_document(provider, document, 1_800_000_000).unwrap();
+        assert_eq!(credential_token(provider, &parsed), Some("secret-codex"));
+    }
+
+    #[test]
+    fn stale_kimi_and_empty_credentials_are_rejected() {
+        let kimi = provider_by_name("kimi").unwrap();
+        let stale = br#"{"access_token":"stale-kimi","expires_at":1700000000}"#;
+        assert!(validate_credential_document(kimi, stale, 1_800_000_000).is_err());
+        assert!(validate_credential_document(kimi, b"", 1_800_000_000).is_err());
+    }
+
+    #[test]
+    fn claude_requires_explicit_durable_setup_token() {
+        let claude = provider_by_name("claude").unwrap();
+        assert!(validate_provider_authorization(claude, None).is_err());
+        assert!(validate_provider_authorization(claude, Some("  ")).is_err());
+        assert!(validate_provider_authorization(claude, Some("setup-token")).is_ok());
+    }
+
+    #[test]
+    fn flood_reconciliation_keeps_one_and_cancels_legacy_and_duplicates() {
+        let key = "oauth:codex:00000000-0000-0000-0000-000000000001";
+        let desired = std::collections::HashSet::from([key]);
+        let mut rows = Vec::with_capacity(48_457);
+        for index in 0..48_457u128 {
+            rows.push(PendingOauthRow {
+                id: uuid::Uuid::from_u128(index + 1),
+                task_class: (index != 0).then(|| OAUTH_TASK_CLASS.to_string()),
+                dedup_key: (index != 0).then(|| key.to_string()),
+            });
+        }
+        let (keep, cancel) = plan_pending_rows(&rows, &desired);
+        assert_eq!(keep.len(), 1);
+        assert_eq!(cancel.len(), 48_456);
+    }
+
+    #[test]
+    fn concurrent_refresh_shape_is_single_flight_and_legacy_class_is_superseded() {
+        let key = "oauth:codex:target";
+        let desired = std::collections::HashSet::from([key]);
+        let rows = vec![
+            PendingOauthRow {
+                id: uuid::Uuid::from_u128(1),
+                task_class: None,
+                dedup_key: None,
+            },
+            PendingOauthRow {
+                id: uuid::Uuid::from_u128(2),
+                task_class: Some(OAUTH_TASK_CLASS.into()),
+                dedup_key: Some(key.into()),
+            },
+            PendingOauthRow {
+                id: uuid::Uuid::from_u128(3),
+                task_class: Some(OAUTH_TASK_CLASS.into()),
+                dedup_key: Some(key.into()),
+            },
+        ];
+        let (keep, cancel) = plan_pending_rows(&rows, &desired);
+        assert_eq!(keep, std::collections::HashSet::from([key.to_string()]));
+        assert_eq!(cancel.len(), 2);
+    }
 }

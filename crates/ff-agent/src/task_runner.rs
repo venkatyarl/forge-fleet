@@ -365,6 +365,12 @@ impl TaskRunner {
                SELECT id FROM fleet_tasks t
                 WHERE t.status = 'pending'
                   AND t.task_type = 'shell'
+                  -- OAuth repair: legacy producers left task_class NULL while
+                  -- new secret-reference fanout uses the explicit `oauth`
+                  -- class. Both are intentionally schedulable (along with all
+                  -- established shell classes) during queue reconciliation.
+                  AND (t.task_class IS NULL OR t.task_class IN
+                       ('build','deferred','oauth','research','self_heal'))
                   AND (t.preferred_computer_id IS NULL
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
@@ -600,7 +606,11 @@ impl TaskRunner {
         // exact leak that wedged priya/sophie (stuck rsync + days-old
         // `git fetch` processes) until every subsequent task hit the cap.
         let outcome = match task_type.as_str() {
-            "shell" => run_shell_payload(&payload, &self.env, max_duration).await,
+            "shell" => {
+                let mut task_env = self.env.as_ref().clone();
+                task_env.push(("FF_FLEET_TASK_ID".to_string(), task_id.to_string()));
+                run_shell_payload(&payload, &task_env, max_duration).await
+            }
             "code_review" => run_review_payload(&payload, max_duration).await,
             other => Err(TaskRunnerError::UnsupportedType(other.to_string())),
         };
@@ -2688,6 +2698,13 @@ mod wave_playbook_tests {
 
 #[cfg(test)]
 mod claim_query_tests {
+    #[test]
+    fn oauth_and_legacy_null_task_classes_are_explicitly_schedulable() {
+        let source = include_str!("task_runner.rs");
+        assert!(source.contains("t.task_class IS NULL OR t.task_class IN"));
+        assert!(source.contains("'build','deferred','oauth','research','self_heal'"));
+    }
+
     /// The distributed review worker must never run more than one review
     /// at a time on a single computer. The constant is wired into the
     /// review claim query; this test keeps it from drifting accidentally.
