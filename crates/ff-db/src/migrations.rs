@@ -3934,12 +3934,18 @@ mod tests {
                 "v294 must not repair or fuzz authority through {forbidden}"
             );
         }
+        let v294_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 294)
+            .expect("V294 must be registered");
+        let v296_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 296)
+            .expect("automatic V296 must be registered");
         assert_eq!(
-            PG_MIGRATIONS
-                .iter()
-                .position(|migration| migration.version == 294),
-            PG_MIGRATIONS.len().checked_sub(1),
-            "v294 must remain the final forward migration"
+            v296_position,
+            v294_position + 1,
+            "automatic V296 must immediately follow V294; V295 is explicit-only"
         );
     }
 
