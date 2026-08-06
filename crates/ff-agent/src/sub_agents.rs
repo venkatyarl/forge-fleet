@@ -79,7 +79,7 @@ pub async fn reconcile_capacity(pool: &sqlx::PgPool, worker_name: &str) -> Resul
             .join(format!("sub-agent-{slot}"))
             .to_string_lossy()
             .into_owned();
-        sqlx::query("INSERT INTO sub_agents (computer_id, slot, status, workspace_dir) VALUES ($1, $2, 'idle', $3) ON CONFLICT (computer_id, slot) DO UPDATE SET status = CASE WHEN sub_agents.status = 'disabled' THEN 'idle' ELSE sub_agents.status END, workspace_dir = EXCLUDED.workspace_dir")
+        sqlx::query("INSERT INTO sub_agents (computer_id, slot, status, workspace_dir, last_heartbeat_at) VALUES ($1, $2, 'idle', $3, NOW()) ON CONFLICT (computer_id, slot) DO UPDATE SET status = CASE WHEN sub_agents.status = 'disabled' THEN 'idle' ELSE sub_agents.status END, workspace_dir = EXCLUDED.workspace_dir, last_heartbeat_at = CASE WHEN sub_agents.current_work_item_id IS NULL AND sub_agents.status IN ('idle', 'disabled') THEN NOW() ELSE sub_agents.last_heartbeat_at END")
             .bind(computer_id).bind(slot).bind(workspace).execute(&mut *tx).await.map_err(|e| e.to_string())?;
     }
     sqlx::query("UPDATE sub_agents SET status = 'disabled' WHERE computer_id = $1 AND slot >= $2 AND current_work_item_id IS NULL AND status <> 'busy'")

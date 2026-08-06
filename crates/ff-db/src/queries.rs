@@ -6501,8 +6501,10 @@ mod tests {
         sqlx::raw_sql(
             "CREATE EXTENSION IF NOT EXISTS pgcrypto;
              CREATE TABLE computers (
-                 id   UUID PRIMARY KEY,
-                 name TEXT NOT NULL
+                 id               UUID PRIMARY KEY,
+                 name             TEXT NOT NULL,
+                 status           TEXT NOT NULL DEFAULT 'online',
+                 dispatch_tick_at TIMESTAMPTZ
              );
              CREATE TABLE work_items (
                  id          UUID PRIMARY KEY,
@@ -7306,12 +7308,15 @@ mod tests {
         };
         let normal = uuid::Uuid::new_v4();
         let vinny = uuid::Uuid::new_v4();
-        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox'), ($2, 'Vinny')")
-            .bind(normal)
-            .bind(vinny)
-            .execute(&pool)
-            .await
-            .expect("insert computers");
+        sqlx::query(
+            "INSERT INTO computers (id, name, dispatch_tick_at)
+             VALUES ($1, 'testbox', NOW()), ($2, 'Vinny', NOW())",
+        )
+        .bind(normal)
+        .bind(vinny)
+        .execute(&pool)
+        .await
+        .expect("insert computers");
         let ids: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
         for (id, computer, slot, status) in [
             (ids[0], normal, 0, "idle"),
@@ -7321,8 +7326,9 @@ mod tests {
             (ids[4], normal, 2, "error"),
         ] {
             sqlx::query(
-                "INSERT INTO sub_agents (id, computer_id, slot, status)
-                 VALUES ($1, $2, $3, $4)",
+                "INSERT INTO sub_agents
+                    (id, computer_id, slot, status, last_heartbeat_at)
+                 VALUES ($1, $2, $3, $4, NOW())",
             )
             .bind(id)
             .bind(computer)
@@ -7338,6 +7344,88 @@ mod tests {
             .expect("query safe free slots");
         assert_eq!(free.len(), 1);
         assert_eq!(free[0].sub_agent_id, ids[0]);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn free_slots_require_fresh_online_worker_and_slot_evidence() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let computers: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+        sqlx::query(
+            "INSERT INTO computers (id, name, status, dispatch_tick_at) VALUES
+                ($1, 'fresh',          'online',  NOW()),
+                ($2, 'stale-worker',   'online',  NOW() - INTERVAL '61 seconds'),
+                ($3, 'offline-worker', 'offline', NOW()),
+                ($4, 'canonical-host', 'online',  NOW()),
+                ($5, 'leased-host',    'online',  NOW())",
+        )
+        .bind(computers[0])
+        .bind(computers[1])
+        .bind(computers[2])
+        .bind(computers[3])
+        .bind(computers[4])
+        .execute(&pool)
+        .await
+        .expect("insert worker evidence matrix");
+
+        let slots: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
+        for (id, computer, slot, kind, heartbeat) in [
+            (slots[0], computers[0], 0, "sub_agent", "NOW()"),
+            (
+                slots[1],
+                computers[0],
+                1,
+                "sub_agent",
+                "NOW() - INTERVAL '5 minutes 1 second'",
+            ),
+            (slots[2], computers[1], 0, "sub_agent", "NOW()"),
+            (slots[3], computers[2], 0, "sub_agent", "NOW()"),
+            (slots[4], computers[3], 0, "canonical", "NOW()"),
+            (slots[5], computers[4], 0, "sub_agent", "NOW()"),
+        ] {
+            let sql = format!(
+                "INSERT INTO sub_agents
+                    (id, computer_id, slot, kind, status, last_heartbeat_at)
+                 VALUES ($1, $2, $3, $4, 'idle', {heartbeat})"
+            );
+            sqlx::query(&sql)
+                .bind(id)
+                .bind(computer)
+                .bind(slot)
+                .bind(kind)
+                .execute(&pool)
+                .await
+                .expect("insert slot evidence matrix");
+        }
+
+        let work_item = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO work_items (id) VALUES ($1)")
+            .bind(work_item)
+            .execute(&pool)
+            .await
+            .expect("insert leased work item");
+        sqlx::query(
+            "INSERT INTO work_item_leases
+                (work_item_id, sub_agent_id, computer_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(work_item)
+        .bind(slots[5])
+        .bind(computers[4])
+        .execute(&pool)
+        .await
+        .expect("insert active slot lease");
+
+        let free = pg_free_slots(&pool, None, 20)
+            .await
+            .expect("query evidence-fenced slots");
+        assert_eq!(free.len(), 1);
+        assert_eq!(free[0].sub_agent_id, slots[0]);
+        assert_eq!(free[0].computer_id, computers[0]);
+
         drop_temp_db(admin, pool, &db_name).await;
     }
 
@@ -12096,7 +12184,9 @@ pub async fn pg_complete_parent_work_items(pool: &PgPool) -> Result<u64> {
 }
 
 /// Free fleet slots: sub_agents not currently running a work_item and with no
-/// active lease. `computer_filter` (computer name) optionally pins to one host.
+/// active lease. Capacity is fail-closed: both the worker dispatch loop and the
+/// concrete slot supplier must have published fresh evidence. `computer_filter`
+/// (computer name) optionally pins to one host.
 pub async fn pg_free_slots(
     pool: &PgPool,
     computer_filter: Option<&str>,
@@ -12108,6 +12198,10 @@ pub async fn pg_free_slots(
            JOIN computers c ON c.id = sa.computer_id
           WHERE sa.current_work_item_id IS NULL
             AND sa.status = 'idle'
+            AND sa.kind = 'sub_agent'
+            AND sa.last_heartbeat_at >= NOW() - INTERVAL '5 minutes'
+            AND c.status = 'online'
+            AND c.dispatch_tick_at >= NOW() - INTERVAL '60 seconds'
             -- Operator quarantine: a 'disabled' slot must never claim work
             -- (2026-07-19: sarah, a 3GB traveler, kept claiming builds it
             -- cannot run because this filter was missing).
@@ -12116,12 +12210,9 @@ pub async fn pg_free_slots(
             -- Vinny remains hard-fenced after its motherboard/data-loss event.
             AND sa.slot <> 99
             AND LOWER(c.name) <> 'vinny'
-            -- NOTE: NO heartbeat freshness filter here (reverted 2026-07-29,
-            -- same day it shipped): slot heartbeats only advance WHILE a build
-            -- runs, so healthy IDLE slots look 'stale' and a freshness floor
-            -- starves the whole queue (live_free_slots dropped to 0 fleet-wide).
-            -- Zombie-slot remediation belongs to the lease reaper (which reaps
-            -- dead leases), not the selector. Freshness still wins the ORDER BY.
+            -- Idle evidence is published by each node's capacity reconciler.
+            -- Keep this paired with that publisher: selecting configured rows
+            -- without fresh host + slot evidence caused phantom fleet capacity.
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_leases l
                  WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL)
@@ -12595,13 +12686,18 @@ async fn lock_available_sub_agent_slot(
     computer_id: uuid::Uuid,
 ) -> std::result::Result<bool, sqlx::Error> {
     let locked: Option<uuid::Uuid> = sqlx::query_scalar(
-        "SELECT id
-           FROM sub_agents
-          WHERE id = $1
-            AND computer_id = $2
-            AND status = 'idle'
-            AND current_work_item_id IS NULL
-          FOR UPDATE",
+        "SELECT sa.id
+           FROM sub_agents sa
+           JOIN computers c ON c.id = sa.computer_id
+          WHERE sa.id = $1
+            AND sa.computer_id = $2
+            AND sa.status = 'idle'
+            AND sa.kind = 'sub_agent'
+            AND sa.current_work_item_id IS NULL
+            AND sa.last_heartbeat_at >= NOW() - INTERVAL '5 minutes'
+            AND c.status = 'online'
+            AND c.dispatch_tick_at >= NOW() - INTERVAL '60 seconds'
+          FOR UPDATE OF sa",
     )
     .bind(sub_agent_id)
     .bind(computer_id)
@@ -13347,13 +13443,17 @@ mod jira_claim_guard_tests {
              );
              CREATE TABLE computers (
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                 name TEXT NOT NULL
+                 name TEXT NOT NULL,
+                 status TEXT NOT NULL DEFAULT 'online',
+                 dispatch_tick_at TIMESTAMPTZ
              );
              CREATE TABLE sub_agents (
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                  computer_id UUID NOT NULL REFERENCES computers(id),
                  current_work_item_id UUID,
-                 status TEXT NOT NULL DEFAULT 'idle'
+                 status TEXT NOT NULL DEFAULT 'idle',
+                 kind TEXT NOT NULL DEFAULT 'sub_agent',
+                 last_heartbeat_at TIMESTAMPTZ
              );
              CREATE TABLE work_items (
                  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -13368,6 +13468,7 @@ mod jira_claim_guard_tests {
                  repo_path TEXT,
                  base_branch TEXT,
                  assigned_computer TEXT,
+                 started_at TIMESTAMPTZ,
                  risk_score REAL NOT NULL DEFAULT 0,
                  retry_count INTEGER NOT NULL DEFAULT 0,
                  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -13442,17 +13543,20 @@ mod jira_claim_guard_tests {
         .fetch_one(pool)
         .await
         .unwrap();
-        let computer_id =
-            sqlx::query_scalar("INSERT INTO computers (name) VALUES ('sia') RETURNING id")
-                .fetch_one(pool)
-                .await
-                .unwrap();
-        let sub_agent_id =
-            sqlx::query_scalar("INSERT INTO sub_agents (computer_id) VALUES ($1) RETURNING id")
-                .bind(computer_id)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let computer_id = sqlx::query_scalar(
+            "INSERT INTO computers (name, dispatch_tick_at) VALUES ('sia', NOW()) RETURNING id",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        let sub_agent_id = sqlx::query_scalar(
+            "INSERT INTO sub_agents (computer_id, last_heartbeat_at)
+             VALUES ($1, NOW()) RETURNING id",
+        )
+        .bind(computer_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         (repo_id, computer_id, sub_agent_id)
     }
 
@@ -13636,6 +13740,42 @@ mod jira_claim_guard_tests {
                 .await
                 .unwrap()
         );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_claims_cannot_reserve_the_same_worker_slot() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        let (_repo_id, computer_id, sub_agent_id) = seed_project_slot(&pool).await;
+        let first = insert_work_item(&pool, "task", "ready", None, json!({}), None, None).await;
+        let second = insert_work_item(&pool, "task", "ready", None, json!({}), None, None).await;
+
+        let (first_claim, second_claim) = tokio::join!(
+            pg_assign_work_item(&pool, first, sub_agent_id, computer_id, 600),
+            pg_assign_work_item(&pool, second, sub_agent_id, computer_id, 600),
+        );
+        let claims = [first_claim.unwrap(), second_claim.unwrap()];
+        assert_eq!(claims.into_iter().filter(|claimed| *claimed).count(), 1);
+
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_item_leases
+              WHERE sub_agent_id = $1 AND released_at IS NULL",
+        )
+        .bind(sub_agent_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 1);
+        let owner: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT current_work_item_id FROM sub_agents WHERE id = $1")
+                .bind(sub_agent_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(owner == Some(first) || owner == Some(second));
 
         drop_temp_db(admin, pool, &db_name).await;
     }
