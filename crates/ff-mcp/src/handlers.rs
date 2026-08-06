@@ -19,6 +19,10 @@ use ff_api::registry::{BackendEndpoint, BackendRegistry};
 use ff_api::router::{TierRouter, TierRouterConfig, TierTimeouts};
 use ff_api::types::{ChatCompletionRequest, ChatMessage};
 use ff_core::config::{self, FleetConfig};
+use ff_core::llm_completion_policy::{
+    CompletionBudget, LEGACY_DEFAULT_COMPLETION_TOKENS, WorkloadClass, apply_completion_policy,
+    redacted_for_logging, validate_completion_response,
+};
 use ff_db::{ModelDeploymentRow, OperationalStore};
 use ff_discovery::health::{HealthMonitor, HealthStatus, HealthTarget};
 use ff_discovery::ports::known_llm_ports;
@@ -82,7 +86,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     let (config, config_path) = load_config_auto()?;
 
     // ─── Primary source: Postgres. Fallback: fleet.toml ─────────────────────
-    let (pg_nodes, pg_deployments) = match get_pg_pool(&config).await {
+    let (pg_nodes, pg_deployments, scan_port) = match get_pg_pool(&config).await {
         Ok(pool) => {
             let nodes = ff_db::pg_list_nodes(&pool).await.unwrap_or_default();
             // Models LOADED = what's actually RUNNING (fleet_model_deployments),
@@ -92,21 +96,33 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             let deployments = ff_db::pg_list_deployments(&pool, None)
                 .await
                 .unwrap_or_default();
+            // `fleet.api_port` is the loopback-only agent API (:51000) on
+            // managed nodes. Cross-node health must probe the public gateway
+            // port, whose live authority is `fleet_secrets.port.gateway`.
+            let gateway_port = sqlx::query_scalar::<_, String>(
+                "SELECT value FROM fleet_secrets WHERE key = 'port.gateway'",
+            )
+            .fetch_optional(&pool)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(config.fleet.api_port);
             if nodes.is_empty() {
                 info!("fleet_status: Postgres fleet_workers empty, falling back to fleet.toml");
-                (None, None)
+                (None, None, config.fleet.api_port)
             } else {
                 info!(
                     nodes = nodes.len(),
                     deployments = deployments.len(),
                     "fleet_status: using Postgres as primary source"
                 );
-                (Some(nodes), Some(deployments))
+                (Some(nodes), Some(deployments), gateway_port)
             }
         }
         Err(e) => {
             warn!("fleet_status: Postgres unavailable ({e}), falling back to fleet.toml");
-            (None, None)
+            (None, None, config.fleet.api_port)
         }
     };
 
@@ -114,19 +130,18 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
 
     // Build scan targets from whichever source we're using
     let scan_targets = if let Some(ref db_nodes) = pg_nodes {
-        let default_port = config.fleet.api_port;
         let node_tuples: Vec<(String, String, Option<u16>, u32)> = db_nodes
             .iter()
             .map(|n| {
                 (
                     n.name.clone(),
                     n.ip.clone(),
-                    Some(default_port),
+                    Some(scan_port),
                     n.election_priority as u32,
                 )
             })
             .collect();
-        build_scan_targets(node_tuples, default_port)
+        build_scan_targets(node_tuples, scan_port)
     } else {
         build_known_scan_targets(&config)
     };
@@ -330,6 +345,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
     Ok(json!({
         "refresh": refresh,
         "config_path": config_path,
+        "scan_port": scan_port,
         "source": if using_postgres { "postgres" } else { "fleet.toml" },
         "nodes": nodes_json,
         "summary": {
@@ -554,6 +570,48 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .and_then(|v| v.as_str())
         .ok_or_else(|| "fleet_run requires 'prompt'".to_string())?;
 
+    let workload = match params.as_ref().and_then(|p| p.get("workload")) {
+        Some(Value::String(value))
+            if matches!(value.as_str(), "code_oneshot" | "code_one_shot") =>
+        {
+            WorkloadClass::CodeOneShot
+        }
+        Some(Value::String(value)) if value == "reasoning" => WorkloadClass::Reasoning,
+        Some(Value::String(other)) => {
+            return Err(format!(
+                "fleet_run workload must be code_oneshot or reasoning, got {other:?}"
+            ));
+        }
+        Some(_) => return Err("fleet_run workload must be a string".to_string()),
+        None => {
+            warn!(
+                "fleet_run request omitted workload; applying deprecated safe default code_oneshot"
+            );
+            WorkloadClass::CodeOneShot
+        }
+    };
+    let requested_max_tokens = match params.as_ref().and_then(|p| p.get("max_tokens")) {
+        Some(value) => Some(
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    "fleet_run max_tokens must be a positive integer no greater than 32768"
+                        .to_string()
+                })?,
+        ),
+        None => None,
+    };
+    let completion_budget =
+        CompletionBudget::new(requested_max_tokens.unwrap_or(LEGACY_DEFAULT_COMPLETION_TOKENS))
+            .map_err(|error| format!("fleet_run invalid max_tokens: {error}"))?;
+    if requested_max_tokens.is_none() {
+        warn!(
+            default_max_tokens = LEGACY_DEFAULT_COMPLETION_TOKENS,
+            "fleet_run request omitted max_tokens; legacy tier routing uses the 2048-token compatibility default while strategy routing preserves its bounded stage budgets"
+        );
+    }
+
     // strategy: "tier" (default — legacy TierRouter escalation, unchanged
     // behaviour) | "auto" (classifier picks the cascade shape) | "single"
     // | "cascade" | "judge_escalate". When != "tier", dispatch through the
@@ -646,15 +704,22 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     // are explicitly trusting the cascade's auto-routing.
     if strategy_str != "tier" {
         let (cfg, _) = load_config_auto()?;
-        let exec = match get_pg_pool(&cfg).await {
-            Ok(pool) => crate::llm_exec::GatewayLlmExec::new().with_pool(pool),
-            Err(e) => {
-                tracing::warn!(
-                    "fleet_run strategy='{strategy_str}': pool unavailable, falling back to hardcoded endpoints: {e}"
-                );
-                crate::llm_exec::GatewayLlmExec::new()
-            }
-        };
+        let pool = get_pg_pool(&cfg).await.map_err(|error| {
+            format!(
+                "fleet_run strategy='{strategy_str}' unavailable: canonical Postgres router is required: {error}"
+            )
+        })?;
+        let stored_policy = config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await;
+        let route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
+            &cfg.llm.timeouts,
+            stored_policy.as_deref(),
+        )?;
+        let exec = crate::llm_exec::GatewayLlmExec::new(
+            pool.clone(),
+            workload,
+            requested_max_tokens.map(|_| completion_budget),
+            route_policy.clone(),
+        );
 
         let tier_hint = params
             .as_ref()
@@ -668,7 +733,6 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 .and_then(|v| v.as_str()),
         );
 
-        let started = std::time::Instant::now();
         let result = crate::strategy_dispatch::dispatch_strategy(
             &exec,
             prompt,
@@ -677,78 +741,16 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             validator_override,
         )
         .await;
-
-        // Interaction-log capture for Path 3 (strategy=auto/single/cascade/
-        // judge_escalate). The legacy tier path captures below; this branch
-        // returns early and used to skip it entirely, so the recommended
-        // `strategy=auto` default never reached the SLM corpus.
-        if let Ok(value) = &result {
-            let prompt_owned = prompt.to_string();
-            let response_owned = value
-                .get("output")
-                .or_else(|| value.get("response"))
-                .and_then(|v| v.as_str())
-                .map(str::to_string)
-                .unwrap_or_default();
-            let route_decision = value.get("strategy").cloned().unwrap_or(json!({}));
-            // Strategy dispatch runs on the local tier cascade; its result JSON
-            // carries no model/usage today, so without a fallback these rows
-            // landed as engine=NULL with 0 tokens. Label the engine
-            // (`local:<catalog_id>` when the strategy names a model, plain
-            // `local` otherwise) and degrade to a flagged chars/4 estimate.
-            let engine_owned = value
-                .get("strategy")
-                .and_then(|s| s.get("model").or_else(|| s.get("engine")))
-                .and_then(|v| v.as_str())
-                .map(ff_agent::llm_attribution::engine_label)
-                .unwrap_or_else(|| "local".to_string());
-            let tokens_out = value
-                .get("usage")
-                .and_then(|u| u.get("completion_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            let tokens_in = value
-                .get("usage")
-                .and_then(|u| u.get("prompt_tokens"))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0) as i32;
-            let (tokens_in, tokens_out, tokens_estimated) =
-                ff_agent::llm_attribution::tokens_or_estimate(
-                    tokens_in,
-                    tokens_out,
-                    prompt,
-                    &response_owned,
-                );
-            let latency_ms = started.elapsed().as_millis().min(i32::MAX as u128) as i32;
-            let strategy_label = strategy_str.to_string();
-            if let Ok((cfg2, _)) = load_config_auto() {
-                tokio::spawn(async move {
-                    if let Ok(pool) = get_pg_pool(&cfg2).await {
-                        let rec = ff_db::InteractionRecord {
-                            channel: "mcp".to_string(),
-                            request_text: prompt_owned,
-                            request_meta: json!({
-                                "strategy": strategy_label,
-                                "tokens_estimated": tokens_estimated,
-                            }),
-                            route_decision,
-                            engine: Some(engine_owned),
-                            response_text: response_owned,
-                            tokens_in,
-                            tokens_out,
-                            latency_ms: Some(latency_ms),
-                            outcome: "ok".to_string(),
-                            ..Default::default()
-                        };
-                        if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
-                            tracing::debug!("fleet_run Path-3 interaction capture failed: {e}");
-                        }
-                    }
-                });
-            }
+        let interaction =
+            path3_interaction_record("fleet_run", prompt, strategy_str, &route_policy, &result);
+        if let Err(error) = ff_db::pg_record_interaction(&pool, &interaction).await {
+            tracing::warn!(%error, "fleet_run Path-3 interaction capture failed");
         }
-
-        return result;
+        return match result {
+            Ok(success) => serde_json::to_value(success)
+                .map_err(|error| format!("serialize local strategy result: {error}")),
+            Err(failure) => Err(failure.error_text()),
+        };
     }
 
     let (config, _config_path) = load_config_auto()?;
@@ -860,6 +862,10 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                 user: None,
                 extra: HashMap::new(),
             };
+            let mut request = serde_json::to_value(request)
+                .map_err(|error| format!("failed serializing fleet_run request: {error}"))?;
+            apply_completion_policy(&mut request, workload, completion_budget)
+                .map_err(|error| format!("fleet_run request policy failed: {error}"))?;
 
             let started = Instant::now();
             let endpoint = ff_core::url::normalize_chat_completions_url(&backend.base_url());
@@ -876,10 +882,6 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
                     if !response.status().is_success() {
                         let status = response.status();
-                        let body = response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "<failed reading error body>".to_string());
 
                         tier_router.record_failure(&backend.id, latency);
                         quality_tracker.record(
@@ -888,17 +890,44 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                             &Outcome::failure(latency.as_millis() as f64),
                         );
 
-                        last_error = format!(
-                            "backend '{}' returned HTTP {}: {}",
-                            backend.id, status, body
-                        );
+                        // Provider bodies can echo prompts or private reasoning.
+                        // Preserve the actionable endpoint/status only.
+                        last_error = format!("backend '{}' returned HTTP {}", backend.id, status);
                         continue;
                     }
 
-                    let payload: Value = response
-                        .json()
-                        .await
-                        .map_err(|e| format!("failed parsing backend JSON response: {e}"))?;
+                    let payload: Value = match response.json().await {
+                        Ok(payload) => payload,
+                        Err(error) => {
+                            tier_router.record_failure(&backend.id, latency);
+                            quality_tracker.record(
+                                &backend.model,
+                                decision.profile.task_type,
+                                &Outcome::failure(latency.as_millis() as f64),
+                            );
+                            last_error = format!(
+                                "backend '{}' returned invalid completion JSON: {error}",
+                                backend.id
+                            );
+                            continue;
+                        }
+                    };
+                    let completion = match validate_completion_response(&payload) {
+                        Ok(completion) => completion,
+                        Err(error) => {
+                            tier_router.record_failure(&backend.id, latency);
+                            quality_tracker.record(
+                                &backend.model,
+                                decision.profile.task_type,
+                                &Outcome::failure(latency.as_millis() as f64),
+                            );
+                            last_error = format!(
+                                "backend '{}' returned an unsafe completion: {error}",
+                                backend.id
+                            );
+                            continue;
+                        }
+                    };
 
                     tier_router.record_success(&backend.id, latency);
                     quality_tracker.record(
@@ -909,14 +938,15 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
                     persist_quality_snapshot(&quality_tracker).await;
 
-                    let text = extract_completion_text(&payload);
+                    let text = completion.content;
+                    let redacted_payload = redacted_for_logging(&payload);
 
                     // Fire-and-forget interaction capture (Track A). Never
                     // blocks the response; skips silently if no pool is
                     // available. channel="mcp".
                     {
                         let prompt_owned = prompt.to_string();
-                        let response_owned = text.clone().unwrap_or_default();
+                        let response_owned = text.clone();
                         // `backend.model` is a local deployment's model name /
                         // gguf filename — record the canonical local engine.
                         let engine_owned = ff_agent::llm_attribution::engine_label(&backend.model);
@@ -973,7 +1003,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                         },
                         "latency_ms": latency.as_millis(),
                         "response": text,
-                        "raw_response": payload,
+                        "raw_response": redacted_payload,
+                        "raw_response_redacted": true,
                         "project_policy": applied_policy
                     }));
                 }
@@ -1000,6 +1031,106 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     })
 }
 
+fn path3_interaction_record(
+    tool: &str,
+    prompt: &str,
+    strategy: &str,
+    policy: &crate::llm_exec::LocalRoutePolicy,
+    result: &crate::strategy_dispatch::StrategyDispatchResult,
+) -> ff_db::InteractionRecord {
+    let (execution, route_decision, response_text, outcome, error_text, engine, worker, endpoint) =
+        match result {
+            Ok(success) if !success.output.trim().is_empty() => {
+                let winner = success.winner();
+                (
+                    &success.execution,
+                    success.route_decision(),
+                    success.output.clone(),
+                    "ok".to_string(),
+                    None,
+                    winner.map(|route| route.engine.clone()),
+                    winner.map(|route| route.worker_name.clone()),
+                    winner.map(|route| route.endpoint.clone()),
+                )
+            }
+            Ok(success) => {
+                // Defense in depth: even a future caller that accidentally
+                // constructs a success object with blank output is recorded as
+                // an error, never as training-corpus success.
+                let last = success.execution.attempts.last();
+                (
+                    &success.execution,
+                    success.route_decision(),
+                    String::new(),
+                    "error".to_string(),
+                    Some("invalid_response: strategy success contained blank output".to_string()),
+                    last.and_then(|attempt| {
+                        attempt
+                            .catalog_id
+                            .as_deref()
+                            .map(ff_agent::llm_attribution::engine_label)
+                    }),
+                    last.map(|attempt| attempt.worker_name.clone()),
+                    last.map(|attempt| attempt.endpoint.clone()),
+                )
+            }
+            Err(failure) => {
+                let last = failure.execution.attempts.last();
+                let error = failure.error_text();
+                (
+                    &failure.execution,
+                    failure.route_decision(),
+                    String::new(),
+                    "error".to_string(),
+                    Some(error),
+                    last.and_then(|attempt| {
+                        attempt
+                            .catalog_id
+                            .as_deref()
+                            .map(ff_agent::llm_attribution::engine_label)
+                    }),
+                    last.map(|attempt| attempt.worker_name.clone()),
+                    last.map(|attempt| attempt.endpoint.clone()),
+                )
+            }
+        };
+    let tokens_in = execution
+        .attempts
+        .iter()
+        .map(|attempt| attempt.tokens_in)
+        .sum();
+    let tokens_out = execution
+        .attempts
+        .iter()
+        .map(|attempt| attempt.tokens_out)
+        .sum();
+    let error_signature = error_text
+        .as_deref()
+        .map(|error| ff_agent::log_signature::global_tracker().signature_for(error));
+    ff_db::InteractionRecord {
+        channel: "mcp".to_string(),
+        request_text: prompt.chars().take(16_000).collect(),
+        request_meta: json!({
+            "tool": tool,
+            "strategy": strategy,
+            "local_route_policy": policy,
+        }),
+        route_decision,
+        engine,
+        steps: serde_json::to_value(&execution.attempts).unwrap_or_else(|_| json!([])),
+        response_text: response_text.chars().take(16_000).collect(),
+        tokens_in,
+        tokens_out,
+        latency_ms: Some(execution.latency_ms.min(i32::MAX as u64) as i32),
+        outcome,
+        error_text,
+        error_signature,
+        worker_name: worker,
+        endpoint,
+        ..Default::default()
+    }
+}
+
 // ─── Fleet Offload ─────────────────────────────────────────────────────────
 //
 // The credit-saver. Lets a cloud orchestrator (Claude Code / Codex / Kimi)
@@ -1014,9 +1145,9 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 //      hosts in v1. This is the SAME scored selector `fleet_route` and the
 //      agent router use — no parallel router.
 //   2. Found → dispatch the task to it over the OpenAI-compatible API, reusing
-//      the same SHARED_HTTP client + `/v1/chat/completions` request shape +
-//      `extract_completion_text` helper that `fleet_run` uses (no parallel LLM
-//      client). Return {offloaded:true, endpoint, model, result, ...}.
+//      the same SHARED_HTTP client + shared fail-closed completion policy that
+//      `fleet_run` uses (no parallel LLM client). Return
+//      {offloaded:true, endpoint, model, result, ...}.
 //   3. None warm → record the UNMET demand (so the P3 autoscaler warms a
 //      matching endpoint for next time) and return {offloaded:false,
 //      decision:"do_in_cloud", autoscaler_signaled, reason:...} so the caller
@@ -1179,18 +1310,18 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         n: None,
         stream: Some(false),
         stop: None,
-        max_tokens: Some(max_tokens),
+        max_tokens: None,
         presence_penalty: None,
         frequency_penalty: None,
         user: None,
-        // Disable Qwen3-style "thinking" so offload returns the answer, not
-        // chain-of-thought that eats the token budget (can return empty content
-        // under a tight cap). Harmless on servers that don't recognize it.
-        extra: HashMap::from([(
-            "chat_template_kwargs".to_string(),
-            json!({"enable_thinking": false}),
-        )]),
+        extra: HashMap::new(),
     };
+    let mut request = serde_json::to_value(request)
+        .map_err(|error| format!("fleet_offload failed serializing request: {error}"))?;
+    let offload_budget = CompletionBudget::new(max_tokens)
+        .map_err(|error| format!("fleet_offload invalid max_tokens: {error}"))?;
+    apply_completion_policy(&mut request, WorkloadClass::CodeOneShot, offload_budget)
+        .map_err(|error| format!("fleet_offload request policy failed: {error}"))?;
 
     let started = Instant::now();
     let response = match client
@@ -1228,12 +1359,8 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
     let latency = started.elapsed();
     let status = response.status();
     if !status.is_success() {
-        let body = response
-            .text()
-            .await
-            .unwrap_or_else(|_| "<failed reading error body>".to_string());
         let error_text = format!(
-            "fleet_offload endpoint {} (model {}) returned HTTP {status}: {body}",
+            "fleet_offload endpoint {} (model {}) returned HTTP {status}",
             target.endpoint, model
         );
         record_mcp_offload_turn(
@@ -1243,7 +1370,7 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
             min_ctx,
             max_tokens,
             &target,
-            &body,
+            "",
             0,
             0,
             Some(latency),
@@ -1276,7 +1403,28 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
             return Err(error_text);
         }
     };
-    let result = strip_think_block(&extract_completion_text(&payload).unwrap_or_default());
+    let result = match validate_completion_response(&payload) {
+        Ok(completion) => completion.content,
+        Err(error) => {
+            let error_text = format!("fleet_offload returned an unsafe completion: {error}");
+            record_mcp_offload_turn(
+                &pool,
+                task,
+                kind,
+                min_ctx,
+                max_tokens,
+                &target,
+                "",
+                0,
+                0,
+                Some(latency),
+                "error",
+                Some(&error_text),
+            )
+            .await;
+            return Err(error_text);
+        }
+    };
     let usage = payload.get("usage");
     let usage_tok = |key: &str| -> i32 {
         usage
@@ -1313,7 +1461,8 @@ pub async fn fleet_offload(params: Option<Value>) -> HandlerResult {
         "kind": kind,
         "latency_ms": latency.as_millis(),
         "result": result,
-        "raw_response": payload,
+        "raw_response": redacted_for_logging(&payload),
+        "raw_response_redacted": true,
         "review_hint": "Review this output before using it. If it's wrong or \
                         the task needed architectural judgment, redo it yourself."
     }))
@@ -1366,37 +1515,6 @@ async fn record_mcp_offload_turn(
     }
 }
 
-/// Strip any `<think>…</think>` reasoning a model emitted, returning the trimmed
-/// remainder. Belt-and-suspenders with chat_template_kwargs.enable_thinking=false.
-/// NOTE: keep in sync with `strip_think` in ff-terminal/src/offload_cmd.rs.
-fn strip_think_block(s: &str) -> String {
-    let mut out = s.to_string();
-    // 1) Remove well-formed <think>…</think> pairs, left-to-right.
-    loop {
-        let Some(open) = out.find("<think>") else {
-            break;
-        };
-        match out[open..].find("</think>") {
-            Some(rel) => {
-                let close = open + rel + "</think>".len();
-                out.replace_range(open..close, "");
-            }
-            // 2) Unclosed opener — a thinking model cut off mid-reasoning under a
-            //    token cap. Everything from <think> on is reasoning; drop it.
-            None => {
-                out.truncate(open);
-                break;
-            }
-        }
-    }
-    // 3) A lone trailing </think> with no opener (the open tag was consumed by
-    //    the chat template): the answer is whatever follows the last </think>.
-    if let Some(i) = out.rfind("</think>") {
-        out = out[i + "</think>".len()..].to_string();
-    }
-    out.trim().to_string()
-}
-
 // ─── Fleet Cascade ───────────────────────────────────────────────────────────
 //
 // Outcome-aware routing: classifier → strategy → cascade/judge-escalate
@@ -1432,35 +1550,45 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
             .and_then(|v| v.as_str()),
     );
 
-    // Wire a Postgres pool into the exec so endpoint resolution queries
-    // fleet_model_deployments at dispatch time. Pool failure degrades to
-    // the hardcoded preferred-endpoint map.
-    let exec = match config::load_config_auto() {
-        Ok((cfg, _)) => match get_pg_pool(&cfg).await {
-            Ok(pool) => crate::llm_exec::GatewayLlmExec::new().with_pool(pool),
-            Err(e) => {
-                tracing::warn!(
-                    "fleet_cascade: pool unavailable, falling back to hardcoded endpoints: {e}"
-                );
-                crate::llm_exec::GatewayLlmExec::new()
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                "fleet_cascade: config load failed, falling back to hardcoded endpoints: {e}"
-            );
-            crate::llm_exec::GatewayLlmExec::new()
-        }
-    };
+    let (cfg, _) = config::load_config_auto().map_err(|error| format!("config: {error}"))?;
+    let pool = get_pg_pool(&cfg).await.map_err(|error| {
+        format!("fleet_cascade unavailable: canonical Postgres router is required: {error}")
+    })?;
+    let stored_policy = config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await;
+    let route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
+        &cfg.llm.timeouts,
+        stored_policy.as_deref(),
+    )?;
+    let exec = crate::llm_exec::GatewayLlmExec::new(
+        pool.clone(),
+        WorkloadClass::CodeOneShot,
+        None,
+        route_policy.clone(),
+    );
 
-    crate::strategy_dispatch::dispatch_strategy(
+    let result = crate::strategy_dispatch::dispatch_strategy(
         &exec,
         prompt,
         strategy_str,
         tier_hint,
         validator_override,
     )
-    .await
+    .await;
+    let interaction = path3_interaction_record(
+        "fleet_cascade",
+        prompt,
+        strategy_str,
+        &route_policy,
+        &result,
+    );
+    if let Err(error) = ff_db::pg_record_interaction(&pool, &interaction).await {
+        tracing::warn!(%error, "fleet_cascade Path-3 interaction capture failed");
+    }
+    match result {
+        Ok(success) => serde_json::to_value(success)
+            .map_err(|error| format!("serialize local cascade result: {error}")),
+        Err(failure) => Err(failure.error_text()),
+    }
 }
 
 // ─── Fleet Route ─────────────────────────────────────────────────────────────
@@ -1895,15 +2023,30 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     info!(task, repo_dir, project_id = ?project_id, "fleet_crew handler called");
 
     let started = Instant::now();
+    let (pattern, strategy, decomposed) = TemplateDecomposer::decompose(task);
     // Build the crew from the V112 `fleet_agents` catalog, routing each agent
     // through the agent-swarm capability router. Falls back to the hardcoded
     // TeamTemplates when the catalog / DB is unavailable (back-compat).
-    let (team, crew_routing) = build_crew_team(applied_policy.as_ref()).await;
+    let (team, crew_routing) = build_crew_team(applied_policy.as_ref()).await?;
+    // The handler's transport-only unit tests inject a loopback mock endpoint
+    // while deliberately making the fleet config invalid. Production builds
+    // never allow that unverified bypass.
+    let allow_unverified_test_endpoint = cfg!(test) && llm_base_url.is_some();
+    if decomposed
+        .iter()
+        .any(|subtask| crew_subtask_requires_code_model(subtask.task_type))
+        && crew_routing.used_template_fallback
+        && !allow_unverified_test_endpoint
+    {
+        return Err(
+            "fleet_crew requires verified code-gen routing but the fleet agent catalog/router is unavailable"
+                .to_string(),
+        );
+    }
     let policy_notes = applied_policy
         .as_ref()
         .map(policy_notes_for_crew)
         .unwrap_or_default();
-    let (pattern, strategy, decomposed) = TemplateDecomposer::decompose(task);
     let decomposition = TemplateDecomposer::to_task_decomposition(task, &decomposed);
     let plan = Planner::plan(&decomposition)
         .map_err(|e| format!("failed to build execution plan: {e}"))?;
@@ -1922,19 +2065,20 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
         );
 
         let model_hint = preferred_model_hint(&assignment.model_preference);
-        let prompt = build_crew_step_prompt(
+        let prompt = build_crew_step_prompt(CrewStepPromptContext {
             task,
             repo_dir,
-            &subtask.title,
-            &subtask.prompt,
-            &assignment,
-            &subtask.depends_on,
-            if policy_notes.is_empty() {
+            title: &subtask.title,
+            subtask_prompt: &subtask.prompt,
+            task_type: decomposed_subtask.task_type,
+            assignment: &assignment,
+            depends_on: &subtask.depends_on,
+            policy_notes: if policy_notes.is_empty() {
                 None
             } else {
                 Some(policy_notes.as_str())
             },
-        );
+        });
 
         let timeout_secs = crew_timeout_for_complexity(decomposed_subtask.estimated_complexity);
 
@@ -1945,6 +2089,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 prompt,
                 model: model_hint,
                 max_tokens: Some(1200),
+                endpoint: assignment.endpoint.clone(),
             },
         )
         .with_timeout(Duration::from_secs(timeout_secs))
@@ -2063,6 +2208,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     let mut skipped = 0usize;
+    let mut reviewer_failures = 0usize;
 
     let subtasks: Vec<Value> = decomposition
         .subtasks
@@ -2073,7 +2219,7 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
             let step_id = StepId::new(subtask.id.to_string());
             let step_result = run.results.get(&step_id);
 
-            let (status, output, error, attempts, duration_ms) = match step_result {
+            let (mut status, output, mut error, attempts, duration_ms) = match step_result {
                 Some(result) => {
                     let status = step_status_label(result.status);
                     match result.status {
@@ -2102,6 +2248,40 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 }
             };
 
+            let mut review_verdict = Value::Null;
+            if ds.task_type == SubTaskType::Review && status == "succeeded" {
+                match parse_crew_review_verdict(&output) {
+                    CrewReviewVerdict::Approve => {
+                        review_verdict = json!({"decision": "approve"});
+                    }
+                    CrewReviewVerdict::RequestChanges(reason) => {
+                        succeeded = succeeded.saturating_sub(1);
+                        failed += 1;
+                        reviewer_failures += 1;
+                        status = "review_rejected".to_string();
+                        error = Some(format!("reviewer requested changes: {reason}"));
+                        review_verdict = json!({
+                            "decision": "request_changes",
+                            "reason": reason
+                        });
+                    }
+                    CrewReviewVerdict::Invalid { tail } => {
+                        succeeded = succeeded.saturating_sub(1);
+                        failed += 1;
+                        reviewer_failures += 1;
+                        status = "review_invalid".to_string();
+                        error = Some(
+                            "reviewer response did not end with the required verdict contract"
+                                .to_string(),
+                        );
+                        review_verdict = json!({
+                            "decision": "invalid",
+                            "raw_tail": tail
+                        });
+                    }
+                }
+            }
+
             let step_json = json!({
                 "id": subtask.id,
                 "index": subtask.index,
@@ -2119,7 +2299,8 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
                 "attempts": attempts,
                 "duration_ms": duration_ms,
                 "output": output,
-                "error": error
+                "error": error,
+                "review_verdict": review_verdict
             });
 
             executed_steps.push(step_json.clone());
@@ -2138,15 +2319,17 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
         .collect();
 
     let total_steps = decomposition.subtasks.len();
-    let execution_status = if run.success { "completed" } else { "failed" };
+    let crew_success = run.success && reviewer_failures == 0;
+    let execution_status = if crew_success { "completed" } else { "failed" };
 
     let summary = json!({
         "total_steps": total_steps,
         "succeeded": succeeded,
         "failed": failed,
         "skipped": skipped,
-        "success": run.success,
-        "text": crew_summary_text(task, run.success, total_steps, succeeded, failed, skipped)
+        "success": crew_success,
+        "reviewer_failures": reviewer_failures,
+        "text": crew_summary_text(task, crew_success, total_steps, succeeded, failed, skipped)
     });
 
     let audit_details = json!({
@@ -3195,6 +3378,24 @@ impl CrewRouting {
     }
 }
 
+fn crew_role_workload(role: &AgentRole) -> Option<&'static str> {
+    match role {
+        AgentRole::Coder | AgentRole::Reviewer | AgentRole::Tester | AgentRole::Executor => {
+            Some("code-gen")
+        }
+        AgentRole::Researcher | AgentRole::Writer | AgentRole::Planner | AgentRole::Assistant => {
+            None
+        }
+    }
+}
+
+fn crew_subtask_requires_code_model(task_type: SubTaskType) -> bool {
+    matches!(
+        task_type,
+        SubTaskType::Code | SubTaskType::ToolUse | SubTaskType::Review
+    )
+}
+
 /// Build the crew [`TeamConfig`] from the V112 `fleet_agents` catalog. Each
 /// agent's endpoint is resolved through the agent-swarm capability router
 /// ([`ff_db::pg_pick_agent_endpoint`]) using the agent's `min_ctx`, so the
@@ -3206,19 +3407,21 @@ impl CrewRouting {
 ///
 /// Returns the team alongside a [`CrewRouting`] summary so the caller can
 /// surface (and this fn logs) any silent routing degradation.
-async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, CrewRouting) {
+async fn build_crew_team(
+    policy: Option<&AppliedProjectPolicy>,
+) -> Result<(TeamConfig, CrewRouting), String> {
     let fallback = |reason: &str| {
         warn!(
             reason,
             "fleet_crew: agent catalog unavailable; using hardcoded TeamTemplates — agents run on the executor's default endpoint, not a routed fleet model"
         );
-        (
+        Ok((
             choose_team_for_policy(policy),
             CrewRouting {
                 used_template_fallback: true,
                 ..Default::default()
             },
-        )
+        ))
     };
 
     let Ok((config, _)) = load_config_auto() else {
@@ -3249,9 +3452,15 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
     let mut built_any = false;
 
     for name in &names {
+        let expected_role = AgentAssignment::role_for_agent_name(name);
         let row = match ff_db::pg_get_agent(&pool, name).await {
             Ok(Some(r)) if r.enabled => r,
-            _ => continue, // missing/disabled — skip; fallback handles empties
+            _ if crew_role_workload(&expected_role).is_some() => {
+                return Err(format!(
+                    "fleet_crew required code agent {name:?} is missing or disabled"
+                ));
+            }
+            _ => continue,
         };
         let role = AgentAssignment::role_for_agent_name(&row.name);
         // Resolve the endpoint via the V111 capability router for this agent's
@@ -3260,14 +3469,46 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
         // default, so we record + log the degradation. A `true` fallback flag
         // means it had to use the leader (preference overridden) — recorded but
         // not degraded.
-        let (candidate, used_leader) =
-            ff_db::pg_pick_agent_endpoint_soft(&pool, row.min_ctx, &soft_exclude)
-                .await
-                .unwrap_or((None, false));
+        let required_workload = crew_role_workload(&role);
+        let (candidate, used_leader) = ff_db::pg_pick_agent_endpoint_for_workload_soft(
+            &pool,
+            row.min_ctx,
+            required_workload,
+            &soft_exclude,
+        )
+        .await
+        .map_err(|error| {
+            format!(
+                "fleet_crew failed routing agent {:?} for workload {:?} with min_ctx {}: {error}",
+                row.name, required_workload, row.min_ctx
+            )
+        })?;
         if used_leader {
             routing.leader_fallbacks.push(row.name.clone());
         }
-        let endpoint = candidate.map(|c| c.endpoint);
+        let (endpoint, routed_model) = match candidate {
+            Some(candidate) => {
+                let (endpoint, model) = validate_crew_route_identity(
+                    &candidate.endpoint,
+                    candidate.catalog_id.as_deref(),
+                    candidate.catalog_name.as_deref(),
+                )
+                .map_err(|error| {
+                        format!(
+                            "fleet_crew routed agent {:?} without a usable endpoint/model identity: {error}",
+                            row.name,
+                        )
+                    })?;
+                (Some(endpoint), Some(model))
+            }
+            None if required_workload.is_some() => {
+                return Err(format!(
+                    "fleet_crew found no eligible endpoint for agent {:?}: required workload {:?}, tool_calling=true, min_ctx={}",
+                    row.name, required_workload, row.min_ctx
+                ));
+            }
+            None => (None, None),
+        };
         match &endpoint {
             Some(_) => routing.routed += 1,
             None => {
@@ -3279,12 +3520,16 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
                 routing.unrouted_agents.push(row.name.clone());
             }
         }
-        team.add(AgentAssignment::from_catalog(
+        let mut assignment = AgentAssignment::from_catalog(
             row.name.clone(),
             role,
             row.system_prompt.clone(),
             endpoint,
-        ));
+        );
+        if let Some(model) = routed_model {
+            assignment.model_preference = ModelPreference::specific(model);
+        }
+        team.add(assignment);
         built_any = true;
     }
 
@@ -3302,10 +3547,48 @@ async fn build_crew_team(policy: Option<&AppliedProjectPolicy>) -> (TeamConfig, 
                 "fleet_crew: no non-leader agent-capable endpoint for some agents — routed them to the leader (preference overridden)"
             );
         }
-        (team, routing)
+        Ok((team, routing))
     } else {
         fallback("empty_catalog")
     }
+}
+
+fn validate_crew_endpoint(endpoint: &str) -> Result<String, String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    if endpoint.is_empty() {
+        return Err("endpoint is empty".to_string());
+    }
+    let parsed = reqwest::Url::parse(endpoint)
+        .map_err(|error| format!("endpoint is not an absolute URL: {error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!(
+            "endpoint scheme {:?} is not http or https",
+            parsed.scheme()
+        ));
+    }
+    if parsed.host_str().is_none() {
+        return Err("endpoint has no host".to_string());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("endpoint must not contain credentials".to_string());
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("endpoint must not contain a query or fragment".to_string());
+    }
+    Ok(endpoint.to_string())
+}
+
+fn validate_crew_route_identity(
+    endpoint: &str,
+    catalog_id: Option<&str>,
+    catalog_name: Option<&str>,
+) -> Result<(String, String), String> {
+    let endpoint = validate_crew_endpoint(endpoint)?;
+    let model = catalog_id
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| catalog_name.filter(|value| !value.trim().is_empty()))
+        .ok_or_else(|| "catalog model identity is empty".to_string())?;
+    Ok((endpoint, model.trim().to_string()))
 }
 
 fn choose_team_for_policy(policy: Option<&AppliedProjectPolicy>) -> TeamConfig {
@@ -3405,15 +3688,28 @@ fn preferred_model_hint(model_preference: &ModelPreference) -> Option<String> {
     }
 }
 
-fn build_crew_step_prompt(
-    task: &str,
-    repo_dir: &str,
-    title: &str,
-    subtask_prompt: &str,
-    assignment: &AgentAssignment,
-    depends_on: &[uuid::Uuid],
-    policy_notes: Option<&str>,
-) -> String {
+struct CrewStepPromptContext<'a> {
+    task: &'a str,
+    repo_dir: &'a str,
+    title: &'a str,
+    subtask_prompt: &'a str,
+    task_type: SubTaskType,
+    assignment: &'a AgentAssignment,
+    depends_on: &'a [uuid::Uuid],
+    policy_notes: Option<&'a str>,
+}
+
+fn build_crew_step_prompt(context: CrewStepPromptContext<'_>) -> String {
+    let CrewStepPromptContext {
+        task,
+        repo_dir,
+        title,
+        subtask_prompt,
+        task_type,
+        assignment,
+        depends_on,
+        policy_notes,
+    } = context;
     let dependency_text = if depends_on.is_empty() {
         "None".to_string()
     } else {
@@ -3425,6 +3721,14 @@ fn build_crew_step_prompt(
     };
 
     let policy_block = policy_notes.unwrap_or("No project policy override.");
+    let review_contract = if task_type == SubTaskType::Review {
+        "\n\nReviewer verdict contract: your LAST non-empty line MUST be exactly one of:\n\
+         FF_REVIEW_VERDICT: APPROVE\n\
+         FF_REVIEW_VERDICT: REQUEST_CHANGES: <specific reason>\n\
+         Do not claim approval anywhere else. Missing or malformed verdicts fail closed."
+    } else {
+        ""
+    };
 
     format!(
         "Role: {role}\n\
@@ -3436,7 +3740,7 @@ fn build_crew_step_prompt(
          Project policy:\n{policy_block}\n\n\
          {system_prompt}\n\n\
          Subtask instructions:\n{subtask_prompt}\n\n\
-         Return concise, actionable output for the next step.",
+         Return concise, actionable output for the next step.{review_contract}",
         role = assignment.role,
         team_role = assignment.role,
         repo_dir = repo_dir,
@@ -3446,6 +3750,7 @@ fn build_crew_step_prompt(
         policy_block = policy_block,
         system_prompt = assignment.full_system_prompt(),
         subtask_prompt = subtask_prompt,
+        review_contract = review_contract,
     )
 }
 
@@ -3467,6 +3772,56 @@ fn step_status_label(status: StepStatus) -> String {
         StepStatus::TimedOut => "timed_out",
     }
     .to_string()
+}
+
+const CREW_REVIEW_TAIL_CHARS: usize = 4_096;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CrewReviewVerdict {
+    Approve,
+    RequestChanges(String),
+    Invalid { tail: String },
+}
+
+fn bounded_review_tail(output: &str) -> String {
+    let mut chars = output
+        .chars()
+        .rev()
+        .take(CREW_REVIEW_TAIL_CHARS)
+        .collect::<Vec<_>>();
+    chars.reverse();
+    chars.into_iter().collect()
+}
+
+fn parse_crew_review_verdict(output: &str) -> CrewReviewVerdict {
+    let tail = bounded_review_tail(output);
+    let Some(line) = tail.lines().rev().find(|line| !line.trim().is_empty()) else {
+        return CrewReviewVerdict::Invalid { tail };
+    };
+    let Some((marker, payload)) = line.trim().split_once(':') else {
+        return CrewReviewVerdict::Invalid { tail };
+    };
+    if !marker.trim().eq_ignore_ascii_case("FF_REVIEW_VERDICT") {
+        return CrewReviewVerdict::Invalid { tail };
+    }
+
+    let payload = payload.trim();
+    if payload
+        .trim_end_matches(['.', ';'])
+        .eq_ignore_ascii_case("APPROVE")
+    {
+        return CrewReviewVerdict::Approve;
+    }
+
+    let Some((decision, reason)) = payload.split_once(':') else {
+        return CrewReviewVerdict::Invalid { tail };
+    };
+    let reason = reason.trim();
+    if decision.trim().eq_ignore_ascii_case("REQUEST_CHANGES") && !reason.is_empty() {
+        CrewReviewVerdict::RequestChanges(reason.to_string())
+    } else {
+        CrewReviewVerdict::Invalid { tail }
+    }
 }
 
 fn crew_summary_text(
@@ -4024,46 +4379,6 @@ fn infer_subnet(config: &FleetConfig) -> Option<String> {
     None
 }
 
-fn extract_completion_text(payload: &Value) -> Option<String> {
-    payload
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| {
-            choice
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(value_to_string)
-                .or_else(|| {
-                    choice
-                        .get("delta")
-                        .and_then(|m| m.get("content"))
-                        .and_then(value_to_string)
-                })
-                .or_else(|| choice.get("text").and_then(value_to_string))
-        })
-}
-
-fn value_to_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Array(arr) => {
-            let mut text_parts = Vec::new();
-            for item in arr {
-                if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
-                    text_parts.push(text.to_string());
-                }
-            }
-            if text_parts.is_empty() {
-                None
-            } else {
-                Some(text_parts.join("\n"))
-            }
-        }
-        _ => None,
-    }
-}
-
 async fn persist_quality_snapshot(tracker: &Arc<QualityTracker>) {
     match tracker.export_json() {
         Ok(snapshot) => {
@@ -4240,7 +4555,9 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
+
+    use tokio::sync::Mutex;
 
     use axum::{Json, Router, http::StatusCode, routing::post};
     use tokio::net::TcpListener;
@@ -4289,6 +4606,268 @@ mod tests {
         assert!(!leader_only.degraded());
     }
 
+    #[test]
+    fn crew_route_identity_preserves_endpoint_and_catalog_model() {
+        assert_eq!(
+            validate_crew_route_identity(
+                "  http://192.168.5.110:55004/ ",
+                Some("lucy-1-7b"),
+                Some("fallback-name"),
+            )
+            .unwrap(),
+            (
+                "http://192.168.5.110:55004".to_string(),
+                "lucy-1-7b".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn crew_route_identity_rejects_unsafe_or_incomplete_routes() {
+        for endpoint in [
+            "",
+            "127.0.0.1:51002",
+            "file:///tmp/socket",
+            "http://user:secret@host:55000",
+            "http://host:55000?token=secret",
+        ] {
+            assert!(
+                validate_crew_route_identity(endpoint, Some("model"), None).is_err(),
+                "unsafe endpoint {endpoint:?} must fail closed"
+            );
+        }
+        assert!(validate_crew_route_identity("http://host:55000", Some("  "), None).is_err());
+    }
+
+    #[test]
+    fn crew_code_roles_require_canonical_codegen_workload() {
+        for role in [
+            AgentRole::Coder,
+            AgentRole::Reviewer,
+            AgentRole::Tester,
+            AgentRole::Executor,
+        ] {
+            assert_eq!(crew_role_workload(&role), Some("code-gen"));
+        }
+        for role in [
+            AgentRole::Researcher,
+            AgentRole::Writer,
+            AgentRole::Planner,
+            AgentRole::Assistant,
+        ] {
+            assert_eq!(crew_role_workload(&role), None);
+        }
+        for task_type in [SubTaskType::Code, SubTaskType::ToolUse, SubTaskType::Review] {
+            assert!(crew_subtask_requires_code_model(task_type));
+        }
+        assert!(!crew_subtask_requires_code_model(SubTaskType::Planning));
+    }
+
+    #[test]
+    fn crew_reviewer_verdict_contract_is_bounded_and_fail_closed() {
+        assert_eq!(
+            parse_crew_review_verdict("findings\nff_review_verdict: approve.;  \n"),
+            CrewReviewVerdict::Approve
+        );
+        assert_eq!(
+            parse_crew_review_verdict(
+                "findings\nFF_REVIEW_VERDICT: REQUEST_CHANGES: add a race test"
+            ),
+            CrewReviewVerdict::RequestChanges("add a race test".to_string())
+        );
+        assert!(matches!(
+            parse_crew_review_verdict("APPROVE"),
+            CrewReviewVerdict::Invalid { .. }
+        ));
+        assert!(matches!(
+            parse_crew_review_verdict("FF_REVIEW_VERDICT: REQUEST_CHANGES:"),
+            CrewReviewVerdict::Invalid { .. }
+        ));
+        let oversized = format!("{}\nmissing contract", "x".repeat(8_192));
+        let CrewReviewVerdict::Invalid { tail } = parse_crew_review_verdict(&oversized) else {
+            panic!("missing verdict must fail closed");
+        };
+        assert!(tail.chars().count() <= CREW_REVIEW_TAIL_CHARS);
+    }
+
+    #[test]
+    fn crew_step_prompt_preserves_exact_bytes() {
+        let mut assignment = AgentAssignment::new(AgentRole::Reviewer);
+        assignment.system_prompt_override = Some("SYSTEM".to_string());
+        let depends_on = [uuid::Uuid::nil()];
+
+        let prompt = build_crew_step_prompt(CrewStepPromptContext {
+            task: "top-level task",
+            repo_dir: "/repo",
+            title: "review step",
+            subtask_prompt: "Review the change.",
+            task_type: SubTaskType::Review,
+            assignment: &assignment,
+            depends_on: &depends_on,
+            policy_notes: Some("POLICY"),
+        });
+
+        assert_eq!(
+            prompt,
+            concat!(
+                "Role: Reviewer\n",
+                "Team: Reviewer\n",
+                "Repo: /repo\n",
+                "Top-level task: top-level task\n",
+                "Step title: review step\n",
+                "Dependencies: 00000000-0000-0000-0000-000000000000\n\n",
+                "Project policy:\nPOLICY\n\n",
+                "SYSTEM\n\n",
+                "Subtask instructions:\nReview the change.\n\n",
+                "Return concise, actionable output for the next step.\n\n",
+                "Reviewer verdict contract: your LAST non-empty line MUST be exactly one of:\n",
+                "FF_REVIEW_VERDICT: APPROVE\n",
+                "FF_REVIEW_VERDICT: REQUEST_CHANGES: <specific reason>\n",
+                "Do not claim approval anywhere else. Missing or malformed verdicts fail closed.",
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_run_rejects_malformed_completion_policy_before_routing() {
+        let workload_error = fleet_run(Some(json!({"prompt": "x", "workload": 7})))
+            .await
+            .unwrap_err();
+        assert_eq!(workload_error, "fleet_run workload must be a string");
+
+        let token_error = fleet_run(Some(json!({"prompt": "x", "max_tokens": -1})))
+            .await
+            .unwrap_err();
+        assert!(token_error.contains("max_tokens must be a positive integer"));
+    }
+
+    fn path3_test_policy() -> crate::llm_exec::LocalRoutePolicy {
+        crate::llm_exec::LocalRoutePolicy::from_config(
+            &ff_core::config::LlmTimeouts::default(),
+            Some(r#"{"total_timeout_ms":10000,"min_start_budget_ms":100,"cooldown_ms":10}"#),
+        )
+        .unwrap()
+    }
+
+    fn path3_test_attempt(
+        outcome: &str,
+        reason_code: Option<crate::llm_exec::FailureReasonCode>,
+    ) -> crate::llm_exec::AttemptLedgerEntry {
+        crate::llm_exec::AttemptLedgerEntry {
+            sequence: 1,
+            role: crate::llm_exec::AttemptRole::Completion,
+            tier: 2,
+            catalog_tier: 2,
+            deployment_id: uuid::Uuid::from_u128(91),
+            endpoint: "http://192.0.2.91:55000".into(),
+            worker_name: "rihanna".into(),
+            catalog_id: Some("glm-4.5-air".into()),
+            attempt_timeout_ms: 1_000,
+            started_offset_ms: 0,
+            latency_ms: 25,
+            outcome: outcome.into(),
+            reason_code,
+            error: reason_code.map(|code| code.as_str().to_string()),
+            tokens_in: 3,
+            tokens_out: 5,
+        }
+    }
+
+    fn path3_test_evidence(
+        attempt: crate::llm_exec::AttemptLedgerEntry,
+        winner: bool,
+    ) -> crate::llm_exec::ExecutionEvidence {
+        crate::llm_exec::ExecutionEvidence {
+            attempts: vec![attempt],
+            candidate_snapshot: vec![crate::llm_exec::CandidateSnapshotEntry {
+                ordinal: 0,
+                deployment_id: uuid::Uuid::from_u128(91),
+                endpoint: "http://192.0.2.91:55000".into(),
+                worker_name: "rihanna".into(),
+                catalog_id: Some("glm-4.5-air".into()),
+                catalog_tier: 2,
+            }],
+            winner: winner.then(|| crate::llm_exec::WinningRoute {
+                deployment_id: uuid::Uuid::from_u128(91),
+                endpoint: "http://192.0.2.91:55000".into(),
+                worker_name: "rihanna".into(),
+                catalog_id: "glm-4.5-air".into(),
+                served_model_id: Some("GLM-4.5-Air".into()),
+                engine: "local:GLM-4.5-Air".into(),
+                route_decision: json!({"deployment_id": uuid::Uuid::from_u128(91)}),
+            }),
+            last_failure: None,
+            latency_ms: 25,
+            local_authority: "process_local_hint_only",
+            cloud_fallback: false,
+        }
+    }
+
+    #[test]
+    fn path3_blank_success_is_recorded_as_error() {
+        let success = crate::strategy_dispatch::StrategyDispatchSuccess {
+            output: "   ".into(),
+            strategy: ff_orchestrator::cascade_strategy::RouteStrategy::SingleTier { tier: 2 },
+            trace: json!([]),
+            early_exit_at_tier: None,
+            execution: path3_test_evidence(path3_test_attempt("ok", None), true),
+        };
+        let record = path3_interaction_record(
+            "fleet_run",
+            "generate code",
+            "single",
+            &path3_test_policy(),
+            &Ok(success),
+        );
+        assert_eq!(record.outcome, "error");
+        assert_eq!(record.request_meta["tool"], "fleet_run");
+        assert_eq!(record.response_text, "");
+        assert!(
+            record
+                .error_text
+                .as_deref()
+                .unwrap()
+                .contains("blank output")
+        );
+        assert!(record.error_signature.is_some());
+        assert_eq!(record.worker_name.as_deref(), Some("rihanna"));
+        assert_eq!(record.endpoint.as_deref(), Some("http://192.0.2.91:55000"));
+    }
+
+    #[test]
+    fn path3_failure_records_last_attempt_and_full_steps() {
+        let mut evidence = path3_test_evidence(
+            path3_test_attempt(
+                "error",
+                Some(crate::llm_exec::FailureReasonCode::InvalidResponse),
+            ),
+            false,
+        );
+        evidence.last_failure = Some(crate::llm_exec::FailureReasonCode::InvalidResponse);
+        let failure = crate::strategy_dispatch::StrategyDispatchFailure {
+            reason_code: crate::llm_exec::FailureReasonCode::InvalidResponse,
+            message: "empty 200".into(),
+            strategy: Some(
+                ff_orchestrator::cascade_strategy::RouteStrategy::SingleTier { tier: 2 },
+            ),
+            execution: evidence,
+        };
+        let record = path3_interaction_record(
+            "fleet_cascade",
+            "generate code",
+            "single",
+            &path3_test_policy(),
+            &Err(failure),
+        );
+        assert_eq!(record.outcome, "error");
+        assert_eq!(record.request_meta["tool"], "fleet_cascade");
+        assert_eq!(record.worker_name.as_deref(), Some("rihanna"));
+        assert_eq!(record.endpoint.as_deref(), Some("http://192.0.2.91:55000"));
+        assert_eq!(record.steps.as_array().unwrap().len(), 1);
+        assert_eq!(record.steps[0]["reason_code"], "invalid_response");
+        assert!(record.error_signature.is_some());
+    }
+
     fn setup_test_db() -> (String, Option<String>) {
         let db_path = std::env::temp_dir().join(format!(
             "ff-mcp-fleet-crew-test-{}.db",
@@ -4319,11 +4898,62 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    async fn spawn_mock_llm_server(always_fail: bool) -> (String, tokio::task::JoinHandle<()>) {
+    fn setup_isolated_crew_test() -> (String, Option<String>, String, Option<String>) {
+        let (db_path, prev_db_path) = setup_test_db();
+        let config_path = std::env::temp_dir().join(format!(
+            "ff-mcp-fleet-crew-config-{}.toml",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&config_path, "this is intentionally invalid TOML =")
+            .expect("write invalid isolated crew config");
+
+        let prev_config_path = std::env::var("FORGEFLEET_CONFIG").ok();
+        // SAFETY: the crew tests serialize environment mutation with env_lock.
+        unsafe {
+            std::env::set_var("FORGEFLEET_CONFIG", &config_path);
+        }
+
+        (
+            db_path,
+            prev_db_path,
+            config_path.to_string_lossy().to_string(),
+            prev_config_path,
+        )
+    }
+
+    fn restore_isolated_crew_test(
+        db_path: &str,
+        prev_db_path: Option<String>,
+        config_path: &str,
+        prev_config_path: Option<String>,
+    ) {
+        match prev_config_path {
+            Some(value) => unsafe {
+                // SAFETY: the crew tests serialize environment mutation with env_lock.
+                std::env::set_var("FORGEFLEET_CONFIG", value);
+            },
+            None => unsafe {
+                // SAFETY: the crew tests serialize environment mutation with env_lock.
+                std::env::remove_var("FORGEFLEET_CONFIG");
+            },
+        }
+        let _ = std::fs::remove_file(config_path);
+        restore_test_db_env(db_path, prev_db_path);
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockLlmMode {
+        Approve,
+        RequestChanges,
+        InvalidReview,
+        TransportFailure,
+    }
+
+    async fn spawn_mock_llm_server(mode: MockLlmMode) -> (String, tokio::task::JoinHandle<()>) {
         let app = Router::new().route(
             "/v1/chat/completions",
             post(move |Json(payload): Json<Value>| async move {
-                if always_fail {
+                if matches!(mode, MockLlmMode::TransportFailure) {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(json!({"error": "forced failure"})),
@@ -4334,14 +4964,26 @@ mod tests {
                     .pointer("/messages/0/content")
                     .and_then(|v| v.as_str())
                     .unwrap_or("<missing prompt>");
+                let verdict = match mode {
+                    MockLlmMode::Approve => "FF_REVIEW_VERDICT: APPROVE",
+                    MockLlmMode::RequestChanges => {
+                        "FF_REVIEW_VERDICT: REQUEST_CHANGES: add a regression test"
+                    }
+                    MockLlmMode::InvalidReview => "review complete without contract",
+                    MockLlmMode::TransportFailure => unreachable!(),
+                };
 
                 (
                     StatusCode::OK,
                     Json(json!({
                         "choices": [
                             {
+                                "finish_reason": "stop",
                                 "message": {
-                                    "content": format!("mock response: {}", prompt)
+                                    "content": format!(
+                                        "mock response: {}\n{}",
+                                        prompt, verdict
+                                    )
                                 }
                             }
                         ]
@@ -4411,25 +5053,12 @@ mod tests {
         assert!(parse_host_port("bad-format").is_err());
     }
 
-    #[test]
-    fn extract_completion_text_prefers_message_content() {
-        let payload = json!({
-            "choices": [
-                {
-                    "message": { "content": "hello" },
-                    "text": "fallback"
-                }
-            ]
-        });
-        assert_eq!(extract_completion_text(&payload).as_deref(), Some("hello"));
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_executes_pipeline_successfully() {
-        let _guard = env_lock().lock().unwrap();
-        let (db_path, prev_db_path) = setup_test_db();
+        let _guard = env_lock().lock().await;
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
-        let (base_url, server_handle) = spawn_mock_llm_server(false).await;
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::Approve).await;
 
         let repo_dir = std::env::temp_dir().join(format!("ff-mcp-repo-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&repo_dir).await.unwrap();
@@ -4444,7 +5073,10 @@ mod tests {
         .expect("fleet_crew should succeed");
 
         let status = response["status"].as_str().unwrap_or_default();
-        assert_eq!(status, "completed");
+        assert_eq!(
+            status, "completed",
+            "unexpected crew response: {response:#}"
+        );
         assert_eq!(response["execution"]["status"], "completed");
 
         let steps = response["execution"]["steps"].as_array().unwrap();
@@ -4456,15 +5088,92 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_dir_all(&repo_dir);
-        restore_test_db_env(&db_path, prev_db_path);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fleet_crew_reviewer_request_changes_makes_run_unsuccessful() {
+        let _guard = env_lock().lock().await;
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::RequestChanges).await;
+        let repo_dir =
+            std::env::temp_dir().join(format!("ff-mcp-review-reject-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+
+        let response = fleet_crew(Some(json!({
+            "task": "build a new API endpoint",
+            "repo_dir": repo_dir,
+            "llm_base_url": base_url
+        })))
+        .await
+        .expect("review rejection should return a structured unsuccessful run");
+
+        assert_eq!(response["status"], "failed");
+        assert_eq!(response["execution"]["summary"]["success"], false);
+        assert!(
+            response["execution"]["summary"]["reviewer_failures"]
+                .as_u64()
+                .unwrap_or(0)
+                >= 1
+        );
+        let rejected = response["execution"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["status"] == "review_rejected")
+            .expect("review rejection step");
+        assert_eq!(
+            rejected["review_verdict"]["reason"],
+            "add a regression test"
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fleet_crew_missing_reviewer_verdict_fails_closed() {
+        let _guard = env_lock().lock().await;
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::InvalidReview).await;
+        let repo_dir =
+            std::env::temp_dir().join(format!("ff-mcp-review-invalid-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&repo_dir).await.unwrap();
+
+        let response = fleet_crew(Some(json!({
+            "task": "build a new API endpoint",
+            "repo_dir": repo_dir,
+            "llm_base_url": base_url
+        })))
+        .await
+        .expect("invalid review should return a structured unsuccessful run");
+
+        assert_eq!(response["status"], "failed");
+        let invalid = response["execution"]["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["status"] == "review_invalid")
+            .expect("invalid review step");
+        assert!(
+            invalid["review_verdict"]["raw_tail"]
+                .as_str()
+                .unwrap()
+                .contains("without contract")
+        );
+
+        server_handle.abort();
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_reports_failures_when_steps_fail() {
-        let _guard = env_lock().lock().unwrap();
-        let (db_path, prev_db_path) = setup_test_db();
+        let _guard = env_lock().lock().await;
+        let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
-        let (base_url, server_handle) = spawn_mock_llm_server(true).await;
+        let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::TransportFailure).await;
 
         let repo_dir = std::env::temp_dir().join(format!("ff-mcp-repo-{}", uuid::Uuid::new_v4()));
         tokio::fs::create_dir_all(&repo_dir).await.unwrap();
@@ -4511,7 +5220,7 @@ mod tests {
 
         server_handle.abort();
         let _ = std::fs::remove_dir_all(&repo_dir);
-        restore_test_db_env(&db_path, prev_db_path);
+        restore_isolated_crew_test(&db_path, prev_db_path, &config_path, prev_config_path);
     }
 
     // Requires a live Postgres: project_profile_upsert/policy_resolve now route
@@ -4520,7 +5229,7 @@ mod tests {
     #[ignore = "requires Postgres (OperationalStore is Postgres-only)"]
     #[tokio::test(flavor = "current_thread")]
     async fn project_profile_round_trip_and_policy_resolve() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let (db_path, prev_db_path) = setup_test_db();
 
         let upsert = project_profile_upsert(Some(json!({

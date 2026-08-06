@@ -16,7 +16,6 @@
 //! survives a missing process and this reconciler reads it.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 /// Canonical inference ports per the fleet port registry ([[canonical-ports]]):
 /// llama.cpp / mlx slots are 55000-55010, vllm uses 51001 / 51003, ollama 11434.
@@ -90,6 +89,21 @@ fn health_requires_autorestart(status: &str) -> bool {
 fn restart_spec(library_id: Option<String>, port: i32) -> Option<(String, u16)> {
     let port = u16::try_from(port).ok().filter(|port| *port != 0)?;
     Some((library_id?, port))
+}
+
+/// Return the linked library that may be projected `hot` after a reconcile.
+/// Health is deliberately insufficient: the caller must also prove that the
+/// listener is the deployment's recorded process incarnation or the MainPID
+/// of its ForgeFleet-written systemd unit.
+fn authenticated_hot_library<'a>(
+    healthy: bool,
+    desired_state: &str,
+    identity_authenticated: bool,
+    library_id: Option<&'a str>,
+) -> Option<&'a str> {
+    (healthy && desired_state == "active" && identity_authenticated)
+        .then_some(library_id)
+        .flatten()
 }
 
 pub async fn restart_hung_local_deployments(pool: &sqlx::PgPool) -> u64 {
@@ -230,17 +244,20 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             // adoption authority.
             // Path-consistency, not strict library-id equality: a model can
             // legitimately have BOTH a directory library row and a file row
-            // inside it (scanner artifacts), and `match_library_to_path`
-            // prefers the exact-file row while the deployment references the
-            // directory row — id equality then rejects our own process
-            // forever. Compare the deployment's library path against the live
-            // process's model path the same way `unload_model` does.
+            // inside it (scanner artifacts), while the deployment references
+            // the directory row — choosing another matching row would reject
+            // our own process forever. Compare the deployment's persisted
+            // library path against the live process's model path the same way
+            // `unload_model` does.
             let existing_lib_path = existing
                 .library_id
                 .as_deref()
                 .and_then(|library_id| libs.iter().find(|lib| lib.id == library_id))
                 .map(|lib| lib.file_path.clone());
-            let model_matches_row = match (existing_lib_path.as_deref(), proc_info.model_path.as_deref()) {
+            let model_matches_row = match (
+                existing_lib_path.as_deref(),
+                proc_info.model_path.as_deref(),
+            ) {
                 (Some(expected), Some(actual)) => {
                     crate::model_runtime::model_paths_match(expected, actual)
                 }
@@ -310,7 +327,7 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             // Guard on the identity we authenticated against (the previously
             // recorded pid/marker), and persist the live incarnation — for a
             // re-adopted supervised restart that rewrites pid + start marker.
-            if let Err(e) = sqlx::query(
+            let refresh_result = sqlx::query(
                 "UPDATE fleet_model_deployments
                     SET health_status = $1,
                         last_health_at = NOW(),
@@ -336,17 +353,73 @@ pub async fn reconcile_local(pool: &sqlx::PgPool) -> Result<ReconcileSummary, St
             .bind(existing.pid)
             .bind(existing.process_start_marker.as_deref())
             .execute(pool)
-            .await
-            {
-                tracing::warn!("failed to refresh deployment {}: {e}", existing.id);
-            } else {
-                summary.refreshed += 1;
-                if usable.is_some() {
-                    tracing::info!(
-                        port,
-                        usable_agent_ctx = usable,
-                        "backfilled agent ctx for adopted deployment"
+            .await;
+            match refresh_result {
+                Err(e) => tracing::warn!("failed to refresh deployment {}: {e}", existing.id),
+                Ok(result) if result.rows_affected() != 1 => {
+                    tracing::warn!(
+                        deployment = %existing.id,
+                        rows_affected = result.rows_affected(),
+                        "authenticated deployment refresh lost its identity race; refusing library projection"
                     );
+                }
+                Ok(_) => {
+                    summary.refreshed += 1;
+                    if usable.is_some() {
+                        tracing::info!(
+                            port,
+                            usable_agent_ctx = usable,
+                            "backfilled agent ctx for adopted deployment"
+                        );
+                    }
+
+                    // A supervised server can come back with a new PID after a
+                    // reboot while its library row remains `cold`. Restore that
+                    // derived projection only after both the live identity proof
+                    // above and the compare-and-swap deployment refresh succeed.
+                    // The EXISTS clause re-checks active/healthy identity in the
+                    // database, so an unauthenticated health endpoint can never
+                    // heat a library by itself.
+                    let identity_authenticated =
+                        recorded_identity_matches || supervised_restart_matches;
+                    if let Some(library_id) = authenticated_hot_library(
+                        healthy,
+                        &existing.desired_state,
+                        identity_authenticated,
+                        existing.library_id.as_deref(),
+                    ) {
+                        if let Err(e) = sqlx::query(
+                            "UPDATE fleet_model_library lib
+                            SET state = 'hot', last_used_at = NOW()
+                          WHERE lib.id = $1::uuid
+                            AND lib.state IS DISTINCT FROM 'hot'
+                            AND EXISTS (
+                                SELECT 1
+                                  FROM fleet_model_deployments deployment
+                                 WHERE deployment.id = $2::uuid
+                                   AND deployment.library_id = lib.id
+                                   AND deployment.desired_state = 'active'
+                                   AND deployment.health_status = 'healthy'
+                                   AND deployment.pid = $3
+                                   AND deployment.process_start_marker
+                                       IS NOT DISTINCT FROM $4
+                            )",
+                        )
+                        .bind(library_id)
+                        .bind(&existing.id)
+                        .bind(proc_info.pid as i32)
+                        .bind(live_marker.as_deref())
+                        .execute(pool)
+                        .await
+                        {
+                            tracing::warn!(
+                                deployment = %existing.id,
+                                library_id,
+                                error = %e,
+                                "failed to project authenticated healthy deployment library hot"
+                            );
+                        }
+                    }
                 }
             }
         } else {
@@ -705,35 +778,6 @@ async fn list_deployments_with_desired_state(
     .map_err(|e| format!("list deployments: {e}"))
 }
 
-/// Pick the best-matching library row for a running process's model path.
-/// Returns (library_id, catalog_id) if we find one.
-fn match_library_to_path(
-    libs: &[ff_db::ModelLibraryRow],
-    model_path: &str,
-) -> (Option<String>, Option<String>) {
-    if let Some(exact) = libs.iter().find(|r| r.file_path == model_path) {
-        return (Some(exact.id.clone()), Some(exact.catalog_id.clone()));
-    }
-    // A deployment whose model path lives INSIDE a library directory matches
-    // that library. Use component-wise `Path::starts_with` ONLY — a byte-wise
-    // `str::starts_with` mis-attributes across models that merely share a string
-    // prefix (e.g. a deployment under ".../qwen3-coder-30b" byte-starts-with a
-    // ".../qwen3" library). Skip empty library paths, which `starts_with` would
-    // otherwise treat as a prefix of every path.
-    let path = Path::new(model_path);
-    if let Some(by_prefix) = libs
-        .iter()
-        .filter(|r| !r.file_path.is_empty())
-        .find(|r| path.starts_with(&r.file_path))
-    {
-        return (
-            Some(by_prefix.id.clone()),
-            Some(by_prefix.catalog_id.clone()),
-        );
-    }
-    (None, None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -781,6 +825,28 @@ mod tests {
             restart_spec(Some("library-id".to_string()), i32::from(u16::MAX) + 1),
             None
         );
+    }
+
+    #[test]
+    fn hot_projection_requires_healthy_active_authenticated_link() {
+        assert_eq!(
+            authenticated_hot_library(true, "active", true, Some("library-id")),
+            Some("library-id")
+        );
+        assert_eq!(
+            authenticated_hot_library(true, "active", false, Some("library-id")),
+            None,
+            "a healthy unauthenticated endpoint is not placement authority"
+        );
+        assert_eq!(
+            authenticated_hot_library(false, "active", true, Some("library-id")),
+            None
+        );
+        assert_eq!(
+            authenticated_hot_library(true, "retired", true, Some("library-id")),
+            None
+        );
+        assert_eq!(authenticated_hot_library(true, "active", true, None), None);
     }
 
     fn lib(id: &str, catalog_id: &str) -> ff_db::ModelLibraryRow {
@@ -862,39 +928,6 @@ mod tests {
     }
 
     #[test]
-    fn match_library_exact_path_wins() {
-        let libs = vec![lib("id-a", "qwen3"), lib("id-b", "qwen3-coder-30b")];
-        let (lib_id, cat) = match_library_to_path(&libs, "/home/duncan/models/qwen3-coder-30b");
-        assert_eq!(lib_id.as_deref(), Some("id-b"));
-        assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
-    }
-
-    #[test]
-    fn match_library_dir_prefix_matches_weights_inside() {
-        // A deployment pointed at a file inside the library dir resolves to it.
-        let libs = vec![lib("id-b", "qwen3-coder-30b")];
-        let (lib_id, _) = match_library_to_path(
-            &libs,
-            "/home/duncan/models/qwen3-coder-30b/model-00001.safetensors",
-        );
-        assert_eq!(lib_id.as_deref(), Some("id-b"));
-    }
-
-    #[test]
-    fn match_library_does_not_confuse_string_prefix_models() {
-        // Regression: ".../qwen3-coder-30b/x" byte-starts-with the ".../qwen3"
-        // library path, but they are different models. Component-wise matching
-        // must resolve to qwen3-coder-30b, never qwen3 (listed first).
-        let libs = vec![lib("id-a", "qwen3"), lib("id-b", "qwen3-coder-30b")];
-        let (lib_id, cat) = match_library_to_path(
-            &libs,
-            "/home/duncan/models/qwen3-coder-30b/model.safetensors",
-        );
-        assert_eq!(lib_id.as_deref(), Some("id-b"));
-        assert_eq!(cat.as_deref(), Some("qwen3-coder-30b"));
-    }
-
-    #[test]
     fn evict_deletes_row_only_on_owning_node() {
         // Owning node (case-insensitive, like the CLI --node comparison) may
         // delete the row after stopping the unit/listener.
@@ -903,21 +936,5 @@ mod tests {
         // A remote row is only retired — its own reconciler completes the
         // evict, so a still-running process is never re-adopted as 'active'.
         assert!(!evict_deletes_row("sia", "duncan"));
-    }
-
-    #[test]
-    fn match_library_empty_path_never_matches() {
-        if std::env::var("FORGEFLEET_POSTGRES_URL").is_err()
-            && std::env::var("FORGEFLEET_DATABASE_URL").is_err()
-        {
-            return;
-        }
-        let mut l = lib("id-empty", "weird");
-        l.file_path = String::new();
-        let libs = vec![l];
-        assert_eq!(
-            match_library_to_path(&libs, "/home/duncan/models/anything"),
-            (None, None)
-        );
     }
 }

@@ -32,6 +32,7 @@ async fn pool() -> Result<sqlx::PgPool> {
 ///   3. a known CLI-native session env var (Claude/Codex/Kimi expose their own)
 ///   4. the SessionStart hook JSON on stdin — Claude Code pipes `{"session_id":…}`
 ///      to its hook command, so a bare `ff workstream attach` auto-detects it
+///
 /// Returns `None` when nothing is found → falls back to the single-seat-per-tool
 /// id (backward compatible).
 fn resolve_session_token(explicit: Option<&str>) -> Option<String> {
@@ -79,6 +80,7 @@ fn resolve_session_token(explicit: Option<&str>) -> Option<String> {
 ///      spawn `ff` as a child, so the parent walk finds the real caller even
 ///      through intermediate shells)
 ///   4. CLI-specific env markers (inherited by spawned children)
+///
 /// Falls back to "unknown" rather than guessing "claude" — a seat under the
 /// WRONG tool (the old default) silently splits one session's record in two.
 fn resolve_tool(explicit: Option<&str>) -> String {

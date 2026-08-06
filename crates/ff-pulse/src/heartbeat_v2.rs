@@ -9,6 +9,7 @@
 //! stable config changes (IPs, installed software, deployment topology)
 //! result in DB writes. See materializer.rs.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
@@ -251,17 +252,17 @@ impl HeartbeatV2Publisher {
                         );
                         Disks::new()
                     });
-                let (disk_total, disk_used) = aggregate_disk_bytes(
-                    disks.iter().map(|d| (d.total_space(), d.available_space())),
-                );
+                let (disk_total, disk_used) = aggregate_disks(&disks);
                 let disk_total_gb = (disk_total as f64 / 1_073_741_824.0) as i32;
                 let disk_free_gb = disk_total.saturating_sub(disk_used) as f64 / 1_073_741_824.0;
+                let gpu_kind = detect_gpu_kind();
 
                 beat.hardware = HardwareInfo {
                     cpu_cores,
                     ram_gb: ram_total_gb,
                     disk_gb: disk_total_gb,
-                    gpu: detect_gpu_model(),
+                    gpu: detect_gpu_model(&gpu_kind),
+                    rocm_version: detect_rocm_version(&gpu_kind),
                 };
 
                 beat.load = LoadInfo {
@@ -307,7 +308,6 @@ impl HeartbeatV2Publisher {
                 beat.source_tree_path = detect_source_tree_path(beat.role_claimed == "leader");
 
                 // ── Capabilities ─────────────────────────────────────────────
-                let gpu_kind = detect_gpu_kind();
                 let gpu_count = if gpu_kind == "none" { 0 } else { 1 };
                 let (gpu_vram_gb, gpu_total_vram_gb) =
                     detect_gpu_vram_gb(&gpu_kind, &beat.os.family);
@@ -598,21 +598,148 @@ async fn publish_beat(
     Ok(())
 }
 
-/// Sum `(total, used)` bytes across disks, guarding against pseudo-filesystems
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DiskObservation {
+    total: u64,
+    available: u64,
+    /// Filesystems that share one physical allocation pool use the same key.
+    /// This is currently populated only for APFS containers on macOS.
+    shared_container: Option<String>,
+}
+
+pub(crate) fn aggregate_disks(disks: &Disks) -> (u64, u64) {
+    aggregate_disk_observations(disks.iter().map(|disk| DiskObservation {
+        total: disk.total_space(),
+        available: disk.available_space(),
+        shared_container: shared_container_key(disk),
+    }))
+}
+
+#[cfg(target_os = "macos")]
+fn shared_container_key(disk: &sysinfo::Disk) -> Option<String> {
+    if !disk
+        .file_system()
+        .to_string_lossy()
+        .eq_ignore_ascii_case("apfs")
+    {
+        return None;
+    }
+
+    macos_mount_device(disk.mount_point())
+        .and_then(|device| parse_apfs_container_device(&device).map(str::to_owned))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn shared_container_key(_disk: &sysinfo::Disk) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mount_device(mount_point: &std::path::Path) -> Option<String> {
+    use std::ffi::{CStr, CString};
+    use std::mem::MaybeUninit;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mount = CString::new(mount_point.as_os_str().as_bytes()).ok()?;
+    let mut stat = MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `mount` is NUL-terminated and valid for the duration of the call;
+    // `statfs` initializes the output structure when it returns zero.
+    if unsafe { libc::statfs(mount.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: guarded by the successful `statfs` result above.
+    let stat = unsafe { stat.assume_init() };
+    // SAFETY: macOS guarantees `f_mntfromname` is a NUL-terminated C string.
+    let device = unsafe { CStr::from_ptr(stat.f_mntfromname.as_ptr()) };
+    device.to_str().ok().map(str::to_owned)
+}
+
+/// Normalize an APFS volume device to its synthetic container device.
+///
+/// `/dev/disk3s1s1` (sealed System snapshot) and `/dev/disk3s5` (Data) both
+/// become `/dev/disk3`. The parser is intentionally strict: an unexpected
+/// device string returns `None`, which preserves the old independent-volume
+/// behavior instead of accidentally coalescing unrelated storage.
+#[cfg(any(target_os = "macos", test))]
+fn parse_apfs_container_device(device: &str) -> Option<&str> {
+    const PREFIX: &str = "/dev/disk";
+    let rest = device.strip_prefix(PREFIX)?;
+    let disk_digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if disk_digits == 0 {
+        return None;
+    }
+    rest[..disk_digits].parse::<u32>().ok()?;
+
+    let mut suffix = &rest[disk_digits..];
+    while !suffix.is_empty() {
+        suffix = suffix.strip_prefix('s')?;
+        let digits = suffix.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 {
+            return None;
+        }
+        suffix[..digits].parse::<u32>().ok()?;
+        suffix = &suffix[digits..];
+    }
+
+    Some(&device[..PREFIX.len() + disk_digits])
+}
+
+/// Sum `(total, used)` bytes across disk observations, guarding against
+/// shared allocation pools and pseudo-filesystems.
+///
+/// macOS exposes each browsable APFS volume separately even though System,
+/// Data, and related volumes draw from one container. Observations with the
+/// same `shared_container` are therefore reduced to one deterministic sample:
+/// the largest reported container total and largest reported availability
+/// (clamped to that total). Unkeyed observations — including every Linux disk
+/// — retain the historical additive behavior.
+pub(crate) fn aggregate_disk_observations(
+    disks: impl IntoIterator<Item = DiskObservation>,
+) -> (u64, u64) {
+    let mut totals = (0u64, 0u64);
+    let mut shared: HashMap<String, (u64, u64)> = HashMap::new();
+
+    for disk in disks {
+        if let Some(key) = disk.shared_container {
+            shared
+                .entry(key)
+                .and_modify(|sample| {
+                    sample.0 = sample.0.max(disk.total);
+                    sample.1 = sample.1.max(disk.available);
+                })
+                .or_insert((disk.total, disk.available));
+        } else {
+            totals = add_disk_bytes(totals, disk.total, disk.available);
+        }
+    }
+
+    shared
+        .into_values()
+        .fold(totals, |acc, (total, available)| {
+            add_disk_bytes(acc, total, available.min(total))
+        })
+}
+
+fn add_disk_bytes((total_acc, used_acc): (u64, u64), total: u64, available: u64) -> (u64, u64) {
+    (
+        total_acc.saturating_add(total),
+        used_acc.saturating_add(total.saturating_sub(available)),
+    )
+}
+
+/// Sum `(total, used)` bytes across independent disks, guarding against pseudo-filesystems
 /// that report `available_space > total_space` (overlay/tmpfs/FUSE mounts, or
 /// mounts reporting `total = 0` with `available > 0`). A plain
 /// `total - available` underflows there — panicking in debug, and in release
 /// (how `forgefleetd` ships) silently wrapping to a garbage huge `u64` that
 /// corrupts the disk metrics reported in the beat.
+#[cfg(test)]
 pub(crate) fn aggregate_disk_bytes(disks: impl IntoIterator<Item = (u64, u64)>) -> (u64, u64) {
-    disks
-        .into_iter()
-        .fold((0u64, 0u64), |(total_acc, used_acc), (total, available)| {
-            (
-                total_acc.saturating_add(total),
-                used_acc.saturating_add(total.saturating_sub(available)),
-            )
-        })
+    aggregate_disk_observations(disks.into_iter().map(|(total, available)| DiskObservation {
+        total,
+        available,
+        shared_container: None,
+    }))
 }
 
 // ─── GPU / network / OS detection helpers ───────────────────────────────
@@ -763,6 +890,36 @@ fn detect_os_info() -> crate::beat_v2::OsInfo {
     }
 }
 
+/// Return true only when `rocminfo` reports an HSA agent whose device type is
+/// GPU.  A marketing-name match is not sufficient: CPU-only systems can have
+/// the ROCm runtime installed and their CPU agent also carries an AMD marketing
+/// name.
+fn rocminfo_reports_gpu(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.trim()
+            .strip_prefix("Device Type:")
+            .is_some_and(|value| value.trim() == "GPU")
+    })
+}
+
+/// Pure precedence policy for Linux accelerator probes.  Keep NVIDIA first,
+/// preserve the existing rocm-smi behavior, then use rocminfo as the fallback
+/// for ROCm installations (notably ROCm 7.1/gfx1151) that no longer ship the
+/// rocm-smi compatibility command.
+fn classify_linux_gpu_probe_results(
+    nvidia_smi_ok: bool,
+    rocm_smi_ok: bool,
+    rocminfo_output: Option<&str>,
+) -> &'static str {
+    if nvidia_smi_ok {
+        "nvidia_cuda"
+    } else if rocm_smi_ok || rocminfo_output.is_some_and(rocminfo_reports_gpu) {
+        "amd_rocm"
+    } else {
+        "none"
+    }
+}
+
 fn detect_gpu_kind() -> String {
     // macOS: aarch64 = Apple Silicon (Metal/MLX), x86_64 = Intel (no useful GPU).
     if std::env::consts::OS == "macos" {
@@ -773,9 +930,11 @@ fn detect_gpu_kind() -> String {
         };
     }
 
-    // Linux: probe for nvidia-smi, then rocm-smi.
+    // Linux: probe for nvidia-smi, then rocm-smi, then rocminfo.  Run the
+    // probes sequentially so the fallback adds no subprocess cost on hosts
+    // already identified by either established probe.
     if std::env::consts::OS == "linux" {
-        if command_output_with_timeout(
+        let nvidia_smi_ok = command_output_with_timeout(
             std::process::Command::new("nvidia-smi")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -783,11 +942,12 @@ fn detect_gpu_kind() -> String {
             3,
         )
         .map(|o| o.status.success())
-        .unwrap_or(false)
-        {
-            return "nvidia_cuda".to_string();
+        .unwrap_or(false);
+        if nvidia_smi_ok {
+            return classify_linux_gpu_probe_results(true, false, None).to_string();
         }
-        if command_output_with_timeout(
+
+        let rocm_smi_ok = command_output_with_timeout(
             std::process::Command::new("rocm-smi")
                 .arg("--version")
                 .stdout(std::process::Stdio::null())
@@ -795,10 +955,18 @@ fn detect_gpu_kind() -> String {
             3,
         )
         .map(|o| o.status.success())
-        .unwrap_or(false)
-        {
-            return "amd_rocm".to_string();
+        .unwrap_or(false);
+        if rocm_smi_ok {
+            return classify_linux_gpu_probe_results(false, true, None).to_string();
         }
+
+        let rocminfo = command_output_with_timeout(
+            std::process::Command::new("rocminfo").stderr(std::process::Stdio::null()),
+            3,
+        )
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+        return classify_linux_gpu_probe_results(false, false, rocminfo.as_deref()).to_string();
     }
 
     "none".to_string()
@@ -929,28 +1097,192 @@ fn local_total_ram_gb() -> Option<f64> {
     None
 }
 
-fn detect_gpu_model() -> Option<String> {
-    match std::env::consts::OS {
-        "macos" if std::env::consts::ARCH == "aarch64" => {
+fn clean_probe_value(value: &str) -> Option<String> {
+    let value = value.trim().trim_matches('"').trim();
+    if value.is_empty()
+        || matches!(
+            value.to_ascii_lowercase().as_str(),
+            "n/a" | "na" | "none" | "unknown" | "not available"
+        )
+    {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn value_after_label(line: &str, label: &str) -> Option<String> {
+    let offset = line.find(label)? + label.len();
+    clean_probe_value(&line[offset..])
+}
+
+/// Parse `rocm-smi --showproductname`, preferring its human-readable card
+/// series. Some releases also emit `Marketing Name`; `Card model` is retained
+/// only as a last resort when it is descriptive rather than a hexadecimal PCI
+/// identifier.
+fn parse_rocm_smi_gpu_model(output: &str) -> Option<String> {
+    let mut series = None;
+    let mut marketing = None;
+    let mut model = None;
+
+    for line in output.lines() {
+        series = series.or_else(|| value_after_label(line, "Card series:"));
+        marketing = marketing.or_else(|| value_after_label(line, "Marketing Name:"));
+        model = model.or_else(|| {
+            value_after_label(line, "Card model:").filter(|value| {
+                !value.to_ascii_lowercase().starts_with("0x")
+                    && value.chars().any(char::is_alphabetic)
+            })
+        });
+    }
+
+    series.or(marketing).or(model)
+}
+
+#[derive(Default)]
+struct RocmAgentIdentity {
+    is_gpu: bool,
+    marketing_name: Option<String>,
+    name: Option<String>,
+}
+
+fn record_rocm_gpu_identity(
+    agent: &RocmAgentIdentity,
+    marketing_name: &mut Option<String>,
+    name: &mut Option<String>,
+) {
+    if !agent.is_gpu {
+        return;
+    }
+    if marketing_name.is_none() {
+        *marketing_name = agent.marketing_name.clone();
+    }
+    if name.is_none() {
+        *name = agent
+            .name
+            .as_ref()
+            .filter(|value| value.to_ascii_lowercase().starts_with("gfx"))
+            .cloned();
+    }
+}
+
+/// Parse rocminfo by agent block so a CPU's AMD marketing name can never be
+/// mistaken for a GPU. Prefer a human marketing name across GPU agents, then
+/// fall back to the first `gfx*` architecture identifier.
+fn parse_rocminfo_gpu_model(output: &str) -> Option<String> {
+    let mut current = RocmAgentIdentity::default();
+    let mut marketing_name = None;
+    let mut name = None;
+
+    for line in output.lines() {
+        let line = line.trim();
+        if line.starts_with("Agent ") {
+            record_rocm_gpu_identity(&current, &mut marketing_name, &mut name);
+            current = RocmAgentIdentity::default();
+            continue;
+        }
+
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        match field.trim() {
+            "Device Type" => current.is_gpu = value.trim() == "GPU",
+            "Marketing Name" => current.marketing_name = clean_probe_value(value),
+            "Name" => current.name = clean_probe_value(value),
+            _ => {}
+        }
+    }
+    record_rocm_gpu_identity(&current, &mut marketing_name, &mut name);
+
+    marketing_name.or(name)
+}
+
+fn parse_rocm_version(output: &str) -> Option<String> {
+    for line in output.lines() {
+        for label in ["HIP version:", "ROCm version:", "ROCm Version:"] {
+            if let Some(value) = value_after_label(line, label)
+                && let Some(version) = value.split_whitespace().next()
+            {
+                let version =
+                    version.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '.');
+                if version.contains('.') && version.chars().any(|c| c.is_ascii_digit()) {
+                    return Some(version.to_string());
+                }
+            }
+        }
+    }
+
+    // `/opt/rocm/.info/version` is a single bare version token.
+    let mut non_blank = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let value = non_blank.next()?;
+    if non_blank.next().is_none()
+        && !value.contains(char::is_whitespace)
+        && value.contains('.')
+        && value.chars().any(|c| c.is_ascii_digit())
+    {
+        clean_probe_value(value)
+    } else {
+        None
+    }
+}
+
+fn rocm_program(name: &str) -> std::path::PathBuf {
+    let installed = std::path::Path::new("/opt/rocm/bin").join(name);
+    if installed.is_file() {
+        installed
+    } else {
+        name.into()
+    }
+}
+
+fn successful_command_stdout(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+) -> Option<String> {
+    let mut command = std::process::Command::new(program);
+    command.args(args);
+    command_output_with_timeout(&mut command, 3)
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn detect_gpu_model(gpu_kind: &str) -> Option<String> {
+    match (std::env::consts::OS, gpu_kind) {
+        ("macos", "apple_silicon") => {
             // Could parse `system_profiler SPDisplaysDataType` but that's slow.
-            // Return a generic label; precise model filled in by a later phase.
             Some("Apple Silicon GPU (Metal)".to_string())
         }
-        "linux" => command_output_with_timeout(
-            std::process::Command::new("nvidia-smi")
-                .args(["--query-gpu=name", "--format=csv,noheader"]),
-            3,
-        )
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .next()
-                .map(|s| s.trim().to_string())
-        })
-        .filter(|s| !s.is_empty()),
+        ("linux", "nvidia_cuda") => {
+            successful_command_stdout("nvidia-smi", &["--query-gpu=name", "--format=csv,noheader"])
+                .and_then(|output| output.lines().find_map(clean_probe_value))
+        }
+        ("linux", "amd_rocm") => {
+            let smi = successful_command_stdout(rocm_program("rocm-smi"), &["--showproductname"])
+                .and_then(|output| parse_rocm_smi_gpu_model(&output));
+            smi.or_else(|| {
+                successful_command_stdout(rocm_program("rocminfo"), &[])
+                    .and_then(|output| parse_rocminfo_gpu_model(&output))
+            })
+        }
         _ => None,
     }
+}
+
+fn detect_rocm_version(gpu_kind: &str) -> Option<String> {
+    if std::env::consts::OS != "linux" || gpu_kind != "amd_rocm" {
+        return None;
+    }
+
+    std::fs::read_to_string("/opt/rocm/.info/version")
+        .ok()
+        .and_then(|output| parse_rocm_version(&output))
+        .or_else(|| {
+            successful_command_stdout(rocm_program("hipconfig"), &["--version"])
+                .and_then(|output| parse_rocm_version(&output))
+        })
 }
 
 fn detect_primary_ip() -> String {
@@ -1007,6 +1339,35 @@ fn run_with_timeout<T: Send + 'static>(
     }
 }
 
+const COMMAND_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
+const COMMAND_CAPTURE_TRUNCATION_MARKER: &[u8] = b"\n[forgefleet: output truncated]\n";
+
+fn drain_command_pipe_bounded<R: std::io::Read>(mut reader: R) -> Vec<u8> {
+    let payload_limit =
+        COMMAND_CAPTURE_LIMIT_BYTES.saturating_sub(COMMAND_CAPTURE_TRUNCATION_MARKER.len());
+    let mut captured = Vec::with_capacity(payload_limit.min(64 * 1024));
+    let mut truncated = false;
+    let mut chunk = [0_u8; 16 * 1024];
+
+    loop {
+        let count = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let remaining = payload_limit.saturating_sub(captured.len());
+        let keep = remaining.min(count);
+        captured.extend_from_slice(&chunk[..keep]);
+        truncated |= keep < count;
+    }
+
+    if truncated {
+        captured.extend_from_slice(COMMAND_CAPTURE_TRUNCATION_MARKER);
+    }
+    captured
+}
+
 fn command_output_with_timeout(
     cmd: &mut std::process::Command,
     timeout_secs: u64,
@@ -1017,31 +1378,48 @@ fn command_output_with_timeout(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .ok()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    // Drain both pipes while the process is running. Waiting for exit first can
+    // deadlock once either OS pipe buffer fills (rocminfo can be especially
+    // verbose on multi-GPU hosts). The readers keep draining after the bounded
+    // prefix is full, so capture is memory-safe without applying backpressure
+    // to the child. One MiB retains the complete output of realistic rocminfo
+    // probes by a wide margin; truncation is explicit for every other caller.
+    let stdout_reader = std::thread::spawn(move || drain_command_pipe_bounded(stdout));
+    let stderr_reader = std::thread::spawn(move || drain_command_pipe_bounded(stderr));
     let pid = child.id();
     let start = std::time::Instant::now();
     loop {
-        match child.try_wait().ok()? {
-            Some(status) => {
-                let mut out = std::process::Output {
-                    status,
-                    stdout: Vec::new(),
-                    stderr: Vec::new(),
-                };
-                // best-effort read stdout/stderr; ignore errors
-                let _ = child.stdout.take().map(|mut r| {
-                    use std::io::Read;
-                    let _ = r.read_to_end(&mut out.stdout);
-                });
-                let _ = child.stderr.take().map(|mut r| {
-                    use std::io::Read;
-                    let _ = r.read_to_end(&mut out.stderr);
-                });
-                return Some(out);
+        match child.try_wait() {
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                tracing::debug!(
+                    pid,
+                    ?cmd,
+                    %error,
+                    "command_output_with_timeout: failed to poll subprocess"
+                );
+                return None;
             }
-            None => {
+            Ok(Some(status)) => {
+                let stdout = stdout_reader.join().unwrap_or_default();
+                let stderr = stderr_reader.join().unwrap_or_default();
+                return Some(std::process::Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
                 if start.elapsed() > Duration::from_secs(timeout_secs) {
                     let _ = child.kill();
                     let _ = child.wait();
+                    let _ = stdout_reader.join();
+                    let _ = stderr_reader.join();
                     tracing::debug!(
                         pid,
                         ?cmd,
@@ -1360,6 +1738,93 @@ mod tests {
         assert_eq!(aggregate_disk_bytes(std::iter::empty()), (0, 0));
     }
 
+    fn observed_disk(total: u64, available: u64, container: Option<&str>) -> DiskObservation {
+        DiskObservation {
+            total,
+            available,
+            shared_container: container.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn aggregate_disk_observations_counts_ace_apfs_container_once() {
+        // Ace's sealed System and writable Data volumes both draw from disk3.
+        // The old mount sum reported roughly 456 GiB for one 245.1 GB container.
+        let total = 245_107_195_904u64;
+        let available = 8_110_985_216u64;
+        let (actual_total, actual_used) = aggregate_disk_observations([
+            observed_disk(total, available, Some("/dev/disk3")),
+            observed_disk(total, available, Some("/dev/disk3")),
+        ]);
+
+        assert_eq!(actual_total, total);
+        assert_eq!(actual_used, total - available);
+    }
+
+    #[test]
+    fn aggregate_disk_observations_is_order_independent_with_shared_free_space() {
+        let first = observed_disk(1_000, 100, Some("/dev/disk3"));
+        let second = observed_disk(1_000, 150, Some("/dev/disk3"));
+
+        let forward = aggregate_disk_observations([first.clone(), second.clone()]);
+        let reverse = aggregate_disk_observations([second, first]);
+
+        assert_eq!(forward, (1_000, 850));
+        assert_eq!(reverse, forward);
+    }
+
+    #[test]
+    fn aggregate_disk_observations_keeps_distinct_apfs_containers() {
+        let (total, used) = aggregate_disk_observations([
+            observed_disk(1_000, 400, Some("/dev/disk3")),
+            observed_disk(2_000, 500, Some("/dev/disk4")),
+        ]);
+
+        assert_eq!((total, used), (3_000, 2_100));
+    }
+
+    #[test]
+    fn aggregate_disk_observations_preserves_unkeyed_linux_mount_sum() {
+        // Equal numeric samples must still add when they have no shared-pool
+        // identity. Linux observations intentionally remain unkeyed.
+        let (total, used) = aggregate_disk_observations([
+            observed_disk(1_000, 400, None),
+            observed_disk(1_000, 400, None),
+        ]);
+
+        assert_eq!((total, used), (2_000, 1_200));
+    }
+
+    #[test]
+    fn apfs_device_parser_normalizes_volume_and_snapshot_devices() {
+        assert_eq!(
+            parse_apfs_container_device("/dev/disk3s1s1"),
+            Some("/dev/disk3")
+        );
+        assert_eq!(
+            parse_apfs_container_device("/dev/disk3s5"),
+            Some("/dev/disk3")
+        );
+        assert_eq!(
+            parse_apfs_container_device("/dev/disk12"),
+            Some("/dev/disk12")
+        );
+    }
+
+    #[test]
+    fn apfs_device_parser_rejects_unknown_or_overflowing_devices() {
+        for invalid in [
+            "disk3s5",
+            "/dev/disk",
+            "/dev/diskx",
+            "/dev/disk3foo",
+            "/dev/disk4294967296s1",
+            "/dev/disk3s4294967296",
+        ] {
+            assert_eq!(parse_apfs_container_device(invalid), None, "{invalid}");
+        }
+    }
+
     #[tokio::test]
     async fn build_beat_roundtrips_through_json() {
         let client = redis::Client::open("redis://localhost:56379").unwrap();
@@ -1399,6 +1864,173 @@ mod tests {
             ),
             "unexpected gpu_kind: {kind}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_drains_full_pipes_and_marks_bounded_output() {
+        // Both streams exceed the common 64 KiB pipe capacity and the helper's
+        // memory cap. The GPU evidence is deliberately emitted first, matching
+        // rocminfo's agent-header ordering, and must survive truncation.
+        let kib_blocks = (COMMAND_CAPTURE_LIMIT_BYTES / 1024) + 128;
+        let script = format!(
+            "printf 'Device Type: GPU\\n'; \
+             dd if=/dev/zero bs=1024 count={kib_blocks} 2>/dev/null & \
+             dd if=/dev/zero bs=1024 count={kib_blocks} 1>&2 2>/dev/null & \
+             wait"
+        );
+        let mut command = std::process::Command::new("sh");
+        command.args(["-c", &script]);
+
+        let started = std::time::Instant::now();
+        let output = command_output_with_timeout(&mut command, 5)
+            .expect("concurrent drains must let a verbose child exit normally");
+
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(output.stdout.len(), COMMAND_CAPTURE_LIMIT_BYTES);
+        assert_eq!(output.stderr.len(), COMMAND_CAPTURE_LIMIT_BYTES);
+        assert!(output.stdout.ends_with(COMMAND_CAPTURE_TRUNCATION_MARKER));
+        assert!(output.stderr.ends_with(COMMAND_CAPTURE_TRUNCATION_MARKER));
+        assert!(rocminfo_reports_gpu(&String::from_utf8_lossy(
+            &output.stdout
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_timeout_kills_and_reaps_child_promptly() {
+        let mut command = std::process::Command::new("sh");
+        // `exec` ensures the PID owned by the helper is the sleeping process,
+        // so killing and reaping it also closes both capture pipes.
+        command.args(["-c", "exec sleep 30"]);
+
+        let started = std::time::Instant::now();
+        assert!(command_output_with_timeout(&mut command, 1).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "timed-out child was not killed and reaped promptly"
+        );
+    }
+
+    #[test]
+    fn rocminfo_fallback_requires_a_gpu_agent() {
+        let gpu = "\
+Agent 1
+  Device Type:             CPU
+  Marketing Name:          AMD Ryzen AI MAX+ 395
+Agent 2
+  Device Type:             GPU
+  Name:                    gfx1151
+  Marketing Name:          Radeon 8060S Graphics
+";
+        assert!(rocminfo_reports_gpu(gpu));
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, false, Some(gpu)),
+            "amd_rocm"
+        );
+
+        let cpu_only = "\
+Agent 1
+  Device Type:             CPU
+  Marketing Name:          AMD Ryzen AI MAX+ 395
+";
+        assert!(!rocminfo_reports_gpu(cpu_only));
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, false, Some(cpu_only)),
+            "none"
+        );
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, false, Some("Marketing Name: Radeon")),
+            "none"
+        );
+    }
+
+    #[test]
+    fn rocminfo_model_parser_ignores_cpu_and_prefers_gpu_marketing_name() {
+        let output = "\
+Agent 1
+  Name:                    cpu
+  Marketing Name:          AMD Ryzen AI MAX+ 395
+  Device Type:             CPU
+Agent 2
+  Name:                    gfx1151
+  Marketing Name:          Radeon 8060S Graphics
+  Device Type:             GPU
+";
+        assert_eq!(
+            parse_rocminfo_gpu_model(output).as_deref(),
+            Some("Radeon 8060S Graphics")
+        );
+        assert_eq!(
+            parse_rocminfo_gpu_model(
+                "Agent 1\n Name: cpu\n Marketing Name: AMD Ryzen\n Device Type: CPU\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn rocminfo_model_parser_falls_back_to_gpu_gfx_name() {
+        let output = "\
+Agent 1
+  Name:                    gfx1151
+  Marketing Name:
+  Device Type:             GPU
+";
+        assert_eq!(parse_rocminfo_gpu_model(output).as_deref(), Some("gfx1151"));
+    }
+
+    #[test]
+    fn rocm_smi_model_parser_prefers_series_and_rejects_hex_only_model() {
+        let output = "\
+GPU[0]          : Card model:          0x15bf
+GPU[0]          : Card series:         AMD Radeon 8060S Graphics
+";
+        assert_eq!(
+            parse_rocm_smi_gpu_model(output).as_deref(),
+            Some("AMD Radeon 8060S Graphics")
+        );
+        assert_eq!(
+            parse_rocm_smi_gpu_model("GPU[0] : Card model: 0x15bf\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn rocm_version_parser_accepts_file_and_hipconfig_formats_only() {
+        assert_eq!(
+            parse_rocm_version("7.1.0-66\n").as_deref(),
+            Some("7.1.0-66")
+        );
+        assert_eq!(
+            parse_rocm_version("HIP version: 7.1.51831-1234\n").as_deref(),
+            Some("7.1.51831-1234")
+        );
+        assert_eq!(
+            parse_rocm_version("ROCm Version: 7.1.0 build 66\n").as_deref(),
+            Some("7.1.0")
+        );
+        assert_eq!(parse_rocm_version("\n\t\n"), None);
+        assert_eq!(parse_rocm_version("ROCm tools installed\n"), None);
+    }
+
+    #[test]
+    fn linux_gpu_probe_precedence_preserves_existing_detectors() {
+        let rocminfo_gpu = "Device Type: GPU";
+        assert_eq!(
+            classify_linux_gpu_probe_results(true, true, Some(rocminfo_gpu)),
+            "nvidia_cuda"
+        );
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, true, Some(rocminfo_gpu)),
+            "amd_rocm"
+        );
+        assert_eq!(
+            classify_linux_gpu_probe_results(false, true, None),
+            "amd_rocm"
+        );
+        assert_eq!(classify_linux_gpu_probe_results(false, false, None), "none");
     }
 
     #[test]

@@ -79,10 +79,10 @@ export const CHECKLIST: ChecklistItem[] = [
   {
     id: 'static_ip',
     group: 'Network',
-    title: 'Assign a static IP in 192.168.5.0/24',
+    title: 'Assign the fleet-approved static IP and routed prefix',
     applies_to: ['all'],
     detail_md:
-      'Pick an unused IP in `192.168.5.100–250`. Check ForgeFleet\'s fleet page for what\'s taken.\n\n**Linux (netplan):** edit `/etc/netplan/01-network.yaml`, set `dhcp4: false` and `addresses: [192.168.5.XXX/24]`, then `sudo netplan apply`.\n\n**macOS:** System Settings → Network → interface → Details → TCP/IP → Configure IPv4: **Manually**, set IP/subnet/router.\n\nClick [Verify] below once set.',
+      'Use the IP, prefix, gateway, and DNS assigned in ForgeFleet\'s computer record; do not choose an address or assume a `/24`. The current routed Linux fleet uses `192.168.5.x/32` addresses through gateway `192.168.4.1`, and changing one of those nodes to `/24` can break reachability.\n\n**Linux (netplan):** edit the active file under `/etc/netplan/`, set `dhcp4: false`, use `addresses: [<assigned-ip>/<assigned-prefix>]`, and configure the assigned default route and DNS before running `sudo netplan apply`. Keep a local-console rollback path while applying network changes.\n\n**macOS:** System Settings → Network → interface → Details → TCP/IP → Configure IPv4: **Manually**, then enter the fleet-assigned IP, subnet mask, and router.\n\nClick [Verify] below once set.',
     verify: { kind: 'ip_ping' },
   },
   {
@@ -241,17 +241,18 @@ export const CHECKLIST: ChecklistItem[] = [
   {
     id: 'tooling_gh_auth',
     group: 'Tooling (auto)',
-    title: 'gh auth login with Venkat\'s GitHub account',
+    title: 'GitHub SSH identity and API-token authority are available',
     applies_to: ['all'],
     detail_md:
-      'Bootstrap script runs `gh auth login --with-token < ~/.forgefleet/gh_pat.txt`. Verifies with `gh auth status` showing `venkatyarl`.',
+      'Bootstrap runs `ff github sync` to materialize the fleet-owned SSH identity and switch the repository remote to its GitHub SSH alias. The API token remains in the fleet/1Password secret authority and must be passed to `gh` through a protected environment or 1Password integration; do not write a PAT to a plaintext file. Verify an authenticated GitHub SSH remote read/push and an API call, because `gh auth login --with-token` can reject otherwise-valid fine-grained tokens that do not carry the classic `read:org` scope.',
   },
   {
     id: 'tooling_1password',
     group: 'Tooling (auto)',
     title: '1Password CLI installed',
     applies_to: ['all'],
-    detail_md: 'Bootstrap script installs `op`. Verifies with `op --version`.',
+    detail_md:
+      'Install the signed `1password-cli` package and verify with `op --version`. Interactive shells may use the unlocked desktop integration; unattended ForgeFleet jobs use the fleet-owned 1Password service-account token without persisting it on the node.',
   },
   {
     id: 'tooling_codex',

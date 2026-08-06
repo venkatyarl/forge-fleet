@@ -40,6 +40,7 @@ mod agent_cmd;
 mod agents_cmd;
 mod alert_cmd;
 mod arbiter_cmd;
+mod artifact_cmd;
 mod backends_cmd;
 mod brain_cmd;
 mod build_cmd;
@@ -53,12 +54,15 @@ mod cortex_cmd;
 mod council_cmd;
 mod daemon_cmd;
 mod db_cmd;
+mod db_migrate_cmd;
 mod defer_cmd;
 mod doctor_cmd;
 mod events_cmd;
 mod ext_cmd;
 mod fabric_cmd;
 mod fleet_cmd;
+mod fleet_db_falkordb_replica;
+mod fleet_db_redis_replica;
 mod fleet_db_replica;
 mod github_cmd;
 mod health_cmd;
@@ -727,6 +731,11 @@ enum Command {
         #[command(subcommand)]
         command: SoftwareCommand,
     },
+    /// Verify and register immutable local release artifacts and custody.
+    Artifact {
+        #[command(subcommand)]
+        command: artifact_cmd::ArtifactCommand,
+    },
     /// Conformance — desired-state profiles + a VERIFY GATE that actually runs
     /// (V120). Catches "green pip but GPU never binds" that a version parse
     /// misses (e.g. a +cu wheel on an AMD box, or a daemon user that can't
@@ -870,10 +879,9 @@ enum Command {
         #[command(subcommand)]
         command: PortsCommand,
     },
-    /// Read-only SQL against the ForgeFleet Postgres. Runs inside a READ ONLY
-    /// transaction (the server rejects writes) — a safe inspection escape
-    /// hatch so a typed `ff db query …` no longer falls through to the LLM
-    /// agent (which would hallucinate against a non-existent database).
+    /// PostgreSQL inspection and explicit bounded migration control. Queries
+    /// run READ ONLY; explicit-only migration versions require the dedicated
+    /// source-attested `migrate apply` command and are never applied at startup.
     Db {
         #[command(subcommand)]
         command: DbCommand,
@@ -1726,10 +1734,10 @@ enum OauthCommand {
         /// Provider name: `claude`, `codex`, `gemini`, `kimi`, `grok`, or `all`.
         provider: String,
     },
-    /// Push the leader's credential file out to every other fleet member's
-    /// matching path (mode 0600). After this, ff-driven CLI invocations on
-    /// any member use the centralised token. Pass `all` to fan out for
-    /// every provider at once.
+    /// Queue a typed canonical credential reference for every other fleet
+    /// member. Each exact target resolves it just in time and atomically writes
+    /// the provider's matching path (mode 0600). Pass `all` to fan out for
+    /// every provider at once; credential bytes never enter the task payload.
     ///
     /// TOS WARNING: most vendor consumer subscriptions (Claude Pro,
     /// ChatGPT Plus, Kimi Pro) prohibit using one account on N concurrent
@@ -1747,13 +1755,18 @@ enum OauthCommand {
         /// non-interactive callers (cron, CI, deferred tasks).
         #[arg(long, default_value_t = false)]
         yes: bool,
+        /// Explicit target computer. Repeat once per intended recipient.
+        /// Broad `all`, duplicate names, the leader, Vinny, and Taylor are
+        /// rejected by the authority layer.
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
     },
-    /// Show per-provider OAuth state: cred-file present on leader,
-    /// mtime, token-in-fleet_secrets, token-preview.
+    /// Show per-provider OAuth state: cred-file present on leader, mtime, and
+    /// whether the canonical token is present. Token content is never shown.
     Status,
-    /// Long-running foreground watcher: re-imports + re-distributes
-    /// whenever any leader cred file changes (vendor CLI refreshed its
-    /// token). Run on the leader; ctrl-C to exit.
+    /// Long-running foreground watcher: re-imports on the leader whenever a
+    /// credential file changes. It never distributes without an explicit
+    /// operator target list. Run on the leader; ctrl-C to exit.
     RefreshWatch,
     /// Probe each oauth_subscription provider's API to verify the
     /// harvested token still authenticates. Reports OK / 401 / network
@@ -1778,6 +1791,18 @@ enum OauthCommand {
         /// or `all`.
         #[arg(default_value = "all")]
         provider: String,
+        /// Explicit target computer. Repeat once per intended recipient.
+        #[arg(long = "target", required = true)]
+        targets: Vec<String>,
+    },
+    /// Preview or repair retained legacy OAuth payloads and the unstarted task
+    /// flood. Apply atomically redacts every exact-fingerprint legacy payload
+    /// (including terminal history), cancels unstarted distribute/repush rows,
+    /// and refuses all changes if a matching legacy task is running. Dry-run
+    /// unless `--apply` is explicit.
+    CancelBacklog {
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
 }
 
@@ -1820,6 +1845,9 @@ enum FleetCommand {
     SshMeshCheck {
         #[arg(long)]
         node: Option<String>,
+        /// Runtime-only endpoint exclusions. Repeat for multiple nodes.
+        #[arg(long = "exclude-node", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_node: Vec<String>,
         #[arg(long)]
         json: bool,
         /// Probe directly FROM this node (ICMP ping + single-hop SSH,
@@ -1840,9 +1868,20 @@ enum FleetCommand {
         #[arg(long, default_value_t = false)]
         yes: bool,
     },
+    /// Preview or cancel only pending/dispatchable `auto-mesh-repair:` shell
+    /// tasks. Defaults to a read-only count; running and terminal rows are
+    /// always left untouched.
+    CleanupMeshRepairBacklog {
+        /// Apply the cancellation. Without this flag the command is read-only.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
+    },
     /// Full 12-check verify battery for one node.
     VerifyNode {
         name: String,
+        /// Ignore persisted mesh rows involving these runtime-only exclusions.
+        #[arg(long = "exclude-node", value_name = "NAME", action = clap::ArgAction::Append)]
+        exclude_node: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -2272,10 +2311,12 @@ enum FleetCommand {
         #[arg(default_value = "status")]
         mode: String,
     },
-    /// Staged upgrade rollout + auto-halt (PROD_READINESS item 26). Drives a
-    /// gated canary→rest progression that halts on a bad build instead of
-    /// rolling every host. The leader-gated `staged_rollout_mode` tick advances
-    /// stages; this command starts a rollout and lists existing ones.
+    /// Legacy staged software-updater rollout + auto-halt.
+    ///
+    /// This namespace drives software-registry upgrade playbooks through a
+    /// gated canary→rest progression. It does not release `ff` or
+    /// `forgefleetd` artifacts; use `ff artifact rollout` for exact release
+    /// binaries and their artifact authority.
     Rollout {
         #[command(subcommand)]
         command: RolloutCommand,
@@ -2284,12 +2325,12 @@ enum FleetCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum RolloutCommand {
-    /// Start a staged rollout: create the `upgrade_rollouts` row and compose
-    /// ONLY stage 0 (the canary). The leader-gated tick advances the rest as
-    /// each stage passes, and halts (+ alerts) if a stage's failure rate
-    /// crosses its threshold. Requires `--staged` (the unstaged path is the
-    /// existing `ff fleet upgrade`). The tick must be enabled
-    /// (`fleet_secrets.staged_rollout_mode` = active) to progress past stage 0.
+    /// Start a legacy staged software-updater rollout.
+    ///
+    /// Creates an `upgrade_rollouts` row and composes ONLY stage 0 (the
+    /// canary). The leader-gated tick advances later stages and halts on a bad
+    /// stage. Requires `--staged`; the unstaged updater is `ff fleet upgrade`.
+    /// Release binaries belong to the exact `ff artifact rollout` namespace.
     Start {
         /// software_id from `software_registry` (e.g. `forgefleetd_git`).
         software: String,
@@ -2346,6 +2387,19 @@ pub enum FleetDbCommand {
     Replica {
         #[command(subcommand)]
         command: FleetDbReplicaCommand,
+    },
+    /// Plan or apply a loopback-only Redis streaming replica bootstrap.
+    /// Priya remains authoritative; this never promotes or fails over Redis.
+    RedisReplica {
+        #[command(subcommand)]
+        command: FleetDbRedisReplicaCommand,
+    },
+    /// Plan, apply, inspect, or non-destructively retire a loopback-only
+    /// FalkorDB replica. Priya remains authoritative; promotion and automatic
+    /// failover are deliberately unavailable.
+    FalkordbReplica {
+        #[command(subcommand)]
+        command: FleetDbFalkordbReplicaCommand,
     },
     /// Register an off-site Postgres replica reachable via Tailscale (or
     /// another overlay network). Stores a row in `database_replicas` with
@@ -2477,9 +2531,17 @@ pub enum FleetDbCommand {
         #[arg(long = "now", default_value_t = true)]
         now: bool,
     },
-    /// Run the backup restore-drill RIGHT NOW against the newest Postgres
-    /// backup: decrypt → extract → validate it's a structurally complete
-    /// PGDATA, record the outcome in `backup_drills`, and alert on failure.
+    /// Inspect or update the two explicit offsite destinations used by the
+    /// backup orchestrator. This is the typed control plane for
+    /// `fleet_backup_config.dest_hosts`; it never accepts raw SQL.
+    BackupPolicy {
+        #[command(subcommand)]
+        command: FleetDbBackupPolicyCommand,
+    },
+    /// Run the backup restore-drill RIGHT NOW against one exact Postgres or
+    /// FalkorDB backup: decrypt → extract → start an isolated digest-pinned
+    /// database → execute a read-only application proof, record the exact run,
+    /// and alert on failure.
     ///
     /// This is the exact path the daily leader tick runs — use it to verify
     /// restorability on demand (run it ON the leader, where the `.age` files
@@ -2488,12 +2550,34 @@ pub enum FleetDbCommand {
     /// `--on <node>` runs the drill on a REMOTE fleet computer via the
     /// deferred-task queue instead of locally: it proves the backup fanned out
     /// to `<node>` AND is restorable there (the leader-loss recovery story).
-    /// The remote node drills the newest copy it actually holds; the result
-    /// lands in `backup_drills` with `drill_node=<node>`. Exits non-zero if the
-    /// remote drill fails or doesn't report back in time.
+    /// The remote node must have fresh checksum+decrypt distribution evidence
+    /// for this backup. The same backup ID and run ID fence dispatch and result
+    /// polling; there is no newest/local fallback.
     Drill {
+        /// Exact Postgres or FalkorDB backup UUID from `backups` (required; no fallback).
+        #[arg(long)]
+        backup_id: String,
+        /// Exact drill-run UUID. Generated when omitted; remote dispatch carries
+        /// this UUID and accepts only the matching result row.
+        #[arg(long)]
+        run_id: Option<String>,
         #[arg(long)]
         on: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbBackupPolicyCommand {
+    /// Show every backup kind and its configured source/destinations.
+    Show,
+    /// Pin one backup kind to exactly two distinct enrolled computers.
+    Set {
+        /// Existing kind from the live `fleet_backup_config` table.
+        #[arg(long)]
+        kind: String,
+        /// Destination computer. Pass exactly twice.
+        #[arg(long = "dest", required = true, action = clap::ArgAction::Append)]
+        destinations: Vec<String>,
     },
 }
 
@@ -2526,6 +2610,121 @@ pub enum FleetDbReplicaCommand {
         primary: String,
         #[arg(long)]
         plan_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbRedisReplicaCommand {
+    /// Read-only authority, backup, target, and Redis-primary preflight.
+    Plan {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+    },
+    /// Enqueue the exact, previously planned bootstrap on the target node.
+    Apply {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Target-side implementation used only by the deferred-task worker.
+    #[command(hide = true)]
+    LocalApply {
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum FleetDbFalkordbReplicaCommand {
+    /// Read-only authority, restore-proof, firewall, and target preflight.
+    Plan {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+    },
+    /// Enqueue the exact, previously planned bootstrap on the target node.
+    Apply {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Read-only topology and exact target-container attestation.
+    Status {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+    },
+    /// Remove only the attested replica container and topology row. Its
+    /// durable volume is always preserved for audit and recovery.
+    Decommission {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long, default_value_t = false)]
+        preserve_volume: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Permanently remove a previously preserved replica volume. Requires the
+    /// exact proof emitted by `status` after topology removal.
+    PurgeVolume {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        proof: String,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Target-side bootstrap used only by the deferred-task worker.
+    #[command(hide = true)]
+    LocalApply {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        plan_id: String,
+    },
+    /// Target-side non-destructive retirement used by the deferred worker.
+    #[command(hide = true)]
+    LocalDecommission {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        proof: String,
+    },
+    /// Target-side exact-volume purge used by the deferred worker.
+    #[command(hide = true)]
+    LocalPurgeVolume {
+        #[arg(long)]
+        to: String,
+        #[arg(long, default_value = "priya")]
+        primary: String,
+        #[arg(long)]
+        proof: String,
     },
 }
 
@@ -2723,6 +2922,35 @@ enum DbCommand {
         /// Cap rows returned (default 200); extra rows are noted as truncated.
         #[arg(long, default_value_t = 200)]
         max_rows: usize,
+    },
+    /// Inspect or explicitly apply bounded PostgreSQL migrations. Ordinary
+    /// daemon/startup migration paths never apply explicit-only versions.
+    Migrate {
+        #[command(subcommand)]
+        command: DbMigrateCommand,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum DbMigrateCommand {
+    /// Read migration status without taking locks, creating tables, or writing.
+    Status {
+        /// Emit the complete status as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Apply through one exact explicit migration version. There is no force
+    /// bypass: the binary commit, requested commit, DB history, and schema must agree.
+    Apply {
+        /// Exact bounded migration target (currently 295 only).
+        #[arg(long)]
+        to: u32,
+        /// Full lowercase commit SHA of this exact clean ff binary.
+        #[arg(long)]
+        source_commit: String,
+        /// Required acknowledgement that this performs PostgreSQL DDL.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -2938,6 +3166,17 @@ pub enum MemoryCommand {
         scope_type: String,
         #[arg(long, default_value = "")]
         scope_key: String,
+    },
+    /// Preview or compact one exact legacy/lowered-cap Scratchpad scope.
+    /// Read-only unless --apply is explicitly supplied.
+    Compact {
+        #[arg(long, default_value = "session")]
+        scope_type: String,
+        #[arg(long, default_value = "default")]
+        scope_key: String,
+        /// Run archive-before-summary/hard-trim compaction.
+        #[arg(long, default_value_t = false)]
+        apply: bool,
     },
 }
 
@@ -3332,7 +3571,7 @@ pub enum CorpusCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum OnboardCommand {
-    /// Print the copy-paste curl command for onboarding a new computer.
+    /// Issue a bound one-time token and print a pinned-HTTPS bootstrap command.
     Show {
         #[arg(long)]
         name: String,
@@ -3676,7 +3915,7 @@ pub enum ModelCommand {
         #[arg(long = "gpu-memory-utilization", default_value_t = 0.85)]
         gpu_memory_utilization: f32,
     },
-    /// Sync the curated model catalog TOML into Postgres.
+    /// Reconcile the constrained canonical Devstral capability in PostgreSQL.
     SyncCatalog,
     /// Search the catalog (fuzzy on id/name/family).
     Search { query: String },
@@ -3742,6 +3981,10 @@ pub enum ModelCommand {
         #[arg(long)]
         models_dir: Option<PathBuf>,
     },
+    /// Import Ace's one reviewed Gemma 4 E4B MLX artifact from its exact
+    /// Hugging Face cache revision, then register the verified final directory.
+    /// This verb accepts no path, node, force, repo, or revision overrides.
+    ImportAceGemma4Mlx,
     /// Show latest disk usage per node (from fleet_disk_usage snapshots).
     Disk {
         /// Emit JSON (every field incl. total_bytes + RFC3339 sampled_at) — for
@@ -4667,6 +4910,9 @@ async fn main() -> Result<()> {
         Some(Command::Software { command }) => {
             return software_cmd::handle_software(command.clone()).await;
         }
+        Some(Command::Artifact { command }) => {
+            return artifact_cmd::handle_artifact(command.clone()).await;
+        }
         Some(Command::Ext { command }) => return ext_cmd::handle_ext(command.clone()).await,
         Some(Command::Github { command }) => {
             return github_cmd::handle_github(command.clone()).await;
@@ -5084,6 +5330,7 @@ async fn main() -> Result<()> {
         }) => ssh_cmd::handle_ssh(worker, command, sudo, timeout, json).await,
         Some(Command::Llm { command }) => llm_cmd::handle_llm(command).await,
         Some(Command::Software { command }) => software_cmd::handle_software(command).await,
+        Some(Command::Artifact { command }) => artifact_cmd::handle_artifact(command).await,
         Some(Command::Conformance { command }) => conformance_cmd::run(command).await,
         Some(Command::Ext { command }) => ext_cmd::handle_ext(command).await,
         Some(Command::Github { command }) => github_cmd::handle_github(command).await,
@@ -5661,12 +5908,17 @@ async fn main() -> Result<()> {
             let pool = ff_agent::fleet_info::get_fleet_pool()
                 .await
                 .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-            ff_db::run_postgres_migrations(&pool)
-                .await
-                .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            // Queue cleanup must be a narrowly scoped operation. In
+            // particular, its default dry-run must not apply unrelated schema
+            // migrations as a side effect.
+            if !matches!(&command, OauthCommand::CancelBacklog { .. }) {
+                ff_db::run_postgres_migrations(&pool)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+            }
             use ff_agent::oauth_distributor::{
-                OAUTH_PROVIDERS, distribute_token, import_token, provider_by_name,
-                spawn_refresh_watch, status,
+                OAUTH_PROVIDERS, cancel_oauth_task_backlog, distribute_token, import_token,
+                provider_by_name, spawn_refresh_watch, status,
             };
             // Resolve `all` to every catalog entry; otherwise look up the
             // single named provider.
@@ -5684,17 +5936,21 @@ async fn main() -> Result<()> {
             match command {
                 OauthCommand::Import { provider } => {
                     for p in resolve(&provider)? {
-                        match import_token(&pool, p).await {
-                            Ok(()) => println!(
-                                "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
-                                p.name, p.secret_key
-                            ),
-                            Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
-                        }
+                        import_token(&pool, p)
+                            .await
+                            .with_context(|| format!("import {}", p.name))?;
+                        println!(
+                            "{GREEN}✓{RESET} imported {} → fleet_secrets[{}]",
+                            p.name, p.secret_key
+                        );
                     }
                     Ok(())
                 }
-                OauthCommand::Distribute { provider, yes } => {
+                OauthCommand::Distribute {
+                    provider,
+                    yes,
+                    targets,
+                } => {
                     println!(
                         "{YELLOW}!{RESET} TOS reminder: distributing one subscription's OAuth token \
                          to multiple machines is grey-area on most vendor TOS — running one Pro/Plus \
@@ -5725,13 +5981,13 @@ async fn main() -> Result<()> {
                         }
                     }
                     for p in resolve(&provider)? {
-                        match distribute_token(&pool, p).await {
-                            Ok(n) => println!(
-                                "{GREEN}✓{RESET} {}: enqueued {n} distribute task(s); follow with `ff tasks list`",
-                                p.name
-                            ),
-                            Err(e) => println!("{RED}✗{RESET} {}: {e}", p.name),
-                        }
+                        let n = distribute_token(&pool, p, &targets)
+                            .await
+                            .with_context(|| format!("distribute {}", p.name))?;
+                        println!(
+                            "{GREEN}✓{RESET} {}: enqueued {n} distribute task(s); follow with `ff tasks list`",
+                            p.name
+                        );
                     }
                     Ok(())
                 }
@@ -5740,7 +5996,7 @@ async fn main() -> Result<()> {
                         .await
                         .map_err(|e| anyhow::anyhow!("status: {e}"))?;
                     println!(
-                        "{:<10} {:<14} {:<18} {:<10} TOKEN PREVIEW",
+                        "{:<10} {:<14} {:<18} {:<10}",
                         "PROVIDER", "CRED FILE", "FILE MTIME", "IN SECRETS"
                     );
                     for s in snap {
@@ -5759,7 +6015,7 @@ async fn main() -> Result<()> {
                             })
                             .unwrap_or_else(|| "-".into());
                         println!(
-                            "{:<10} {:<14} {:<18} {:<10} {}",
+                            "{:<10} {:<14} {:<18} {:<10}",
                             s.name,
                             if s.cred_file_present {
                                 "present"
@@ -5768,24 +6024,29 @@ async fn main() -> Result<()> {
                             },
                             mtime,
                             if s.token_in_secrets { "yes" } else { "no" },
-                            s.token_preview.unwrap_or_else(|| "-".into()),
                         );
                     }
-                    let setup_token = ff_db::pg_get_secret(&pool, "claude.setup_token")
-                        .await
-                        .ok()
-                        .flatten();
+                    let setup_token_present: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM fleet_secrets
+                             WHERE key = 'claude.setup_token' AND value <> ''
+                        )",
+                    )
+                    .fetch_one(&pool)
+                    .await
+                    .context("check durable headless claude token presence")?;
                     println!();
-                    match setup_token {
-                        Some(t) if !t.trim().is_empty() => println!(
+                    if setup_token_present {
+                        println!(
                             "{GREEN}✓{RESET} durable headless claude token set (fleet_secrets[claude.setup_token]) \
                              — every node exports it as CLAUDE_CODE_OAUTH_TOKEN when spawning `claude`"
-                        ),
-                        _ => println!(
+                        );
+                    } else {
+                        println!(
                             "{YELLOW}!{RESET} no durable headless claude token — run `claude setup-token` once \
                              (browser approval), then `ff secrets set claude.setup_token` (or pipe via --stdin) \
                              to mint one that survives refresh-token rotation fleet-wide"
-                        ),
+                        );
                     }
                     Ok(())
                 }
@@ -5823,16 +6084,35 @@ async fn main() -> Result<()> {
                     }
                     Ok(())
                 }
-                OauthCommand::Refresh { provider } => {
+                OauthCommand::Refresh { provider, targets } => {
                     let providers = resolve(&provider)?;
                     for p in providers {
-                        let n = ff_agent::oauth_distributor::refresh_and_distribute(&pool, p)
-                            .await
-                            .with_context(|| format!("refresh and distribute {}", p.name))?;
+                        let n =
+                            ff_agent::oauth_distributor::refresh_and_distribute(&pool, p, &targets)
+                                .await
+                                .with_context(|| format!("refresh and distribute {}", p.name))?;
                         println!(
                             "{:<10} {GREEN}✓{RESET} refreshed and enqueued {n} re-push task(s)",
                             p.name
                         );
+                    }
+                    Ok(())
+                }
+                OauthCommand::CancelBacklog { apply } => {
+                    let result = cancel_oauth_task_backlog(&pool, apply)
+                        .await
+                        .context("OAuth task backlog cleanup")?;
+                    if result.applied {
+                        println!(
+                            "{GREEN}✓{RESET} redacted {} retained legacy OAuth payload(s) and cancelled {} pending/dispatchable distribute/repush task(s); terminal audit metadata was preserved",
+                            result.scrubbed, result.cancelled
+                        );
+                    } else {
+                        println!(
+                            "{YELLOW}dry-run{RESET}: {} retained legacy payload(s) would be redacted and {} pending/dispatchable distribute/repush task(s) would be cancelled; {} matching task(s) are running",
+                            result.legacy_matched, result.cancel_eligible, result.running_blocked
+                        );
+                        println!("rerun with `ff oauth cancel-backlog --apply` to apply");
                     }
                     Ok(())
                 }
@@ -6455,6 +6735,453 @@ mod free_prompt_guard_tests {
         // the multi-arg form does. Quoting must not change the verdict.
         assert!(guard(&["summarize the fleet state"]).is_none());
         assert!(guard(&["what is running on the fleet"]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod oauth_cli_guard_tests {
+    use super::{Cli, Command, FleetCommand, OauthCommand};
+    use clap::Parser;
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread panicked")
+    }
+
+    fn parse_cancel_backlog(args: &[&str]) -> bool {
+        try_parse(args)
+            .expect("valid oauth cancel-backlog command")
+            .command
+            .and_then(|command| match command {
+                Command::Oauth {
+                    command: OauthCommand::CancelBacklog { apply },
+                } => Some(apply),
+                _ => None,
+            })
+            .expect("parsed OAuth cancel-backlog")
+    }
+
+    #[test]
+    fn oauth_backlog_cleanup_is_dry_run_unless_apply_is_explicit() {
+        assert!(!parse_cancel_backlog(&["ff", "oauth", "cancel-backlog"]));
+        assert!(parse_cancel_backlog(&[
+            "ff",
+            "oauth",
+            "cancel-backlog",
+            "--apply",
+        ]));
+    }
+
+    #[test]
+    fn oauth_distribution_and_refresh_require_repeatable_explicit_targets() {
+        for missing in [
+            vec!["ff", "oauth", "distribute", "codex", "--yes"],
+            vec!["ff", "oauth", "refresh", "codex"],
+        ] {
+            assert!(try_parse(&missing).is_err());
+        }
+
+        let cli = try_parse(&[
+            "ff",
+            "oauth",
+            "distribute",
+            "codex",
+            "--yes",
+            "--target",
+            "Sia",
+            "--target",
+            "Adele",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Oauth {
+                command:
+                    OauthCommand::Distribute {
+                        provider,
+                        yes,
+                        targets,
+                    },
+            }) => {
+                assert_eq!(provider, "codex");
+                assert!(yes);
+                assert_eq!(targets, ["Sia", "Adele"]);
+            }
+            other => panic!("unexpected parsed command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_status_never_renders_token_content_or_preview() {
+        let source = include_str!("main.rs");
+        let status_arm = source
+            .split("OauthCommand::Status =>")
+            .nth(1)
+            .unwrap()
+            .split("OauthCommand::RefreshWatch")
+            .next()
+            .unwrap();
+        assert!(!status_arm.contains("token_preview"));
+        assert!(!status_arm.contains("TOKEN PREVIEW"));
+        assert!(!status_arm.contains("chars().take"));
+    }
+
+    fn parse_mesh_repair_cleanup(args: &[&str]) -> bool {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread panicked")
+            .expect("valid mesh repair cleanup command")
+            .command
+            .and_then(|command| match command {
+                Command::Fleet {
+                    command: FleetCommand::CleanupMeshRepairBacklog { apply },
+                } => Some(apply),
+                _ => None,
+            })
+            .expect("parsed fleet cleanup-mesh-repair-backlog")
+    }
+
+    #[test]
+    fn mesh_repair_backlog_cleanup_is_dry_run_unless_apply_is_explicit() {
+        assert!(!parse_mesh_repair_cleanup(&[
+            "ff",
+            "fleet",
+            "cleanup-mesh-repair-backlog",
+        ]));
+        assert!(parse_mesh_repair_cleanup(&[
+            "ff",
+            "fleet",
+            "cleanup-mesh-repair-backlog",
+            "--apply",
+        ]));
+    }
+}
+
+#[cfg(test)]
+mod legacy_rollout_cli_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn legacy_rollout_help_distinguishes_exact_artifact_rollouts() {
+        let (rollout_help, start_help) = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut root = Cli::command();
+                let rollout = root
+                    .find_subcommand_mut("fleet")
+                    .expect("fleet command")
+                    .find_subcommand_mut("rollout")
+                    .expect("fleet rollout command");
+                let rollout_help = rollout.render_long_help().to_string();
+                let start_help = rollout
+                    .find_subcommand_mut("start")
+                    .expect("fleet rollout start command")
+                    .render_long_help()
+                    .to_string();
+                (rollout_help, start_help)
+            })
+            .expect("spawn rollout help thread")
+            .join()
+            .expect("rollout help thread panicked");
+        assert!(rollout_help.contains("Legacy staged software-updater rollout"));
+        assert!(rollout_help.contains("ff artifact rollout"));
+        assert!(start_help.contains("legacy staged software-updater rollout"));
+        assert!(start_help.contains("ff artifact rollout"));
+    }
+}
+
+#[cfg(test)]
+mod artifact_cli_tests {
+    use super::{
+        Cli, Command,
+        artifact_cmd::{ArtifactCommand, ArtifactRolloutCommand},
+    };
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn artifact parser thread")
+            .join()
+            .expect("artifact parser thread panicked")
+    }
+
+    fn complete_args() -> Vec<&'static str> {
+        vec![
+            "ff",
+            "artifact",
+            "register",
+            "--name",
+            "ff",
+            "--version",
+            "2026.8.5_1",
+            "--source-commit",
+            "6dc4086b7217cb8c2ccc1945b1e1f3213b9b1941",
+            "--target",
+            "aarch64-unknown-linux-gnu",
+            "--sha256",
+            "b810351bb47e90c3d52f7db50ae3df00faddd1e147671a0cb32a5f8ac8cf8e30",
+            "--size-bytes",
+            "58188224",
+            "--path",
+            "ff-6dc4086b-aarch64/artifact/ff",
+            "--json",
+        ]
+    }
+
+    #[test]
+    fn artifact_register_requires_and_parses_exact_evidence() {
+        let cli = parse(&complete_args()).expect("complete artifact register must parse");
+        match cli.command {
+            Some(Command::Artifact {
+                command:
+                    ArtifactCommand::Register {
+                        name,
+                        version,
+                        source_commit,
+                        target,
+                        sha256,
+                        size_bytes,
+                        path,
+                        json,
+                    },
+            }) => {
+                assert_eq!(name, "ff");
+                assert_eq!(version, "2026.8.5_1");
+                assert_eq!(source_commit.len(), 40);
+                assert_eq!(target, "aarch64-unknown-linux-gnu");
+                assert_eq!(sha256.len(), 64);
+                assert_eq!(size_bytes, 58_188_224);
+                assert_eq!(path.to_string_lossy(), "ff-6dc4086b-aarch64/artifact/ff");
+                assert!(json);
+            }
+            _ => panic!("expected artifact register"),
+        }
+
+        let mut missing_digest = complete_args();
+        let index = missing_digest
+            .iter()
+            .position(|arg| *arg == "--sha256")
+            .unwrap();
+        missing_digest.drain(index..=index + 1);
+        assert!(parse(&missing_digest).is_err());
+    }
+
+    #[test]
+    fn artifact_register_exposes_no_holder_force_or_delete_surface() {
+        let mut holder = complete_args();
+        holder.extend(["--holder", "sia"]);
+        assert!(parse(&holder).is_err());
+
+        let mut force = complete_args();
+        force.push("--force");
+        assert!(parse(&force).is_err());
+
+        assert!(parse(&["ff", "artifact", "delete"]).is_err());
+        assert!(parse(&["ff", "artifact", "unregister"]).is_err());
+    }
+
+    #[test]
+    fn artifact_rollout_exposes_only_exact_authority_and_transaction_ids() {
+        let source = "39b017341b7536df64b61f42672ab33fb62343f8";
+        let authority = "11111111-1111-4111-8111-111111111111";
+        let request = "22222222-2222-4222-8222-222222222222";
+        let parsed = parse(&[
+            "ff",
+            "artifact",
+            "rollout",
+            "start",
+            "--authority-id",
+            authority,
+            "--request-id",
+            request,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Artifact {
+                command: ArtifactCommand::Rollout {
+                    command: ArtifactRolloutCommand::Start { json: true, .. }
+                }
+            })
+        ));
+        assert!(
+            parse(&[
+                "ff",
+                "artifact",
+                "rollout",
+                "plan",
+                "--source-commit",
+                source,
+                "--force"
+            ])
+            .is_err()
+        );
+        for forbidden in ["--host", "--path", "--command", "--force"] {
+            assert!(
+                parse(&[
+                    "ff",
+                    "artifact",
+                    "rollout",
+                    "resume",
+                    "--transaction-id",
+                    request,
+                    forbidden,
+                    "vinny",
+                ])
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn local_rollback_accepts_only_transaction_identity_and_no_force() {
+        let transaction = "33333333-3333-4333-8333-333333333333";
+        assert!(
+            parse(&[
+                "ff",
+                "artifact",
+                "rollback",
+                "--transaction-id",
+                transaction,
+                "--json",
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "ff",
+                "artifact",
+                "rollback",
+                "--transaction-id",
+                transaction,
+                "--force",
+            ])
+            .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod memory_cli_guard_tests {
+    use super::{Cli, Command, MemoryCommand};
+    use clap::Parser;
+
+    fn parse_compact(args: &[&str]) -> (String, String, bool) {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn parser thread")
+            .join()
+            .expect("parser thread panicked")
+            .expect("valid memory compact command")
+            .command
+            .and_then(|command| match command {
+                Command::Memory {
+                    command:
+                        MemoryCommand::Compact {
+                            scope_type,
+                            scope_key,
+                            apply,
+                        },
+                } => Some((scope_type, scope_key, apply)),
+                _ => None,
+            })
+            .expect("parsed memory compact")
+    }
+
+    #[test]
+    fn memory_compact_defaults_to_exact_auto_scope_preview() {
+        assert_eq!(
+            parse_compact(&["ff", "memory", "compact"]),
+            ("session".to_string(), "default".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn memory_compact_apply_and_explicit_scope_parse() {
+        assert_eq!(
+            parse_compact(&[
+                "ff",
+                "memory",
+                "compact",
+                "--scope-type",
+                "project",
+                "--scope-key",
+                "forge-fleet",
+                "--apply",
+            ]),
+            ("project".to_string(), "forge-fleet".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn memory_compact_preserves_arbitrary_explicit_scope_keys() {
+        for scope_key in ["default", "github.com/venkatyarl/forge-fleet"] {
+            assert_eq!(
+                parse_compact(&[
+                    "ff",
+                    "memory",
+                    "compact",
+                    "--scope-type",
+                    "project",
+                    "--scope-key",
+                    scope_key,
+                ]),
+                ("project".to_string(), scope_key.to_string(), false)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ace_mlx_cli_tests {
+    use super::{Cli, Command, ModelCommand};
+    use clap::Parser;
+
+    fn try_parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        let args = args
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect::<Vec<_>>();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(args))
+            .expect("spawn CLI parser")
+            .join()
+            .expect("CLI parser thread")
+    }
+
+    #[test]
+    fn ace_mlx_import_is_a_fixed_no_argument_verb() {
+        let cli = try_parse(&["ff", "model", "import-ace-gemma4-mlx"])
+            .expect("fixed Ace MLX import verb must parse");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Model {
+                command: ModelCommand::ImportAceGemma4Mlx
+            })
+        ));
+
+        for forbidden in ["--path", "--node", "--force", "--repo", "--revision"] {
+            assert!(
+                try_parse(&["ff", "model", "import-ace-gemma4-mlx", forbidden]).is_err(),
+                "accepted forbidden importer override {forbidden}"
+            );
+        }
     }
 }
 
@@ -8766,6 +9493,155 @@ mod fleet_deploy_cli_tests {
             "--all",
             "--graceful=false"
         ]));
+    }
+}
+
+#[cfg(test)]
+mod backup_policy_cli_tests {
+    use super::{Cli, Command, FleetCommand, FleetDbBackupPolicyCommand, FleetDbCommand};
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> FleetDbBackupPolicyCommand {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn backup-policy parser test")
+            .join()
+            .expect("backup-policy parser test panicked")
+            .expect("valid backup-policy command")
+            .command
+            .and_then(|command| match command {
+                Command::Fleet {
+                    command:
+                        FleetCommand::Db {
+                            command: FleetDbCommand::BackupPolicy { command },
+                        },
+                } => Some(command),
+                _ => None,
+            })
+            .expect("parsed fleet db backup-policy command")
+    }
+
+    #[test]
+    fn backup_policy_show_parses() {
+        assert!(matches!(
+            parse(&["ff", "fleet", "db", "backup-policy", "show"]),
+            FleetDbBackupPolicyCommand::Show
+        ));
+    }
+
+    #[test]
+    fn backup_policy_set_preserves_repeated_destinations() {
+        match parse(&[
+            "ff",
+            "fleet",
+            "db",
+            "backup-policy",
+            "set",
+            "--kind",
+            "postgres",
+            "--dest",
+            "lily",
+            "--dest",
+            "rihanna",
+        ]) {
+            FleetDbBackupPolicyCommand::Set { kind, destinations } => {
+                assert_eq!(kind, "postgres");
+                assert_eq!(destinations, ["lily", "rihanna"]);
+            }
+            other => panic!("expected backup-policy set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn backup_policy_set_requires_kind() {
+        let rejected = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                Cli::try_parse_from([
+                    "ff",
+                    "fleet",
+                    "db",
+                    "backup-policy",
+                    "set",
+                    "--dest",
+                    "lily",
+                    "--dest",
+                    "rihanna",
+                ])
+                .is_err()
+            })
+            .expect("spawn backup-policy missing-kind parser test")
+            .join()
+            .expect("backup-policy missing-kind parser test panicked");
+        assert!(rejected);
+    }
+}
+
+#[cfg(test)]
+mod mesh_exclusion_cli_tests {
+    use super::{Cli, Command, FleetCommand};
+    use clap::Parser;
+
+    fn parse_fleet(args: &[&str]) -> FleetCommand {
+        let owned: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || Cli::try_parse_from(owned))
+            .expect("spawn mesh exclusion parser test")
+            .join()
+            .expect("mesh exclusion parser test panicked")
+            .expect("valid fleet command")
+            .command
+            .and_then(|command| match command {
+                Command::Fleet { command } => Some(command),
+                _ => None,
+            })
+            .expect("parsed fleet command")
+    }
+
+    #[test]
+    fn ssh_mesh_check_accepts_repeatable_runtime_exclusions() {
+        match parse_fleet(&[
+            "ff",
+            "fleet",
+            "ssh-mesh-check",
+            "--node",
+            "Logan",
+            "--exclude-node",
+            "Vinny",
+            "--exclude-node",
+            "Sia",
+        ]) {
+            FleetCommand::SshMeshCheck {
+                node, exclude_node, ..
+            } => {
+                assert_eq!(node.as_deref(), Some("Logan"));
+                assert_eq!(exclude_node, ["Vinny", "Sia"]);
+            }
+            other => panic!("expected ssh-mesh-check, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_node_accepts_the_same_runtime_exclusion_scope() {
+        match parse_fleet(&[
+            "ff",
+            "fleet",
+            "verify-node",
+            "Logan",
+            "--exclude-node",
+            "Vinny",
+        ]) {
+            FleetCommand::VerifyNode {
+                name, exclude_node, ..
+            } => {
+                assert_eq!(name, "Logan");
+                assert_eq!(exclude_node, ["Vinny"]);
+            }
+            other => panic!("expected verify-node, got {other:?}"),
+        }
     }
 }
 

@@ -672,11 +672,22 @@ pub async fn run_judge_escalate<E: LlmExec>(
         let jp = judge_prompt(user_prompt, &output);
         // See run_cascade comment — judge needs ≥ ~256 tokens or mlx_lm.server
         // truncates to empty.
-        let judge_score = match exec.judge(&jp, 256, Duration::from_secs(30)).await {
-            Ok(resp) => parse_judge_response(&resp),
+        let (judge_score, judge_error) = match exec.judge(&jp, 256, Duration::from_secs(30)).await {
+            Ok(resp) => match parse_judge_response(&resp) {
+                Some(score) => (Some(score), None),
+                None => {
+                    tracing::warn!("judge returned an unparseable score at tier-{tier}");
+                    (
+                        None,
+                        Some(format!(
+                            "judge returned an unparseable score at tier-{tier}"
+                        )),
+                    )
+                }
+            },
             Err(e) => {
                 tracing::warn!("judge call failed at tier-{tier}: {e}");
-                None
+                (None, Some(format!("judge call failed at tier-{tier}: {e}")))
             }
         };
 
@@ -688,19 +699,41 @@ pub async fn run_judge_escalate<E: LlmExec>(
             elapsed_ms,
         });
 
-        let pass = judge_score.map(|s| s >= threshold).unwrap_or(true);
-        if pass || tier >= max_tier {
-            return Ok(JudgeEscalateOutcome {
-                final_output: output,
-                steps,
-            });
+        match judge_score {
+            Some(score) if score >= threshold => {
+                return Ok(JudgeEscalateOutcome {
+                    final_output: output,
+                    steps,
+                });
+            }
+            // A real below-threshold score at the configured ceiling keeps the
+            // existing bounded behaviour: there is nowhere further to
+            // escalate, so return the max-tier answer with its low score in the
+            // trace for the caller to inspect.
+            Some(_) if tier >= max_tier => {
+                return Ok(JudgeEscalateOutcome {
+                    final_output: output,
+                    steps,
+                });
+            }
+            // No score is not approval. Escalate while possible, then fail
+            // closed rather than shipping an answer that was never judged.
+            None if tier >= max_tier => {
+                return Err(format!(
+                    "judge unavailable at max tier {tier}: {}",
+                    judge_error.unwrap_or_else(|| "no valid score returned".to_string())
+                ));
+            }
+            _ => {}
         }
         // Build a short critique for the next tier (just the score note for
         // now — a fuller critique would be a second judge call).
         prior_critique = Some(format!(
             "Judge scored the previous attempt {}/10 (threshold {}); add depth, \
              correct any errors, and address edge cases the previous attempt missed.",
-            judge_score.map(|s| s.to_string()).unwrap_or("?".into()),
+            judge_score
+                .map(|s| s.to_string())
+                .unwrap_or("unavailable".into()),
             threshold
         ));
         tier += 1;
@@ -1033,7 +1066,7 @@ mod tests {
 
     struct CannedExec {
         per_tier: Vec<String>,
-        judge_scores: Vec<u8>,
+        judge_responses: Vec<Result<String, String>>,
         complete_calls: Mutex<usize>,
         judge_calls: Mutex<usize>,
     }
@@ -1041,7 +1074,25 @@ mod tests {
         fn new(per_tier: Vec<&str>, judge_scores: Vec<u8>) -> Self {
             Self {
                 per_tier: per_tier.into_iter().map(String::from).collect(),
-                judge_scores,
+                judge_responses: judge_scores
+                    .into_iter()
+                    .map(|score| Ok(score.to_string()))
+                    .collect(),
+                complete_calls: Mutex::new(0),
+                judge_calls: Mutex::new(0),
+            }
+        }
+
+        fn with_judge_responses(
+            per_tier: Vec<&str>,
+            judge_responses: Vec<Result<&str, &str>>,
+        ) -> Self {
+            Self {
+                per_tier: per_tier.into_iter().map(String::from).collect(),
+                judge_responses: judge_responses
+                    .into_iter()
+                    .map(|response| response.map(String::from).map_err(String::from))
+                    .collect(),
                 complete_calls: Mutex::new(0),
                 judge_calls: Mutex::new(0),
             }
@@ -1073,7 +1124,10 @@ mod tests {
             let mut n = self.judge_calls.lock().unwrap();
             let idx = *n;
             *n += 1;
-            Ok(self.judge_scores.get(idx).copied().unwrap_or(0).to_string())
+            self.judge_responses
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| Ok("0".to_string()))
         }
     }
 
@@ -1140,6 +1194,65 @@ mod tests {
             .unwrap();
         assert_eq!(result.steps.len(), 1);
         assert_eq!(result.final_output, "good first try");
+    }
+
+    #[tokio::test]
+    async fn judge_escalate_escalates_when_judge_call_fails() {
+        let exec = CannedExec::with_judge_responses(
+            vec!["unjudged first try", "judged second try"],
+            vec![Err("judge offline"), Ok("8")],
+        );
+        let result = run_judge_escalate(&exec, "explain X", 3, 4, 7)
+            .await
+            .expect("a later valid passing judgment should succeed");
+
+        assert_eq!(result.steps.len(), 2);
+        assert_eq!(result.steps[0].judge_score, None);
+        assert_eq!(result.steps[1].judge_score, Some(8));
+        assert_eq!(result.final_output, "judged second try");
+    }
+
+    #[tokio::test]
+    async fn judge_escalate_fails_closed_when_judge_is_unparseable_at_max_tier() {
+        let exec = CannedExec::with_judge_responses(
+            vec!["first try", "max-tier try"],
+            vec![Ok("not a score"), Ok("still not a score")],
+        );
+        let error = run_judge_escalate(&exec, "explain X", 3, 4, 7)
+            .await
+            .expect_err("an unavailable max-tier judgment must not pass");
+
+        assert!(error.contains("judge unavailable at max tier 4"));
+        assert_eq!(*exec.complete_calls.lock().unwrap(), 2);
+        assert_eq!(*exec.judge_calls.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn judge_escalate_fails_closed_when_judge_call_fails_at_max_tier() {
+        let exec = CannedExec::with_judge_responses(
+            vec!["max-tier try"],
+            vec![Err("judge endpoint unavailable")],
+        );
+        let error = run_judge_escalate(&exec, "explain X", 4, 4, 7)
+            .await
+            .expect_err("a failed max-tier judge call must not pass");
+
+        assert!(error.contains("judge unavailable at max tier 4"));
+        assert!(error.contains("judge endpoint unavailable"));
+        assert_eq!(*exec.complete_calls.lock().unwrap(), 1);
+        assert_eq!(*exec.judge_calls.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn judge_escalate_keeps_bounded_max_tier_output_after_real_low_score() {
+        let exec = CannedExec::new(vec!["weak answer", "best bounded answer"], vec![4, 5]);
+        let result = run_judge_escalate(&exec, "explain X", 3, 4, 7)
+            .await
+            .expect("a real max-tier score keeps the bounded return behaviour");
+
+        assert_eq!(result.steps.len(), 2);
+        assert_eq!(result.steps[1].judge_score, Some(5));
+        assert_eq!(result.final_output, "best bounded answer");
     }
 
     #[tokio::test]

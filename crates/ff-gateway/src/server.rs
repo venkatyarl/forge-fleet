@@ -56,6 +56,9 @@ use crate::{
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
     pub bind_addr: String,
+    /// Canonical local fleet member name. When present, the gateway supervises
+    /// the separate leader-only TLS enrollment listener on port 51443.
+    pub node_name: Option<String>,
     pub bot_aliases: Vec<String>,
     pub command_prefixes: Vec<char>,
     /// Fleet config for /api/config and fleet status.
@@ -76,6 +79,7 @@ impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: "127.0.0.1:8787".to_string(),
+            node_name: None,
             bot_aliases: vec!["forgefleet".to_string(), "vinny".to_string()],
             command_prefixes: vec!['/', '!'],
             fleet_config: None,
@@ -480,6 +484,14 @@ impl GatewayServer {
 
         let cancel_token = self.state.cancel_token.clone();
 
+        let enrollment_handle = self.config.node_name.clone().map(|node_name| {
+            tokio::spawn(crate::secure_enrollment::run_supervisor(
+                self.state.clone(),
+                node_name,
+                cancel_token.clone(),
+            ))
+        });
+
         // Spawn WebSocket heartbeat pruning task (30s interval, 60s timeout).
         let heartbeat_handle = self.state.ws_hub.spawn_heartbeat_task(
             std::time::Duration::from_secs(30),
@@ -488,9 +500,9 @@ impl GatewayServer {
         );
 
         info!(address = %listener.local_addr()?, "ff-gateway listening");
-        axum::serve(listener, self.app())
+        let serve_result = axum::serve(listener, self.app())
             .with_graceful_shutdown(shutdown_signal(cancel_token.clone()))
-            .await?;
+            .await;
 
         // Graceful shutdown: cancel background tasks and signal warmer.
         cancel_token.cancel();
@@ -498,10 +510,14 @@ impl GatewayServer {
             let _ = tx.send(true);
         }
         heartbeat_handle.abort();
+        if let Some(enrollment_handle) = enrollment_handle {
+            let _ = tokio::time::timeout(Duration::from_secs(5), enrollment_handle).await;
+        }
         if let Some(flush_handle) = self.flush_handle.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), flush_handle).await;
         }
         info!("ff-gateway shutdown complete");
+        serve_result?;
         Ok(())
     }
 
@@ -1123,7 +1139,7 @@ fn map_merge_train_ci_status(gh_status: &str, conclusion: &str) -> &'static str 
 /// Prefers the explicit `project_repos` mapping, then falls back to the
 /// legacy short-repo-name convention used by `projects.id`.
 async fn resolve_project_id_for_repo(pool: &sqlx::PgPool, repo_full: &str) -> Option<String> {
-    let github_url = format!("https://github.com/{}", repo_full);
+    let github_url = format!("https://github.com/{repo_full}");
     if let Ok(Some(row)) = sqlx::query(
         "SELECT project_id FROM project_repos \
             WHERE github_url = $1 \
@@ -1156,7 +1172,7 @@ async fn find_merge_queue_by_pr(
     project_id: &str,
     pr_number: i64,
 ) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
-    let pr_pattern = format!("%/pull/{}", pr_number);
+    let pr_pattern = format!("%/pull/{pr_number}");
     let row = sqlx::query(
         "SELECT id, work_item_id FROM work_item_merge_queue \
             WHERE project_id = $1 AND pr_url LIKE $2 LIMIT 1",
@@ -1174,7 +1190,7 @@ async fn find_work_item_by_pr(
     project_id: &str,
     pr_number: i64,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let pr_pattern = format!("%/pull/{}", pr_number);
+    let pr_pattern = format!("%/pull/{pr_number}");
     sqlx::query_scalar("SELECT id FROM work_items WHERE project_id = $1 AND pr_url LIKE $2 LIMIT 1")
         .bind(project_id)
         .bind(&pr_pattern)
@@ -1190,7 +1206,7 @@ async fn update_merge_queue_status(
     status: &str,
     conclusion: &str,
 ) -> Result<u64, sqlx::Error> {
-    let pr_pattern = format!("%/pull/{}", pr_number);
+    let pr_pattern = format!("%/pull/{pr_number}");
     let failure_reason = if status == "failed" {
         Some(conclusion)
     } else {
@@ -1237,7 +1253,7 @@ async fn handle_train_creation(pool: &sqlx::PgPool, payload: &Value) -> (StatusC
             let r = parts.next().unwrap_or("unknown").to_string();
             (o, r)
         });
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = format!("{owner}/{repo}");
 
     let Some(project_id) = resolve_project_id_for_repo(pool, &repo_full).await else {
         return (
@@ -1255,7 +1271,7 @@ async fn handle_train_creation(pool: &sqlx::PgPool, payload: &Value) -> (StatusC
         );
     };
 
-    let pr_url = format!("https://github.com/{}/pull/{}", repo_full, pr_number);
+    let pr_url = format!("https://github.com/{repo_full}/pull/{pr_number}");
 
     match find_merge_queue_by_pr(pool, &project_id, pr_number).await {
         Ok(Some((id, _))) => {
@@ -2077,66 +2093,6 @@ struct FleetHeartbeatStaleness {
     offline_after_secs: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct FleetEnrollPayload {
-    node_id: String,
-    #[serde(default)]
-    hostname: Option<String>,
-    #[serde(default)]
-    ip: Option<String>,
-    #[serde(default)]
-    ips: Vec<String>,
-    #[serde(default)]
-    role: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
-    #[serde(default)]
-    heartbeat_at: Option<String>,
-    #[serde(default)]
-    resources: Value,
-    #[serde(default)]
-    services: Value,
-    #[serde(default)]
-    models: Vec<String>,
-    #[serde(default)]
-    capabilities: Value,
-    #[serde(default)]
-    service_version: Option<String>,
-    #[serde(default)]
-    metadata: Value,
-    #[serde(default)]
-    stale: Option<FleetHeartbeatStaleness>,
-}
-
-fn extract_enrollment_token_from_headers(headers: &HeaderMap) -> Option<String> {
-    if let Some(token) = headers
-        .get("x-fleet-enrollment-token")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(token.to_string());
-    }
-
-    if let Some(token) = headers
-        .get("x-enrollment-token")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(token.to_string());
-    }
-
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
 /// GET /api/fleet/status — complete connected fleet operational status.
 async fn fleet_status(
     State(state): State<Arc<GatewayState>>,
@@ -2438,289 +2394,22 @@ fn normalize_array(value: Value) -> Value {
     if value.is_array() { value } else { json!([]) }
 }
 
-/// POST /api/fleet/enroll — trust-gated runtime node enrollment.
-async fn fleet_enroll(
-    State(state): State<Arc<GatewayState>>,
-    headers: HeaderMap,
-    Json(payload): Json<FleetEnrollPayload>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let Some(runtime_registry) = &state.runtime_registry else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"error": {"message": "runtime registry not initialized", "type": "not_ready"}}),
-            ),
-        ));
-    };
-
-    let Some(config_lock) = &state.fleet_config else {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": {"message": "fleet config not loaded", "type": "not_ready"}})),
-        ));
-    };
-
-    let config = config_lock.read().await.clone();
-    let enrollment = config.enrollment.clone();
-
-    let policy = crate::onboard::resolve_enrollment_policy(&state).await;
-    if matches!(
-        &policy,
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired
-    ) {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(
-                json!({"error": {"message": "enrollment shared secret is not configured", "type": "enrollment_not_configured"}}),
-            ),
-        ));
-    }
-
-    let node_id = payload.node_id.trim().to_string();
-    if node_id.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": {"message": "node_id is required", "type": "invalid_payload"}})),
-        ));
-    }
-
-    let hostname = payload
-        .hostname
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| node_id.clone());
-
-    let mut ips = payload
-        .ips
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    if let Some(single_ip) = payload
-        .ip
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        ips.push(single_ip.to_string());
-    }
-    ips.sort();
-    ips.dedup();
-
-    let normalized_allowed_roles = enrollment
-        .allowed_roles
-        .iter()
-        .map(|role| normalize_role_for_runtime(Some(role.clone())))
-        .collect::<HashSet<_>>();
-
-    let requested_role = normalize_role_for_runtime(
-        payload
-            .role
-            .clone()
-            .or_else(|| enrollment.default_role.clone()),
-    );
-
-    if !normalized_allowed_roles.is_empty() && !normalized_allowed_roles.contains(&requested_role) {
-        let capabilities = normalize_object(payload.capabilities.clone());
-        let event = queries::FleetEnrollmentEventInsert {
-            node_id: Some(node_id.clone()),
-            hostname: Some(hostname.clone()),
-            outcome: "rejected".to_string(),
-            reason: Some(format!("requested role '{requested_role}' is not allowed")),
-            role: Some(requested_role.clone()),
-            service_version: payload.service_version.clone(),
-            addresses_json: serde_json::to_string(&ips).unwrap_or_else(|_| "[]".to_string()),
-            capabilities_json: serde_json::to_string(&capabilities)
-                .unwrap_or_else(|_| "{}".to_string()),
-            metadata_json: serde_json::to_string(&normalize_object(payload.metadata.clone()))
-                .unwrap_or_else(|_| "{}".to_string()),
-        };
-        let _ = runtime_registry.insert_enrollment_event(&event).await;
-
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(
-                json!({"error": {"message": "requested role is not allowed", "type": "role_not_allowed"}}),
-            ),
-        ));
-    }
-
-    let presented_token = payload
-        .token
-        .clone()
-        .or_else(|| extract_enrollment_token_from_headers(&headers));
-
-    match &policy {
-        ff_core::config::EnrollmentEnforcement::Disabled => {
-            tracing::warn!(
-                endpoint = "/api/fleet/enroll",
-                node = %node_id,
-                "enrollment token check DISABLED (require_shared_secret=false) — accepting request without auth"
-            );
-        }
-        ff_core::config::EnrollmentEnforcement::Required(expected) => {
-            if presented_token.as_deref() != Some(expected.as_str()) {
-                let capabilities = normalize_object(payload.capabilities.clone());
-                let event = queries::FleetEnrollmentEventInsert {
-                    node_id: Some(node_id.clone()),
-                    hostname: Some(hostname.clone()),
-                    outcome: "rejected".to_string(),
-                    reason: Some("invalid enrollment token".to_string()),
-                    role: Some(requested_role.clone()),
-                    service_version: payload.service_version.clone(),
-                    addresses_json: serde_json::to_string(&ips)
-                        .unwrap_or_else(|_| "[]".to_string()),
-                    capabilities_json: serde_json::to_string(&capabilities)
-                        .unwrap_or_else(|_| "{}".to_string()),
-                    metadata_json: serde_json::to_string(&normalize_object(
-                        payload.metadata.clone(),
-                    ))
-                    .unwrap_or_else(|_| "{}".to_string()),
-                };
-                let _ = runtime_registry.insert_enrollment_event(&event).await;
-
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(
-                        json!({"error": {"message": "invalid enrollment token", "type": "unauthorized"}}),
-                    ),
-                ));
+/// POST /api/fleet/enroll — permanently quarantined on the ordinary HTTP listener.
+///
+/// The compatibility route deliberately has no extractors, so Axum does not
+/// parse or retain a credential-bearing request body or headers. New-node
+/// admission is available only through the dedicated server-verified TLS
+/// enrollment listener.
+async fn fleet_enroll() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": {
+                "message": "runtime enrollment is quarantined on ordinary HTTP; use the dedicated server-verified TLS enrollment listener",
+                "type": "enrollment_transport_quarantined"
             }
-        }
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
-            unreachable!("handled above")
-        }
-    }
-
-    let reported_status = "online".to_string();
-    let heartbeat_at = if let Some(raw) = payload.heartbeat_at {
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        } else {
-            chrono::DateTime::parse_from_rfc3339(trimmed)
-                .map_err(|error| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        Json(json!({"error": {"message": format!("invalid heartbeat_at timestamp: {error}"), "type": "invalid_payload"}})),
-                    )
-                })?
-                .with_timezone(&Utc)
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        }
-    } else {
-        Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-    };
-
-    let degraded_after_secs = payload
-        .stale
-        .as_ref()
-        .and_then(|stale| stale.degraded_after_secs)
-        .unwrap_or(90)
-        .max(1);
-    let offline_after_secs = payload
-        .stale
-        .as_ref()
-        .and_then(|stale| stale.offline_after_secs)
-        .unwrap_or(180)
-        .max(degraded_after_secs + 1);
-
-    let resources = normalize_object(payload.resources);
-    let services = normalize_array(payload.services);
-    let capabilities = normalize_object(payload.capabilities);
-    let metadata = normalize_object(payload.metadata);
-
-    let mut models = payload
-        .models
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    models.sort();
-    models.dedup();
-
-    let heartbeat_row = queries::FleetNodeRuntimeHeartbeatRow {
-        node_id: node_id.clone(),
-        hostname: hostname.clone(),
-        ips_json: serde_json::to_string(&ips).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("failed to serialize ips: {error}"), "type": "serialization_error"}})),
-            )
-        })?,
-        role: requested_role.clone(),
-        reported_status,
-        last_heartbeat: heartbeat_at,
-        resources_json: serde_json::to_string(&resources).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("failed to serialize resources: {error}"), "type": "serialization_error"}})),
-            )
-        })?,
-        services_json: serde_json::to_string(&services).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("failed to serialize services: {error}"), "type": "serialization_error"}})),
-            )
-        })?,
-        models_json: serde_json::to_string(&models).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("failed to serialize models: {error}"), "type": "serialization_error"}})),
-            )
-        })?,
-        capabilities_json: serde_json::to_string(&capabilities).map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("failed to serialize capabilities: {error}"), "type": "serialization_error"}})),
-            )
-        })?,
-        stale_degraded_after_secs: degraded_after_secs,
-        stale_offline_after_secs: offline_after_secs,
-    };
-
-    let event = queries::FleetEnrollmentEventInsert {
-        node_id: Some(node_id.clone()),
-        hostname: Some(hostname.clone()),
-        outcome: "accepted".to_string(),
-        reason: None,
-        role: Some(requested_role.clone()),
-        service_version: payload.service_version,
-        addresses_json: serde_json::to_string(&ips).unwrap_or_else(|_| "[]".to_string()),
-        capabilities_json: serde_json::to_string(&capabilities)
-            .unwrap_or_else(|_| "{}".to_string()),
-        metadata_json: serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string()),
-    };
-
-    let runtime_row = runtime_registry
-        .upsert_runtime_with_enrollment(&heartbeat_row, &event)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": {"message": format!("failed to enroll node: {error}"), "type": "db_error"}})),
-            )
-        })?;
-
-    let heartbeat_interval_secs = enrollment
-        .heartbeat_interval_secs
-        .unwrap_or(config.fleet.heartbeat_interval_secs)
-        .max(1);
-
-    Ok(Json(json!({
-        "status": "ok",
-        "enrollment": {
-            "accepted": true,
-            "node_id": runtime_row.node_id,
-            "hostname": runtime_row.hostname,
-            "assigned_role": requested_role,
-            "derived_status": runtime_row.derived_status,
-            "heartbeat_interval_secs": heartbeat_interval_secs,
-            "heartbeat_endpoint": "/api/fleet/heartbeat"
-        }
-    })))
+        })),
+    )
 }
 
 /// POST /api/fleet/heartbeat — persist live runtime node state.
@@ -6778,6 +6467,48 @@ fn parse_autoload_url(url: &str) -> Option<(String, u16)> {
     let (host, port_str) = rest.rsplit_once(':')?;
     let port: u16 = port_str.parse().ok()?;
     Some((host.to_string(), port))
+}
+
+#[cfg(test)]
+mod ordinary_http_enrollment_quarantine_tests {
+    use super::fleet_enroll;
+    use axum::{
+        Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::post,
+    };
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn ordinary_http_enroll_is_503_without_parsing_credentials() {
+        let app = Router::new().route("/api/fleet/enroll", post(fleet_enroll));
+        let marker = "must-not-be-read-or-persisted";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/enroll")
+                    .header("content-type", "application/json")
+                    .header("x-fleet-enrollment-token", marker)
+                    .body(Body::from(format!("{{malformed-json:{marker}")))
+                    .expect("build quarantine request"),
+            )
+            .await
+            .expect("quarantine response");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("read quarantine response");
+        let payload: serde_json::Value =
+            serde_json::from_slice(&body).expect("quarantine response is JSON");
+        assert_eq!(payload["error"]["type"], "enrollment_transport_quarantined");
+        assert!(
+            !String::from_utf8_lossy(&body).contains(marker),
+            "the quarantine response must not reflect credential material"
+        );
+    }
 }
 
 #[cfg(test)]

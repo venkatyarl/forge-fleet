@@ -385,7 +385,7 @@ mod rbac_tests {
 #[cfg(test)]
 mod router_auth_tests {
     use std::{
-        sync::Mutex,
+        sync::LazyLock,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -397,11 +397,12 @@ mod router_auth_tests {
         routing::{get, post},
     };
     use jsonwebtoken::{EncodingKey, Header, encode};
+    use tokio::sync::Mutex;
     use tower::ServiceExt;
 
     use super::{JwtClaims, jwt_auth_middleware};
 
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn set_env(name: &str, value: Option<&str>) {
         // SAFETY: this test serializes all mutations of these process globals.
@@ -439,7 +440,7 @@ mod router_auth_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn router_fails_closed_without_secret_and_enforces_jwt_when_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().await;
         let old_secret = std::env::var("FF_JWT_SECRET").ok();
         let old_trusted_lan = std::env::var("FF_GATEWAY_TRUSTED_LAN").ok();
         let router = test_router();

@@ -15,12 +15,30 @@ const MAX_BACKUP_AGE_HOURS: i64 = 24;
 const MAX_POSTCHECK_LAG_BYTES: i64 = 1 << 30;
 const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const COMPOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const REPLICA_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const FIND_EXISTING_REPLICA_TASK_SQL: &str = "SELECT id FROM fleet_tasks WHERE task_class='deferred' AND summary=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->'deferred_payload'->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1";
+const INSERT_REPLICA_TASK_SQL: &str = "INSERT INTO fleet_tasks (task_type,summary,payload,priority,requires_capability,status,created_at,task_class) VALUES ('shell',$1,$2,50,$3,'pending',NOW(),'deferred') RETURNING id";
+const UPSERT_PRIMARY_AUTHORITY_SQL: &str = "INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,notes) VALUES ($1,'postgres','primary','running',0,NOW(),$2) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='primary',status='running',lag_bytes=0,last_sync_at=NOW(),notes=$2";
+const UPSERT_REPLICA_SQL: &str = "INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'postgres','replica','running',$4,NOW(),$2,$3) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='replica',status='running',lag_bytes=$4,last_sync_at=NOW(),bootstrapped_from_backup_id=$2,notes=$3";
+
+fn postgres_major_from_version_output(output: &[u8]) -> Option<i32> {
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .find_map(|token| {
+            let version = token.trim_matches(|character: char| !character.is_ascii_digit());
+            version
+                .contains('.')
+                .then(|| version.split('.').next()?.parse().ok())
+                .flatten()
+        })
+}
 
 #[derive(Debug, Clone)]
 struct Plan {
     target_id: Uuid,
     target_name: String,
     target_ip: String,
+    primary_id: Uuid,
     primary_name: String,
     primary_ip: String,
     slot: String,
@@ -31,10 +49,11 @@ struct Plan {
 impl Plan {
     fn id(&self) -> String {
         let canonical = format!(
-            "v1\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+            "v2\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
             self.target_id,
             self.target_name,
             self.target_ip,
+            self.primary_id,
             self.primary_name,
             self.primary_ip,
             self.slot,
@@ -230,6 +249,7 @@ async fn build_plan(pool: &sqlx::PgPool, to: &str, primary: &str) -> Result<Plan
         target_id,
         target_name: target.get("name"),
         target_ip,
+        primary_id,
         primary_name: primary_row.get("name"),
         primary_ip: named_primary_ip,
         slot: physical_slot(target_id),
@@ -251,19 +271,83 @@ async fn enqueue_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<String> {
     let title = format!("bootstrap PostgreSQL replica on {}", plan.target_name);
     let payload = serde_json::json!({"command": local_apply_command(plan), "summary": "PostgreSQL replica bootstrap"});
     let trigger = serde_json::json!({"node": plan.target_name});
+    let required_caps = serde_json::json!([]);
     let mut tx = pool.begin().await?;
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
         .bind(plan.id())
         .execute(&mut *tx)
         .await?;
     let like = format!("%--plan-id {}%", plan.id());
-    let id = if let Some(id) = sqlx::query_scalar::<_, Uuid>("SELECT id FROM deferred_tasks WHERE title=$1 AND status IN ('pending','dispatchable','running','completed') AND payload->>'command' LIKE $2 ORDER BY created_at DESC LIMIT 1")
-        .bind(&title).bind(&like).fetch_optional(&mut *tx).await? { id } else {
-        sqlx::query_scalar("INSERT INTO deferred_tasks (created_by,title,kind,payload,trigger_type,trigger_spec,preferred_node,required_caps,max_attempts) VALUES ($1,$2,'shell',$3,'node_online',$4,$5,'[]'::jsonb,1) RETURNING id")
-            .bind(whoami_tag()).bind(&title).bind(&payload).bind(&trigger).bind(&plan.target_name).fetch_one(&mut *tx).await?
+    let id = if let Some(id) = sqlx::query_scalar::<_, Uuid>(FIND_EXISTING_REPLICA_TASK_SQL)
+        .bind(&title)
+        .bind(&like)
+        .fetch_optional(&mut *tx)
+        .await?
+    {
+        id
+    } else {
+        let canonical_payload = serde_json::json!({
+            "deferred_payload": payload,
+            "created_by": whoami_tag(),
+            "kind": "shell",
+            "trigger_type": "node_online",
+            "trigger_spec": trigger,
+            "preferred_node": plan.target_name,
+            "required_caps": required_caps,
+            "attempts": 0,
+            "max_attempts": 1,
+        });
+        sqlx::query_scalar(INSERT_REPLICA_TASK_SQL)
+            .bind(&title)
+            .bind(&canonical_payload)
+            .bind(&required_caps)
+            .fetch_one(&mut *tx)
+            .await?
     };
     tx.commit().await?;
     Ok(id.to_string())
+}
+
+async fn register_replica_topology(pool: &sqlx::PgPool, plan: &Plan, lag_bytes: i64) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let server_is_still_primary: bool = sqlx::query_scalar("SELECT NOT pg_is_in_recovery()")
+        .fetch_one(&mut *tx)
+        .await?;
+    if !server_is_still_primary {
+        bail!("connected PostgreSQL authority became a standby during replica bootstrap");
+    }
+    let registered_primary: Option<Uuid> = sqlx::query_scalar(
+        "SELECT computer_id FROM database_replicas WHERE database_kind='postgres' AND role='primary' FOR UPDATE",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if registered_primary.is_some_and(|id| id != plan.primary_id) {
+        bail!("PostgreSQL primary authority changed during replica bootstrap");
+    }
+    sqlx::query(UPSERT_PRIMARY_AUTHORITY_SQL)
+        .bind(plan.primary_id)
+        .bind(format!(
+            "authority=verified-by-replica-plan;plan={};pg_major={}",
+            plan.id(),
+            plan.pg_major
+        ))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(UPSERT_REPLICA_SQL)
+        .bind(plan.target_id)
+        .bind(plan.backup_id)
+        .bind(format!(
+            "primary={};slot={};plan={};pg_major={}",
+            plan.primary_name,
+            plan.slot,
+            plan.id(),
+            plan.pg_major
+        ))
+        .bind(lag_bytes)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
@@ -309,13 +393,13 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
         .output()
         .await
         .context("PostgreSQL image version preflight")?;
-    if !version.status.success()
-        || !String::from_utf8_lossy(&version.stdout)
-            .contains(&format!("PostgreSQL {}.", plan.pg_major))
-    {
+    let image_major = postgres_major_from_version_output(&version.stdout)
+        .or_else(|| postgres_major_from_version_output(&version.stderr));
+    if !version.status.success() || image_major != Some(plan.pg_major) {
         bail!(
-            "target PostgreSQL image major does not match primary major {}",
-            plan.pg_major
+            "target PostgreSQL image major {:?} does not match primary major {}",
+            image_major,
+            plan.pg_major,
         );
     }
     let required_bytes: i64 = sqlx::query_scalar("SELECT pg_database_size(current_database()) * 2")
@@ -432,7 +516,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     if !status.success() {
         bail!("follower compose failed; PGDATA and slot were preserved for retry");
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+    let deadline = std::time::Instant::now() + REPLICA_READY_TIMEOUT;
     loop {
         let output = tokio::time::timeout(PREFLIGHT_TIMEOUT, tokio::process::Command::new("docker").args(["exec", "forgefleet-postgres-replica", "psql", "-U", "forgefleet", "-d", "forgefleet", "-Atc", "SELECT pg_is_in_recovery() AND current_setting('transaction_read_only')::bool AND EXISTS (SELECT 1 FROM pg_stat_wal_receiver WHERE status='streaming') AND pg_last_wal_replay_lsn() IS NOT NULL"]).output())
             .await.context("replica postcheck timed out")?.context("replica postcheck")?;
@@ -441,7 +525,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
         }
         if std::time::Instant::now() >= deadline {
             bail!(
-                "replica did not become recovery/read-only/streaming within 10 minutes; PGDATA and slot preserved"
+                "replica did not become recovery/read-only/streaming within 30 minutes; PGDATA and slot preserved"
             );
         }
         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -469,8 +553,7 @@ async fn local_apply(pool: &sqlx::PgPool, plan: &Plan) -> Result<()> {
     if lag_bytes > MAX_POSTCHECK_LAG_BYTES {
         bail!("replica lag {lag_bytes} bytes exceeds postcheck limit {MAX_POSTCHECK_LAG_BYTES}");
     }
-    sqlx::query("INSERT INTO database_replicas (computer_id,database_kind,role,status,lag_bytes,last_sync_at,bootstrapped_from_backup_id,notes) VALUES ($1,'postgres','replica','running',$4,NOW(),$2,$3) ON CONFLICT (computer_id,database_kind) DO UPDATE SET role='replica',status='running',lag_bytes=$4,last_sync_at=NOW(),bootstrapped_from_backup_id=$2,notes=$3")
-        .bind(plan.target_id).bind(plan.backup_id).bind(format!("primary={};slot={};plan={};pg_major={}", plan.primary_name, plan.slot, plan.id(), plan.pg_major)).bind(lag_bytes).execute(pool).await?;
+    register_replica_topology(pool, plan, lag_bytes).await?;
     Ok(())
 }
 
@@ -542,6 +625,30 @@ mod tests {
         let s = physical_slot(id);
         assert_eq!(s, "ff_00000000000000000000000000000000");
         assert!(s.len() <= 63);
+    }
+
+    #[test]
+    fn parses_postgres_image_major_from_real_version_output() {
+        assert_eq!(
+            postgres_major_from_version_output(
+                b"postgres (PostgreSQL) 16.14 (Debian 16.14-1.pgdg12+1)\n"
+            ),
+            Some(16)
+        );
+        assert_eq!(
+            postgres_major_from_version_output(b"PostgreSQL 17.2\n"),
+            Some(17)
+        );
+        assert_eq!(postgres_major_from_version_output(b"not a version\n"), None);
+    }
+
+    #[test]
+    fn replica_ready_timeout_covers_checkpoint_and_large_basebackup() {
+        assert_eq!(
+            REPLICA_READY_TIMEOUT,
+            std::time::Duration::from_secs(30 * 60)
+        );
+        assert!(REPLICA_READY_TIMEOUT > COMPOSE_TIMEOUT);
     }
     #[test]
     fn connected_primary_authority_is_fail_closed() {
@@ -616,6 +723,7 @@ mod tests {
             target_id: Uuid::nil(),
             target_name: "node one".into(),
             target_ip: "10.0.0.2".into(),
+            primary_id: Uuid::from_u128(1),
             primary_name: "primary".into(),
             primary_ip: "10.0.0.1".into(),
             slot: physical_slot(Uuid::nil()),
@@ -627,12 +735,23 @@ mod tests {
         assert!(c.contains("local-apply"));
         assert!(c.starts_with("cd \"$HOME/projects/forge-fleet\""));
     }
+
+    #[test]
+    fn deferred_enqueue_uses_canonical_fleet_tasks_schema() {
+        assert!(FIND_EXISTING_REPLICA_TASK_SQL.contains("FROM fleet_tasks"));
+        assert!(FIND_EXISTING_REPLICA_TASK_SQL.contains("task_class='deferred'"));
+        assert!(FIND_EXISTING_REPLICA_TASK_SQL.contains("payload->'deferred_payload'->>'command'"));
+        assert!(INSERT_REPLICA_TASK_SQL.contains("INSERT INTO fleet_tasks"));
+        assert!(!INSERT_REPLICA_TASK_SQL.contains("deferred_tasks"));
+    }
+
     #[test]
     fn plan_id_is_stable_and_sensitive() {
         let mut p = Plan {
             target_id: Uuid::nil(),
             target_name: "n".into(),
             target_ip: "1".into(),
+            primary_id: Uuid::from_u128(1),
             primary_name: "p".into(),
             primary_ip: "2".into(),
             slot: physical_slot(Uuid::nil()),
@@ -641,11 +760,21 @@ mod tests {
         };
         let a = p.id();
         assert_eq!(a, p.id());
+        p.primary_id = Uuid::from_u128(2);
+        assert_ne!(a, p.id());
+        p.primary_id = Uuid::from_u128(1);
         p.primary_ip = "3".into();
         assert_ne!(a, p.id());
         let b = p.id();
         p.pg_major = 17;
         assert_ne!(b, p.id());
+    }
+    #[test]
+    fn topology_registration_declares_primary_and_replica_rows() {
+        assert!(UPSERT_PRIMARY_AUTHORITY_SQL.contains("role,status"));
+        assert!(UPSERT_PRIMARY_AUTHORITY_SQL.contains("'primary','running'"));
+        assert!(UPSERT_REPLICA_SQL.contains("'replica','running'"));
+        assert!(UPSERT_REPLICA_SQL.contains("bootstrapped_from_backup_id"));
     }
     #[test]
     fn pgpass_fields_escape_delimiters_and_reject_lines() {
@@ -665,6 +794,10 @@ mod tests {
         assert!(script.contains("BOOTSTRAP_EVIDENCE"));
         assert!(script.contains("CURRENT_PRIMARY_SLOT"));
         assert!(script.contains("different primary host"));
+        assert!(script.contains("STAGED_PGPASS_FILE=/tmp/forgefleet-replication-pgpass"));
+        assert!(script.contains("install -o postgres -g postgres -m 0600"));
+        assert!(script.contains("PGPASSFILE=\"$POSTGRES_REPLICATION_PGPASS_FILE\""));
+        assert!(!script.contains("PGPASSFILE=\"$PGDATA/.pgpass\""));
         let compose = include_str!("../../../deploy/docker-compose.follower.yml");
         assert!(!compose.contains("192.168.5.100"));
         assert!(!compose.contains("POSTGRES_PASSWORD: forgefleet"));

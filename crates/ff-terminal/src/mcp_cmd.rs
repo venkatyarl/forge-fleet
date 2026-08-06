@@ -179,7 +179,10 @@ fn install_claude_code(
     dry_run: bool,
 ) -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
-    upsert_resilient_mcp_server_json(&settings_path, "forgefleet", server_url, dry_run)?;
+    // Claude Code supports native HTTP MCP servers.  Keep the client pointed
+    // at the independently supervised loopback service so a forgefleetd
+    // restart does not permanently close a session-owned stdio pipe.
+    upsert_mcp_server_json(&settings_path, "forgefleet", server_url, dry_run)?;
     println!("  ✓ claude-code: {}", settings_path.display());
     if write_instructions {
         let claude_md = home.join(".claude").join("CLAUDE.md");
@@ -246,14 +249,9 @@ fn install_gemini(
     dry_run: bool,
 ) -> Result<()> {
     let config = home.join(".gemini").join("settings.json");
-    let entry = if matches!(
-        server_url,
-        "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
-    ) {
-        json!({ "command": "forgefleetd", "args": ["mcp", "--stdio"] })
-    } else {
-        json!({ "httpUrl": server_url })
-    };
+    // Gemini's native HTTP transport works for loopback as well as remote
+    // URLs.  A local stdio child couples MCP lifetime to one CLI session.
+    let entry = json!({ "httpUrl": server_url });
     upsert_mcp_entry(&config, "forgefleet", entry, dry_run)?;
     println!("  ✓ gemini: {}", config.display());
     if write_instructions {
@@ -275,7 +273,9 @@ fn install_kimi(
     // ~/.kimi-code/mcp.json (the legacy ~/.kimi/config.json location is no
     // longer loaded by current releases).
     let config = home.join(".kimi-code").join("mcp.json");
-    upsert_resilient_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
+    // Kimi Code supports native HTTP MCP entries.  Use the supervised service
+    // instead of a per-session stdio child so daemon restarts are reconnectable.
+    upsert_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ kimi: {}", config.display());
     if write_instructions {
         // Kimi reads agent instructions from ~/.kimi/AGENTS.md (the cross-tool
@@ -365,31 +365,6 @@ fn upsert_mcp_server_json(
     upsert_mcp_entry(path, server_name, entry, dry_run)
 }
 
-/// A local stdio server is available as soon as the installed binary can be
-/// spawned. Unlike a one-shot remote HTTP enumeration it survives an MCP HTTP
-/// daemon or Postgres outage at agent startup; DB-backed calls degrade with a
-/// normal tool error while schema-independent tools remain usable.
-fn upsert_resilient_mcp_server_json(
-    path: &std::path::Path,
-    server_name: &str,
-    server_url: &str,
-    dry_run: bool,
-) -> Result<()> {
-    if matches!(
-        server_url,
-        "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
-    ) {
-        upsert_mcp_entry(
-            path,
-            server_name,
-            json!({ "command": "forgefleetd", "args": ["mcp", "--stdio"] }),
-            dry_run,
-        )
-    } else {
-        upsert_mcp_server_json(path, server_name, server_url, dry_run)
-    }
-}
-
 /// Like [`upsert_mcp_server_json`] but writes a STDIO entry that bridges the
 /// remote HTTP MCP endpoint through `npx mcp-remote`. Required by the Claude
 /// Desktop app, whose config loader only launches stdio (`command`) servers and
@@ -473,23 +448,15 @@ fn upsert_codex_mcp(
         "http://localhost:50001/mcp" | "http://127.0.0.1:50001/mcp"
     ) {
         // Remote Codex configs retain the native HTTP transport. The local
-        // default is the resilient DB-independent stdio bootstrap below.
+        // default now uses the same native transport via the independently
+        // supervised loopback MCP service below.
         let block =
             format!("\n[mcp_servers.{server_name}]\ntype = \"http\"\nurl = \"{server_url}\"\n");
         return replace_codex_section(path, &existing, server_name, &block, dry_run);
     }
     let block = format!(
-        "\n[mcp_servers.{server_name}]\ncommand = \"forgefleetd\"\nargs = [\"mcp\", \"--stdio\"]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n"
+        "\n[mcp_servers.{server_name}]\nurl = \"{server_url}\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n"
     );
-
-    // If the marker is already present and points at the same URL, skip.
-    let marker = format!("[mcp_servers.{server_name}]");
-    if existing.contains(&marker)
-        && existing.contains("command = \"forgefleetd\"")
-        && existing.contains("args = [\"mcp\", \"--stdio\"]")
-    {
-        return Ok(());
-    }
 
     replace_codex_section(path, &existing, server_name, &block, dry_run)
 }
@@ -523,7 +490,7 @@ fn replace_codex_section(
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&block);
+        out.push_str(block);
         out
     } else {
         let mut out = existing.to_string();
@@ -687,17 +654,78 @@ fn config_has_forgefleet(path: &std::path::Path) -> bool {
     contents.contains("forgefleet")
 }
 
+/// Report the configured transport, not merely whether a server entry exists.
+/// A session-owned stdio child is materially different from the supervised
+/// loopback HTTP service: once its pipe closes, an already-open client cannot
+/// reconnect it.  Keep this parser deliberately read-only and tolerant of the
+/// small JSON/TOML/YAML shapes written by the installers above.
+fn config_forgefleet_transport(path: &std::path::Path) -> Option<&'static str> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        let doc: Value = serde_json::from_str(&contents).ok()?;
+        let server = doc.get("mcpServers")?.as_object()?.get("forgefleet")?;
+        if server.get("type").and_then(Value::as_str) == Some("http")
+            || server.get("url").and_then(Value::as_str).is_some()
+            || server.get("httpUrl").and_then(Value::as_str).is_some()
+        {
+            return Some("http");
+        }
+        if server.get("command").and_then(Value::as_str) == Some("npx")
+            && server
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("mcp-remote")))
+        {
+            return Some("http_bridge");
+        }
+        if server.get("command").and_then(Value::as_str).is_some() {
+            return Some("stdio");
+        }
+        return Some("unknown");
+    }
+
+    let section = if let Some((_, tail)) = contents.split_once("[mcp_servers.forgefleet]") {
+        tail.split_once("\n[")
+            .map(|(current, _)| current)
+            .unwrap_or(tail)
+    } else {
+        // Goose uses YAML.  Its installer writes only native HTTP entries.
+        if contents.contains("  forgefleet:") && contents.contains("    type: http") {
+            return Some("http");
+        }
+        return None;
+    };
+    if section
+        .lines()
+        .any(|line| line.trim_start().starts_with("url ="))
+    {
+        Some("http")
+    } else if section
+        .lines()
+        .any(|line| line.trim_start().starts_with("command ="))
+    {
+        Some("stdio")
+    } else {
+        Some("unknown")
+    }
+}
+
 fn status_rows(home: &std::path::Path) -> Vec<Value> {
     status_candidates(home)
         .into_iter()
         .map(|(name, path)| {
             let exists = path.exists();
             let has_ff = exists && config_has_forgefleet(&path);
+            let transport = has_ff.then(|| config_forgefleet_transport(&path)).flatten();
             json!({
                 "client": name,
                 "config_path": path.display().to_string(),
                 "exists": exists,
                 "forgefleet_installed": has_ff,
+                "transport": transport,
                 "state": classify_state(exists, has_ff),
             })
         })
@@ -715,7 +743,13 @@ fn render_status(home: &std::path::Path, as_json: bool) -> String {
         let name = row["client"].as_str().unwrap_or_default();
         let state = row["state"].as_str().unwrap_or_default();
         let path = row["config_path"].as_str().unwrap_or_default();
-        output.push_str(&format!("  {name:<12} {} {path}\n", text_mark(state)));
+        let mark = match (state, row["transport"].as_str()) {
+            ("installed", Some("http")) => "✓ forgefleet installed (http)",
+            ("installed", Some("http_bridge")) => "✓ forgefleet installed (http bridge)",
+            ("installed", Some("stdio")) => "⚠ forgefleet installed (stdio; session-coupled)",
+            _ => text_mark(state),
+        };
+        output.push_str(&format!("  {name:<12} {mark} {path}\n"));
     }
     output
 }
@@ -772,7 +806,9 @@ mod tests {
         assert_eq!(row["config_path"], config.display().to_string());
         assert_eq!(row["exists"], true);
         assert_eq!(row["forgefleet_installed"], true);
+        assert_eq!(row["transport"], "stdio");
         assert_eq!(row["state"], "installed");
+        assert!(render_status(temp.path(), false).contains("stdio; session-coupled"));
     }
 
     #[test]
@@ -850,8 +886,110 @@ mod tests {
     }
 
     #[test]
+    fn codex_localhost_replaces_legacy_stdio_with_native_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "model = \"gpt-5\"\n\n[mcp_servers.forgefleet]\ncommand = \"forgefleetd\"\nargs = [\"mcp\", \"--stdio\"]\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n",
+        )
+        .unwrap();
+
+        upsert_codex_mcp(&config, "forgefleet", "http://127.0.0.1:50001/mcp", false).unwrap();
+
+        let updated = std::fs::read_to_string(config).unwrap();
+        assert!(updated.contains("model = \"gpt-5\""));
+        assert!(updated.contains("url = \"http://127.0.0.1:50001/mcp\""));
+        assert!(!updated.contains("command = \"forgefleetd\""));
+        assert!(!updated.contains("--stdio"));
+    }
+
+    #[test]
+    fn codex_local_http_install_is_byte_idempotent_and_preserves_other_sections() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".codex").join("config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "model = \"gpt-5\"\n\n[mcp_servers.other]\nurl = \"https://other.example/mcp\"\n",
+        )
+        .unwrap();
+
+        upsert_codex_mcp(&config, "forgefleet", "http://localhost:50001/mcp", false).unwrap();
+        let first = std::fs::read_to_string(&config).unwrap();
+        upsert_codex_mcp(&config, "forgefleet", "http://localhost:50001/mcp", false).unwrap();
+        let second = std::fs::read_to_string(config).unwrap();
+
+        assert_eq!(second, first);
+        assert!(second.contains("[mcp_servers.other]"));
+        assert!(second.contains("url = \"https://other.example/mcp\""));
+        assert_eq!(second.matches("[mcp_servers.forgefleet]").count(), 1);
+    }
+
+    #[test]
+    fn codex_explicit_remote_url_keeps_native_http_shape() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join(".codex").join("config.toml");
+
+        upsert_codex_mcp(&config, "forgefleet", "https://fleet.example/mcp", false).unwrap();
+
+        let updated = std::fs::read_to_string(config).unwrap();
+        assert!(updated.contains("type = \"http\""));
+        assert!(updated.contains("url = \"https://fleet.example/mcp\""));
+        assert!(!updated.contains("command ="));
+    }
+
+    #[test]
     fn all_targets_include_gemini() {
         assert!(resolve_targets("all").contains(&"gemini"));
+    }
+
+    #[test]
+    fn local_cli_installers_replace_stdio_with_native_http() {
+        let temp = tempfile::tempdir().unwrap();
+        let local_url = "http://localhost:50001/mcp";
+        for relative in [
+            ".claude/settings.json",
+            ".kimi-code/mcp.json",
+            ".gemini/settings.json",
+        ] {
+            let config = temp.path().join(relative);
+            std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+            std::fs::write(
+                config,
+                r#"{"mcpServers":{"forgefleet":{"command":"forgefleetd","args":["mcp","--stdio"]}}}"#,
+            )
+            .unwrap();
+        }
+
+        install_claude_code(temp.path(), local_url, false, false).unwrap();
+        install_kimi(temp.path(), local_url, false, false).unwrap();
+        install_gemini(temp.path(), local_url, false, false).unwrap();
+
+        for relative in [
+            ".claude/settings.json",
+            ".kimi-code/mcp.json",
+            ".gemini/settings.json",
+        ] {
+            let config = temp.path().join(relative);
+            let contents = std::fs::read_to_string(&config).unwrap();
+            assert!(!contents.contains("--stdio"), "{}", config.display());
+            assert_eq!(
+                config_forgefleet_transport(&config),
+                Some("http"),
+                "{}",
+                config.display()
+            );
+        }
+    }
+
+    #[test]
+    fn claude_desktop_keeps_http_bridge_transport() {
+        let temp = tempfile::tempdir().unwrap();
+        install_claude_desktop(temp.path(), "http://localhost:50001/mcp", false).unwrap();
+        let config = claude_desktop_config_path(temp.path());
+        assert_eq!(config_forgefleet_transport(&config), Some("http_bridge"));
     }
 
     #[test]

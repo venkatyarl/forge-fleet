@@ -11,6 +11,8 @@
 //! build each ONCE (lazily, on first use) and hand out cheap clones that share
 //! the same underlying connections.
 
+use std::time::Duration;
+
 use ff_core::config;
 use ff_pulse::PulseClient;
 use sqlx::postgres::PgPoolOptions;
@@ -20,9 +22,21 @@ use tokio::sync::OnceCell;
 /// tool call, so this is sized for concurrent MCP traffic rather than the
 /// old per-call `max_connections(2)` that multiplied without bound.
 const MCP_POOL_MAX_CONNECTIONS: u32 = 8;
+const MCP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const MCP_POOL_MAX_LIFETIME: Duration = Duration::from_secs(30 * 60);
+const MCP_POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 
 static PG_POOL: OnceCell<sqlx::PgPool> = OnceCell::const_new();
 static PULSE: OnceCell<PulseClient> = OnceCell::const_new();
+
+fn pg_pool_options() -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(MCP_POOL_MAX_CONNECTIONS)
+        .min_connections(0)
+        .idle_timeout(Some(MCP_POOL_IDLE_TIMEOUT))
+        .max_lifetime(Some(MCP_POOL_MAX_LIFETIME))
+        .acquire_timeout(MCP_POOL_ACQUIRE_TIMEOUT)
+}
 
 /// The shared MCP Postgres pool, built once from the fleet config. Returns a
 /// cheap clone (the pool is an `Arc` internally; clones share connections).
@@ -31,8 +45,7 @@ pub async fn shared_pg_pool() -> Result<sqlx::PgPool, String> {
         .get_or_try_init(|| async {
             let (cfg, _) = config::load_config_auto()
                 .map_err(|e| format!("failed to load fleet config: {e}"))?;
-            PgPoolOptions::new()
-                .max_connections(MCP_POOL_MAX_CONNECTIONS)
+            pg_pool_options()
                 .connect(&cfg.database.url)
                 .await
                 .map_err(|e| format!("Postgres connection failed: {e}"))
@@ -54,4 +67,20 @@ pub async fn shared_pulse() -> Result<PulseClient, String> {
         })
         .await
         .cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_pool_has_bounded_idle_and_acquire_policy() {
+        let options = pg_pool_options();
+
+        assert_eq!(options.get_max_connections(), MCP_POOL_MAX_CONNECTIONS);
+        assert_eq!(options.get_min_connections(), 0);
+        assert_eq!(options.get_idle_timeout(), Some(MCP_POOL_IDLE_TIMEOUT));
+        assert_eq!(options.get_max_lifetime(), Some(MCP_POOL_MAX_LIFETIME));
+        assert_eq!(options.get_acquire_timeout(), MCP_POOL_ACQUIRE_TIMEOUT);
+    }
 }

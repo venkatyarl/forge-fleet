@@ -1964,8 +1964,21 @@ pub async fn pg_pick_agent_endpoint(
     min_ctx: i32,
     exclude_hosts: &[String],
 ) -> Result<Option<RouteCandidate>> {
+    pg_pick_agent_endpoint_for_workload(pool, min_ctx, None, exclude_hosts).await
+}
+
+/// Pick an agent-capable deployment while optionally requiring a canonical
+/// workload. This is the workload-aware form used by code crews: it keeps the
+/// same tool-calling, context, freshness, and load filters as the general
+/// agent picker instead of introducing a parallel routing path.
+pub async fn pg_pick_agent_endpoint_for_workload(
+    pool: &PgPool,
+    min_ctx: i32,
+    workload: Option<&str>,
+    exclude_hosts: &[String],
+) -> Result<Option<RouteCandidate>> {
     let filter = RouteFilter {
-        workload: None,
+        workload: workload.map(str::to_string),
         require_tool_calling: true,
         min_ctx: Some(min_ctx),
         exclude_hosts: exclude_hosts.to_vec(),
@@ -2005,16 +2018,31 @@ pub async fn pg_pick_agent_endpoint_soft(
     min_ctx: i32,
     soft_exclude: &[String],
 ) -> Result<(Option<RouteCandidate>, bool)> {
+    pg_pick_agent_endpoint_for_workload_soft(pool, min_ctx, None, soft_exclude).await
+}
+
+/// Workload-aware soft-exclude picker. The workload is a hard capability
+/// requirement in both passes; only the host exclusion is softened.
+pub async fn pg_pick_agent_endpoint_for_workload_soft(
+    pool: &PgPool,
+    min_ctx: i32,
+    workload: Option<&str>,
+    soft_exclude: &[String],
+) -> Result<(Option<RouteCandidate>, bool)> {
     if soft_exclude.is_empty() {
-        return Ok((pg_pick_agent_endpoint(pool, min_ctx, &[]).await?, false));
+        return Ok((
+            pg_pick_agent_endpoint_for_workload(pool, min_ctx, workload, &[]).await?,
+            false,
+        ));
     }
     // Pass 1: honor the preference.
-    let preferred = pg_pick_agent_endpoint(pool, min_ctx, soft_exclude).await?;
+    let preferred =
+        pg_pick_agent_endpoint_for_workload(pool, min_ctx, workload, soft_exclude).await?;
     if preferred.is_some() {
         return Ok((preferred, false));
     }
     // Pass 2: preference unsatisfiable — fall back to the full fleet.
-    let fallback = pg_pick_agent_endpoint(pool, min_ctx, &[]).await?;
+    let fallback = pg_pick_agent_endpoint_for_workload(pool, min_ctx, workload, &[]).await?;
     let used_excluded = soft_fallback_used(false, fallback.is_some());
     Ok((fallback, used_excluded))
 }
@@ -3612,6 +3640,107 @@ pub async fn pg_delete_mesh_status_for_node(pool: &PgPool, node: &str) -> Result
     Ok(r.rows_affected())
 }
 
+// ─── Backup distribution receipts ─────────────────────────────────────────
+
+/// Atomically merge one verified host receipt into an exact backup row.
+/// Callers must produce the evidence themselves; this function supplies the
+/// database clock, exact catalog CAS, stable host-key merge, and monotonic
+/// same-host ordering. `None` means the catalog identity changed or the status
+/// map is structurally invalid.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_record_backup_distribution_receipt(
+    pool: &PgPool,
+    backup_id: uuid::Uuid,
+    expected_checksum: &str,
+    host_key: &str,
+    computer_id: uuid::Uuid,
+    canonical_host: &str,
+    observed_checksum: &str,
+    size_bytes: i64,
+    receipt_version: i64,
+    run_id: uuid::Uuid,
+    database_kind: &str,
+    file_name: &str,
+) -> Result<Option<(chrono::DateTime<chrono::Utc>, JsonValue)>> {
+    let row = sqlx::query(
+        r#"WITH proof AS (
+               SELECT clock_timestamp() AS verified_at
+           )
+           UPDATE backups AS b
+              SET distribution_status = jsonb_set(
+                    jsonb_set(
+                        b.distribution_status,
+                        '{hosts}',
+                        COALESCE(b.distribution_status->'hosts', '{}'::jsonb),
+                        true
+                    ),
+                    ARRAY['hosts', $3::text],
+                    jsonb_build_object(
+                        'version', $8::bigint,
+                        'backup_id', $1::uuid,
+                        'computer_id', $4::uuid,
+                        'host', $5::text,
+                        'expected_checksum', LOWER($2::text),
+                        'observed_checksum', LOWER($6::text),
+                        'size_bytes', $7::bigint,
+                        'database_kind', $10::text,
+                        'file_name', $11::text,
+                        'checksum', 'ok',
+                        'decrypt', 'ok',
+                        'age_format', true,
+                        'evidence_tier', 'checksum_decrypt',
+                        'run_id', $9::uuid,
+                        'observed_at', proof.verified_at,
+                        'last_ok', proof.verified_at,
+                        'verified_at', proof.verified_at
+                    ),
+                    true
+                  )
+             FROM proof
+            WHERE b.id = $1
+              AND LOWER(b.checksum_sha256) = LOWER($2)
+              AND b.database_kind = $10
+              AND b.file_name = $11
+              AND b.size_bytes = $7
+              AND b.size_bytes > 0
+              AND $3::text = $4::uuid::text
+              AND LOWER($6::text) = LOWER($2::text)
+              AND LOWER($2::text) ~ '^[0-9a-f]{64}$'
+              AND $8::bigint > 0
+              AND BTRIM($5::text) <> ''
+              AND jsonb_typeof(b.distribution_status) = 'object'
+              AND (
+                    b.distribution_status->'hosts' IS NULL
+                    OR jsonb_typeof(b.distribution_status->'hosts') = 'object'
+                  )
+              AND CASE
+                    WHEN b.distribution_status->'hosts'->$3 IS NULL THEN true
+                    WHEN jsonb_typeof(b.distribution_status->'hosts'->$3) <> 'object' THEN true
+                    WHEN (b.distribution_status->'hosts'->$3->>'verified_at')
+                           ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}[T ]' THEN
+                        (b.distribution_status->'hosts'->$3->>'verified_at')::timestamptz
+                            <= proof.verified_at
+                    ELSE true
+                  END
+        RETURNING proof.verified_at,
+                  b.distribution_status->'hosts'->$3 AS receipt"#,
+    )
+    .bind(backup_id)
+    .bind(expected_checksum)
+    .bind(host_key)
+    .bind(computer_id)
+    .bind(canonical_host)
+    .bind(observed_checksum)
+    .bind(size_bytes)
+    .bind(receipt_version)
+    .bind(run_id)
+    .bind(database_kind)
+    .bind(file_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|row| (row.get("verified_at"), row.get("receipt"))))
+}
+
 // ─── Deferred Task Queue ───────────────────────────────────────────────────
 
 /// One row of the deferred_tasks table. Payload/trigger_spec/result/required_caps are free-form JSON.
@@ -3689,6 +3818,47 @@ pub async fn pg_enqueue_deferred(
         created_by,
         max_attempts,
         0,
+    )
+    .await
+}
+
+/// Insert a deferred task that may run only after `depends_on_task_id`
+/// completes successfully. The dependency lives in canonical
+/// `fleet_tasks.depends_on_task_id`; [`pg_claim_deferred`] enforces it for the
+/// folded deferred queue and terminal parent failures are propagated before a
+/// claim is attempted.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_enqueue_deferred_dependent(
+    pool: &PgPool,
+    title: &str,
+    kind: &str,
+    payload: &JsonValue,
+    trigger_type: &str,
+    trigger_spec: &JsonValue,
+    preferred_node: Option<&str>,
+    required_caps: &JsonValue,
+    created_by: Option<&str>,
+    max_attempts: Option<i32>,
+    depends_on_task_id: &str,
+) -> Result<String> {
+    let dependency = sqlx::types::Uuid::parse_str(depends_on_task_id).map_err(|e| {
+        crate::error::DbError::NotFound(format!(
+            "bad deferred dependency uuid {depends_on_task_id}: {e}"
+        ))
+    })?;
+    pg_enqueue_deferred_delayed_with_dependency(
+        pool,
+        title,
+        kind,
+        payload,
+        trigger_type,
+        trigger_spec,
+        preferred_node,
+        required_caps,
+        created_by,
+        max_attempts,
+        0,
+        Some(dependency),
     )
     .await
 }
@@ -3853,10 +4023,42 @@ pub async fn pg_enqueue_deferred_delayed(
     max_attempts: Option<i32>,
     delay_secs: i64,
 ) -> Result<String> {
+    pg_enqueue_deferred_delayed_with_dependency(
+        pool,
+        title,
+        kind,
+        payload,
+        trigger_type,
+        trigger_spec,
+        preferred_node,
+        required_caps,
+        created_by,
+        max_attempts,
+        delay_secs,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pg_enqueue_deferred_delayed_with_dependency(
+    pool: &PgPool,
+    title: &str,
+    kind: &str,
+    payload: &JsonValue,
+    trigger_type: &str,
+    trigger_spec: &JsonValue,
+    preferred_node: Option<&str>,
+    required_caps: &JsonValue,
+    created_by: Option<&str>,
+    max_attempts: Option<i32>,
+    delay_secs: i64,
+    depends_on_task_id: Option<sqlx::types::Uuid>,
+) -> Result<String> {
     let row = sqlx::query(
         "INSERT INTO fleet_tasks
             (task_type, summary, payload, priority, requires_capability, status,
-             created_at, task_class, not_before)
+             created_at, task_class, not_before, depends_on_task_id)
          VALUES (
              $2,
              $1,
@@ -3878,7 +4080,8 @@ pub async fn pg_enqueue_deferred_delayed(
              'pending',
              NOW(),
              'deferred',
-             CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END
+             CASE WHEN $10 > 0 THEN NOW() + make_interval(secs => $10) ELSE NULL END,
+             $11
          )
          RETURNING id",
     )
@@ -3892,6 +4095,7 @@ pub async fn pg_enqueue_deferred_delayed(
     .bind(created_by)
     .bind(max_attempts)
     .bind(delay_secs as f64)
+    .bind(depends_on_task_id)
     .fetch_one(pool)
     .await?;
     let id: sqlx::types::Uuid = row.get("id");
@@ -4270,18 +4474,36 @@ pub async fn pg_scheduler_pass(
 ///   3. Tasks whose `preferred_node` is set to a DIFFERENT node, but the task has
 ///      been `dispatchable` for >2 minutes — assume the preferred node has no
 ///      live worker and let any other worker pick it up and route via SSH.
+///
+/// Typed `backup_receipt` tasks are the exception to fallback stealing: their
+/// proof must be produced by the enrolled host that owns the bytes, so only the
+/// exact preferred worker may claim them.
 pub async fn pg_claim_deferred(
     pool: &PgPool,
     worker_node: &str,
 ) -> Result<Option<DeferredTaskRow>> {
+    pg_propagate_terminal_deferred_dependencies(pool).await?;
     let mut tx = pool.begin().await?;
     let row = sqlx::query(&format!(
         "{DEFERRED_TASK_SELECT}
           AND t.status = 'dispatchable'
             AND (
-                 (t.payload->>'preferred_node') IS NULL
-              OR t.payload->>'preferred_node' = $1
-              OR t.not_before <= NOW() - INTERVAL '2 minutes'
+                 (t.task_type = 'backup_receipt'
+                  AND t.payload->>'preferred_node' = $1)
+              OR (t.task_type <> 'backup_receipt' AND (
+                     (t.payload->>'preferred_node') IS NULL
+                  OR t.payload->>'preferred_node' = $1
+                  OR t.not_before <= NOW() - INTERVAL '2 minutes'
+              ))
+            )
+            AND (
+                 t.depends_on_task_id IS NULL
+              OR EXISTS (
+                    SELECT 1
+                      FROM fleet_tasks dependency
+                     WHERE dependency.id = t.depends_on_task_id
+                       AND dependency.status = 'completed'
+              )
             )
             AND (t.not_before IS NULL OR t.not_before <= NOW())
           ORDER BY
@@ -4320,6 +4542,37 @@ pub async fn pg_claim_deferred(
 
     tx.commit().await?;
     Ok(claimed)
+}
+
+/// Fail/cancel deferred children whose dependency is terminally unsuccessful.
+/// Retrying parents remain `pending` and therefore do not reach this query; a
+/// child is terminalized only after the parent's retry budget is exhausted or
+/// an operator cancels it.
+pub async fn pg_propagate_terminal_deferred_dependencies(pool: &PgPool) -> Result<u64> {
+    let affected = sqlx::query(
+        "UPDATE fleet_tasks child
+            SET status = CASE
+                    WHEN dependency.status = 'cancelled' THEN 'cancelled'
+                    ELSE 'failed'
+                END,
+                error = format(
+                    'dependency %s ended in terminal status %s',
+                    dependency.id,
+                    dependency.status
+                ),
+                completed_at = NOW(),
+                claimed_at = NULL,
+                payload = child.payload - 'claimed_by'
+           FROM fleet_tasks dependency
+          WHERE child.task_class = 'deferred'
+            AND child.depends_on_task_id = dependency.id
+            AND child.status IN ('pending', 'dispatchable')
+            AND dependency.status IN ('failed', 'cancelled')",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
 }
 
 /// Operator-initiated promotion: flip a pending task (any trigger_type) to
@@ -5459,23 +5712,27 @@ mod tests {
             supply.general_endpoints[0].catalog_id.as_deref(),
             Some("near")
         );
-        assert!(supply
-            .code_endpoints
-            .iter()
-            .chain(&supply.general_endpoints)
-            .all(|row| !matches!(
-                row.catalog_id.as_deref(),
-                Some("retired-code" | "retired-general" | "inactive-code")
-            )));
+        assert!(
+            supply
+                .code_endpoints
+                .iter()
+                .chain(&supply.general_endpoints)
+                .all(|row| !matches!(
+                    row.catalog_id.as_deref(),
+                    Some("retired-code" | "retired-general" | "inactive-code")
+                ))
+        );
 
         let readiness = pg_agent_readiness(&pool, None)
             .await
             .expect("read readiness");
         assert_eq!(readiness.len(), 2);
         assert_eq!(readiness.iter().filter(|row| row.is_code).count(), 1);
-        assert!(readiness
-            .iter()
-            .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code));
+        assert!(
+            readiness
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("mixed") && row.is_code)
+        );
         assert!(readiness.iter().all(|row| !matches!(
             row.catalog_id.as_deref(),
             Some("retired-code" | "retired-general" | "inactive-code")
@@ -5486,9 +5743,11 @@ mod tests {
             .expect("read reprofile candidates");
         assert_eq!(reprofile.len(), 2);
         assert_eq!(reprofile.iter().filter(|row| row.is_code).count(), 1);
-        assert!(reprofile
-            .iter()
-            .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code));
+        assert!(
+            reprofile
+                .iter()
+                .any(|row| row.catalog_id.as_deref() == Some("near") && !row.is_code)
+        );
         assert!(reprofile.iter().all(|row| !matches!(
             row.catalog_id.as_deref(),
             Some("retired-code" | "retired-general" | "inactive-code")
@@ -5557,10 +5816,21 @@ mod tests {
             .expect("route general request")
             .expect("general endpoint");
         assert_eq!(general.catalog_id.as_deref(), Some("near"));
+        let general_agent = pg_pick_agent_endpoint_for_workload(&pool, 16_384, None, &[])
+            .await
+            .expect("route general agent")
+            .expect("general agent endpoint");
+        assert_eq!(general_agent.catalog_id.as_deref(), Some("near"));
         assert!(
             pg_pick_offload_endpoint(&pool, 16_384, Some("code"), &[])
                 .await
                 .expect("route code without capable coder")
+                .is_none()
+        );
+        assert!(
+            pg_pick_agent_endpoint_for_workload(&pool, 16_384, Some("code-gen"), &[])
+                .await
+                .expect("route code agent without capable coder")
                 .is_none()
         );
 
@@ -5579,6 +5849,24 @@ mod tests {
             .expect("route capable code request")
             .expect("coder endpoint");
         assert_eq!(code.catalog_id.as_deref(), Some("mixed"));
+        let code_agent = pg_pick_agent_endpoint_for_workload(&pool, 16_384, Some("code-gen"), &[])
+            .await
+            .expect("route capable code agent")
+            .expect("code agent endpoint");
+        assert_eq!(code_agent.catalog_id.as_deref(), Some("mixed"));
+        let (soft_code_agent, used_soft_fallback) = pg_pick_agent_endpoint_for_workload_soft(
+            &pool,
+            16_384,
+            Some("code-gen"),
+            &["CODE-HOST".to_string()],
+        )
+        .await
+        .expect("soft-excluded code agent route");
+        assert!(used_soft_fallback);
+        assert_eq!(
+            soft_code_agent.and_then(|row| row.catalog_id),
+            Some("mixed".to_string())
+        );
         assert!(
             pg_pick_offload_endpoint(&pool, 16_384, Some("edits"), &["CODE-HOST".to_string()],)
                 .await
@@ -5874,6 +6162,7 @@ mod tests {
                  created_by_computer_id UUID,
                  task_class TEXT,
                  not_before TIMESTAMPTZ,
+                 depends_on_task_id UUID,
                  dedup_signature TEXT,
                  parent_work_item_id UUID
              );
@@ -5897,6 +6186,14 @@ mod tests {
                  last_error TEXT,
                  result JSONB,
                  completed_at TIMESTAMPTZ
+             );
+             CREATE TABLE backups (
+                 id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 database_kind TEXT NOT NULL,
+                 file_name TEXT NOT NULL,
+                 checksum_sha256 TEXT NOT NULL,
+                 size_bytes BIGINT NOT NULL,
+                 distribution_status JSONB NOT NULL DEFAULT '{}'::jsonb
              );",
         )
         .execute(&pool)
@@ -5948,13 +6245,16 @@ mod tests {
                  name TEXT NOT NULL
              );
              CREATE TABLE work_items (
-                 id     UUID PRIMARY KEY,
-                 status TEXT NOT NULL DEFAULT 'ready'
+                 id          UUID PRIMARY KEY,
+                 status      TEXT NOT NULL DEFAULT 'ready',
+                 branch_name TEXT,
+                 pr_url      TEXT
              );
              CREATE TABLE sub_agents (
                  id                   UUID PRIMARY KEY,
                  computer_id          UUID NOT NULL REFERENCES computers(id),
                  slot                 INT NOT NULL,
+                 kind                 TEXT NOT NULL DEFAULT 'sub_agent',
                  status               TEXT NOT NULL DEFAULT 'idle',
                  current_work_item_id UUID REFERENCES work_items(id),
                  started_at           TIMESTAMPTZ,
@@ -5972,6 +6272,35 @@ mod tests {
                  created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                  released_at      TIMESTAMPTZ,
                  release_reason   TEXT
+             );
+             CREATE TABLE work_item_worktrees (
+                 id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id  UUID NOT NULL REFERENCES work_items(id),
+                 computer_id   UUID NOT NULL REFERENCES computers(id),
+                 sub_agent_id  UUID REFERENCES sub_agents(id),
+                 repo_path     TEXT NOT NULL DEFAULT '',
+                 worktree_path TEXT NOT NULL DEFAULT '',
+                 base_branch   TEXT NOT NULL DEFAULT 'main',
+                 task_branch   TEXT NOT NULL,
+                 head_sha      TEXT,
+                 status        TEXT NOT NULL,
+                 cleaned_at    TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_merge_queue (
+                 id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 work_item_id        UUID NOT NULL UNIQUE REFERENCES work_items(id),
+                 project_id          TEXT NOT NULL DEFAULT 'test',
+                 position            BIGSERIAL,
+                 status              TEXT NOT NULL DEFAULT 'queued',
+                 branch_name         TEXT NOT NULL,
+                 pr_url              TEXT,
+                 head_sha            TEXT,
+                 review_verdict      TEXT,
+                 review_completed_at TIMESTAMPTZ
+             );
+             CREATE TABLE work_item_provenance (
+                 work_item_id UUID PRIMARY KEY REFERENCES work_items(id),
+                 pr_url       TEXT
              );",
         )
         .execute(&pool)
@@ -6558,6 +6887,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconcile_review_custody_releases_only_exact_durable_handoffs() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+
+        let normal = uuid::Uuid::new_v4();
+        let vinny = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox'), ($2, 'Vinny')")
+            .bind(normal)
+            .bind(vinny)
+            .execute(&pool)
+            .await
+            .expect("insert computers");
+
+        // Only case 0 is an exact durable handoff. Case 1 lacks provenance,
+        // case 2 is Vinny, case 3 is sentinel slot 99, and case 4 has two
+        // non-cleaned worktree custody rows and is therefore ambiguous. Case 5
+        // still says `building`, proving stale review-looking artifacts cannot
+        // authorize release while the item retains active-build ownership.
+        let items: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
+        let slots: Vec<uuid::Uuid> = (0..6).map(|_| uuid::Uuid::new_v4()).collect();
+        for i in 0..6 {
+            let computer = if i == 2 { vinny } else { normal };
+            let slot = if i == 3 { 99 } else { i as i32 };
+            let branch = format!("wi/{}", items[i]);
+            let pr = format!("https://example.invalid/pr/{}", items[i]);
+            let head = format!("head-{i}");
+            let item_status = if i == 5 { "building" } else { "in_review" };
+            sqlx::query(
+                "INSERT INTO work_items (id, status, branch_name, pr_url)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(items[i])
+            .bind(item_status)
+            .bind(&branch)
+            .bind(&pr)
+            .execute(&pool)
+            .await
+            .expect("insert review item");
+            sqlx::query(
+                "INSERT INTO sub_agents
+                    (id, computer_id, slot, status, current_work_item_id)
+                 VALUES ($1, $2, $3, 'busy', $4)",
+            )
+            .bind(slots[i])
+            .bind(computer)
+            .bind(slot)
+            .bind(items[i])
+            .execute(&pool)
+            .await
+            .expect("insert review slot");
+            sqlx::query(
+                "INSERT INTO work_item_leases
+                    (work_item_id, sub_agent_id, computer_id, lease_state,
+                     lease_expires_at, heartbeat_at)
+                 VALUES ($1, $2, $3, 'reviewing',
+                         NOW() - INTERVAL '1 hour', NOW() - INTERVAL '2 hours')",
+            )
+            .bind(items[i])
+            .bind(slots[i])
+            .bind(computer)
+            .execute(&pool)
+            .await
+            .expect("insert reviewing lease");
+            sqlx::query(
+                "INSERT INTO work_item_worktrees
+                    (work_item_id, computer_id, sub_agent_id, task_branch, head_sha, status)
+                 VALUES ($1, $2, $3, $4, $5, 'ready_for_review')",
+            )
+            .bind(items[i])
+            .bind(computer)
+            .bind(slots[i])
+            .bind(&branch)
+            .bind(&head)
+            .execute(&pool)
+            .await
+            .expect("insert review worktree");
+            sqlx::query(
+                "INSERT INTO work_item_merge_queue
+                    (work_item_id, status, branch_name, pr_url, head_sha,
+                     review_verdict, review_completed_at)
+                 VALUES ($1, 'queued', $2, $3, $4, 'approve', NOW())",
+            )
+            .bind(items[i])
+            .bind(&branch)
+            .bind(&pr)
+            .bind(&head)
+            .execute(&pool)
+            .await
+            .expect("insert review queue row");
+            if i != 1 {
+                sqlx::query(
+                    "INSERT INTO work_item_provenance (work_item_id, pr_url) VALUES ($1, $2)",
+                )
+                .bind(items[i])
+                .bind(&pr)
+                .execute(&pool)
+                .await
+                .expect("insert review provenance");
+            }
+        }
+        sqlx::query(
+            "INSERT INTO work_item_worktrees
+                (work_item_id, computer_id, sub_agent_id, task_branch, head_sha, status)
+             VALUES ($1, $2, $3, $4, 'other-head', 'active')",
+        )
+        .bind(items[4])
+        .bind(normal)
+        .bind(slots[4])
+        .bind(format!("ambiguous/{}", items[4]))
+        .execute(&pool)
+        .await
+        .expect("insert ambiguous custody row");
+
+        let (relinked, freed) = pg_reconcile_sub_agent_slots(&pool)
+            .await
+            .expect("reconcile durable review custody");
+        assert_eq!(relinked, 0);
+        assert_eq!(freed, 1, "only the exact normal-slot handoff is released");
+
+        for i in 0..6 {
+            let (slot_status, current_item, released): (String, Option<uuid::Uuid>, bool) =
+                sqlx::query_as(
+                    "SELECT sa.status, sa.current_work_item_id, l.released_at IS NOT NULL
+                       FROM sub_agents sa
+                       JOIN work_item_leases l ON l.sub_agent_id = sa.id
+                      WHERE sa.id = $1",
+                )
+                .bind(slots[i])
+                .fetch_one(&pool)
+                .await
+                .expect("read reconciled custody");
+            if i == 0 {
+                assert_eq!(slot_status, "idle");
+                assert_eq!(current_item, None);
+                assert!(released);
+            } else {
+                assert_eq!(slot_status, "busy", "case {i} must fail closed");
+                assert_eq!(current_item, Some(items[i]));
+                assert!(!released, "case {i} lease must remain owned");
+            }
+        }
+
+        assert_eq!(
+            pg_reconcile_sub_agent_slots(&pool)
+                .await
+                .expect("idempotent custody reconcile"),
+            (0, 0)
+        );
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn free_slots_exclude_quarantine_sentinels_and_vinny() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+        let normal = uuid::Uuid::new_v4();
+        let vinny = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'testbox'), ($2, 'Vinny')")
+            .bind(normal)
+            .bind(vinny)
+            .execute(&pool)
+            .await
+            .expect("insert computers");
+        let ids: Vec<uuid::Uuid> = (0..5).map(|_| uuid::Uuid::new_v4()).collect();
+        for (id, computer, slot, status) in [
+            (ids[0], normal, 0, "idle"),
+            (ids[1], normal, 99, "idle"),
+            (ids[2], normal, 1, "disabled"),
+            (ids[3], vinny, 0, "idle"),
+            (ids[4], normal, 2, "error"),
+        ] {
+            sqlx::query(
+                "INSERT INTO sub_agents (id, computer_id, slot, status)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(id)
+            .bind(computer)
+            .bind(slot)
+            .bind(status)
+            .execute(&pool)
+            .await
+            .expect("insert slot");
+        }
+
+        let free = pg_free_slots(&pool, None, 20)
+            .await
+            .expect("query safe free slots");
+        assert_eq!(free.len(), 1);
+        assert_eq!(free[0].sub_agent_id, ids[0]);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn mergeable_rows_only_participate_when_automerge_is_enabled() {
+        let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
+            return;
+        };
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO work_items (id) VALUES ($1), ($2)")
+            .bind(first)
+            .bind(second)
+            .execute(&pool)
+            .await
+            .expect("insert merge work items");
+        for (item, status, branch) in [(first, "mergeable", "first"), (second, "queued", "second")]
+        {
+            sqlx::query(
+                "INSERT INTO work_item_merge_queue
+                    (work_item_id, project_id, status, branch_name, review_verdict)
+                 VALUES ($1, 'ordering', $2, $3, 'approve')",
+            )
+            .bind(item)
+            .bind(status)
+            .bind(branch)
+            .execute(&pool)
+            .await
+            .expect("insert merge queue item");
+        }
+
+        let gated = pg_next_merge_queue_item(&pool, false)
+            .await
+            .expect("read gated queue")
+            .expect("queued row must remain actionable");
+        assert_eq!(gated.work_item_id, second);
+
+        let enabled = pg_next_merge_queue_item(&pool, true)
+            .await
+            .expect("read enabled queue")
+            .expect("mergeable row must rejoin original ordering");
+        assert_eq!(enabled.work_item_id, first);
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
     async fn reset_busy_slots_on_startup_only_touches_named_computer() {
         let Some((admin, pool, db_name)) = create_slot_reconcile_db().await else {
             return;
@@ -6710,6 +7276,314 @@ mod tests {
         .await
         .expect("count remaining dispatchable deferred tasks");
         assert_eq!(remaining, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_dependencies_order_receipts_and_propagate_terminal_parents() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+
+        let parent = pg_enqueue_deferred(
+            &pool,
+            "copy exact backup to lily",
+            "shell",
+            &serde_json::json!({"command": "true"}),
+            "node_online",
+            &serde_json::json!({"node": "lily"}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+        )
+        .await
+        .expect("enqueue rsync parent");
+        let receipt = pg_enqueue_deferred_dependent(
+            &pool,
+            "verify exact backup on lily",
+            "backup_receipt",
+            &serde_json::json!({
+                "backup_id": uuid::Uuid::new_v4(),
+                "expected_checksum": "a".repeat(64),
+            }),
+            "node_online",
+            &serde_json::json!({"node": "lily"}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+            &parent,
+        )
+        .await
+        .expect("enqueue dependent receipt");
+        let receipt_id = uuid::Uuid::parse_str(&receipt).unwrap();
+        sqlx::query(
+            "UPDATE fleet_tasks
+                SET status='dispatchable', not_before=NOW() - INTERVAL '5 minutes'
+              WHERE id=$1",
+        )
+        .bind(receipt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(
+            pg_claim_deferred(&pool, "lily").await.unwrap().is_none(),
+            "receipt must not run before its copy dependency completes"
+        );
+        sqlx::query("UPDATE fleet_tasks SET status='completed', completed_at=NOW() WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(&parent).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            pg_claim_deferred(&pool, "rihanna").await.unwrap().is_none(),
+            "typed receipt must never fall back to a different worker"
+        );
+        let claimed = pg_claim_deferred(&pool, "lily")
+            .await
+            .unwrap()
+            .expect("preferred worker claims completed dependency child");
+        assert_eq!(claimed.id, receipt);
+        assert_eq!(claimed.kind, "backup_receipt");
+
+        let failed_parent = pg_enqueue_deferred(
+            &pool,
+            "failed copy",
+            "shell",
+            &serde_json::json!({"command": "false"}),
+            "now",
+            &serde_json::json!({}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+        )
+        .await
+        .unwrap();
+        let blocked_child = pg_enqueue_deferred_dependent(
+            &pool,
+            "blocked receipt",
+            "backup_receipt",
+            &serde_json::json!({
+                "backup_id": uuid::Uuid::new_v4(),
+                "expected_checksum": "b".repeat(64),
+            }),
+            "now",
+            &serde_json::json!({}),
+            Some("lily"),
+            &serde_json::json!([]),
+            Some("test"),
+            Some(1),
+            &failed_parent,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE fleet_tasks SET status='failed', completed_at=NOW() WHERE id=$1")
+            .bind(uuid::Uuid::parse_str(&failed_parent).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            pg_propagate_terminal_deferred_dependencies(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        let (status, error): (String, Option<String>) =
+            sqlx::query_as("SELECT status, error FROM fleet_tasks WHERE id=$1")
+                .bind(uuid::Uuid::parse_str(&blocked_child).unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "failed");
+        assert!(error.unwrap().contains("terminal status failed"));
+
+        assert!(
+            pg_enqueue_deferred_dependent(
+                &pool,
+                "bad dependency",
+                "backup_receipt",
+                &serde_json::json!({}),
+                "now",
+                &serde_json::json!({}),
+                Some("lily"),
+                &serde_json::json!([]),
+                Some("test"),
+                Some(1),
+                "not-a-uuid",
+            )
+            .await
+            .is_err()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn backup_receipt_json_merge_is_atomic_monotonic_and_catalog_fenced() {
+        let Some((admin, pool, db_name)) = create_temp_db().await else {
+            return;
+        };
+        let backup_id = uuid::Uuid::new_v4();
+        let checksum = "c".repeat(64);
+        sqlx::query(
+            "INSERT INTO backups
+                (id, database_kind, file_name, checksum_sha256, size_bytes)
+             VALUES ($1, 'postgres', 'pg-exact.tar.gz.age', $2, 8192)",
+        )
+        .bind(backup_id)
+        .bind(&checksum)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let lily_id = uuid::Uuid::new_v4();
+        let rihanna_id = uuid::Uuid::new_v4();
+        let lily_key = lily_id.to_string();
+        let rihanna_key = rihanna_id.to_string();
+        let lily = pg_record_backup_distribution_receipt(
+            &pool,
+            backup_id,
+            &checksum,
+            &lily_key,
+            lily_id,
+            "lily",
+            &checksum,
+            8192,
+            1,
+            uuid::Uuid::new_v4(),
+            "postgres",
+            "pg-exact.tar.gz.age",
+        );
+        let rihanna = pg_record_backup_distribution_receipt(
+            &pool,
+            backup_id,
+            &checksum,
+            &rihanna_key,
+            rihanna_id,
+            "rihanna",
+            &checksum,
+            8192,
+            1,
+            uuid::Uuid::new_v4(),
+            "postgres",
+            "pg-exact.tar.gz.age",
+        );
+        let (lily, rihanna) = tokio::join!(lily, rihanna);
+        let lily = lily.unwrap().expect("lily receipt persisted");
+        assert!(rihanna.unwrap().is_some(), "rihanna receipt persisted");
+
+        let status: JsonValue =
+            sqlx::query_scalar("SELECT distribution_status FROM backups WHERE id=$1")
+                .bind(backup_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status["hosts"][&lily_key]["host"], "lily");
+        assert_eq!(status["hosts"][&lily_key]["database_kind"], "postgres");
+        assert_eq!(
+            status["hosts"][&lily_key]["file_name"],
+            "pg-exact.tar.gz.age"
+        );
+        assert_eq!(status["hosts"][&rihanna_key]["host"], "rihanna");
+        assert_eq!(status["hosts"].as_object().unwrap().len(), 2);
+
+        let before = status.clone();
+        assert!(
+            pg_record_backup_distribution_receipt(
+                &pool,
+                backup_id,
+                &"d".repeat(64),
+                &lily_key,
+                lily_id,
+                "lily",
+                &checksum,
+                8192,
+                1,
+                uuid::Uuid::new_v4(),
+                "postgres",
+                "pg-exact.tar.gz.age",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "enqueue/catalog checksum mismatch must fail the CAS"
+        );
+        let after_bad_cas: JsonValue =
+            sqlx::query_scalar("SELECT distribution_status FROM backups WHERE id=$1")
+                .bind(backup_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(after_bad_cas, before);
+
+        // A future success represents a newer monotonic writer. An older retry
+        // using the database's current clock must not replace it.
+        sqlx::query(
+            "UPDATE backups
+                SET distribution_status = jsonb_set(
+                    distribution_status,
+                    ARRAY['hosts', $2::text, 'verified_at'],
+                    to_jsonb((NOW() + INTERVAL '1 hour')::timestamptz),
+                    false
+                )
+              WHERE id=$1",
+        )
+        .bind(backup_id)
+        .bind(&lily_key)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            pg_record_backup_distribution_receipt(
+                &pool,
+                backup_id,
+                &checksum,
+                &lily_key,
+                lily_id,
+                "lily",
+                &checksum,
+                8192,
+                1,
+                uuid::Uuid::new_v4(),
+                "postgres",
+                "pg-exact.tar.gz.age",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale same-host writer must not replace a newer receipt"
+        );
+        assert!(lily.0 <= chrono::Utc::now() + chrono::Duration::seconds(5));
+
+        sqlx::query(r#"UPDATE backups SET distribution_status='{"hosts":[]}'::jsonb WHERE id=$1"#)
+            .bind(backup_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            pg_record_backup_distribution_receipt(
+                &pool,
+                backup_id,
+                &checksum,
+                &lily_key,
+                lily_id,
+                "lily",
+                &checksum,
+                8192,
+                1,
+                uuid::Uuid::new_v4(),
+                "postgres",
+                "pg-exact.tar.gz.age",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "malformed hosts map must fail closed"
+        );
 
         drop_temp_db(admin, pool, &db_name).await;
     }
@@ -9426,6 +10300,45 @@ pub struct MemoryBlock {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One coherent, scope-locked Scratchpad view used by compaction.
+#[derive(Debug, Clone)]
+pub struct MemoryScopeSnapshot {
+    pub blocks: Vec<MemoryBlock>,
+    pub cap_bytes: i32,
+    /// SHA-256 over the complete ordered block/content/byte state.
+    pub scope_hash: String,
+}
+
+/// A compaction preview/result snapshot plus durable preservation evidence.
+#[derive(Debug, Clone)]
+pub struct MemoryCompactSnapshot {
+    pub scope: MemoryScopeSnapshot,
+    pub evidence: MemoryPreservationEvidence,
+}
+
+const MEMORY_SCOPE_HASH_SQL: &str = "SELECT encode(
+         digest(
+             COALESCE(
+                 jsonb_agg(jsonb_build_array(block, content, bytes) ORDER BY block)::TEXT,
+                 '[]'
+             ),
+             'sha256'
+         ),
+         'hex'
+     ) AS scope_hash
+       FROM agent_memory
+      WHERE scope_type = $1 AND scope_key = $2";
+
+const MEMORY_PRESERVATION_EVIDENCE_SQL: &str = "SELECT COUNT(DISTINCT e.id)::BIGINT AS evictions,
+            COUNT(DISTINCT CASE
+                WHEN b.body IS NOT NULL
+                 AND encode(digest(b.body, 'sha256'), 'hex') = e.prev_hash
+                THEN b.id
+            END)::BIGINT AS brain_candidates
+       FROM agent_memory_evictions e
+       LEFT JOIN brain_knowledge_candidates b ON b.id::TEXT = e.brain_ref
+      WHERE e.scope_type = $1 AND e.scope_key = $2";
+
 /// Resolve the byte cap for a scope: a `(scope_type, scope_key)` override,
 /// else the `(scope_type, '')` default, else [`MEMORY_DEFAULT_CAP_BYTES`].
 pub async fn pg_memory_cap(pool: &PgPool, scope_type: &str, scope_key: &str) -> Result<i32> {
@@ -9494,6 +10407,124 @@ pub async fn pg_memory_get_all(
         .collect())
 }
 
+async fn memory_scope_snapshot_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryScopeSnapshot> {
+    let rows = sqlx::query(
+        "SELECT scope_type, scope_key, block, content, bytes, updated_at
+           FROM agent_memory
+          WHERE scope_type = $1 AND scope_key = $2
+          ORDER BY array_position(ARRAY['task','decisions','findings','state','scratch'], block)",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_all(&mut **tx)
+    .await?;
+    let blocks = rows
+        .iter()
+        .map(|row| MemoryBlock {
+            scope_type: row.get("scope_type"),
+            scope_key: row.get("scope_key"),
+            block: row.get("block"),
+            content: row.get("content"),
+            bytes: row.get("bytes"),
+            updated_at: row.get("updated_at"),
+        })
+        .collect();
+    let cap_bytes: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT cap_bytes FROM agent_memory_caps
+               WHERE scope_type = $1 AND scope_key IN ($2, '')
+               ORDER BY (scope_key = $2) DESC
+               LIMIT 1),
+             $3
+         )",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(MEMORY_DEFAULT_CAP_BYTES)
+    .fetch_one(&mut **tx)
+    .await?;
+    let scope_hash: String = sqlx::query_scalar(MEMORY_SCOPE_HASH_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(MemoryScopeSnapshot {
+        blocks,
+        cap_bytes,
+        scope_hash,
+    })
+}
+
+async fn memory_preservation_evidence_in(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryPreservationEvidence> {
+    let row = sqlx::query(MEMORY_PRESERVATION_EVIDENCE_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(MemoryPreservationEvidence {
+        evictions: row.get("evictions"),
+        brain_candidates: row.get("brain_candidates"),
+    })
+}
+
+async fn begin_locked_memory_snapshot<'a>(
+    pool: &'a PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<sqlx::Transaction<'a, sqlx::Postgres>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let lock_name = format!("agent-memory:{scope_type}:{scope_key}");
+    let locked: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_name)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !locked {
+        tx.rollback().await?;
+        return Err(sqlx::Error::Protocol(
+            "Scratchpad scope is being updated concurrently; retry compaction".into(),
+        )
+        .into());
+    }
+    Ok(tx)
+}
+
+/// Read an exact Scratchpad scope/cap revision while holding its writer lock.
+pub async fn pg_memory_scope_snapshot(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryScopeSnapshot> {
+    let mut tx = begin_locked_memory_snapshot(pool, scope_type, scope_key).await?;
+    let snapshot = memory_scope_snapshot_in(&mut tx, scope_type, scope_key).await?;
+    tx.commit().await?;
+    Ok(snapshot)
+}
+
+/// Read an exact compaction preview/result, including preservation evidence.
+pub async fn pg_memory_compact_snapshot(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryCompactSnapshot> {
+    let mut tx = begin_locked_memory_snapshot(pool, scope_type, scope_key).await?;
+    let scope = memory_scope_snapshot_in(&mut tx, scope_type, scope_key).await?;
+    let evidence = memory_preservation_evidence_in(&mut tx, scope_type, scope_key).await?;
+    tx.commit().await?;
+    Ok(MemoryCompactSnapshot { scope, evidence })
+}
+
 /// Read a single block's content (empty string if the block does not exist).
 pub async fn pg_memory_get_block(
     pool: &PgPool,
@@ -9553,6 +10584,326 @@ pub async fn pg_memory_set_block(
     Ok(())
 }
 
+/// Outcome from a serialized Scratchpad block write.
+///
+/// `Applied` may still report `over_cap = true` only for an explicitly allowed
+/// repair that strictly reduced a scope which was already over its cap. Normal
+/// writes are accepted only when their resulting scope fits the cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryBlockWriteStatus {
+    Applied,
+    Busy,
+    Stale,
+    OverCap,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryBlockWriteResult {
+    pub status: MemoryBlockWriteStatus,
+    pub bytes_used: i64,
+    pub cap_bytes: i32,
+    pub over_cap: bool,
+    /// Present only when an archive and replacement committed atomically.
+    pub eviction_id: Option<uuid::Uuid>,
+    /// Exact complete scope state after an applied write.
+    pub scope_hash: Option<String>,
+}
+
+/// Full-content preservation metadata for an atomic compaction write.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryEvictionArchive<'a> {
+    /// Full scope revision captured with the block list used to choose this target.
+    pub expected_scope_hash: &'a str,
+    /// Effective cap captured by the compactor. A changed cap invalidates the write.
+    pub expected_cap_bytes: i32,
+    pub prev_bytes: i32,
+    /// Summary/trim result. The DB primitive appends the full expected content.
+    pub result_summary: &'a str,
+    pub summarizer: &'a str,
+    pub brain_ref: Option<&'a str>,
+}
+
+/// Compare-and-set inputs for one bounded Scratchpad block write.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryTrySetBlockRequest<'a> {
+    pub scope_type: &'a str,
+    pub scope_key: &'a str,
+    pub block: &'a str,
+    pub expected_content: &'a str,
+    pub new_content: &'a str,
+    pub allow_over_cap_repair: bool,
+    pub eviction_archive: Option<MemoryEvictionArchive<'a>>,
+}
+
+fn memory_write_allowed(
+    current_total: i64,
+    current_block_bytes: i64,
+    new_block_bytes: i64,
+    cap_bytes: i32,
+    allow_over_cap_repair: bool,
+) -> (bool, i64) {
+    let prospective = current_total - current_block_bytes + new_block_bytes;
+    let fits = prospective <= i64::from(cap_bytes);
+    let repairs = allow_over_cap_repair && prospective < current_total;
+    (fits || repairs, prospective)
+}
+
+/// Compare-and-set one Scratchpad block while serializing writers for the
+/// whole scope with a transaction-scoped advisory lock.
+///
+/// This is the fail-closed write primitive for shared cross-session memory:
+/// the expected block content is checked after the lock is acquired, and a
+/// normal write is committed only if the resulting scope is within its cap.
+/// Compaction may set `allow_over_cap_repair` to make monotonic progress on a
+/// scope that was already oversized; it can never make that scope larger. If
+/// `eviction_archive` is present, the scope revision and cap are also compared
+/// and the full-content archive is inserted in this same transaction before
+/// the block replacement.
+pub async fn pg_memory_try_set_block(
+    pool: &PgPool,
+    request: MemoryTrySetBlockRequest<'_>,
+) -> Result<MemoryBlockWriteResult> {
+    let MemoryTrySetBlockRequest {
+        scope_type,
+        scope_key,
+        block,
+        expected_content,
+        new_content,
+        allow_over_cap_repair,
+        eviction_archive,
+    } = request;
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        .execute(&mut *tx)
+        .await?;
+    let lock_name = format!("agent-memory:{scope_type}:{scope_key}");
+    let locked: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lock_name)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !locked {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::Busy,
+            bytes_used: 0,
+            cap_bytes: 0,
+            over_cap: false,
+            eviction_id: None,
+            scope_hash: None,
+        });
+    }
+
+    let current = sqlx::query(
+        "SELECT content, bytes FROM agent_memory
+          WHERE scope_type = $1 AND scope_key = $2 AND block = $3",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(block)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let current_content = current
+        .as_ref()
+        .map(|row| row.get::<String, _>("content"))
+        .unwrap_or_default();
+    let current_block_bytes = current
+        .as_ref()
+        .map(|row| i64::from(row.get::<i32, _>("bytes")))
+        .unwrap_or(0);
+
+    let cap_bytes: i32 = sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT cap_bytes FROM agent_memory_caps
+               WHERE scope_type = $1 AND scope_key IN ($2, '')
+               ORDER BY (scope_key = $2) DESC
+               LIMIT 1),
+             $3
+         )",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(MEMORY_DEFAULT_CAP_BYTES)
+    .fetch_one(&mut *tx)
+    .await?;
+    let current_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes), 0)::BIGINT
+           FROM agent_memory WHERE scope_type = $1 AND scope_key = $2",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    let current_scope_hash: String = sqlx::query_scalar(MEMORY_SCOPE_HASH_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    if current_content != expected_content {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::Stale,
+            bytes_used: current_total,
+            cap_bytes,
+            over_cap: current_total > i64::from(cap_bytes),
+            eviction_id: None,
+            scope_hash: Some(current_scope_hash.clone()),
+        });
+    }
+    if let Some(archive) = eviction_archive
+        && (current_scope_hash != archive.expected_scope_hash
+            || cap_bytes != archive.expected_cap_bytes
+            || current_block_bytes != i64::from(archive.prev_bytes))
+    {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::Stale,
+            bytes_used: current_total,
+            cap_bytes,
+            over_cap: current_total > i64::from(cap_bytes),
+            eviction_id: None,
+            scope_hash: Some(current_scope_hash.clone()),
+        });
+    }
+
+    let new_block_bytes = i64::try_from(new_content.len())
+        .map_err(|_| sqlx::Error::Protocol("Scratchpad block is too large".into()))?;
+    let (allowed, prospective) = memory_write_allowed(
+        current_total,
+        current_block_bytes,
+        new_block_bytes,
+        cap_bytes,
+        allow_over_cap_repair,
+    );
+    if !allowed {
+        tx.rollback().await?;
+        return Ok(MemoryBlockWriteResult {
+            status: MemoryBlockWriteStatus::OverCap,
+            bytes_used: prospective,
+            cap_bytes,
+            over_cap: true,
+            eviction_id: None,
+            scope_hash: Some(current_scope_hash),
+        });
+    }
+
+    // Archive and compare-and-set commit together. If the audit insert or the
+    // later block update fails, PostgreSQL rolls both back, so content can
+    // never be mutated without its complete pre-mutation value being durable.
+    let eviction_id = if let Some(archive) = eviction_archive {
+        let durable_summary = durable_memory_archive(archive.result_summary, expected_content);
+        let id: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO agent_memory_evictions
+                (scope_type, scope_key, block, prev_hash, prev_bytes,
+                 summary, summarizer, brain_ref)
+             VALUES ($1, $2, $3, encode(digest($4, 'sha256'), 'hex'), $5, $6, $7, $8)
+             RETURNING id",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .bind(expected_content)
+        .bind(archive.prev_bytes)
+        .bind(durable_summary)
+        .bind(archive.summarizer)
+        .bind(
+            archive
+                .brain_ref
+                .filter(|reference| !reference.trim().is_empty()),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        Some(id)
+    } else {
+        None
+    };
+
+    if new_content.is_empty() {
+        sqlx::query(
+            "DELETE FROM agent_memory
+              WHERE scope_type = $1 AND scope_key = $2 AND block = $3",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .execute(&mut *tx)
+        .await?;
+    } else {
+        sqlx::query(
+            "INSERT INTO agent_memory (scope_type, scope_key, block, content, bytes, updated_at)
+             VALUES ($1, $2, $3, $4, octet_length($4), NOW())
+             ON CONFLICT (scope_type, scope_key, block)
+             DO UPDATE SET content = EXCLUDED.content,
+                           bytes = EXCLUDED.bytes,
+                           updated_at = NOW()",
+        )
+        .bind(scope_type)
+        .bind(scope_key)
+        .bind(block)
+        .bind(new_content)
+        .execute(&mut *tx)
+        .await?;
+    }
+    let scope_hash: String = sqlx::query_scalar(MEMORY_SCOPE_HASH_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(MemoryBlockWriteResult {
+        status: MemoryBlockWriteStatus::Applied,
+        bytes_used: prospective,
+        cap_bytes,
+        over_cap: prospective > i64::from(cap_bytes),
+        eviction_id,
+        scope_hash: Some(scope_hash),
+    })
+}
+
+fn durable_memory_archive(result_summary: &str, full_content: &str) -> String {
+    format!(
+        "(archive-before-mutation; full pre-mutation content preserved below)\n\nRESULT:\n{result_summary}\n\nFULL PRE-MUTATION:\n{full_content}"
+    )
+}
+
+#[cfg(test)]
+mod scratchpad_write_tests {
+    use super::{durable_memory_archive, memory_write_allowed};
+
+    #[test]
+    fn normal_write_fails_closed_above_cap() {
+        assert_eq!(
+            memory_write_allowed(6_000, 100, 400, 6_144, false),
+            (false, 6_300)
+        );
+        assert_eq!(
+            memory_write_allowed(6_000, 100, 200, 6_144, false),
+            (true, 6_100)
+        );
+    }
+
+    #[test]
+    fn repair_may_only_reduce_an_existing_overage() {
+        assert_eq!(
+            memory_write_allowed(100_000, 90_000, 45_000, 6_144, true),
+            (true, 55_000)
+        );
+        assert_eq!(
+            memory_write_allowed(100_000, 90_000, 95_000, 6_144, true),
+            (false, 105_000)
+        );
+    }
+
+    #[test]
+    fn atomic_eviction_archive_contains_complete_previous_content() {
+        let archive = durable_memory_archive("short summary", "complete previous content");
+        assert!(archive.contains("RESULT:\nshort summary"));
+        assert!(archive.contains("FULL PRE-MUTATION:\ncomplete previous content"));
+    }
+}
+
 /// Total bytes used across all blocks in a scope.
 pub async fn pg_memory_total_bytes(
     pool: &PgPool,
@@ -9602,6 +10953,34 @@ pub async fn pg_memory_record_eviction(
     Ok(row.get("id"))
 }
 
+/// Durable preservation evidence for one Scratchpad scope.
+///
+/// `evictions` counts archive-before-mutation audit rows. `brain_candidates`
+/// counts only references that still resolve to a Brain candidate whose body
+/// hashes to the eviction's `prev_hash`, rather than trusting a text reference
+/// or row existence by itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct MemoryPreservationEvidence {
+    pub evictions: i64,
+    pub brain_candidates: i64,
+}
+
+pub async fn pg_memory_preservation_evidence(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+) -> Result<MemoryPreservationEvidence> {
+    let row = sqlx::query(MEMORY_PRESERVATION_EVIDENCE_SQL)
+        .bind(scope_type)
+        .bind(scope_key)
+        .fetch_one(pool)
+        .await?;
+    Ok(MemoryPreservationEvidence {
+        evictions: row.get("evictions"),
+        brain_candidates: row.get("brain_candidates"),
+    })
+}
+
 // ── Pillar 4: distributed-dev work_item scheduler ────────────────────────
 // Leader-only, serial tick. The partial-unique active-lease index guards
 // double-assignment, and the claim transaction rechecks eligibility so stale
@@ -9630,12 +11009,14 @@ const JIRA_ANCESTOR_GUARD_SQL: &str = "\
 AND NOT EXISTS (
     WITH RECURSIVE ancestors AS (
         SELECT p.id, p.project_id, p.parent_id, p.kind, p.status,
-               p.metadata, p.repo_id, p.repo_url, ARRAY[p.id] AS path
+               p.metadata, p.repo_id, p.repo_url, p.repo_path, p.base_branch,
+               ARRAY[p.id] AS path
           FROM work_items p
          WHERE p.id = w.parent_id
         UNION ALL
         SELECT p.id, p.project_id, p.parent_id, p.kind, p.status,
-               p.metadata, p.repo_id, p.repo_url, a.path || p.id
+               p.metadata, p.repo_id, p.repo_url, p.repo_path, p.base_branch,
+               a.path || p.id
           FROM ancestors a
           JOIN work_items p ON p.id = a.parent_id
          WHERE NOT p.id = ANY(a.path)
@@ -9647,17 +11028,24 @@ AND NOT EXISTS (
            LOWER(BTRIM(COALESCE(a.status, ''))) IN ('blocked', 'blocked on vinny')
         OR LOWER(BTRIM(COALESCE(a.metadata->>'jira_status', ''))) IN ('blocked', 'blocked on vinny')
         OR NULLIF(BTRIM(COALESCE(a.metadata->>'jira_execution_hold', '')), '') IS NOT NULL
+        OR NULLIF(BTRIM(COALESCE(a.metadata->>'jira_repo_hold', '')), '') IS NOT NULL
+        OR a.metadata->>'jira_repo_resolution_state' IS DISTINCT FROM 'bound'
+        OR a.repo_id IS NULL
+        OR NULLIF(BTRIM(COALESCE(a.repo_url, '')), '') IS NULL
+        OR NULLIF(BTRIM(COALESCE(a.repo_path, '')), '') IS NULL
+        OR NULLIF(BTRIM(COALESCE(a.base_branch, '')), '') IS NULL
         OR LOWER(BTRIM(COALESCE(a.metadata->>'repo_binding_required', ''))) NOT IN ('', 'false', '0', 'no')
         OR NOT EXISTS (
             SELECT 1
               FROM project_repos pr
              WHERE pr.project_id = a.project_id
+               AND pr.id = a.repo_id
                AND NULLIF(BTRIM(pr.github_url), '') IS NOT NULL
-               AND (
-                   (a.repo_id IS NOT NULL AND pr.id = a.repo_id)
-                OR (NULLIF(BTRIM(COALESCE(a.repo_url, '')), '') IS NOT NULL
-                    AND pr.github_url = a.repo_url)
-               )
+               AND NULLIF(BTRIM(COALESCE(pr.local_path, '')), '') IS NOT NULL
+               AND NULLIF(BTRIM(pr.default_branch), '') IS NOT NULL
+               AND pr.github_url = a.repo_url
+               AND pr.local_path = a.repo_path
+               AND pr.default_branch = a.base_branch
         )
        )
 )";
@@ -10031,73 +11419,153 @@ pub async fn pg_reap_stale_work_item_leases(
     Ok(reaped)
 }
 
-/// Count work_items orphaned in `in_progress` with NO active (unreleased) lease.
-/// These never went through — or fell out of — the lease lifecycle, so the
-/// lease-based reaper [`pg_reap_stale_work_item_leases`] can't see them; they
-/// sit `in_progress` forever. `min_age_secs` guards against a just-assigned
-/// item whose lease row is created a moment after the status flips.
+/// Count lease-managed task projections stuck in `building`/`in_progress`
+/// without live execution, worktree, review, merge, child, or task-dispatch
+/// custody.
+/// These have no active lease for the stale-lease reaper to own. `claimed` is
+/// deliberately excluded because it is a legitimate scheduler handshake.
 ///
 /// Scoped to `kind='task'` — the ONLY kind the scheduler/lease flow manages
 /// (`pg_ready_work_items` filters `kind='task'`). Non-task kinds (`dispatch`
 /// provenance containers, `audit`/`epic`/`port` backlog) are never leased by
 /// design, so judging them "orphaned" would churn legitimate rows.
-pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<i64> {
-    let n = sqlx::query_scalar(
-        "SELECT COUNT(*)
-           FROM work_items w
-          WHERE w.status = 'in_progress'
-            AND w.kind = 'task'
-            AND w.created_at < NOW() - make_interval(secs => $1)
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_leases l
-                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)",
+fn orphaned_lease_managed_predicate(alias: &str) -> String {
+    format!(
+        "{alias}.kind = 'task' \
+         AND {alias}.status IN ('building', 'in_progress') \
+         AND GREATEST( \
+             {alias}.created_at, \
+             COALESCE({alias}.started_at, {alias}.created_at), \
+             COALESCE(( \
+                 SELECT MAX(e.occurred_at) FROM work_item_events e \
+                  WHERE e.work_item_id = {alias}.id AND e.to_status = {alias}.status \
+             ), {alias}.created_at) \
+         ) < NOW() - make_interval(secs => $1) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_item_leases l \
+              WHERE l.work_item_id = {alias}.id AND l.released_at IS NULL) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM sub_agents sa \
+              WHERE sa.current_work_item_id = {alias}.id \
+                AND sa.status NOT IN ('idle', 'disabled')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_item_worktrees wt \
+              WHERE wt.work_item_id = {alias}.id AND wt.cleaned_at IS NULL \
+                AND wt.status NOT IN ('failed', 'cleaned')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_item_merge_queue mq \
+              WHERE mq.work_item_id = {alias}.id \
+                AND mq.status NOT IN ('failed', 'merged')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM fleet_tasks ft \
+              WHERE ft.parent_work_item_id = {alias}.id \
+                AND ft.status NOT IN ('cancelled', 'completed', 'failed')) \
+         AND NOT EXISTS ( \
+             SELECT 1 FROM work_items child \
+              WHERE child.parent_id = {alias}.id \
+                AND child.status NOT IN ('done', 'merged', 'cancelled', 'failed'))"
     )
-    .bind(min_age_secs as f64)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| {
-        warn!(min_age_secs, error = %e, "pg_count_orphaned_work_items query failed");
-        e
-    })?;
+}
+
+pub async fn pg_count_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM work_items w WHERE {}",
+        orphaned_lease_managed_predicate("w")
+    );
+    let n = sqlx::query_scalar(&sql)
+        .bind(min_age_secs as f64)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            warn!(min_age_secs, error = %e, "pg_count_orphaned_work_items query failed");
+            e
+        })?;
     Ok(n)
 }
 
-/// Reap orphaned `in_progress` work_items that have no active lease (see
-/// [`pg_count_orphaned_work_items`]) by marking them terminal `cancelled`.
+/// Reap orphaned `building`/`in_progress` work_items with no live custody (see
+/// [`pg_count_orphaned_work_items`]) by atomically cancelling and auditing them.
 /// Distinct from [`pg_reap_stale_work_item_leases`], which re-queues items whose
 /// lease heartbeat went stale — these have no lease to go stale, so they need a
-/// separate sweep. `cancelled` (not `ready`) is correct: a never-leased
-/// in_progress row is an abandoned/botched dispatch, and re-queueing it would
-/// re-dispatch junk forever.
+/// separate sweep. `cancelled` (not `ready`) is correct: a lease-managed row
+/// without any remaining custody is an abandoned/botched dispatch, and
+/// re-queueing it would re-dispatch junk forever.
 ///
 /// Scoped to `kind='task'` (the lease-managed kind) — see
 /// [`pg_count_orphaned_work_items`]. Without this scope it also cancelled
 /// `kind='dispatch'` provenance containers, which are not pipeline work.
 pub async fn pg_reap_orphaned_work_items(pool: &PgPool, min_age_secs: i64) -> Result<u64> {
-    let res = sqlx::query(
-        "UPDATE work_items
-            SET status = 'cancelled',
-                completed_at = NOW(),
-                last_error = 'auto-reaped: in_progress with no active lease'
-          WHERE status = 'in_progress'
-            AND kind = 'task'
-            AND created_at < NOW() - make_interval(secs => $1)
-            AND NOT EXISTS (
-                SELECT 1 FROM work_item_leases l
-                 WHERE l.work_item_id = work_items.id AND l.released_at IS NULL)",
-    )
-    .bind(min_age_secs as f64)
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        warn!(min_age_secs, error = %e, "pg_reap_orphaned_work_items query failed");
-        e
-    })?;
-    let rows = res.rows_affected();
+    let predicate = orphaned_lease_managed_predicate("w");
+    let sql = format!(
+        "WITH candidates AS ( \
+             SELECT w.id, w.status, w.assigned_computer, w.attempts \
+               FROM work_items w \
+              WHERE {predicate} \
+              ORDER BY w.id FOR UPDATE SKIP LOCKED \
+         ), updated AS ( \
+             UPDATE work_items w \
+                SET status = 'cancelled', \
+                    completed_at = COALESCE(w.completed_at, NOW()), \
+                    last_error = CONCAT_WS(E'\\n', \
+                        NULLIF(BTRIM(COALESCE(w.last_error, '')), ''), \
+                        FORMAT('auto-reaped: orphaned %s with no live custody', c.status)) \
+               FROM candidates c \
+              WHERE w.id = c.id AND w.status = c.status \
+                AND {predicate} \
+              RETURNING w.id, c.status AS from_status, \
+                        w.assigned_computer, w.attempts \
+         ), events AS ( \
+             INSERT INTO work_item_events \
+                 (work_item_id, from_status, to_status, computer, attempt, detail) \
+             SELECT id, from_status, 'cancelled', assigned_computer, attempts, \
+                    FORMAT('auto-reaped: orphaned %s with no live custody', from_status) \
+               FROM updated \
+             RETURNING 1 \
+         ) \
+         SELECT COUNT(*) FROM events"
+    );
+    let rows: i64 = sqlx::query_scalar(&sql)
+        .bind(min_age_secs as f64)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            warn!(min_age_secs, error = %e, "pg_reap_orphaned_work_items query failed");
+            e
+        })?;
+    let rows = rows.max(0) as u64;
     if rows > 0 {
         info!(rows, min_age_secs, "reaped orphaned work_items");
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod orphaned_lease_managed_tests {
+    use super::orphaned_lease_managed_predicate;
+
+    #[test]
+    fn predicate_is_bounded_to_stale_lease_managed_rows_without_custody() {
+        let predicate = orphaned_lease_managed_predicate("candidate");
+
+        assert!(predicate.contains("candidate.kind = 'task'"));
+        assert!(predicate.contains("candidate.status IN ('building', 'in_progress')"));
+        assert!(!predicate.contains("'claimed'"));
+        assert!(predicate.contains("MAX(e.occurred_at)"));
+        assert!(predicate.contains("e.to_status = candidate.status"));
+        for custody_table in [
+            "work_item_leases",
+            "sub_agents",
+            "work_item_worktrees",
+            "work_item_merge_queue",
+            "fleet_tasks",
+            "work_items child",
+        ] {
+            assert!(
+                predicate.contains(custody_table),
+                "missing custody fence for {custody_table}"
+            );
+        }
+    }
 }
 
 /// Prune terminal (`completed`/`failed`/`cancelled`) rows older than
@@ -10344,10 +11812,15 @@ pub async fn pg_free_slots(
            FROM sub_agents sa
            JOIN computers c ON c.id = sa.computer_id
           WHERE sa.current_work_item_id IS NULL
+            AND sa.status = 'idle'
             -- Operator quarantine: a 'disabled' slot must never claim work
             -- (2026-07-19: sarah, a 3GB traveler, kept claiming builds it
             -- cannot run because this filter was missing).
             AND COALESCE(sa.status, '') <> 'disabled'
+            -- Canonical sentinel rows describe the checkout, not capacity.
+            -- Vinny remains hard-fenced after its motherboard/data-loss event.
+            AND sa.slot <> 99
+            AND LOWER(c.name) <> 'vinny'
             -- NOTE: NO heartbeat freshness filter here (reverted 2026-07-29,
             -- same day it shipped): slot heartbeats only advance WHILE a build
             -- runs, so healthy IDLE slots look 'stale' and a freshness floor
@@ -10412,6 +11885,92 @@ pub async fn pg_free_slots(
 ///    coordinator's non-lease claims (`fleet_run` dispatch never writes lease
 ///    rows), which stay owned by the stuck-slot reaper's age ceiling.
 pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
+    let mut tx = pool.begin().await?;
+
+    // A completed, approved PR handoff owns durable review state in Postgres;
+    // it no longer needs to monopolize the compute slot that built it. This
+    // repairs historical rows written before mark_ready_for_review released
+    // its lease. Every custody field must agree, and the lease must be both
+    // expired and stale. Ambiguous/incomplete rows deliberately stay owned.
+    // The exact slot row is locked by the UPDATE until both lease and slot
+    // changes commit, so assignment cannot observe a half-release.
+    let review_handoffs = sqlx::query(
+        r#"
+        WITH durable AS (
+            SELECT l.id AS lease_id, l.sub_agent_id, l.computer_id, l.work_item_id
+              FROM work_item_leases l
+              JOIN work_items w ON w.id = l.work_item_id
+              JOIN sub_agents sa ON sa.id = l.sub_agent_id
+                                AND sa.computer_id = l.computer_id
+              JOIN computers c ON c.id = l.computer_id
+              JOIN work_item_worktrees wt ON wt.work_item_id = l.work_item_id
+                                          AND wt.sub_agent_id = l.sub_agent_id
+                                          AND wt.computer_id = l.computer_id
+              JOIN work_item_merge_queue mq ON mq.work_item_id = l.work_item_id
+              JOIN work_item_provenance p ON p.work_item_id = l.work_item_id
+             WHERE l.released_at IS NULL
+               AND l.lease_state = 'reviewing'
+               AND l.lease_expires_at <= NOW()
+               AND l.heartbeat_at < NOW() - INTERVAL '10 minutes'
+               AND w.status = 'in_review'
+               AND sa.status = 'busy'
+               AND sa.current_work_item_id = l.work_item_id
+               AND sa.slot <> 99
+               AND LOWER(c.name) <> 'vinny'
+               AND wt.status = 'ready_for_review'
+               AND (SELECT COUNT(*)
+                      FROM work_item_worktrees wt2
+                     WHERE wt2.work_item_id = l.work_item_id
+                       AND wt2.status <> 'cleaned') = 1
+               AND NULLIF(BTRIM(w.pr_url), '') IS NOT NULL
+               AND mq.pr_url = w.pr_url
+               AND p.pr_url = w.pr_url
+               AND mq.branch_name = w.branch_name
+               AND wt.task_branch = w.branch_name
+               AND NULLIF(BTRIM(wt.head_sha), '') IS NOT NULL
+               AND mq.head_sha = wt.head_sha
+               AND mq.status IN ('queued', 'ci_running', 'mergeable')
+               AND mq.review_verdict = 'approve'
+               AND mq.review_completed_at IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM work_item_leases other
+                    WHERE other.sub_agent_id = l.sub_agent_id
+                      AND other.id <> l.id
+                      AND other.released_at IS NULL)
+             -- Freeze every custody source until lease + slot release commit;
+             -- merge drain or another reconciler cannot invalidate the
+             -- evidence between qualification and mutation.
+             FOR UPDATE OF w, wt, mq, p, l, sa
+        ), released AS (
+            UPDATE work_item_leases l
+               SET lease_state = 'released',
+                   released_at = NOW(),
+                   release_reason = 'durable PR/review custody reconciled'
+              FROM durable d
+             WHERE l.id = d.lease_id
+             RETURNING l.id AS lease_id, d.sub_agent_id, d.computer_id, d.work_item_id
+        )
+        UPDATE sub_agents sa
+           SET status = 'idle',
+               current_work_item_id = NULL,
+               started_at = NULL,
+               last_heartbeat_at = NOW()
+          FROM released r
+         WHERE sa.id = r.sub_agent_id
+           AND sa.computer_id = r.computer_id
+           AND sa.status = 'busy'
+           AND sa.current_work_item_id = r.work_item_id
+           AND NOT EXISTS (
+               SELECT 1 FROM work_item_leases active
+                WHERE active.sub_agent_id = sa.id
+                  AND active.id <> r.lease_id
+                  AND active.released_at IS NULL)
+        "#,
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+
     let relinked = sqlx::query(
         "UPDATE sub_agents sa
             SET status = 'busy',
@@ -10427,7 +11986,7 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
             AND (sa.status <> 'busy'
                  OR sa.current_work_item_id IS DISTINCT FROM l.work_item_id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
@@ -10448,11 +12007,12 @@ pub async fn pg_reconcile_sub_agent_slots(pool: &PgPool) -> Result<(u64, u64)> {
                    AND l.work_item_id = sa.current_work_item_id
                    AND l.released_at IS NOT NULL)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?
     .rows_affected();
 
-    Ok((relinked, freed))
+    tx.commit().await?;
+    Ok((relinked, freed + review_handoffs))
 }
 
 /// Reset every `'busy'` `sub_agents` row for a single computer back to
@@ -10628,7 +12188,7 @@ pub async fn pg_record_route_decision(
         session_id: Some(decision.trace_id),
         channel: "router-decision".to_string(),
         request_text: "cloud backend route decision".to_string(),
-        route_decision: serde_json::to_value(&decision)?,
+        route_decision: serde_json::to_value(decision)?,
         engine: decision.chosen.clone(),
         cost_usd: decision.estimated_cost_usd,
         outcome: if decision.mode == "debug" {
@@ -10933,7 +12493,12 @@ pub struct MergeQueueItem {
 /// entry whose project has nothing else already in flight ahead of it —
 /// serializes merges to ONE per project. (A 'ci_running' row is one we're
 /// already watching; re-returning it lets the drain re-check its PR CI.)
-pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueueItem>> {
+/// `mergeable` rows participate only while the operator's automerge gate is
+/// enabled; while it is off they remain visible without head-blocking CI work.
+pub async fn pg_next_merge_queue_item(
+    pool: &PgPool,
+    include_mergeable: bool,
+) -> Result<Option<MergeQueueItem>> {
     // Fail-open enqueues (review produced no verdict) insert with a NULL/empty
     // review_verdict — by design they are still meant to drain ('reject' rows
     // are only ever written with status='failed', so an ACTIVE row can never
@@ -10943,17 +12508,20 @@ pub async fn pg_next_merge_queue_item(pool: &PgPool) -> Result<Option<MergeQueue
     let row = sqlx::query(
         "SELECT id, work_item_id, project_id, pr_url, branch_name
            FROM work_item_merge_queue q
-          WHERE q.status IN ('queued', 'ci_running', 'mergeable')
+          WHERE (q.status IN ('queued', 'ci_running')
+                 OR ($1 AND q.status = 'mergeable'))
             AND COALESCE(q.review_verdict, '') <> 'reject'
             AND NOT EXISTS (
                 SELECT 1 FROM work_item_merge_queue q2
                  WHERE q2.project_id = q.project_id
-                   AND q2.status IN ('queued', 'ci_running', 'mergeable')
+                   AND (q2.status IN ('queued', 'ci_running')
+                        OR ($1 AND q2.status = 'mergeable'))
                    AND COALESCE(q2.review_verdict, '') <> 'reject'
                    AND q2.position < q.position)
           ORDER BY q.position ASC
           LIMIT 1",
     )
+    .bind(include_mergeable)
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|r| MergeQueueItem {
@@ -11068,6 +12636,8 @@ pub async fn pg_mark_merge_failed(
 #[derive(Debug, Clone)]
 pub struct ReapableWorktree {
     pub work_item_id: uuid::Uuid,
+    pub sub_agent_id: uuid::Uuid,
+    pub computer_id: uuid::Uuid,
     pub repo_path: String,
     pub worktree_path: String,
     pub task_branch: String,
@@ -11083,15 +12653,26 @@ pub async fn pg_reapable_worktrees(
     worker_name: &str,
 ) -> Result<Vec<ReapableWorktree>> {
     let rows = sqlx::query(
-        "SELECT wt.work_item_id, wt.repo_path, wt.worktree_path, wt.task_branch, \
+        "SELECT wt.work_item_id, wt.sub_agent_id, wt.computer_id, \
+                wt.repo_path, wt.worktree_path, wt.task_branch, \
                 wt.status = 'stale' AS stale_slot \
            FROM work_item_worktrees wt \
            JOIN work_items w ON w.id = wt.work_item_id \
            JOIN computers c ON c.id = wt.computer_id \
-          WHERE c.name = $1 \
+           JOIN sub_agents sa ON sa.id = wt.sub_agent_id \
+                             AND sa.computer_id = wt.computer_id \
+          WHERE LOWER(c.name) = LOWER($1) \
+            AND LOWER(c.name) <> 'vinny' \
+            AND sa.slot <> 99 \
             AND wt.status <> 'cleaned' \
             AND (w.status IN ('cancelled', 'merged', 'failed', 'done') \
                  OR wt.status = 'stale') \
+            AND ((sa.status = 'idle' AND sa.current_work_item_id IS NULL) \
+                 OR (wt.status = 'stale' AND sa.status = 'cleanup_pending' \
+                     AND sa.current_work_item_id = wt.work_item_id)) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM work_item_leases l \
+                 WHERE l.sub_agent_id = sa.id AND l.released_at IS NULL) \
           LIMIT 32",
     )
     .bind(worker_name)
@@ -11101,6 +12682,8 @@ pub async fn pg_reapable_worktrees(
         .iter()
         .map(|r| ReapableWorktree {
             work_item_id: r.get("work_item_id"),
+            sub_agent_id: r.get("sub_agent_id"),
+            computer_id: r.get("computer_id"),
             repo_path: r.get("repo_path"),
             worktree_path: r.get("worktree_path"),
             task_branch: r.get("task_branch"),
@@ -11415,6 +12998,7 @@ mod jira_claim_guard_tests {
                  github_url TEXT NOT NULL,
                  name TEXT,
                  default_branch TEXT NOT NULL DEFAULT 'main',
+                 local_path TEXT,
                  is_primary BOOLEAN NOT NULL DEFAULT FALSE,
                  metadata JSONB NOT NULL DEFAULT '{}'::jsonb
              );
@@ -11438,6 +13022,8 @@ mod jira_claim_guard_tests {
                  metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                  repo_id UUID,
                  repo_url TEXT,
+                 repo_path TEXT,
+                 base_branch TEXT,
                  assigned_computer TEXT,
                  risk_score REAL NOT NULL DEFAULT 0,
                  retry_count INTEGER NOT NULL DEFAULT 0,
@@ -11494,9 +13080,10 @@ mod jira_claim_guard_tests {
             .await
             .unwrap();
         let repo_id = sqlx::query_scalar(
-            "INSERT INTO project_repos (project_id, github_url, name, is_primary)
+            "INSERT INTO project_repos
+                (project_id, github_url, name, default_branch, local_path, is_primary)
              VALUES ('hireflow360', 'git@github.com-venkat:HireFlow360-INC/hf-auth-api.git',
-                     'hf-auth-api', true)
+                     'hf-auth-api', 'main', '/srv/hf-auth-api', true)
              RETURNING id",
         )
         .fetch_one(pool)
@@ -11525,10 +13112,13 @@ mod jira_claim_guard_tests {
         repo_id: Option<uuid::Uuid>,
         repo_url: Option<&str>,
     ) -> uuid::Uuid {
+        let repo_path = repo_url.map(|_| "/srv/hf-auth-api");
+        let base_branch = repo_url.map(|_| "main");
         sqlx::query_scalar(
             "INSERT INTO work_items
-                (project_id, kind, title, status, parent_id, metadata, repo_id, repo_url)
-             VALUES ('hireflow360', $1, $2, $3, $4, $5, $6, $7)
+                (project_id, kind, title, status, parent_id, metadata, repo_id,
+                 repo_url, repo_path, base_branch)
+             VALUES ('hireflow360', $1, $2, $3, $4, $5, $6, $7, $8, $9)
              RETURNING id",
         )
         .bind(kind)
@@ -11538,6 +13128,8 @@ mod jira_claim_guard_tests {
         .bind(metadata)
         .bind(repo_id)
         .bind(repo_url)
+        .bind(repo_path)
+        .bind(base_branch)
         .fetch_one(pool)
         .await
         .unwrap()
@@ -11603,14 +13195,37 @@ mod jira_claim_guard_tests {
             None,
         )
         .await;
-        let bound_parent = insert_work_item(
+        let stale_metadata_parent = insert_work_item(
             &pool,
             "jira",
             "ready",
             None,
             json!({"jira_status": "To Do"}),
             Some(repo_id),
+            Some("git@github.com-venkat:HireFlow360-INC/hf-auth-api.git"),
+        )
+        .await;
+        let stale_metadata_child = insert_work_item(
+            &pool,
+            "task",
+            "ready",
+            Some(stale_metadata_parent),
+            json!({}),
             None,
+            None,
+        )
+        .await;
+        let bound_parent = insert_work_item(
+            &pool,
+            "jira",
+            "ready",
+            None,
+            json!({
+                "jira_status": "To Do",
+                "jira_repo_resolution_state": "bound"
+            }),
+            Some(repo_id),
+            Some("git@github.com-venkat:HireFlow360-INC/hf-auth-api.git"),
         )
         .await;
         let bound_child = insert_work_item(
@@ -11631,6 +13246,11 @@ mod jira_claim_guard_tests {
         );
         assert!(
             !pg_assign_work_item(&pool, unbound_child, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !pg_assign_work_item(&pool, stale_metadata_child, sub_agent_id, computer_id, 600,)
                 .await
                 .unwrap()
         );

@@ -38,6 +38,8 @@
 //! so only the leader advances it (no N-way compose races). On failover the new
 //! leader's forgefleetd picks the tick up.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
@@ -54,6 +56,141 @@ const POLICY_NAME: &str = "upgrade_rollout_halted";
 /// Wave fanout used when composing a stage's targets. The stage IS the
 /// concurrency unit, so a generous fanout lets a whole stage build in parallel.
 const STAGE_FANOUT: usize = 8;
+
+/// Stable target identity used by the legacy software-updater rollout path.
+/// Names remain useful for task composition, while UUIDs make protection and
+/// namespace-overlap checks resilient to renames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LegacyRolloutTarget {
+    pub computer_id: uuid::Uuid,
+    pub computer_name: String,
+}
+
+/// Return whether a computer is permanently protected from fleet-wide
+/// rollouts. Vinny is protected by either its exact name (case-insensitive) or
+/// its fixed UUID, so a rename or a leadership handoff cannot bypass safety.
+pub fn is_protected_rollout_node(computer_name: &str, computer_id: uuid::Uuid) -> bool {
+    computer_id == ff_db::FORBIDDEN_VINNY_ID
+        || computer_name.eq_ignore_ascii_case(ff_db::FORBIDDEN_VINNY_NAME)
+}
+
+/// Preserve input order while removing permanently protected computers.
+pub fn unprotected_rollout_targets(
+    targets: impl IntoIterator<Item = LegacyRolloutTarget>,
+) -> Vec<LegacyRolloutTarget> {
+    targets
+        .into_iter()
+        .filter(|target| !is_protected_rollout_node(&target.computer_name, target.computer_id))
+        .collect()
+}
+
+/// Resolve names to stable computer identities in the caller's order.
+/// Missing or case-insensitively ambiguous names fail closed. Protected nodes
+/// are then removed using [`is_protected_rollout_node`].
+pub async fn resolve_legacy_rollout_targets(
+    pg: &PgPool,
+    target_names: &[String],
+) -> Result<Vec<LegacyRolloutTarget>, String> {
+    if target_names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT requested.ordinality::bigint AS requested_ordinal,
+               requested.name AS requested_name,
+               c.id AS computer_id,
+               c.name AS computer_name
+          FROM unnest($1::text[]) WITH ORDINALITY AS requested(name, ordinality)
+          LEFT JOIN computers c ON lower(c.name) = lower(requested.name)
+         ORDER BY requested.ordinality, c.name
+        "#,
+    )
+    .bind(target_names)
+    .fetch_all(pg)
+    .await
+    .map_err(|e| format!("resolve legacy rollout target identities: {e}"))?;
+
+    let mut resolved: Vec<Option<LegacyRolloutTarget>> = vec![None; target_names.len()];
+    for row in rows {
+        let ordinal = row
+            .try_get::<i64, _>("requested_ordinal")
+            .map_err(|e| format!("decode legacy rollout target ordinal: {e}"))?;
+        let requested_name = row
+            .try_get::<String, _>("requested_name")
+            .map_err(|e| format!("decode legacy rollout requested name: {e}"))?;
+        let idx = usize::try_from(ordinal.saturating_sub(1))
+            .map_err(|_| format!("invalid legacy rollout target ordinal {ordinal}"))?;
+        let Some(slot) = resolved.get_mut(idx) else {
+            return Err(format!("invalid legacy rollout target ordinal {ordinal}"));
+        };
+        let Some(computer_id) = row
+            .try_get::<Option<uuid::Uuid>, _>("computer_id")
+            .map_err(|e| format!("decode legacy rollout computer id: {e}"))?
+        else {
+            return Err(format!(
+                "legacy rollout target '{requested_name}' no longer resolves"
+            ));
+        };
+        let computer_name = row
+            .try_get::<Option<String>, _>("computer_name")
+            .map_err(|e| format!("decode legacy rollout computer name: {e}"))?
+            .ok_or_else(|| format!("legacy rollout target '{requested_name}' has no name"))?;
+        if slot.is_some() {
+            return Err(format!(
+                "legacy rollout target '{requested_name}' is ambiguous case-insensitively"
+            ));
+        }
+        *slot = Some(LegacyRolloutTarget {
+            computer_id,
+            computer_name,
+        });
+    }
+
+    let resolved = resolved
+        .into_iter()
+        .enumerate()
+        .map(|(idx, target)| {
+            target.ok_or_else(|| {
+                format!(
+                    "legacy rollout target '{}' no longer resolves",
+                    target_names[idx]
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(unprotected_rollout_targets(resolved))
+}
+
+/// Pure overlap check used by both preview and atomic start enforcement.
+pub fn release_rollout_targets_overlap(
+    legacy_targets: &[LegacyRolloutTarget],
+    active_release_target_ids: &[uuid::Uuid],
+) -> bool {
+    let active: HashSet<_> = active_release_target_ids.iter().copied().collect();
+    legacy_targets
+        .iter()
+        .any(|target| active.contains(&target.computer_id))
+}
+
+fn reject_release_rollout_overlap(
+    legacy_targets: &[LegacyRolloutTarget],
+    active_release_target_ids: &[uuid::Uuid],
+) -> Result<(), String> {
+    if !release_rollout_targets_overlap(legacy_targets, active_release_target_ids) {
+        return Ok(());
+    }
+    let active: HashSet<_> = active_release_target_ids.iter().copied().collect();
+    let mut names = legacy_targets
+        .iter()
+        .filter(|target| active.contains(&target.computer_id))
+        .map(|target| target.computer_name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    Err(format!(
+        "legacy software-updater rollout overlaps active `ff artifact rollout` target(s): {}; use the exact artifact rollout namespace or wait for it to finish",
+        names.join(", ")
+    ))
+}
 
 /// The operating mode read from `fleet_secrets.rollout_mode` each tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,7 +597,8 @@ pub async fn maybe_start_continuous_rollout(
 
     let rows = sqlx::query(
         r#"
-        SELECT c.name,
+        SELECT c.id,
+               c.name,
                COALESCE(c.metadata->>'arch', c.build_archs->>0, c.os_family, 'unknown') AS arch
           FROM computers c
           JOIN computer_software cs ON cs.computer_id = c.id
@@ -476,53 +614,68 @@ pub async fn maybe_start_continuous_rollout(
     .fetch_all(pg)
     .await
     .map_err(|e| format!("select continuous rollout targets: {e}"))?;
-    let mut by_arch: std::collections::BTreeMap<String, Vec<String>> =
+    let mut by_arch: std::collections::BTreeMap<String, Vec<LegacyRolloutTarget>> =
         std::collections::BTreeMap::new();
     for row in rows {
-        by_arch
-            .entry(row.try_get("arch").unwrap_or_else(|_| "unknown".into()))
-            .or_default()
-            .push(row.try_get("name").map_err(|e| e.to_string())?);
-    }
-    let mut canaries = Vec::new();
-    let mut remaining = Vec::new();
-    for names in by_arch.values() {
-        if let Some((first, rest)) = names.split_first() {
-            canaries.push(first.clone());
-            remaining.extend_from_slice(rest);
+        let target = LegacyRolloutTarget {
+            computer_id: row.try_get("id").map_err(|e| e.to_string())?,
+            computer_name: row.try_get("name").map_err(|e| e.to_string())?,
+        };
+        if !is_protected_rollout_node(&target.computer_name, target.computer_id) {
+            by_arch
+                .entry(row.try_get("arch").unwrap_or_else(|_| "unknown".into()))
+                .or_default()
+                .push(target);
         }
     }
-    if canaries.is_empty() {
+    let mut canary_targets = Vec::new();
+    let mut remaining_targets = Vec::new();
+    for targets in by_arch.values() {
+        if let Some((first, rest)) = targets.split_first() {
+            canary_targets.push(first.clone());
+            remaining_targets.extend_from_slice(rest);
+        }
+    }
+    if canary_targets.is_empty() {
         return Ok(false);
     }
+    let all_targets = canary_targets
+        .iter()
+        .chain(&remaining_targets)
+        .cloned()
+        .collect::<Vec<_>>();
     let mut stages = vec![RolloutStage {
         stage_idx: 0,
-        target_names: canaries,
+        target_names: canary_targets
+            .iter()
+            .map(|target| target.computer_name.clone())
+            .collect(),
     }];
-    if !remaining.is_empty() {
+    if !remaining_targets.is_empty() {
         stages.push(RolloutStage {
             stage_idx: 1,
-            target_names: remaining,
+            target_names: remaining_targets
+                .iter()
+                .map(|target| target.computer_name.clone())
+                .collect(),
         });
     }
-    let stages_json = serde_json::to_value(&stages).map_err(|e| e.to_string())?;
-    let rollout_id: uuid::Uuid = match sqlx::query_scalar(
-        r#"INSERT INTO upgrade_rollouts
-              (software_id, started_by, stages, current_stage, status,
-               failure_threshold_pct, target_version, automatic)
-            VALUES ($1, $2, $3, 0, 'in_progress', 0, $4, TRUE)
-            RETURNING id"#,
+    let rollout_id = match insert_legacy_rollout(
+        pg,
+        LegacyRolloutInsertSpec {
+            software_id,
+            started_by: my_name,
+            stages: &stages,
+            failure_threshold_pct: 0,
+            target_version: Some(target_sha),
+            automatic: true,
+        },
+        &all_targets,
     )
-    .bind(software_id)
-    .bind(my_name)
-    .bind(stages_json)
-    .bind(target_sha)
-    .fetch_one(pg)
-    .await
+    .await?
     {
-        Ok(id) => id,
-        Err(sqlx::Error::Database(e)) if e.is_unique_violation() => return Ok(false),
-        Err(e) => return Err(format!("insert continuous rollout: {e}")),
+        LegacyRolloutInsert::Inserted(id) => id,
+        LegacyRolloutInsert::ExistingActive => return Ok(false),
     };
     let leader_id = leader_computer_id(pg, my_name)
         .await
@@ -541,42 +694,147 @@ pub async fn maybe_start_continuous_rollout(
     Ok(true)
 }
 
+enum LegacyRolloutInsert {
+    Inserted(uuid::Uuid),
+    ExistingActive,
+}
+
+struct LegacyRolloutInsertSpec<'a> {
+    software_id: &'a str,
+    started_by: &'a str,
+    stages: &'a [RolloutStage],
+    failure_threshold_pct: i32,
+    target_version: Option<&'a str>,
+    automatic: bool,
+}
+
+/// Insert a legacy updater rollout only after atomically proving that none of
+/// its stable target identities belongs to an active exact artifact rollout.
+/// The shared advisory lock serializes this check with exact rollout starts.
+async fn insert_legacy_rollout(
+    pg: &PgPool,
+    spec: LegacyRolloutInsertSpec<'_>,
+    targets: &[LegacyRolloutTarget],
+) -> Result<LegacyRolloutInsert, String> {
+    let stages_json =
+        serde_json::to_value(spec.stages).map_err(|e| format!("serialize stages: {e}"))?;
+    let mut transaction = pg
+        .begin()
+        .await
+        .map_err(|e| format!("begin legacy rollout namespace check: {e}"))?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ff_db::RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|e| format!("lock rollout namespace: {e}"))?;
+    let active_release_target_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        SELECT DISTINCT target.computer_id
+          FROM release_rollout_transactions rollout
+          JOIN release_rollout_target_states target
+            ON target.transaction_id = rollout.id
+         WHERE rollout.state IN ('planned', 'running', 'rolling_back')
+         ORDER BY target.computer_id
+        "#,
+    )
+    .fetch_all(&mut *transaction)
+    .await
+    .map_err(|e| format!("check active artifact rollout targets: {e}"))?;
+    reject_release_rollout_overlap(targets, &active_release_target_ids)?;
+
+    let inserted = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        INSERT INTO upgrade_rollouts
+            (software_id, started_by, stages, current_stage, status,
+             failure_threshold_pct, target_version, automatic)
+        VALUES ($1, $2, $3, 0, 'in_progress', $4, $5, $6)
+        RETURNING id
+        "#,
+    )
+    .bind(spec.software_id)
+    .bind(spec.started_by)
+    .bind(stages_json)
+    .bind(spec.failure_threshold_pct.max(0))
+    .bind(spec.target_version)
+    .bind(spec.automatic)
+    .fetch_one(&mut *transaction)
+    .await;
+    let rollout_id = match inserted {
+        Ok(id) => id,
+        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+            return Ok(LegacyRolloutInsert::ExistingActive);
+        }
+        Err(error) => return Err(format!("insert legacy upgrade rollout: {error}")),
+    };
+    transaction
+        .commit()
+        .await
+        .map_err(|e| format!("commit legacy rollout namespace check: {e}"))?;
+    Ok(LegacyRolloutInsert::Inserted(rollout_id))
+}
+
+/// Read-only preview of the namespace guard used by CLI dry runs.
+pub async fn ensure_no_active_release_rollout_overlap(
+    pg: &PgPool,
+    targets: &[LegacyRolloutTarget],
+) -> Result<(), String> {
+    let active_release_target_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        SELECT DISTINCT target.computer_id
+          FROM release_rollout_transactions rollout
+          JOIN release_rollout_target_states target
+            ON target.transaction_id = rollout.id
+         WHERE rollout.state IN ('planned', 'running', 'rolling_back')
+         ORDER BY target.computer_id
+        "#,
+    )
+    .fetch_all(pg)
+    .await
+    .map_err(|e| format!("check active artifact rollout targets: {e}"))?;
+    reject_release_rollout_overlap(targets, &active_release_target_ids)
+}
+
 /// Create a staged rollout row and compose ONLY stage 0 (the canary). Stages
 /// after the canary are recorded in the row but composed lazily by the tick as
-/// each prior stage passes. `available_targets` is the resolvable non-leader
-/// member set (already excluding the leader); `canary` is the canary size.
+/// each prior stage passes. `available_targets` is the stable, resolvable,
+/// unprotected non-leader member set; `canary` is the canary size.
 ///
 /// Returns the new rollout id. Used by `ff fleet rollout start --staged`.
 pub async fn create_staged_rollout(
     pg: &PgPool,
     software_id: &str,
-    available_targets: &[String],
+    available_targets: &[LegacyRolloutTarget],
     canary: usize,
     failure_threshold_pct: i32,
     started_by: &str,
 ) -> Result<uuid::Uuid, String> {
-    let stages = plan_stages(available_targets, canary);
+    let target_names = available_targets
+        .iter()
+        .map(|target| target.computer_name.clone())
+        .collect::<Vec<_>>();
+    let stages = plan_stages(&target_names, canary);
     if stages.is_empty() {
-        return Err("no resolvable non-leader targets for this software".into());
+        return Err("no resolvable unprotected non-leader targets for this software".into());
     }
-    let stages_json =
-        serde_json::to_value(&stages).map_err(|e| format!("serialize stages: {e}"))?;
-
-    let rollout_id: uuid::Uuid = sqlx::query_scalar(
-        r#"
-        INSERT INTO upgrade_rollouts
-            (software_id, started_by, stages, current_stage, status, failure_threshold_pct)
-        VALUES ($1, $2, $3, 0, 'in_progress', $4)
-        RETURNING id
-        "#,
+    let rollout_id = match insert_legacy_rollout(
+        pg,
+        LegacyRolloutInsertSpec {
+            software_id,
+            started_by,
+            stages: &stages,
+            failure_threshold_pct,
+            target_version: None,
+            automatic: false,
+        },
+        available_targets,
     )
-    .bind(software_id)
-    .bind(started_by)
-    .bind(&stages_json)
-    .bind(failure_threshold_pct.max(0))
-    .fetch_one(pg)
-    .await
-    .map_err(|e| format!("insert upgrade_rollouts: {e}"))?;
+    .await?
+    {
+        LegacyRolloutInsert::Inserted(id) => id,
+        LegacyRolloutInsert::ExistingActive => {
+            return Err("another legacy updater rollout is already in progress".into());
+        }
+    };
 
     let leader_id = leader_computer_id(pg, started_by)
         .await
@@ -955,6 +1213,56 @@ pub fn spawn_upgrade_rollout_tick(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn legacy_target(name: &str, computer_id: uuid::Uuid) -> LegacyRolloutTarget {
+        LegacyRolloutTarget {
+            computer_id,
+            computer_name: name.to_string(),
+        }
+    }
+
+    #[test]
+    fn vinny_nonleader_is_excluded_by_case_insensitive_exact_name() {
+        let beyonce = legacy_target("beyonce", uuid::Uuid::new_v4());
+        let vinny = legacy_target("ViNnY", uuid::Uuid::new_v4());
+        assert_eq!(
+            unprotected_rollout_targets([vinny, beyonce.clone()]),
+            [beyonce]
+        );
+    }
+
+    #[test]
+    fn vinny_nonleader_is_excluded_by_fixed_uuid() {
+        assert!(is_protected_rollout_node(
+            "vinny-recovered",
+            ff_db::FORBIDDEN_VINNY_ID
+        ));
+    }
+
+    #[test]
+    fn renamed_fixed_vinny_uuid_is_excluded() {
+        let renamed = legacy_target("taylor-again", ff_db::FORBIDDEN_VINNY_ID);
+        let sia = legacy_target("sia", uuid::Uuid::new_v4());
+        assert_eq!(unprotected_rollout_targets([renamed, sia.clone()]), [sia]);
+    }
+
+    #[test]
+    fn overlapping_exact_artifact_target_refuses_legacy_start() {
+        let shared = uuid::Uuid::new_v4();
+        let targets = [legacy_target("sia", shared)];
+        assert!(release_rollout_targets_overlap(&targets, &[shared]));
+        let error = reject_release_rollout_overlap(&targets, &[shared]).unwrap_err();
+        assert!(error.contains("ff artifact rollout"));
+        assert!(error.contains("sia"));
+    }
+
+    #[test]
+    fn nonoverlapping_exact_artifact_targets_leave_legacy_start_unchanged() {
+        let targets = [legacy_target("sia", uuid::Uuid::new_v4())];
+        let exact = [uuid::Uuid::new_v4()];
+        assert!(!release_rollout_targets_overlap(&targets, &exact));
+        assert_eq!(reject_release_rollout_overlap(&targets, &exact), Ok(()));
+    }
 
     #[test]
     fn mode_defaults_manual_and_is_failsafe() {

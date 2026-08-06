@@ -14,11 +14,13 @@ pub mod dsn_of_record;
 pub mod leader_state;
 pub mod metrics_partitions;
 pub mod migrations;
+pub mod model_integrity;
 pub mod models;
 pub mod operational_store;
 pub mod pm;
 pub mod postgres;
 pub mod queries;
+pub mod rollout_authority;
 pub mod runtime_registry;
 pub mod schema;
 pub mod work_queue;
@@ -26,7 +28,22 @@ pub mod work_queue;
 pub use leader_state::*;
 
 pub use metrics_partitions::{pg_drop_expired_metrics_partitions, pg_ensure_metrics_partitions};
-pub use migrations::run_postgres_migrations;
+pub use migrations::{
+    AppliedPostgresMigration, LATEST_AUTOMATIC_POSTGRES_MIGRATION,
+    LATEST_EXPLICIT_POSTGRES_MIGRATION, PostgresMigrationDescriptor, PostgresMigrationStatus,
+    apply_explicit_postgres_migrations, postgres_migration_status,
+};
+pub use migrations::{
+    SECURE_ENROLLMENT_XACT_LOCK_KEY, run_postgres_migrations, validate_secure_enrollment_schema,
+};
+pub use model_integrity::{
+    HashWriteDecision, ModelLibraryHashAssertion, ModelLibraryHashCasOutcome,
+    ReleaseArtifactAssertion, ReleaseArtifactBatchAssertion, ReleaseArtifactBatchRegistration,
+    ReleaseArtifactCustodyRow, ReleaseArtifactRegistration, ReleaseArtifactRegistrationOutcome,
+    ReleaseArtifactRow, pg_compare_or_cas_model_library_sha256, pg_get_release_artifact,
+    pg_list_release_artifact_custody, pg_list_release_artifacts, pg_register_release_artifact,
+    pg_register_release_artifact_batch,
+};
 pub use models::WorkItem;
 pub use operational_store::OperationalStore;
 pub use queries::{
@@ -149,6 +166,7 @@ pub use queries::{
     pg_dispatchable_backends,
     pg_enqueue_deferred,
     pg_enqueue_deferred_delayed,
+    pg_enqueue_deferred_dependent,
     pg_evaluate_cloud_route,
     pg_finish_deferred,
     pg_fire_brain_reminder,
@@ -230,11 +248,15 @@ pub use queries::{
     pg_open_disk_move,
     pg_pending_work_intents,
     pg_pick_agent_endpoint,
+    pg_pick_agent_endpoint_for_workload,
+    pg_pick_agent_endpoint_for_workload_soft,
     pg_pick_agent_endpoint_soft,
     pg_pick_offload_endpoint,
     pg_placement_candidates,
     pg_promote_deferred,
+    pg_propagate_terminal_deferred_dependencies,
     pg_prune_terminal_task_history,
+    pg_purge_deferred,
     pg_rank_computers_by_capacity,
     pg_read_gate_value,
     pg_read_safety_gate,
@@ -246,6 +268,7 @@ pub use queries::{
     pg_reap_stale_work_item_leases,
     pg_reapable_worktrees,
     pg_recent_demand_snapshots,
+    pg_record_backup_distribution_receipt,
     pg_record_interaction,
     pg_record_route_decision,
     pg_release_model_load_reservation,
@@ -255,7 +278,6 @@ pub use queries::{
     pg_reserve_model_load,
     pg_reserve_operation,
     pg_resolve_channel_user,
-    pg_purge_deferred,
     pg_retired_catalog_ids,
     pg_retry_deferred,
     pg_route_deployments,
@@ -300,6 +322,16 @@ pub use queries::{
     // Orchestrator P2 — demand sensing emission (V116)
     record_session_work_signal,
     seed_from_fleet_toml,
+};
+pub use rollout_authority::{
+    FORBIDDEN_VINNY_ID, FORBIDDEN_VINNY_NAME, RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY,
+    ReleaseRolloutAuthorityRow, ReleaseRolloutAuthoritySpec, ReleaseRolloutTargetStateRow,
+    ReleaseRolloutTransactionRow, RolloutArtifactAuthority, RolloutAuthorityRegistration,
+    RolloutAuthorityRegistrationOutcome, RolloutTargetAuthority, RolloutTransactionBegin,
+    RolloutTransactionBeginOutcome, pg_begin_release_rollout, pg_cas_release_rollout_target_state,
+    pg_cas_release_rollout_transaction_state, pg_get_release_rollout_transaction_by_request_id,
+    pg_register_release_rollout_authority, pg_renew_release_rollout_lease,
+    pg_take_over_release_rollout_lease, release_rollout_schema_is_exact,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sqlx::PgPool;
@@ -349,6 +381,9 @@ pub mod error {
 
         #[error("not found: {0}")]
         NotFound(String),
+
+        #[error("artifact integrity error: {0}")]
+        ArtifactIntegrity(String),
     }
 
     pub type Result<T> = std::result::Result<T, DbError>;

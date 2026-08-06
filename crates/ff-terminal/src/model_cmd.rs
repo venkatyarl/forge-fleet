@@ -328,7 +328,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             let n = ff_agent::model_catalog::sync_catalog(&pool)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))?;
-            println!("Synced {n} catalog entries from TOML to Postgres");
+            println!("Reconciled {n} canonical catalog row(s) in PostgreSQL");
         }
         crate::ModelCommand::Search { query } => {
             let rows = ff_db::pg_search_catalog(&pool, &query).await?;
@@ -362,7 +362,7 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
                 return Ok(());
             }
             if rows.is_empty() {
-                println!("(catalog empty — run `ff model sync-catalog` first)");
+                println!("(catalog empty — database catalog migrations have not been applied)");
                 return Ok(());
             }
             println!(
@@ -490,6 +490,20 @@ pub async fn handle_model(cmd: crate::ModelCommand) -> Result<()> {
             println!(
                 "  total:   {} across models dir",
                 human_bytes(summary.total_bytes)
+            );
+        }
+        crate::ModelCommand::ImportAceGemma4Mlx => {
+            let report = ff_agent::ace_mlx_import::import_ace_gemma4_mlx(&pool).await?;
+            let disposition = match report.disposition {
+                ff_agent::ace_mlx_import::ImportDisposition::Imported => "imported",
+                ff_agent::ace_mlx_import::ImportDisposition::AlreadyPresent => {
+                    "already present and reverified"
+                }
+            };
+            println!(
+                "Ace Gemma 4 E4B MLX: {disposition}; path={}; library_id={}",
+                report.final_path.display(),
+                report.library_id
             );
         }
         crate::ModelCommand::Disk { json } => {

@@ -35,6 +35,18 @@ pub struct LeaderEndpoints {
     pub nats_url: Option<String>,
 }
 
+/// Values required for one stale-leader takeover attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct LeaderTakeoverRequest<'a> {
+    pub my_computer_id: Uuid,
+    pub my_name: &'a str,
+    pub new_epoch: i64,
+    pub old_leader_name: &'a str,
+    pub stale_threshold_secs: i64,
+    pub redis_url: Option<&'a str>,
+    pub nats_url: Option<&'a str>,
+}
+
 /// Read the current leader, if any.
 pub async fn pg_get_current_leader(pool: &PgPool) -> Result<Option<LeaderState>, sqlx::Error> {
     let row = sqlx::query(
@@ -112,14 +124,17 @@ pub async fn pg_claim_leader_initial(
 /// replaced.
 pub async fn pg_claim_leader_takeover(
     pool: &PgPool,
-    my_computer_id: Uuid,
-    my_name: &str,
-    new_epoch: i64,
-    old_leader_name: &str,
-    stale_threshold_secs: i64,
-    redis_url: Option<&str>,
-    nats_url: Option<&str>,
+    request: LeaderTakeoverRequest<'_>,
 ) -> Result<bool, sqlx::Error> {
+    let LeaderTakeoverRequest {
+        my_computer_id,
+        my_name,
+        new_epoch,
+        old_leader_name,
+        stale_threshold_secs,
+        redis_url,
+        nats_url,
+    } = request;
     let result = sqlx::query(
         "UPDATE fleet_leader_state
          SET computer_id  = $1,

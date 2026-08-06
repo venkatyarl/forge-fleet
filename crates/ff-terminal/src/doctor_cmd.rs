@@ -270,7 +270,7 @@ pub async fn handle_doctor(json: bool, strict: bool) -> Result<()> {
     checks.push(DoctorCheck {
         name: "work_item orphans".into(),
         status: orphan_health(orphans),
-        detail: format!("{orphans} orphaned in_progress"),
+        detail: format!("{orphans} orphaned building/in_progress"),
     });
 
     // 4) Alert policies that can't fire (enabled but dead).

@@ -25,6 +25,7 @@ pub async fn handle_db(cmd: crate::DbCommand) -> Result<()> {
             json,
             max_rows,
         } => query(&sql, json, max_rows).await,
+        crate::DbCommand::Migrate { command } => crate::db_migrate_cmd::handle(command).await,
     }
 }
 

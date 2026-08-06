@@ -9,6 +9,10 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use ff_runtime::process_manager::{
+    LlamaServerBackend, LlamaServerSelection, resolve_llama_server_binary,
+};
+
 const STARTUP_TIMEOUT_ENV: &str = "FORGEFLEET_MODEL_STARTUP_TIMEOUT_SECS";
 const STARTUP_TIMEOUT_FLOOR_SECS: u64 = 120;
 const STARTUP_TIMEOUT_CAP_SECS: u64 = 1_800;
@@ -470,6 +474,15 @@ pub struct LoadResult {
     pub model_path: String,
 }
 
+type IncumbentDeploymentRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<i32>,
+    Option<String>,
+    String,
+);
+
 /// A running inference process detected on this host.
 #[derive(Debug, Clone)]
 pub struct RunningProcess {
@@ -618,14 +631,7 @@ async fn load_model_with_authority(
         let mut expected_deployment: Option<ExpectedDeployment> = None;
         // desired_state is durable placement intent. A stale health snapshot or
         // an unreachable endpoint is never permission to overwrite that intent.
-        let incumbent: Option<(
-            String,
-            Option<String>,
-            Option<String>,
-            Option<i32>,
-            Option<String>,
-            String,
-        )> = sqlx::query_as(
+        let incumbent: Option<IncumbentDeploymentRow> = sqlx::query_as(
             "SELECT id::text, library_id::text, catalog_id, pid,
                     process_start_marker, desired_state
                FROM fleet_model_deployments
@@ -723,6 +729,12 @@ async fn load_model_with_authority(
         None => (ServingMode::Chat, false),
     };
 
+    // Ace's reviewed Gemma MLX directory is content-addressed as a complete
+    // ten-file artifact, not merely by its model weight. Reverify that exact
+    // manifest immediately before constructing the launcher so drift after an
+    // import or library scan can never reach `mlx_lm.server`.
+    verify_model_artifact_authority(&lib.catalog_id, &lib.file_path).await?;
+
     // Capable chat models default to the agent serving profile so the endpoint
     // is router/autoscaler-eligible (they require usable_agent_ctx >= 32768).
     let agent = resolve_agent_profile(opts.agent_profile, mode, tool_calling, opts.parallel);
@@ -751,9 +763,11 @@ async fn load_model_with_authority(
     };
 
     // Build the launch command per runtime.
-    let (program, args, runtime_label) = match lib.runtime.as_str() {
+    let (program, args, runtime_label, llama_selection) = match lib.runtime.as_str() {
         "llama.cpp" => {
-            let bin = llama_server_binary();
+            let selection = resolve_llama_server_binary()
+                .map_err(|error| format!("llama-server runtime policy: {error}"))?;
+            let bin = selection.path.display().to_string();
             // llama-server expects a single .gguf file, not a directory.
             // The library scanner often registers a directory (the model
             // root); resolve to the largest .gguf inside so the spawn
@@ -855,12 +869,21 @@ async fn load_model_with_authority(
                     args.push("--reranking".into());
                 }
             }
-            // On macOS Metal builds this enables full-GPU inference.
-            if cfg!(target_os = "macos") {
+            // Strict backend identity owns the offload setting. ROCm may not
+            // silently relaunch CPU-only, and an authorized CPU rollback may
+            // not drift back onto a GPU backend.
+            if selection.backend == LlamaServerBackend::Rocm {
+                args.push("--n-gpu-layers".into());
+                args.push("999".into());
+            } else if selection.backend == LlamaServerBackend::CpuRollback {
+                args.push("--n-gpu-layers".into());
+                args.push("0".into());
+            } else if cfg!(target_os = "macos") {
+                // Legacy macOS Metal behavior remains unchanged.
                 args.push("--n-gpu-layers".into());
                 args.push("999".into());
             }
-            (bin, args, "llama.cpp")
+            (bin, args, "llama.cpp", Some(selection))
         }
         "mlx" => {
             // mlx_lm.server is chat-only — no /v1/embeddings, no /v1/rerank.
@@ -888,15 +911,16 @@ async fn load_model_with_authority(
             }
             // mlx_lm.server expects the MODEL to be either an HF repo id or a local dir
             // with config/weights. We use the local dir.
-            let args = vec![
+            let (program, mut args) = mlx_server_launcher()?;
+            args.extend([
                 "--model".into(),
                 lib.file_path.clone(),
                 "--host".into(),
                 "0.0.0.0".into(),
                 "--port".into(),
                 port.to_string(),
-            ];
-            ("mlx_lm.server".to_string(), args, "mlx")
+            ]);
+            (program, args, "mlx", None)
         }
         "vllm" => {
             if mode != ServingMode::Chat {
@@ -929,7 +953,7 @@ async fn load_model_with_authority(
                 "--max-model-len".into(),
                 ctx.to_string(),
             ];
-            ("vllm".to_string(), args, "vllm")
+            ("vllm".to_string(), args, "vllm", None)
         }
         other => return Err(format!("unsupported runtime: {other}")),
     };
@@ -974,7 +998,15 @@ async fn load_model_with_authority(
     // LD_LIBRARY_PATH so co-located .so files resolve. Harmless on macOS
     // (Mach-O uses different linker plumbing) and on system-installed
     // builds where the libs are already on the global loader path.
-    if cfg!(target_os = "linux")
+    if llama_selection
+        .as_ref()
+        .is_some_and(LlamaServerSelection::is_strict)
+    {
+        llama_selection
+            .as_ref()
+            .expect("strict selection exists")
+            .configure_command(&mut cmd);
+    } else if cfg!(target_os = "linux")
         && program.contains("llama-server")
         && let Some(bin_dir) = std::path::Path::new(&program).parent()
     {
@@ -1030,7 +1062,13 @@ async fn load_model_with_authority(
     // type-checked on every target while only executing on Linux. Falls back
     // to the manual spawn if systemd isn't usable (no user manager, etc.).
     let mut systemd_pid: Option<u32> = None;
-    if cfg!(target_os = "linux") {
+    let strict_llama = llama_selection
+        .as_ref()
+        .is_some_and(LlamaServerSelection::is_strict);
+    // User-owned persistent units can restart later without re-entering the
+    // root-policy resolver. Keep strict launches on the directly-attested
+    // path until a typed privileged ff operation owns a root system unit.
+    if cfg!(target_os = "linux") && !strict_llama {
         match write_systemd_unit(&program, &args, port, &log_path).await {
             Ok(()) => match start_systemd_unit(port).await {
                 Ok(p) => {
@@ -1058,6 +1096,11 @@ async fn load_model_with_authority(
     let pid = if let Some(p) = systemd_pid {
         p
     } else {
+        if let Some(selection) = &llama_selection {
+            selection.revalidate().map_err(|error| {
+                format!("llama-server changed before manual launch: {error}")
+            })?;
+        }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1094,6 +1137,16 @@ async fn load_model_with_authority(
             return Err(format!("launched pid {pid} exited before identity capture"));
         }
     };
+    if let Some(selection) = &llama_selection
+        && let Err(error) = selection.attest_process(pid)
+    {
+        if !cleanup_launched_process(pid, &launched_start, port, systemd_pid.is_some()).await {
+            release_reservation = false;
+        }
+        return Err(format!(
+            "launched llama-server failed executable/environment attestation: {error}"
+        ));
+    }
     let launched_model_path = match launched_model_path(runtime_label, &args) {
         Some(path) => path,
         None => {
@@ -1169,16 +1222,49 @@ async fn load_model_with_authority(
         ),
     )
     .await
-    .and_then(|result| result.map_err(|_| "startup health check failed"));
+    .map_err(str::to_string)
+    .and_then(|result| result);
     if let Err(startup_error) = health {
         // Never signal from a stale observation. cleanup_launched_process
         // rechecks the exact PID incarnation and confirms its termination.
         launch_guard.cleanup_now().await;
         release_reservation = false;
-        return Err(format!(
+        let message = format!(
             "refusing to activate {worker_name}:{port} after {}ms: {startup_error}",
             startup_started.elapsed().as_millis()
-        ));
+        );
+        if runtime_label == "mlx" {
+            log_model_error(
+                pool,
+                &worker_name,
+                None,
+                Some(&lib.id),
+                Some(&lib.catalog_id),
+                runtime_label,
+                ModelErrorKind::Startup,
+                &message,
+                serde_json::json!({
+                    "port": port,
+                    "phase": "health_and_generation_readiness",
+                    "model_path": launched_model_path,
+                    "error": startup_error,
+                }),
+                tail_log_file(&log_path, 16_384).as_deref(),
+            )
+            .await;
+        }
+        return Err(message);
+    }
+
+    if let Some(selection) = llama_selection.as_ref().filter(|selection| selection.is_strict()) {
+        let expect_rocm = selection.backend == LlamaServerBackend::Rocm;
+        if let Err(attestation_error) = attest_strict_backend_endpoint(port, expect_rocm).await {
+            launch_guard.cleanup_now().await;
+            release_reservation = false;
+            return Err(format!(
+                "refusing to activate {worker_name}:{port}: strict backend attestation failed: {attestation_error}"
+            ));
+        }
     }
 
     // Record the parallel slot count so the data plane can compute
@@ -1305,6 +1391,19 @@ async fn load_model_with_authority(
         );
     }
     result
+}
+
+async fn verify_model_artifact_authority(catalog_id: &str, file_path: &str) -> Result<(), String> {
+    if catalog_id != crate::ace_mlx_import::CATALOG_ID {
+        return Ok(());
+    }
+    let path = PathBuf::from(file_path);
+    tokio::task::spawn_blocking(move || {
+        crate::ace_mlx_import::verify_installed_ace_gemma4_mlx(&path)
+            .map_err(|error| format!("exact Ace Gemma 4 artifact verification failed: {error:#}"))
+    })
+    .await
+    .map_err(|error| format!("exact Ace Gemma 4 verification worker failed: {error}"))?
 }
 
 /// Hard fallback cap for a live append log. The 30-second metrics scraper
@@ -1945,25 +2044,68 @@ fn find_sibling_mmproj(model_path: &str) -> Option<String> {
     best.map(|(_, ep)| ep.to_string_lossy().to_string())
 }
 
-fn llama_server_binary() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/".into());
-    // Known install locations across the fleet. The "no-prefix" form
-    // (`llama.cpp/build/bin/llama-server` at `$HOME`) is the layout used
-    // by sophie and other operators who cloned llama.cpp at the home
-    // root rather than under `projects/`. Discovered 2026-05-16 when
-    // `ff model load` on sophie failed with "No such file or directory".
-    for rel in [
-        "llama.cpp/build/bin/llama-server",
-        "projects/llama.cpp/build/bin/llama-server",
-        ".forgefleet/llama.cpp/build/bin/llama-server",
-    ] {
-        let candidate = PathBuf::from(&home).join(rel);
-        if candidate.is_file() {
-            return candidate.to_string_lossy().to_string();
-        }
+/// Resolve the MLX HTTP launcher without assuming pip installed its console
+/// script into the current process's PATH.
+///
+/// Prefer the ForgeFleet-owned production venv so a known-bad user/global MLX
+/// package cannot win through PATH. The historical standalone entrypoint is a
+/// compatibility fallback. An unversioned `python3 -m mlx_lm.server` fallback
+/// is disabled unless the operator explicitly opts in; Ace's global Python is
+/// known to resolve an older package that passes health but fails generation.
+fn mlx_server_launcher() -> Result<(String, Vec<String>), String> {
+    let production = std::env::var("HOME")
+        .ok()
+        .map(PathBuf::from)
+        .map(|home| home.join(".forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server"))
+        .filter(|candidate| is_regular_executable(candidate))
+        .map(|candidate| candidate.to_string_lossy().to_string());
+    let allow_unversioned_python =
+        std::env::var("FF_MLX_ALLOW_UNVERSIONED_PYTHON").as_deref() == Ok("1");
+    resolve_mlx_server_launcher(
+        production,
+        crate::cli_executor::which_on_path("mlx_lm.server"),
+        crate::cli_executor::which_on_path("python3"),
+        allow_unversioned_python,
+    )
+}
+
+fn is_regular_executable(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return false;
     }
-    // Fallback: rely on PATH.
-    "llama-server".to_string()
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn resolve_mlx_server_launcher(
+    production: Option<String>,
+    standalone: Option<String>,
+    python3: Option<String>,
+    allow_unversioned_python: bool,
+) -> Result<(String, Vec<String>), String> {
+    if let Some(program) = production {
+        return Ok((program, Vec::new()));
+    }
+    if let Some(program) = standalone {
+        return Ok((program, Vec::new()));
+    }
+    if allow_unversioned_python && let Some(program) = python3 {
+        return Ok((program, vec!["-m".to_string(), "mlx_lm.server".to_string()]));
+    }
+    Err(
+        "MLX_LAUNCHER_NOT_FOUND: install an executable at ~/.forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server or provide mlx_lm.server on PATH; unversioned python3 fallback requires FF_MLX_ALLOW_UNVERSIONED_PYTHON=1"
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2028,6 +2170,19 @@ async fn wait_for_startup_health(
         // connection refusal are deliberately transient until the deadline.
         if probe_health(runtime, port, std::time::Duration::from_secs(2), client).await {
             inspect_listener_identity(port, pid, start, model_path).await?;
+            if runtime == "mlx" {
+                probe_mlx_generation_readiness(
+                    port,
+                    model_path,
+                    std::time::Duration::from_secs(20),
+                    client,
+                )
+                .await?;
+                // The generation path can expose a runtime failure that the
+                // metadata endpoint cannot. Recheck the exact process and
+                // listener after the completed response before activation.
+                inspect_listener_identity(port, pid, start, model_path).await?;
+            }
             return classify_startup_observation(
                 started.elapsed(),
                 timeout,
@@ -2044,6 +2199,76 @@ async fn wait_for_startup_health(
         }
         tokio::time::sleep(STARTUP_PROBE_INTERVAL.min(deadline.saturating_duration_since(now)))
             .await;
+    }
+}
+
+/// MLX readiness requires one bounded, non-streaming generation. MLX-LM can
+/// return 200 from `/v1/models` while its generation worker is broken, so
+/// metadata health alone is insufficient evidence for activation.
+async fn probe_mlx_generation_readiness(
+    port: u16,
+    model_path: &str,
+    timeout: std::time::Duration,
+    client: &reqwest::Client,
+) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    let request = client.post(&url).json(&serde_json::json!({
+        "model": model_path,
+        "messages": [{"role": "user", "content": "Reply with one short word."}],
+        "max_tokens": 16,
+        "temperature": 0,
+        "stream": false,
+    }));
+    let (status, body) = tokio::time::timeout(timeout, async {
+        let response = request.send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "MLX_GENERATION_READINESS_TIMEOUT: no complete response within {}s",
+            timeout.as_secs()
+        )
+    })?
+    .map_err(|error| format!("MLX_GENERATION_READINESS_HTTP: {error}"))?;
+
+    if !status.is_success() {
+        return Err(format!(
+            "MLX_GENERATION_READINESS_STATUS: HTTP {}",
+            status.as_u16()
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .map_err(|error| format!("MLX_GENERATION_READINESS_BODY: {error}"))?;
+    classify_mlx_generation_response(&value).map_err(str::to_string)
+}
+
+fn classify_mlx_generation_response(value: &serde_json::Value) -> Result<(), &'static str> {
+    let Some(choices) = value.get("choices").and_then(serde_json::Value::as_array) else {
+        return Err("MLX_GENERATION_READINESS_BODY: missing choices array");
+    };
+    let complete = choices.iter().any(|choice| {
+        let Some(message) = choice.get("message").and_then(serde_json::Value::as_object) else {
+            return false;
+        };
+        let has_generated_text = ["content", "reasoning_content"].into_iter().any(|field| {
+            message
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.is_empty())
+        });
+        let has_finish_reason = choice
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|reason| !reason.is_empty());
+        has_generated_text && has_finish_reason
+    });
+    if complete {
+        Ok(())
+    } else {
+        Err("MLX_GENERATION_READINESS_BODY: no complete generated choice")
     }
 }
 
@@ -2121,6 +2346,51 @@ pub async fn probe_agent_ctx(runtime: &str, port: u16) -> Option<(i32, i32)> {
         }
         _ => None,
     }
+}
+
+/// A healthy HTTP listener cannot prove a strict backend identity. The running
+/// server's `/props` evidence must agree with either ROCm or the authorized
+/// CPU-only rollback before its deployment is activated.
+async fn attest_strict_backend_endpoint(port: u16, expect_rocm: bool) -> Result<(), String> {
+    let response = SHARED_HTTP
+        .get(format!("http://127.0.0.1:{port}/props"))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .map_err(|error| format!("GET /props: {error}"))?;
+    if !response.status().is_success() {
+        return Err(format!("GET /props returned {}", response.status()));
+    }
+    let props: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("decode /props: {error}"))?;
+    let reports_rocm = llama_props_report_rocm(&props);
+    if reports_rocm != expect_rocm {
+        let expected = if expect_rocm { "ROCm" } else { "CPU-only" };
+        return Err(format!(
+            "/props system_info does not report the required {expected} backend identity"
+        ));
+    }
+    Ok(())
+}
+
+fn llama_props_report_rocm(value: &serde_json::Value) -> bool {
+    fn visit(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(key, value)| {
+                (key == "system_info"
+                    && value.as_str().is_some_and(|info| {
+                        info.split('|')
+                            .any(|field| field.trim().starts_with("ROCm :"))
+                    }))
+                    || visit(value)
+            }),
+            serde_json::Value::Array(values) => values.iter().any(visit),
+            _ => false,
+        }
+    }
+    visit(value)
 }
 
 /// Extract `(per_slot_ctx, total_slots)` from a llama.cpp `/props` body.
@@ -2211,7 +2481,7 @@ pub(crate) fn process_start_marker(pid: u32) -> Option<String> {
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let after_comm = stat.rsplit_once(')')?.1.trim();
-        return after_comm.split_whitespace().nth(19).map(String::from);
+        after_comm.split_whitespace().nth(19).map(String::from)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -2716,7 +2986,7 @@ fn current_model_memlock_limit_bytes() -> u64 {
     if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut limit) } != 0 {
         return 0;
     }
-    bounded_model_memlock_bytes(limit.rlim_cur as u64, limit.rlim_max as u64)
+    bounded_model_memlock_bytes(limit.rlim_cur, limit.rlim_max)
 }
 
 #[cfg(not(unix))]
@@ -3357,6 +3627,104 @@ mod tests {
     }
 
     #[test]
+    fn mlx_launcher_prefers_the_production_venv_over_path() {
+        let resolved = resolve_mlx_server_launcher(
+            Some("/Users/ace/.forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server".to_string()),
+            Some("/opt/mlx/bin/mlx_lm.server".to_string()),
+            Some("/usr/bin/python3".to_string()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved.0,
+            "/Users/ace/.forgefleet/venvs/mlx-lm-production/bin/mlx_lm.server"
+        );
+        assert!(resolved.1.is_empty());
+    }
+
+    #[test]
+    fn mlx_launcher_prefers_the_existing_console_entrypoint() {
+        let resolved = resolve_mlx_server_launcher(
+            None,
+            Some("/opt/mlx/bin/mlx_lm.server".to_string()),
+            Some("/usr/bin/python3".to_string()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(resolved.0, "/opt/mlx/bin/mlx_lm.server");
+        assert!(resolved.1.is_empty());
+    }
+
+    #[test]
+    fn mlx_launcher_only_uses_unversioned_python_after_explicit_opt_in() {
+        let python = Some("/opt/homebrew/bin/python3".to_string());
+        let denied = resolve_mlx_server_launcher(None, None, python.clone(), false).unwrap_err();
+        assert!(denied.starts_with("MLX_LAUNCHER_NOT_FOUND:"));
+
+        let resolved = resolve_mlx_server_launcher(None, None, python, true).unwrap();
+
+        assert_eq!(resolved.0, "/opt/homebrew/bin/python3");
+        assert_eq!(resolved.1, ["-m", "mlx_lm.server"]);
+    }
+
+    #[test]
+    fn mlx_launcher_fails_before_spawn_when_no_launcher_exists() {
+        let error = resolve_mlx_server_launcher(None, None, None, false).unwrap_err();
+
+        assert!(error.starts_with("MLX_LAUNCHER_NOT_FOUND:"));
+    }
+
+    #[test]
+    fn mlx_generation_readiness_requires_a_complete_generated_choice() {
+        let content = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "Ready"},
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(classify_mlx_generation_response(&content), Ok(()));
+
+        let reasoning = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "", "reasoning_content": "Thinking"},
+                "finish_reason": "length"
+            }]
+        });
+        assert_eq!(classify_mlx_generation_response(&reasoning), Ok(()));
+
+        for invalid in [
+            serde_json::json!({"choices": []}),
+            serde_json::json!({"choices": [{"message": {"content": "Ready"}}]}),
+            serde_json::json!({"choices": [{"message": {"content": ""}, "finish_reason": "stop"}]}),
+            serde_json::json!({"error": {"message": "generation failed"}}),
+        ] {
+            assert!(classify_mlx_generation_response(&invalid).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mlx_production_launcher_must_be_a_regular_executable() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let launcher = temp.path().join("mlx_lm.server");
+        std::fs::write(&launcher, b"#!/bin/sh\n").unwrap();
+        assert!(!is_regular_executable(&launcher));
+
+        let mut permissions = std::fs::metadata(&launcher).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&launcher, permissions).unwrap();
+        assert!(is_regular_executable(&launcher));
+
+        let link = temp.path().join("linked-mlx_lm.server");
+        symlink(&launcher, &link).unwrap();
+        assert!(!is_regular_executable(&link));
+    }
+
+    #[test]
     fn parses_llama_props_per_slot_ctx_and_slots() {
         // Shape observed live on veronica's qwen36 llama.cpp /props.
         let v = serde_json::json!({
@@ -3365,6 +3733,42 @@ mod tests {
             "model_path": "/x"
         });
         assert_eq!(parse_llama_props_ctx(&v), Some((4096, 4)));
+    }
+
+    #[test]
+    fn strict_rocm_props_attestation_requires_system_info_backend_field() {
+        let rocm = serde_json::json!({
+            "system_info": "threads = 16 | ROCm : NO_VMM = 1 | CPU : AVX2 = 1 |",
+            "default_generation_settings": {"n_ctx": 32768}
+        });
+        assert!(llama_props_report_rocm(&rocm));
+        assert!(!llama_props_report_rocm(&serde_json::json!({
+            "system_info": "threads = 16 | CPU : AVX2 = 1 |",
+            "note": "ROCm : text outside system_info must not count"
+        })));
+        assert!(!llama_props_report_rocm(&serde_json::json!({
+            "system_info": "threads = 16 | ROCm support unavailable |"
+        })));
+    }
+
+    #[tokio::test]
+    async fn ace_gemma_load_requires_the_exact_installed_manifest() {
+        assert!(
+            verify_model_artifact_authority("unrelated-catalog", "/definitely/missing")
+                .await
+                .is_ok(),
+            "unrelated catalog entries retain their existing runtime path"
+        );
+        let error = verify_model_artifact_authority(
+            crate::ace_mlx_import::CATALOG_ID,
+            "/definitely/not-the-fixed-ace-model-path",
+        )
+        .await
+        .expect_err("Ace Gemma must fail closed before launch when its exact artifact is absent");
+        assert!(
+            error.contains("exact Ace Gemma 4 artifact verification failed"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

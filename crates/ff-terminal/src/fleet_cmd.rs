@@ -8,8 +8,8 @@ use ff_deploy::resolution::{
 };
 
 use crate::{
-    CYAN, FleetCommand, FleetDbCommand, GREEN, LeaderAction, RED, RESET, TaskCoverageCommand,
-    YELLOW, pulse_reader, shell_escape_single, whoami_tag,
+    CYAN, FleetCommand, FleetDbBackupPolicyCommand, FleetDbCommand, GREEN, LeaderAction, RED,
+    RESET, TaskCoverageCommand, YELLOW, pulse_reader, shell_escape_single, whoami_tag,
 };
 
 /// `ff fleet panic-stop` — emergency halt of every daemon.
@@ -247,8 +247,9 @@ pub async fn handle_fleet_drain(pool: &sqlx::PgPool, computer: &str, yes: bool) 
     Ok(())
 }
 
-/// `ff fleet undrain <computer>` — explicitly recover an ownerless deploy
-/// drain. Operator-owned reservations and Vinny are deliberately immutable.
+/// `ff fleet undrain <computer>` — explicitly recover an ownerless drain.
+/// Vinny remains immutable except when reversing an explicit operator drain;
+/// deploy drains and operator-owned reservations are never crossed.
 pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool) -> Result<()> {
     if !yes {
         anyhow::bail!("pass --yes to recover the ownerless deploy drain on '{computer}'");
@@ -261,17 +262,19 @@ pub async fn handle_fleet_undrain(pool: &sqlx::PgPool, computer: &str, yes: bool
                 reserved_reason = NULL,
                 reservation_expires_at = NULL
           WHERE LOWER(name) = LOWER($1)
-            AND LOWER(name) <> 'vinny'
             AND reservation_state = 'drained'
             AND reservation_owner IS NULL
+            AND (LOWER(name) <> 'vinny'
+                 OR reserved_reason = $2)
         RETURNING id",
     )
     .bind(computer)
+    .bind(ff_agent::ha::node_drain::OPERATOR_DRAIN_REASON)
     .fetch_optional(&mut *tx)
     .await?;
     let Some(computer_id) = computer_id else {
         anyhow::bail!(
-            "refusing to undrain '{computer}': node is Vinny, not drained, or has an operator owner"
+            "refusing to undrain '{computer}': node is not an ownerless drain, or Vinny was not explicitly operator-drained"
         );
     };
     let enabled = sqlx::query(
@@ -590,6 +593,12 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Replica { command } => {
             crate::fleet_db_replica::handle(pool, command).await?;
         }
+        FleetDbCommand::RedisReplica { command } => {
+            crate::fleet_db_redis_replica::handle(pool, command).await?;
+        }
+        FleetDbCommand::FalkordbReplica { command } => {
+            crate::fleet_db_falkordb_replica::handle(pool, command).await?;
+        }
         FleetDbCommand::Failover { to, force, yes } => {
             handle_fleet_db_failover(pool, &to, force, yes).await?;
         }
@@ -620,33 +629,298 @@ pub async fn handle_fleet_db(pool: &sqlx::PgPool, cmd: FleetDbCommand) -> Result
         FleetDbCommand::Backup { kind, now } => {
             handle_fleet_db_backup_now(pool, &kind, now).await?;
         }
-        FleetDbCommand::Drill { on } => {
-            handle_fleet_db_drill(pool, on.as_deref()).await?;
+        FleetDbCommand::BackupPolicy { command } => {
+            handle_fleet_db_backup_policy(pool, command).await?;
+        }
+        FleetDbCommand::Drill {
+            backup_id,
+            run_id,
+            on,
+        } => {
+            handle_fleet_db_drill(pool, &backup_id, run_id.as_deref(), on.as_deref()).await?;
         }
     }
     Ok(())
 }
 
-/// `ff fleet db drill` — run the backup restore-drill on demand. Shares the
-/// exact path (`RestoreDrillTick::run_record_and_alert`) the daily leader tick
-/// uses: decrypt → extract → validate the newest Postgres backup, record to
-/// `backup_drills`, alert on failure. Exits non-zero on a failed drill.
-pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Result<()> {
+type BackupPolicyRow = (
+    String,
+    Option<String>,
+    Vec<String>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+fn validate_backup_policy_destinations(destinations: &[String]) -> Result<Vec<String>> {
+    if destinations.len() != 2 {
+        anyhow::bail!(
+            "backup policy requires exactly two --dest values (got {})",
+            destinations.len()
+        );
+    }
+
+    let normalized: Vec<String> = destinations
+        .iter()
+        .map(|destination| destination.trim().to_string())
+        .collect();
+    if normalized.iter().any(String::is_empty) {
+        anyhow::bail!("backup policy destinations cannot be empty");
+    }
+    if normalized[0].eq_ignore_ascii_case(&normalized[1]) {
+        anyhow::bail!("backup policy destinations must be distinct (case-insensitive)");
+    }
+    Ok(normalized)
+}
+
+fn ensure_backup_policy_excludes_source(
+    destinations: &[String],
+    source: Option<&str>,
+) -> Result<()> {
+    let Some(source) = source.map(str::trim).filter(|source| !source.is_empty()) else {
+        return Ok(());
+    };
+    if destinations
+        .iter()
+        .any(|destination| destination.eq_ignore_ascii_case(source))
+    {
+        anyhow::bail!("backup source '{source}' cannot also be a destination");
+    }
+    Ok(())
+}
+
+fn print_backup_policy_row(label: &str, row: &BackupPolicyRow, resolved_source: Option<&str>) {
+    let source = row
+        .1
+        .as_deref()
+        .filter(|source| !source.trim().is_empty())
+        .or(resolved_source)
+        .unwrap_or("unresolved");
+    let source_mode = if row
+        .1
+        .as_deref()
+        .is_some_and(|source| !source.trim().is_empty())
+    {
+        "pinned"
+    } else {
+        "authority"
+    };
+    let destinations = if row.2.is_empty() {
+        "auto".to_string()
+    } else {
+        row.2.join(",")
+    };
+    println!(
+        "{label:<7} kind={kind:<12} source={source} ({source_mode}) destinations={destinations} updated={updated}",
+        kind = row.0,
+        updated = row.3.to_rfc3339(),
+    );
+}
+
+async fn resolve_backup_policy_source_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    configured_source: Option<&str>,
+) -> Result<String> {
+    if let Some(source) = configured_source
+        .map(str::trim)
+        .filter(|source| !source.is_empty())
+    {
+        return sqlx::query_scalar(
+            "SELECT name FROM computers WHERE LOWER(name) = LOWER($1) FOR SHARE",
+        )
+        .bind(source)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| anyhow::anyhow!("resolve configured backup source '{source}': {error}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("configured backup source '{source}' is not an enrolled computer")
+        });
+    }
+
+    // Serialize this authority read with the failover CAS so a destination
+    // policy cannot be committed against a source that changes mid-command.
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('forgefleet:postgres-primary-authority'))")
+        .execute(&mut **tx)
+        .await
+        .map_err(|error| anyhow::anyhow!("lock current backup source authority: {error}"))?;
+
+    let source: Option<String> = sqlx::query_scalar(
+        "SELECT COALESCE(
+             (SELECT c.name FROM dsn_of_record d JOIN computers c
+                ON lower(c.name)=lower(NULLIF(d.primary_member, ''))
+               WHERE d.singleton_key='current'),
+             (SELECT c.name FROM computers c
+               WHERE c.primary_ip=host(inet_server_addr()) LIMIT 1),
+             (SELECT c.name FROM database_replicas d JOIN computers c ON c.id=d.computer_id
+               WHERE d.database_kind='postgres' AND d.role='primary'
+               ORDER BY d.promoted_at DESC NULLS LAST LIMIT 1))",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("resolve current backup source authority: {error}"))?;
+    source.ok_or_else(|| {
+        anyhow::anyhow!(
+            "current backup source authority is unresolved; refusing to change destinations"
+        )
+    })
+}
+
+async fn lock_backup_policy_row(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    kind: &str,
+) -> Result<BackupPolicyRow> {
+    let kind = kind.trim();
+    if kind.is_empty() {
+        anyhow::bail!("--kind cannot be empty");
+    }
+    sqlx::query_as::<_, BackupPolicyRow>(
+        "SELECT kind, source_host, dest_hosts, updated_at
+           FROM fleet_backup_config
+          WHERE LOWER(kind) = LOWER($1)
+          FOR UPDATE",
+    )
+    .bind(kind)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(|error| anyhow::anyhow!("read backup policy for kind '{kind}': {error}"))?
+    .ok_or_else(|| anyhow::anyhow!("no backup policy kind '{kind}' exists in fleet_backup_config"))
+}
+
+async fn canonical_backup_destinations(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    destinations: &[String],
+) -> Result<Vec<String>> {
+    let mut canonical = Vec::with_capacity(destinations.len());
+    for destination in destinations {
+        let enrolled: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM computers WHERE LOWER(name) = LOWER($1) FOR SHARE",
+        )
+        .bind(destination)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| anyhow::anyhow!("look up backup destination '{destination}': {error}"))?;
+        canonical.push(enrolled.ok_or_else(|| {
+            anyhow::anyhow!("backup destination '{destination}' is not an enrolled computer")
+        })?);
+    }
+    Ok(canonical)
+}
+
+/// Typed control plane for `fleet_backup_config.dest_hosts`.
+async fn handle_fleet_db_backup_policy(
+    pool: &sqlx::PgPool,
+    command: FleetDbBackupPolicyCommand,
+) -> Result<()> {
+    match command {
+        FleetDbBackupPolicyCommand::Show => {
+            let rows = sqlx::query_as::<_, BackupPolicyRow>(
+                "SELECT kind, source_host, dest_hosts, updated_at
+                   FROM fleet_backup_config
+                  ORDER BY kind",
+            )
+            .fetch_all(pool)
+            .await
+            .map_err(|error| anyhow::anyhow!("read backup policies: {error}"))?;
+            for row in rows {
+                let source = ff_agent::ha::backup::resolve_backup_source_host(pool, &row.0)
+                    .await
+                    .map_err(|error| anyhow::anyhow!("resolve {} backup source: {error}", row.0))?;
+                print_backup_policy_row("policy", &row, source.as_deref());
+            }
+        }
+        FleetDbBackupPolicyCommand::Set { kind, destinations } => {
+            let requested = validate_backup_policy_destinations(&destinations)?;
+            let mut tx = pool.begin().await?;
+            let before = lock_backup_policy_row(&mut tx, &kind).await?;
+            let canonical = canonical_backup_destinations(&mut tx, &requested).await?;
+            let source = resolve_backup_policy_source_in_tx(&mut tx, before.1.as_deref()).await?;
+            ensure_backup_policy_excludes_source(&canonical, Some(&source))?;
+
+            let after = sqlx::query_as::<_, BackupPolicyRow>(
+                "UPDATE fleet_backup_config
+                    SET dest_hosts = $2, updated_at = NOW()
+                  WHERE kind = $1
+              RETURNING kind, source_host, dest_hosts, updated_at",
+            )
+            .bind(&before.0)
+            .bind(&canonical)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|error| anyhow::anyhow!("update {} backup policy: {error}", before.0))?;
+            tx.commit().await?;
+
+            print_backup_policy_row("before", &before, Some(&source));
+            print_backup_policy_row("after", &after, Some(&source));
+            println!("{GREEN}✓{RESET} backup destinations updated atomically");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod backup_policy_tests {
+    use super::*;
+
+    #[test]
+    fn destinations_require_exactly_two_distinct_nonempty_values() {
+        for invalid in [
+            vec![],
+            vec!["lily".to_string()],
+            vec!["lily".to_string(), "rihanna".to_string(), "sia".to_string()],
+            vec!["lily".to_string(), "LILY".to_string()],
+            vec!["lily".to_string(), "   ".to_string()],
+        ] {
+            assert!(validate_backup_policy_destinations(&invalid).is_err());
+        }
+        assert_eq!(
+            validate_backup_policy_destinations(&[" Lily ".to_string(), "Rihanna".to_string(),])
+                .unwrap(),
+            vec!["Lily", "Rihanna"]
+        );
+    }
+
+    #[test]
+    fn configured_or_resolved_source_is_rejected_case_insensitively() {
+        let destinations = vec!["Lily".to_string(), "Rihanna".to_string()];
+        assert!(ensure_backup_policy_excludes_source(&destinations, Some("lily")).is_err());
+        assert!(ensure_backup_policy_excludes_source(&destinations, Some("RIHANNA")).is_err());
+        assert!(ensure_backup_policy_excludes_source(&destinations, Some("Priya")).is_ok());
+        assert!(ensure_backup_policy_excludes_source(&destinations, None).is_ok());
+    }
+}
+
+/// `ff fleet db drill --backup-id <uuid>` — run one identity-fenced backup
+/// restore-drill. No caller path is allowed to substitute newest/local data.
+pub async fn handle_fleet_db_drill(
+    pool: &sqlx::PgPool,
+    backup_id: &str,
+    run_id: Option<&str>,
+    on: Option<&str>,
+) -> Result<()> {
+    let backup_id = uuid::Uuid::parse_str(backup_id)
+        .map_err(|error| anyhow::anyhow!("invalid --backup-id UUID: {error}"))?;
+    let run_id = match run_id {
+        Some(run_id) => uuid::Uuid::parse_str(run_id)
+            .map_err(|error| anyhow::anyhow!("invalid --run-id UUID: {error}"))?,
+        None => uuid::Uuid::new_v4(),
+    };
     let my_name = ff_agent::fleet_info::resolve_this_worker_name().await;
     // Cross-node: dispatch the drill to a remote computer via the deferred-task
     // queue and report back its result. Proves DR-readiness on the node that
     // would actually take over (the backup fanned out there AND restores).
     if let Some(node) = on {
         if !node.eq_ignore_ascii_case(&my_name) {
-            return enqueue_remote_drill(pool, node, &my_name).await;
+            return enqueue_remote_drill(pool, node, &my_name, backup_id, run_id).await;
         }
     }
-    println!("{CYAN}▶ ff fleet db drill{RESET}  (node={my_name})");
+    println!(
+        "{CYAN}▶ ff fleet db drill{RESET}  (node={my_name}, backup={backup_id}, run={run_id})"
+    );
     let tick = ff_agent::ha::restore_drill::RestoreDrillTick::new(pool.clone(), my_name);
-    let o = tick.run_record_and_alert().await;
+    let o = tick.run_record_and_alert_exact(backup_id, run_id).await;
     if o.success {
         println!(
-            "{GREEN}✓ restore drill PASSED{RESET}  backup={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+            "{GREEN}✓ restore drill PASSED{RESET}  run={} backup_id={} file={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+            o.run_id,
+            o.backup_id.unwrap_or(backup_id),
             o.backup_file,
             o.file_count.unwrap_or(0),
             o.extracted_bytes.unwrap_or(0),
@@ -657,12 +931,192 @@ pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Res
         println!("    {}", o.detail);
     } else {
         eprintln!(
-            "{RED}✗ restore drill FAILED{RESET}  backup={} stage={}\n    {}",
-            o.backup_file, o.stage, o.detail
+            "{RED}✗ restore drill FAILED{RESET}  run={} backup_id={} file={} stage={}\n    {}",
+            o.run_id, backup_id, o.backup_file, o.stage, o.detail
         );
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn remote_drill_payload(
+    node: &str,
+    backup_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+    database_kind: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "command": format!(
+            "\"$HOME/.local/bin/ff\" fleet db drill --backup-id {backup_id} --run-id {run_id}"
+        ),
+        "summary": format!("exact backup restore-drill on {node}"),
+        "operation": "exact_backup_restore_drill",
+        "backup_id": backup_id,
+        "run_id": run_id,
+        "expected_computer": node,
+        "evidence_tier": "restore",
+        "metadata": {
+            "database_kind": database_kind,
+            "identity_fence": "backup_id+run_id+node",
+        },
+    })
+}
+
+/// Require host-local checksum+decrypt evidence for the exact catalog
+/// checksum before dispatching a remote restore. Legacy `rsync completed`
+/// arrays and evidence for a different host/checksum fail closed.
+pub(crate) fn validate_remote_backup_receipt(
+    distribution_status: &serde_json::Value,
+    expected_backup_id: uuid::Uuid,
+    expected_computer_id: uuid::Uuid,
+    canonical_node: &str,
+    expected_checksum: &str,
+    expected_size: i64,
+    expected_database_kind: &str,
+    expected_file_name: &str,
+    backup_created_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> std::result::Result<(), String> {
+    if expected_checksum.len() != 64
+        || !expected_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("exact catalog checksum is not a SHA-256 digest".into());
+    }
+    if expected_size <= 0 {
+        return Err("exact catalog size must be positive".into());
+    }
+    let hosts = distribution_status
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| "distribution_status.hosts receipt map is missing".to_string())?;
+    let host_key = expected_computer_id.to_string();
+    let receipt = hosts.get(&host_key).ok_or_else(|| {
+        format!("no verified distribution receipt for exact host {canonical_node}")
+    })?;
+    let receipt = receipt
+        .as_object()
+        .ok_or_else(|| format!("distribution receipt for {canonical_node} is not an object"))?;
+    let string = |field: &str| {
+        receipt
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("receipt field {field} is missing or not a string"))
+    };
+
+    if receipt.get("version").and_then(serde_json::Value::as_i64)
+        != Some(ff_agent::ha::backup::BACKUP_RECEIPT_VERSION)
+    {
+        return Err("receipt version is missing or unsupported".into());
+    }
+    let receipt_backup_id = uuid::Uuid::parse_str(string("backup_id")?)
+        .map_err(|_| "receipt backup_id is not a UUID".to_string())?;
+    if receipt_backup_id != expected_backup_id {
+        return Err("receipt is bound to another backup id".into());
+    }
+    let receipt_computer_id = uuid::Uuid::parse_str(string("computer_id")?)
+        .map_err(|_| "receipt computer_id is not a UUID".to_string())?;
+    if receipt_computer_id != expected_computer_id {
+        return Err("receipt is bound to another computer id".into());
+    }
+    if !string("host")?.eq_ignore_ascii_case(canonical_node) {
+        return Err("receipt host does not match the canonical enrolled name".into());
+    }
+    if string("database_kind")? != expected_database_kind {
+        return Err("receipt is bound to another database kind".into());
+    }
+    if string("file_name")? != expected_file_name {
+        return Err("receipt is bound to another backup file".into());
+    }
+
+    let tier = string("evidence_tier")?;
+    if !matches!(tier, "checksum_decrypt" | "restore") {
+        return Err(format!("receipt evidence_tier {tier:?} is insufficient"));
+    }
+    if string("checksum")? != "ok" {
+        return Err("receipt checksum status is not ok".into());
+    }
+    if string("decrypt")? != "ok" {
+        return Err("receipt decrypt status is not ok".into());
+    }
+    if receipt
+        .get("age_format")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err("receipt age_format is not true".into());
+    }
+    let observed_checksum = string("observed_checksum")?;
+    if !observed_checksum.eq_ignore_ascii_case(expected_checksum) {
+        return Err(format!(
+            "receipt checksum {observed_checksum} does not match exact catalog checksum {expected_checksum}"
+        ));
+    }
+    let receipt_expected = string("expected_checksum")?;
+    if !receipt_expected.eq_ignore_ascii_case(expected_checksum) {
+        return Err("receipt expected_checksum is bound to another catalog version".into());
+    }
+    if receipt
+        .get("size_bytes")
+        .and_then(serde_json::Value::as_i64)
+        != Some(expected_size)
+    {
+        return Err("receipt size is bound to another catalog artifact".into());
+    }
+    uuid::Uuid::parse_str(string("run_id")?)
+        .map_err(|_| "receipt run_id is not a UUID".to_string())?;
+
+    let parse_time = |field: &str| {
+        chrono::DateTime::parse_from_rfc3339(string(field)?)
+            .map(|value| value.with_timezone(&chrono::Utc))
+            .map_err(|_| format!("receipt {field} is not RFC3339"))
+    };
+    let observed_at = parse_time("observed_at")?;
+    let last_ok = parse_time("last_ok")?;
+    let verified_at = parse_time("verified_at")?;
+    if observed_at < backup_created_at
+        || last_ok < backup_created_at
+        || verified_at < backup_created_at
+    {
+        return Err("receipt predates the exact backup catalog row".into());
+    }
+    if last_ok < observed_at || verified_at < last_ok {
+        return Err(
+            "receipt timestamps are not ordered observed_at <= last_ok <= verified_at".into(),
+        );
+    }
+    let future_skew = chrono::Duration::minutes(5);
+    if observed_at > now + future_skew
+        || last_ok > now + future_skew
+        || verified_at > now + future_skew
+    {
+        return Err("receipt timestamp is implausibly in the future".into());
+    }
+    if now.signed_duration_since(verified_at).num_seconds()
+        > ff_agent::ha::backup::BACKUP_RECEIPT_MAX_AGE_SECS
+    {
+        return Err("receipt verification is stale and must be reconciled".into());
+    }
+    Ok(())
+}
+
+fn require_unique_remote_drill_target(
+    requested_node: &str,
+    matches: Vec<(uuid::Uuid, String)>,
+) -> std::result::Result<(uuid::Uuid, String), String> {
+    match matches.as_slice() {
+        [(id, name)] if !name.trim().is_empty() => Ok((*id, name.clone())),
+        [] => Err(format!(
+            "remote drill target {requested_node:?} is not an enrolled computer"
+        )),
+        [_] => Err(format!(
+            "remote drill target {requested_node:?} has an empty canonical name"
+        )),
+        _ => Err(format!(
+            "remote drill target {requested_node:?} is ambiguous under case-insensitive matching"
+        )),
+    }
 }
 
 /// Enqueue a restore-drill on a remote fleet computer via the deferred-task
@@ -670,40 +1124,83 @@ pub async fn handle_fleet_db_drill(pool: &sqlx::PgPool, on: Option<&str>) -> Res
 /// `ff fleet db drill --on <node>`: proves the backup fanned out to `<node>`
 /// AND is restorable there — the leader-loss recovery story, on the node that
 /// would actually take over.
-async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Result<()> {
+async fn enqueue_remote_drill(
+    pool: &sqlx::PgPool,
+    node: &str,
+    me: &str,
+    backup_id: uuid::Uuid,
+    run_id: uuid::Uuid,
+) -> Result<()> {
     println!(
-        "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (dispatched from {me} via the defer queue)"
+        "{CYAN}▶ ff fleet db drill --on {node}{RESET}  (from={me}, backup={backup_id}, run={run_id})"
     );
-    let baseline = chrono::Utc::now();
-    // The remote defer-worker runs this shell command; `ff` lives at the
-    // canonical install path. The drill records into the shared `backup_drills`
-    // table with `drill_node=<node>`, which is how we recover its result.
-    let payload = serde_json::json!({
-        "command": "\"$HOME/.local/bin/ff\" fleet db drill",
-        "summary": format!("backup restore-drill on {node}"),
-    });
-    let trigger_spec = serde_json::json!({ "node": node });
+    let target_matches: Vec<(uuid::Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM computers WHERE LOWER(name)=LOWER($1) ORDER BY id")
+            .bind(node)
+            .fetch_all(pool)
+            .await?;
+    let (target_computer_id, canonical_node) =
+        require_unique_remote_drill_target(node, target_matches).map_err(anyhow::Error::msg)?;
+    let (checksum, size_bytes, created_at, distribution_status, database_kind, file_name): (
+        String,
+        i64,
+        chrono::DateTime<chrono::Utc>,
+        serde_json::Value,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT checksum_sha256, size_bytes, created_at, distribution_status, database_kind,
+                file_name
+           FROM backups
+          WHERE id=$1 AND database_kind IN ('postgres', 'falkordb')",
+    )
+    .bind(backup_id)
+    .fetch_optional(pool)
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "no supported postgres/falkordb backup row with id {backup_id}; remote drill refuses fallback"
+        )
+    })?;
+    validate_remote_backup_receipt(
+        &distribution_status,
+        backup_id,
+        target_computer_id,
+        &canonical_node,
+        &checksum,
+        size_bytes,
+        &database_kind,
+        &file_name,
+        created_at,
+        chrono::Utc::now(),
+    )
+    .map_err(|error| anyhow::anyhow!("remote backup receipt gate rejected {node}: {error}"))?;
+
+    ff_agent::ha::restore_drill::reserve_drill_run(pool, run_id, backup_id, &canonical_node)
+        .await?;
+    let payload = remote_drill_payload(&canonical_node, backup_id, run_id, &database_kind);
+    let trigger_spec = serde_json::json!({ "node": &canonical_node });
     let id = ff_db::pg_enqueue_deferred(
         pool,
-        &format!("backup restore-drill → {node}"),
+        &format!("backup restore-drill → {canonical_node}"),
         "shell",
         &payload,
         "node_online",
         &trigger_spec,
-        Some(node),
+        Some(&canonical_node),
         &serde_json::json!([]),
-        Some("ff fleet db drill --on"),
+        Some("ff fleet db drill --backup-id/--run-id --on"),
         Some(3),
     )
     .await?;
     println!(
-        "{GREEN}✓{RESET} enqueued drill task {id} (preferred_node={node}, trigger=node_online)"
+        "{GREEN}✓{RESET} enqueued drill task {id} (preferred_node={canonical_node}, trigger=node_online)"
     );
     println!(
-        "  waiting up to 200s for {node} to run it (the defer-worker claims pending tasks ~every 15s)…"
+        "  waiting up to 30m for exact run {run_id} (the worker claims pending tasks ~every 15s)…"
     );
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30 * 60);
     loop {
         #[allow(clippy::type_complexity)]
         let row: Option<(
@@ -720,11 +1217,13 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
             "SELECT success, stage, detail, file_count, extracted_bytes, pg_version, \
                     verifybackup, backup_file, duration_ms \
                FROM backup_drills \
-              WHERE drill_node = $1 AND started_at > $2 \
-              ORDER BY started_at DESC LIMIT 1",
+              WHERE id = $1 AND backup_id = $2
+                AND LOWER(drill_node) = LOWER($3)
+                AND finished_at IS NOT NULL",
         )
-        .bind(node)
-        .bind(baseline)
+        .bind(run_id)
+        .bind(backup_id)
+        .bind(&canonical_node)
         .fetch_optional(pool)
         .await?;
 
@@ -743,7 +1242,7 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
             let detail = detail.unwrap_or_default();
             if success {
                 println!(
-                    "{GREEN}✓ remote restore drill PASSED on {node}{RESET}  backup={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
+                    "{GREEN}✓ remote restore drill PASSED on {node}{RESET}  run={run_id} backup_id={backup_id} file={} files={} bytes={} pg_version={} verifybackup={:?} ({}ms)",
                     backup_file,
                     file_count.unwrap_or(0),
                     extracted_bytes.unwrap_or(0),
@@ -755,20 +1254,308 @@ async fn enqueue_remote_drill(pool: &sqlx::PgPool, node: &str, me: &str) -> Resu
                 return Ok(());
             }
             eprintln!(
-                "{RED}✗ remote restore drill FAILED on {node}{RESET}  backup={backup_file} stage={stage}\n    {detail}"
+                "{RED}✗ remote restore drill FAILED on {node}{RESET}  run={run_id} backup_id={backup_id} file={backup_file} stage={stage}\n    {detail}"
             );
             std::process::exit(1);
         }
 
         if std::time::Instant::now() >= deadline {
             eprintln!(
-                "{YELLOW}⏱ no result from {node} within 200s.{RESET} The task may still be \
+                "{YELLOW}⏱ no exact result from {node} within 30m (run={run_id}, backup={backup_id}).{RESET} The task may still be \
                  queued/running — check `ff defer get {id}`. A worker that is offline or has \
                  no backup copy won't report."
             );
             std::process::exit(2);
         }
         tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+    }
+}
+
+#[cfg(test)]
+mod exact_restore_drill_tests {
+    use super::*;
+
+    fn receipt(
+        backup_id: uuid::Uuid,
+        computer_id: uuid::Uuid,
+        node: &str,
+        checksum: &str,
+        observed_at: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "hosts": {
+                computer_id.to_string(): {
+                    "version": ff_agent::ha::backup::BACKUP_RECEIPT_VERSION,
+                    "backup_id": backup_id,
+                    "computer_id": computer_id,
+                    "host": node,
+                    "observed_at": observed_at,
+                    "last_ok": observed_at,
+                    "verified_at": observed_at,
+                    "run_id": uuid::Uuid::new_v4(),
+                    "evidence_tier": "checksum_decrypt",
+                    "checksum": "ok",
+                    "expected_checksum": checksum,
+                    "observed_checksum": checksum,
+                    "size_bytes": 8192,
+                    "database_kind": "postgres",
+                    "file_name": "pg-exact.tar.gz.age",
+                    "decrypt": "ok",
+                    "age_format": true,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn verified_remote_receipt_is_bound_to_host_checksum_and_backup_time() {
+        let now = chrono::Utc::now();
+        let created = now - chrono::Duration::hours(1);
+        let backup_id = uuid::Uuid::new_v4();
+        let computer_id = uuid::Uuid::new_v4();
+        let checksum = "a".repeat(64);
+        let status = receipt(backup_id, computer_id, "priya", &checksum, now);
+        validate_remote_backup_receipt(
+            &status,
+            backup_id,
+            computer_id,
+            "PRIYA",
+            &checksum.to_ascii_uppercase(),
+            8192,
+            "postgres",
+            "pg-exact.tar.gz.age",
+            created,
+            now,
+        )
+        .unwrap();
+
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                uuid::Uuid::new_v4(),
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "falkordb",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-renamed.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "vinny",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &status,
+                backup_id,
+                computer_id,
+                "priya",
+                "different",
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &receipt(
+                    backup_id,
+                    computer_id,
+                    "priya",
+                    &checksum,
+                    created - chrono::Duration::seconds(1),
+                ),
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_drill_target_resolution_rejects_zero_or_ambiguous_case_matches() {
+        let computer_id = uuid::Uuid::new_v4();
+        assert_eq!(
+            require_unique_remote_drill_target("priya", vec![(computer_id, "Priya".into())],)
+                .unwrap(),
+            (computer_id, "Priya".into())
+        );
+        assert!(require_unique_remote_drill_target("missing", Vec::new()).is_err());
+        let error = require_unique_remote_drill_target(
+            "priya",
+            vec![
+                (computer_id, "Priya".into()),
+                (uuid::Uuid::new_v4(), "PRIYA".into()),
+            ],
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"));
+    }
+
+    #[test]
+    fn legacy_or_incomplete_distribution_evidence_fails_closed() {
+        let now = chrono::Utc::now();
+        let created = now - chrono::Duration::hours(1);
+        let backup_id = uuid::Uuid::new_v4();
+        let computer_id = uuid::Uuid::new_v4();
+        let checksum = "b".repeat(64);
+        for status in [
+            serde_json::json!(["priya"]),
+            serde_json::json!({"hosts": {"priya": {"checksum": "ok"}}}),
+            serde_json::json!({"hosts": {"priya": {
+                "observed_at": now,
+                "last_ok": now,
+                "run_id": uuid::Uuid::new_v4(),
+                "evidence_tier": "checksum_decrypt",
+                "checksum": "ok",
+                "observed_checksum": "ab12",
+                "decrypt": "ok",
+                "age_format": false
+            }}}),
+        ] {
+            assert!(
+                validate_remote_backup_receipt(
+                    &status,
+                    backup_id,
+                    computer_id,
+                    "priya",
+                    &checksum,
+                    8192,
+                    "postgres",
+                    "pg-exact.tar.gz.age",
+                    created,
+                    now,
+                )
+                .is_err()
+            );
+        }
+
+        let stale = receipt(
+            backup_id,
+            computer_id,
+            "priya",
+            &checksum,
+            now - chrono::Duration::seconds(ff_agent::ha::backup::BACKUP_RECEIPT_MAX_AGE_SECS + 1),
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &stale,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created - chrono::Duration::days(2),
+                now,
+            )
+            .is_err()
+        );
+
+        let mut forged = receipt(backup_id, computer_id, "priya", &checksum, now);
+        forged["hosts"][computer_id.to_string()]["backup_id"] =
+            serde_json::json!(uuid::Uuid::new_v4());
+        assert!(
+            validate_remote_backup_receipt(
+                &forged,
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                8192,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_remote_backup_receipt(
+                &receipt(backup_id, computer_id, "priya", &checksum, now),
+                backup_id,
+                computer_id,
+                "priya",
+                &checksum,
+                4096,
+                "postgres",
+                "pg-exact.tar.gz.age",
+                created,
+                now,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn remote_payload_carries_exact_backup_and_run_ids() {
+        let backup_id = uuid::Uuid::new_v4();
+        let run_id = uuid::Uuid::new_v4();
+        let payload = remote_drill_payload("priya", backup_id, run_id, "falkordb");
+        assert_eq!(payload["backup_id"], serde_json::json!(backup_id));
+        assert_eq!(payload["run_id"], serde_json::json!(run_id));
+        assert_eq!(payload["expected_computer"], "priya");
+        assert_eq!(payload["metadata"]["database_kind"], "falkordb");
+        let command = payload["command"].as_str().unwrap();
+        assert!(command.contains(&format!("--backup-id {backup_id}")));
+        assert!(command.contains(&format!("--run-id {run_id}")));
+        assert!(!command.contains(" --on "));
     }
 }
 
@@ -3102,7 +3889,14 @@ mod computer_reachability_tests {
         assert!(computer_reachable("127.0.0.1", port).await);
 
         drop(listener);
-        assert!(!computer_reachable("127.0.0.1", port).await);
+
+        let reserved_socket = tokio::net::TcpSocket::new_v4().unwrap();
+        reserved_socket
+            .bind("127.0.0.1:0".parse().unwrap())
+            .unwrap();
+        let reserved_port = reserved_socket.local_addr().unwrap().port();
+
+        assert!(!computer_reachable("127.0.0.1", reserved_port).await);
     }
 }
 
@@ -3691,29 +4485,43 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    // Queue cleanup must remain narrowly scoped. In particular, the default
+    // dry-run must not apply unrelated schema migrations as a side effect.
+    if !matches!(&cmd, FleetCommand::CleanupMeshRepairBacklog { .. }) {
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    }
 
     match cmd {
         FleetCommand::SshMeshCheck {
             node,
+            exclude_node,
             json,
             from_here,
             since,
             repair,
             yes,
         } => {
+            let scope = ff_agent::mesh_check::resolve_mesh_check_scope(
+                &pool,
+                node.as_deref(),
+                &exclude_node,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
             if from_here {
                 if repair || since.is_some() {
                     anyhow::bail!(
                         "--from-here is a direct probe from this node; it can't be combined with --repair or --since"
                     );
                 }
-                println!(
-                    "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
-                );
-                let probes = ff_agent::mesh_check::local_reach_check(&pool, node.as_deref())
+                if !json {
+                    println!(
+                        "{CYAN}▶ Probing ping + SSH from this node to every fleet worker...{RESET}"
+                    );
+                }
+                let probes = ff_agent::mesh_check::local_reach_check_scoped(&pool, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 if probes.is_empty() {
@@ -3732,6 +4540,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                         })
                         .collect();
                     println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                    ensure_mesh_json_success(
+                        probes.iter().filter(|probe| probe.status != "ok").count(),
+                    )?;
                     return Ok(());
                 }
                 println!(
@@ -3767,13 +4578,15 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     .await
                     .map_err(|e| anyhow::anyhow!("pg_list_mesh_status: {e}"))?
                     .into_iter()
-                    .filter(|r| r.status == "failed")
+                    .filter(|r| {
+                        r.status == "failed" && scope.edge_in_scope(&r.src_node, &r.dst_node)
+                    })
                     .collect::<Vec<_>>();
                 println!(
                     "  found {} failed pair(s) — re-enqueuing as mesh_retry tasks",
                     failed.len()
                 );
-                let created = ff_agent::mesh_check::enqueue_retries(&pool)
+                let created = ff_agent::mesh_check::enqueue_retries_scoped(&pool, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 println!("  enqueued {created} mesh_retry task(s)");
@@ -3783,18 +4596,18 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     anyhow::anyhow!("unrecognized --since value '{spec}' (try 1h, 30m, 2d)")
                 })?;
                 println!("{CYAN}▶ Refreshing pairs older than {spec}...{RESET}");
-                let n = ff_agent::mesh_check::refresh_stale(&pool, age)
+                let n = ff_agent::mesh_check::refresh_stale_scoped(&pool, age, &scope)
                     .await
                     .map_err(|e| anyhow::anyhow!(e))?;
                 println!("  refreshed {n} stale pair(s)");
                 return Ok(());
             }
-            println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
-            let matrix = match &node {
-                Some(n) => ff_agent::mesh_check::pairwise_ssh_check_node(&pool, n).await,
-                None => ff_agent::mesh_check::pairwise_ssh_check(&pool).await,
+            if !json {
+                println!("{CYAN}▶ Running pairwise SSH mesh check...{RESET}");
             }
-            .map_err(|e| anyhow::anyhow!(e))?;
+            let matrix = ff_agent::mesh_check::pairwise_ssh_check_scoped(&pool, &scope)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             if json {
                 let arr: Vec<_> = matrix
                     .cells
@@ -3808,6 +4621,13 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&arr).unwrap_or_default());
+                ensure_mesh_json_success(
+                    matrix
+                        .cells
+                        .iter()
+                        .filter(|cell| cell.status != "ok")
+                        .count(),
+                )?;
             } else {
                 let mut ok = 0;
                 let mut fail = 0;
@@ -3832,11 +4652,43 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                 );
             }
         }
-        FleetCommand::VerifyNode { name, json } => {
-            println!("{CYAN}▶ Running verify-node battery for {name}...{RESET}");
-            let report = ff_agent::verify_computer::verify_computer(&pool, &name)
+        FleetCommand::CleanupMeshRepairBacklog { apply } => {
+            let result = ff_agent::mesh_check::cancel_mesh_auto_repair_backlog(&pool, apply)
                 .await
-                .map_err(|e| anyhow::anyhow!(e))?;
+                .map_err(|e| anyhow::anyhow!("SSH mesh auto-repair backlog cleanup: {e}"))?;
+            if result.applied {
+                println!(
+                    "{GREEN}✓{RESET} cancelled {} pending/dispatchable auto-mesh-repair shell task(s); running and terminal rows were untouched",
+                    result.cancelled
+                );
+            } else {
+                println!(
+                    "{YELLOW}dry-run{RESET}: {} pending/dispatchable auto-mesh-repair shell task(s) would be cancelled; running and terminal rows would be untouched",
+                    result.eligible
+                );
+                println!("rerun with `ff fleet cleanup-mesh-repair-backlog --apply` to apply");
+            }
+        }
+        FleetCommand::VerifyNode {
+            name,
+            exclude_node,
+            json,
+        } => {
+            let scope =
+                ff_agent::mesh_check::resolve_mesh_check_scope(&pool, Some(&name), &exclude_node)
+                    .await
+                    .map_err(|e| anyhow::anyhow!(e))?;
+            let canonical_name = scope
+                .only_node()
+                .expect("verify-node always resolves a selected node");
+            println!("{CYAN}▶ Running verify-node battery for {canonical_name}...{RESET}");
+            let report = ff_agent::verify_computer::verify_computer_with_exclusions(
+                &pool,
+                canonical_name,
+                scope.exclusions(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
             if json {
                 println!(
                     "{}",
@@ -4077,7 +4929,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
                     );
                     println!("  new fingerprint: {}", report.new_fingerprint);
                     if let Some(old) = &report.old_fingerprint {
-                        println!("  old fingerprint: {}", old);
+                        println!("  old fingerprint: {old}");
                     }
                     println!(
                         "  peers reached: {} / failed: {}",
@@ -4188,7 +5040,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
     Ok(())
 }
 
-/// `ff fleet rollout <start|status>` — staged upgrade rollouts (item 26).
+/// `ff fleet rollout <start|status>` — legacy staged software-updater rollouts.
 async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -> Result<()> {
     use crate::RolloutCommand;
     match cmd {
@@ -4213,19 +5065,30 @@ async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -
             )
             .await?;
             let leader_lower = me.to_ascii_lowercase();
-            let targets: Vec<String> = plans
+            let requested_targets: Vec<String> = plans
                 .into_iter()
                 .map(|p| p.computer_name)
                 .filter(|n| !n.eq_ignore_ascii_case(&leader_lower))
                 .collect();
+            let targets =
+                ff_agent::upgrade_rollout::resolve_legacy_rollout_targets(pool, &requested_targets)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve legacy rollout targets: {e}"))?;
 
             if targets.is_empty() {
                 anyhow::bail!(
-                    "no resolvable non-leader targets for software_id='{software}' \
+                    "no resolvable unprotected non-leader targets for software_id='{software}' \
                      ({} skipped)",
                     skipped.len()
                 );
             }
+            ff_agent::upgrade_rollout::ensure_no_active_release_rollout_overlap(pool, &targets)
+                .await
+                .map_err(|e| anyhow::anyhow!("refusing legacy rollout start: {e}"))?;
+            let target_names = targets
+                .iter()
+                .map(|target| target.computer_name.clone())
+                .collect::<Vec<_>>();
 
             // Phase 2: optional cumulative percentage stages (e.g. --stages 10,50,100).
             // Empty/absent → canary + the rest (Phase 1 behaviour).
@@ -4237,10 +5100,13 @@ async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -
                         .collect()
                 })
                 .unwrap_or_default();
-            let stages = ff_agent::upgrade_rollout::plan_stages_pct(&targets, canary, &pcts);
+            let stages = ff_agent::upgrade_rollout::plan_stages_pct(&target_names, canary, &pcts);
             println!("{CYAN}▶ ff fleet rollout start {software} --staged{RESET}");
+            println!(
+                "  namespace:         legacy software updater (release binaries use `ff artifact rollout`)"
+            );
             println!("  software:          {software}");
-            println!("  targets (non-leader): {}", targets.len());
+            println!("  targets (unprotected non-leader): {}", targets.len());
             println!("  failure threshold:  {failure_threshold_pct}% (canary halts on first fail)");
             for s in &stages {
                 let label = if s.stage_idx == 0 { "canary" } else { "stage" };
@@ -4436,6 +5302,15 @@ fn route_candidate_json(r: &ff_db::RouteCandidate) -> serde_json::Value {
     })
 }
 
+/// Preserve machine-readable stdout, then turn a degraded JSON scan into a
+/// non-zero CLI result for automation.
+fn ensure_mesh_json_success(failed_edges: usize) -> Result<()> {
+    if failed_edges > 0 {
+        anyhow::bail!("SSH mesh check found {failed_edges} failed edge(s)");
+    }
+    Ok(())
+}
+
 /// Render a candidate's latest sampled load as `"<cpu>%/<reqs>"` (e.g.
 /// `"3.9%/0"`) for the `LOAD` column. An unsampled host (never written a
 /// `computer_metrics_history` row) shows `"-"` rather than a fake `0%/0`, so the
@@ -4492,6 +5367,13 @@ mod from_here_probe_row_tests {
     fn icmp_blocked_keeps_ssh_ok_but_flags_ping() {
         let row = fmt_from_here_probe_row(&probe(false, true, None));
         assert!(row.contains("down   ok"));
+    }
+
+    #[test]
+    fn json_mesh_exit_contract_fails_on_any_failed_edge() {
+        assert!(ensure_mesh_json_success(0).is_ok());
+        let error = ensure_mesh_json_success(32).expect_err("failed edges must return nonzero");
+        assert_eq!(error.to_string(), "SSH mesh check found 32 failed edge(s)");
     }
 }
 
@@ -4984,7 +5866,7 @@ async fn handoff_deploy_leader(
                 .num_seconds()
                 <= 45
         {
-            eprintln!("{GREEN}✓ leadership transferred to '{}'{RESET}", successor);
+            eprintln!("{GREEN}✓ leadership transferred to '{successor}'{RESET}");
             return Ok(Some((current.member_name, successor)));
         }
         if tokio::time::Instant::now() >= deadline {
@@ -5278,10 +6160,9 @@ fn deploy_playbook(
         ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
          cd \"{src}\" && \
          {git_sync} && \
-         {web_build} && \
+         {WEB_BUILD_STEP} && \
          {cargo_build} && \
-         {install_restart}",
-        web_build = WEB_BUILD_STEP,
+         {install_restart}"
     )
 }
 
@@ -7265,7 +8146,7 @@ mod route_tests {
     }
 
     #[test]
-    fn undrain_is_limited_to_ownerless_non_vinny_drains() {
+    fn undrain_is_limited_to_ownerless_drains_and_explicit_vinny_operator_drains() {
         let source = include_str!("fleet_cmd.rs");
         let undrain = source
             .split("pub async fn handle_fleet_undrain")
@@ -7274,6 +8155,7 @@ mod route_tests {
         assert!(undrain.contains("reservation_state = 'drained'"));
         assert!(undrain.contains("reservation_owner IS NULL"));
         assert!(undrain.contains("LOWER(name) <> 'vinny'"));
+        assert!(undrain.contains("OPERATOR_DRAIN_REASON"));
         assert!(undrain.contains("status = 'disabled'"));
     }
 
@@ -7401,9 +8283,49 @@ const DAEMON_GATES: &[GateSpec] = &[
         controls: "disk-reconcile policy actuation",
     },
     GateSpec {
+        key: "deployment_autorestart_mode",
+        default: "off",
+        controls: "automatic restart of unhealthy model deployments",
+    },
+    GateSpec {
+        key: "dreamer_mode",
+        default: "on",
+        controls: "scheduled memory consolidation and dreamer chain",
+    },
+    GateSpec {
         key: "fleet_integrity_mode",
         default: "off",
         controls: "fleet-integrity verify sweep",
+    },
+    GateSpec {
+        key: "ha_handoff_mode",
+        default: "disabled",
+        controls: "automatic leader and database handoff",
+    },
+    GateSpec {
+        key: "metrics_partition_mode",
+        default: "on",
+        controls: "metrics partition creation and retention",
+    },
+    GateSpec {
+        key: "oauth_distribution_enabled",
+        default: "true",
+        controls: "autonomous OAuth credential distribution task producers",
+    },
+    GateSpec {
+        key: "rolling_deploy_mode",
+        default: "off",
+        controls: "automatic origin/main convergence deploys",
+    },
+    GateSpec {
+        key: "rollout_mode",
+        default: "manual",
+        controls: "continuous staged rollout advancement",
+    },
+    GateSpec {
+        key: "ssh_mesh_auto_repair_enabled",
+        default: "true",
+        controls: "leader SSH mesh auto-repair task producer",
     },
     GateSpec {
         key: "staged_rollout_mode",
@@ -7416,9 +8338,34 @@ const DAEMON_GATES: &[GateSpec] = &[
         controls: "Pillar-4 merge-queue auto-merge",
     },
     GateSpec {
+        key: "work_item_execution_enabled",
+        default: "true",
+        controls: "Pillar-4 assignment, child dispatch, and self-heal writers",
+    },
+    GateSpec {
+        key: "work_item_lane15_mode",
+        default: "on",
+        controls: "lane-15 480B work-item routing",
+    },
+    GateSpec {
         key: "auto_feeder_mode",
         default: "off",
         controls: "idea backlog decomposition and promotion",
+    },
+    GateSpec {
+        key: "review_ladder_mode",
+        default: "cost_optimal",
+        controls: "local-to-cloud work-item review escalation",
+    },
+    GateSpec {
+        key: "target_cleanup_mode",
+        default: "on",
+        controls: "stale per-host Rust incremental-cache cleanup",
+    },
+    GateSpec {
+        key: "task_retention_mode",
+        default: "on",
+        controls: "leader terminal task-history retention",
     },
     GateSpec {
         key: "cortex_index_mode",
@@ -7526,6 +8473,8 @@ mod gates_tests {
     fn defaults_when_unset() {
         let rows = build_gate_rows(&HashMap::new());
         assert_eq!(rows.len(), DAEMON_GATES.len());
+        let unique: std::collections::HashSet<_> = rows.iter().map(|row| &row.key).collect();
+        assert_eq!(unique.len(), rows.len(), "daemon gate keys must be unique");
         // Every row falls back to its default + is marked "default".
         assert!(rows.iter().all(|r| r.source == "default"));
         let auto = rows
@@ -7535,6 +8484,17 @@ mod gates_tests {
         assert_eq!(auto.value, "false");
         let idx = rows.iter().find(|r| r.key == "cortex_index_mode").unwrap();
         assert_eq!(idx.value, "on");
+        for recovery_gate in [
+            "oauth_distribution_enabled",
+            "rolling_deploy_mode",
+            "ssh_mesh_auto_repair_enabled",
+            "work_item_execution_enabled",
+        ] {
+            assert!(
+                rows.iter().any(|row| row.key == recovery_gate),
+                "recovery-critical gate {recovery_gate} must be visible"
+            );
+        }
     }
 
     #[test]

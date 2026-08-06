@@ -34,6 +34,15 @@ if [ "$(id -u)" = "0" ]; then
   mkdir -p "$PGDATA"
   chown -R postgres:postgres "$(dirname "$PGDATA")"
   chmod 0700 "$PGDATA" || true
+  # Compose implements local secrets as read-only bind mounts. Their host UID
+  # is preserved, so the postgres UID cannot necessarily read the mount after
+  # gosu. Stage a container-local copy while still root, then pass only that
+  # protected path across the privilege drop.
+  STAGED_PGPASS_FILE=/tmp/forgefleet-replication-pgpass
+  install -o postgres -g postgres -m 0600 \
+    "$POSTGRES_REPLICATION_PGPASS_FILE" "$STAGED_PGPASS_FILE"
+  POSTGRES_REPLICATION_PGPASS_FILE="$STAGED_PGPASS_FILE"
+  export POSTGRES_REPLICATION_PGPASS_FILE
   exec gosu postgres "$0" "$@"
 fi
 
@@ -76,12 +85,12 @@ else
   printf '%s' "$BOOTSTRAP_EVIDENCE" > "$BOOTSTRAP_MARKER"
 fi
 
-# Docker metadata contains only the mounted secret path. Copy the pgpass
-# material into PGDATA with libpq-required permissions, and keep the path in
-# the inherited environment for both pg_basebackup and the WAL receiver.
-PGPASSFILE="$PGDATA/.pgpass"
+# Docker metadata contains only the mounted secret path. The root branch above
+# stages it outside PGDATA with libpq-required permissions. Keeping it outside
+# PGDATA is important: pg_basebackup refuses any non-empty destination.
+PGPASSFILE="$POSTGRES_REPLICATION_PGPASS_FILE"
 export PGPASSFILE
-install -m 0600 "$POSTGRES_REPLICATION_PGPASS_FILE" "$PGPASSFILE"
+test -r "$PGPASSFILE"
 
 if [ ! -s "$PGDATA/PG_VERSION" ]; then
   pg_basebackup \

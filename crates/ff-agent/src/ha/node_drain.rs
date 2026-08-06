@@ -15,8 +15,14 @@
 //! in `main.rs`), which resolves the operator-supplied computer name to its
 //! `computers.id` and calls [`drain_node`] below.
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
+
+/// Durable reservation reason written by the explicit operator drain verb.
+/// Capacity reconciliation uses `computers.reservation_state='drained'` as
+/// the source of truth, so changing only the mutable slot projection is not
+/// sufficient.
+pub const OPERATOR_DRAIN_REASON: &str = "operator-drain";
 
 /// Result of processing a single node drain request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -27,11 +33,68 @@ pub struct DrainResult {
     pub work_items_released: u64,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DrainError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("refusing operator drain: {0}")]
+    Refused(String),
+    #[error(
+        "lease release failed after the node was durably drained; safe partial result {partial:?}: {source}"
+    )]
+    LeaseRelease {
+        partial: DrainResult,
+        #[source]
+        source: sqlx::Error,
+    },
+}
+
 /// Process a drain request for `computer_id`: disable its sub-agent slots
 /// and release any in-flight work back to `ready` so other nodes can pick it
 /// up. Idempotent — draining an already-drained node disables zero
 /// additional slots and releases zero additional work items.
-pub async fn drain_node(pool: &PgPool, computer_id: Uuid) -> Result<DrainResult, sqlx::Error> {
+pub async fn drain_node(pool: &PgPool, computer_id: Uuid) -> Result<DrainResult, DrainError> {
+    let mut tx = pool.begin().await?;
+    let computer = sqlx::query(
+        "SELECT COALESCE(reservation_state, 'available') AS reservation_state,
+                reserved_reason, reservation_owner
+           FROM computers
+          WHERE id = $1
+          FOR UPDATE",
+    )
+    .bind(computer_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| DrainError::Refused(format!("computer {computer_id} does not exist")))?;
+    let reservation_state: String = computer.get("reservation_state");
+    let reserved_reason: Option<String> = computer.try_get("reserved_reason").ok().flatten();
+    let reservation_owner: Option<Uuid> = computer.try_get("reservation_owner").ok().flatten();
+    if reservation_state == "reserved" && reservation_owner.is_some() {
+        return Err(DrainError::Refused(format!(
+            "computer {computer_id} has an active owned reservation"
+        )));
+    }
+    if reservation_state == "drained" && reserved_reason.as_deref() != Some(OPERATOR_DRAIN_REASON) {
+        return Err(DrainError::Refused(format!(
+            "computer {computer_id} is already drained for reason {}",
+            reserved_reason.as_deref().unwrap_or("<unknown>")
+        )));
+    }
+
+    sqlx::query(
+        "UPDATE computers
+            SET reservation_state = 'drained',
+                reserved_reason = $2,
+                reserved_at = COALESCE(reserved_at, NOW()),
+                reservation_owner = NULL,
+                reservation_expires_at = NULL
+          WHERE id = $1",
+    )
+    .bind(computer_id)
+    .bind(OPERATOR_DRAIN_REASON)
+    .execute(&mut *tx)
+    .await?;
+
     let sub_agents_disabled: i64 = sqlx::query_scalar(
         "WITH disabled AS (
              UPDATE sub_agents
@@ -43,10 +106,17 @@ pub async fn drain_node(pool: &PgPool, computer_id: Uuid) -> Result<DrainResult,
          SELECT COUNT(*) FROM disabled",
     )
     .bind(computer_id)
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
 
-    let work_items_released = super::drain_work_item_leases(pool, computer_id).await?;
+    let partial = DrainResult {
+        sub_agents_disabled: sub_agents_disabled as u64,
+        work_items_released: 0,
+    };
+    let work_items_released = super::drain_work_item_leases(pool, computer_id)
+        .await
+        .map_err(|source| DrainError::LeaseRelease { partial, source })?;
 
     Ok(DrainResult {
         sub_agents_disabled: sub_agents_disabled as u64,
@@ -92,8 +162,13 @@ mod tests {
         sqlx::raw_sql(
             "CREATE EXTENSION IF NOT EXISTS pgcrypto;
              CREATE TABLE computers (
-                 id   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-                 name TEXT NOT NULL UNIQUE
+                 id                     UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                 name                   TEXT NOT NULL UNIQUE,
+                 reservation_state      TEXT NOT NULL DEFAULT 'available',
+                 reserved_reason        TEXT,
+                 reserved_at            TIMESTAMPTZ,
+                 reservation_owner      UUID,
+                 reservation_expires_at TIMESTAMPTZ
              );
              CREATE TABLE projects (
                  id TEXT PRIMARY KEY
@@ -254,6 +329,22 @@ mod tests {
                 .collect();
         assert!(statuses.iter().all(|s| s == "disabled"));
 
+        let (reservation_state, reserved_reason, reservation_owner): (
+            String,
+            Option<String>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT reservation_state, reserved_reason, reservation_owner
+               FROM computers WHERE id = $1",
+        )
+        .bind(computer_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch durable drain reservation");
+        assert_eq!(reservation_state, "drained");
+        assert_eq!(reserved_reason.as_deref(), Some(OPERATOR_DRAIN_REASON));
+        assert!(reservation_owner.is_none());
+
         let current_work_item: Option<Uuid> =
             sqlx::query_scalar("SELECT current_work_item_id FROM sub_agents WHERE id = $1")
                 .bind(busy_slot_id)
@@ -283,6 +374,42 @@ mod tests {
         let repeat = drain_node(&pool, computer_id).await.expect("re-drain node");
         assert_eq!(repeat.sub_agents_disabled, 0);
         assert_eq!(repeat.work_items_released, 0);
+
+        let reserved_id = Uuid::new_v4();
+        let reservation_owner = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO computers
+                 (id, name, reservation_state, reserved_reason, reservation_owner)
+             VALUES ($1, 'node-reserved', 'reserved', 'active-owner', $2)",
+        )
+        .bind(reserved_id)
+        .bind(reservation_owner)
+        .execute(&pool)
+        .await
+        .expect("insert owned reservation");
+        sqlx::query(
+            "INSERT INTO sub_agents (computer_id, slot, status, workspace_dir)
+             VALUES ($1, 0, 'idle', '')",
+        )
+        .bind(reserved_id)
+        .execute(&pool)
+        .await
+        .expect("insert reserved slot");
+
+        let error = drain_node(&pool, reserved_id)
+            .await
+            .expect_err("owned reservation must be preserved");
+        assert!(matches!(error, DrainError::Refused(_)));
+        let preserved: (String, String) = sqlx::query_as(
+            "SELECT c.reservation_state, sa.status
+               FROM computers c JOIN sub_agents sa ON sa.computer_id = c.id
+              WHERE c.id = $1",
+        )
+        .bind(reserved_id)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch preserved owned reservation");
+        assert_eq!(preserved, ("reserved".into(), "idle".into()));
 
         drop_temp_db(admin, pool, &db_name).await;
     }

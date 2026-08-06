@@ -1,0 +1,20 @@
+[Unit]
+Description=ForgeFleet FalkorDB source firewall
+Documentation=https://github.com/venkatyarl/forge-fleet
+Requires=docker.service
+After=network-online.target docker.service
+Wants=network-online.target
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/forgefleet/falkordb-source-firewall.env
+ExecStart=/usr/local/sbin/forgefleet-falkor-source-firewall apply
+ExecReload=/usr/local/sbin/forgefleet-falkor-source-firewall apply
+ExecStop=/usr/local/sbin/forgefleet-falkor-source-firewall remove
+RemainAfterExit=yes
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target docker.service

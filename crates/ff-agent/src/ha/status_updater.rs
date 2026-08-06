@@ -136,7 +136,7 @@ impl SessionStatusUpdater {
                     _ = ticker.tick() => {
                         let body = self.source.status();
                         let changed = last_sent_body.as_deref() != Some(body.as_str());
-                        if !should_send(changed, last_sent_at.elapsed().into()) {
+                        if !should_send(changed, last_sent_at.elapsed()) {
                             debug!(
                                 session_id = %self.session_id,
                                 "session status updater: unchanged — skipping"

@@ -4,6 +4,7 @@
 //! with version tracking via a `_migrations` meta-table.
 
 use sqlx::{Acquire, PgPool};
+use std::collections::{BTreeMap, BTreeSet};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DbError, Result};
@@ -11,6 +12,10 @@ use crate::schema;
 
 /// The highest migration version baked into the squashed fresh-DB bootstrap.
 const BOOTSTRAP_BASELINE_VERSION: u32 = schema::PG_BASELINE_VERSION;
+
+/// Transaction-scoped lock shared by enrollment issuance and consumption.
+/// The value is the stable ASCII tag `FF_ENROL` encoded as a signed i64.
+pub const SECURE_ENROLLMENT_XACT_LOCK_KEY: i64 = 0x4646_5f45_4e52_4f4c;
 
 // ─── Postgres Migrations ─────────────────────────────────────────────────────
 
@@ -1038,8 +1043,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 211,
-        name: "decommission_vinny_github_identity",
-        sql: schema::SCHEMA_V211_DECOMMISSION_VINNY_GITHUB_IDENTITY,
+        name: "decommission_taylor_github_identity",
+        sql: schema::SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY,
     },
     PgMigration {
         version: 212,
@@ -1217,8 +1222,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 274,
-        name: "project_digest_fields",
-        sql: schema::SCHEMA_V274_PROJECT_DIGEST_FIELDS,
+        name: "project_repo_scan_metadata",
+        sql: schema::SCHEMA_V274_PROJECT_REPO_SCAN_METADATA,
     },
     PgMigration {
         version: 275,
@@ -1232,8 +1237,8 @@ static PG_MIGRATIONS: &[PgMigration] = &[
     },
     PgMigration {
         version: 277,
-        name: "work_item_lease_build_started_at",
-        sql: schema::SCHEMA_V277_WORK_ITEM_LEASE_BUILD_STARTED_AT,
+        name: "node_health",
+        sql: schema::SCHEMA_V277_NODE_HEALTH,
     },
     PgMigration {
         version: 278,
@@ -1245,11 +1250,9 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "fleet_logs",
         sql: schema::SCHEMA_V279_FLEET_LOGS,
     },
-    PgMigration {
-        version: 280,
-        name: "merge_fleet_tables",
-        sql: schema::SCHEMA_V280_MERGE_FLEET_TABLES,
-    },
+    // V280 was quarantined manually on the live fleet. Its destructive table
+    // merge is intentionally not runnable; the exact historical ledger row is
+    // recognized by REVIEWED_LEGACY_LEDGER_ROWS below.
     PgMigration {
         version: 281,
         name: "work_item_acceptance_criteria",
@@ -1275,7 +1278,396 @@ static PG_MIGRATIONS: &[PgMigration] = &[
         name: "ring_safe_fabric",
         sql: schema::SCHEMA_V285_RING_SAFE_FABRIC,
     },
+    PgMigration {
+        version: 286,
+        name: "oauth_distribution_gate",
+        sql: schema::SCHEMA_V286_OAUTH_DISTRIBUTION_GATE,
+    },
+    PgMigration {
+        version: 287,
+        name: "ssh_mesh_auto_repair_gate",
+        sql: schema::SCHEMA_V287_SSH_MESH_AUTO_REPAIR_GATE,
+    },
+    PgMigration {
+        version: 288,
+        name: "ubuntu_2604_software_projection",
+        sql: schema::SCHEMA_V288_UBUNTU_2604_SOFTWARE_PROJECTION,
+    },
+    PgMigration {
+        version: 289,
+        name: "secure_enrollment_tokens",
+        sql: schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS,
+    },
+    PgMigration {
+        version: 290,
+        name: "secure_enrollment_hardening",
+        sql: schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING,
+    },
+    PgMigration {
+        version: 291,
+        name: "release_artifact_custody",
+        sql: schema::SCHEMA_V291_RELEASE_ARTIFACT_CUSTODY,
+    },
+    PgMigration {
+        version: 292,
+        name: "james_qwen_served_model_alias",
+        sql: schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS,
+    },
+    PgMigration {
+        version: 293,
+        name: "smolvlm_exact_variant_authority",
+        sql: schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY,
+    },
+    PgMigration {
+        version: 294,
+        name: "ace_gemma4_mlx_exact_authority",
+        sql: schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY,
+    },
+    PgMigration {
+        version: 296,
+        name: "devstral_code_capability_authority",
+        sql: schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY,
+    },
+    PgMigration {
+        version: 297,
+        name: "release_rollout_post_success_rollback",
+        sql: schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK,
+    },
 ];
+
+/// Explicit-only migrations are structurally unreachable from
+/// [`run_postgres_migrations`], which is called by daemon/startup paths.
+/// Applying one requires the bounded, source-attested operator API below.
+static EXPLICIT_PG_MIGRATIONS: &[PgMigration] = &[PgMigration {
+    version: 295,
+    name: "release_rollout_authority",
+    sql: schema::SCHEMA_V295_RELEASE_ROLLOUT_AUTHORITY,
+}];
+
+/// Exact evidence from the one reviewed legacy V290 fleet ledger. These rows
+/// are deliberately separate from runnable migrations: their source branches
+/// were either superseded before merge or, for V280, explicitly quarantined.
+/// They authorize status/reconciliation only at the recorded microsecond and
+/// with no retroactive provenance; they must never be inserted by startup.
+struct ReviewedLegacyLedgerRow {
+    version: u32,
+    name: &'static str,
+    applied_at: &'static str,
+}
+
+static REVIEWED_LEGACY_LEDGER_ROWS: &[ReviewedLegacyLedgerRow] = &[
+    ReviewedLegacyLedgerRow {
+        version: 211,
+        name: "decommission_taylor_github_identity",
+        applied_at: "2026-07-20T16:39:14.109001Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 234,
+        name: "work_item_cortex_subgraph_id",
+        applied_at: "2026-07-22T04:50:37.318577Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 236,
+        name: "work_item_context_and_cortex_subgraph",
+        applied_at: "2026-07-22T15:13:32.818634Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 246,
+        name: "glm_45_air_ab_catalog",
+        applied_at: "2026-07-24T03:03:02.342428Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 260,
+        name: "model_utilization_view",
+        applied_at: "2026-07-24T20:49:10.028987Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 270,
+        name: "workstream_session_fields",
+        applied_at: "2026-07-25T19:04:23.380858Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 274,
+        name: "project_repo_scan_metadata",
+        applied_at: "2026-07-26T05:54:24.449824Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 277,
+        name: "node_health",
+        applied_at: "2026-07-26T18:23:36.239244Z",
+    },
+    ReviewedLegacyLedgerRow {
+        version: 280,
+        name: "merge_fleet_tables__QUARANTINED_MANUAL",
+        applied_at: "2026-07-27T06:28:42.086663Z",
+    },
+];
+
+const REVIEWED_LEDGER_ONLY_VERSIONS: &[u32] = &[234, 236, 246, 260, 270, 280];
+
+const RELEASE_ROLLOUT_AUTHORITY_MIGRATION: u32 = 295;
+const DEVSTRAL_CODE_CAPABILITY_MIGRATION: u32 = 296;
+const RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK_MIGRATION: u32 = 297;
+
+pub const LATEST_AUTOMATIC_POSTGRES_MIGRATION: u32 =
+    RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK_MIGRATION;
+pub const LATEST_EXPLICIT_POSTGRES_MIGRATION: u32 = 295;
+
+fn automatic_migration_prerequisites_satisfied(
+    migration_version: u32,
+    applied_versions: &BTreeSet<u32>,
+) -> bool {
+    !matches!(
+        migration_version,
+        DEVSTRAL_CODE_CAPABILITY_MIGRATION | RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK_MIGRATION
+    ) || applied_versions.contains(&RELEASE_ROLLOUT_AUTHORITY_MIGRATION)
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PostgresMigrationDescriptor {
+    pub version: u32,
+    pub name: String,
+    pub explicit_only: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct AppliedPostgresMigration {
+    pub version: u32,
+    pub name: String,
+    pub source_commit: Option<String>,
+    pub applied_by: Option<String>,
+    pub applied_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct PostgresMigrationStatus {
+    pub current_version: u32,
+    pub automatic_ceiling: u32,
+    pub explicit_ceiling: u32,
+    pub pending_automatic: Vec<PostgresMigrationDescriptor>,
+    pub pending_explicit: Vec<PostgresMigrationDescriptor>,
+    pub applied: Vec<AppliedPostgresMigration>,
+    pub drift: Vec<String>,
+    pub rollout_schema_valid: Option<bool>,
+    /// True only for the exact reviewed V290 ledger + physical V247 pre-state.
+    pub reviewed_v247_repair_pending: bool,
+    /// Exact forward-repair postcondition once V295 has been recorded.
+    pub reconciliation_schema_valid: Option<bool>,
+}
+
+type AppliedMigrationQueryRow = (
+    i32,
+    String,
+    Option<String>,
+    Option<String>,
+    chrono::DateTime<chrono::Utc>,
+);
+
+/// Fail closed unless the enrollment authority table is exactly the reviewed
+/// v290 shape. This is intentionally validation-only: callers such as
+/// `ff onboard` and the TLS supervisor must never repair or create authority
+/// schema as an ordinary request side effect. Only the forward migration runner
+/// owns that lifecycle.
+pub async fn validate_secure_enrollment_schema(pool: &PgPool) -> Result<()> {
+    let valid: bool = sqlx::query_scalar(
+        r#"
+        WITH relation AS (
+            SELECT to_regclass('public.fleet_enrollment_tokens') AS oid
+        ),
+        expected_columns(attnum, attname, type_name, required, default_expr) AS (
+            VALUES
+                (1, 'token_hash', 'bytea', true, NULL::text),
+                (2, 'node_name', 'text', true, NULL::text),
+                (3, 'intended_ip', 'inet', true, NULL::text),
+                (4, 'ssh_user', 'text', true, NULL::text),
+                (5, 'role', 'text', true, NULL::text),
+                (6, 'runtime', 'text', true, NULL::text),
+                (7, 'purpose', 'text', true, '''node-enrollment''::text'),
+                (8, 'leader_name', 'text', true, NULL::text),
+                (9, 'leader_epoch', 'bigint', true, NULL::text),
+                (10, 'expires_at', 'timestamp with time zone', true, NULL::text),
+                (11, 'consumed_at', 'timestamp with time zone', false, NULL::text),
+                (12, 'consumed_peer_ip', 'inet', false, NULL::text),
+                (13, 'created_at', 'timestamp with time zone', true, 'clock_timestamp()'),
+                (14, 'created_by', 'text', false, NULL::text),
+                (15, 'revoked_at', 'timestamp with time zone', false, NULL::text)
+        ),
+        actual_columns AS (
+            SELECT a.attnum::integer AS attnum,
+                   a.attname,
+                   format_type(a.atttypid, a.atttypmod) AS type_name,
+                   a.attnotnull AS required,
+                   pg_get_expr(d.adbin, d.adrelid) AS default_expr
+              FROM relation r
+              JOIN pg_attribute a ON a.attrelid = r.oid
+              LEFT JOIN pg_attrdef d
+                ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+             WHERE a.attnum > 0 AND NOT a.attisdropped
+        ),
+        expected_constraints(conname, condef) AS (
+            VALUES
+                ('fleet_enrollment_tokens_canonical_leader', 'CHECK (leader_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)'),
+                ('fleet_enrollment_tokens_canonical_name', 'CHECK (node_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)'),
+                ('fleet_enrollment_tokens_canonical_ssh_user', 'CHECK (ssh_user ~ ''^[a-z_][a-z0-9_-]{0,63}$''::text)'),
+                ('fleet_enrollment_tokens_consumption', 'CHECK (consumed_at IS NULL AND consumed_peer_ip IS NULL OR consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)'),
+                ('fleet_enrollment_tokens_epoch', 'CHECK (leader_epoch >= 0)'),
+                ('fleet_enrollment_tokens_expiry', 'CHECK (expires_at > created_at AND expires_at <= (created_at + ''00:15:00''::interval))'),
+                ('fleet_enrollment_tokens_hash_length', 'CHECK (octet_length(token_hash) = 32)'),
+                ('fleet_enrollment_tokens_pkey', 'PRIMARY KEY (token_hash)'),
+                ('fleet_enrollment_tokens_purpose', 'CHECK (purpose = ''node-enrollment''::text)'),
+                ('fleet_enrollment_tokens_revocation', 'CHECK (revoked_at IS NULL OR consumed_at IS NULL AND revoked_at >= created_at)'),
+                ('fleet_enrollment_tokens_role', 'CHECK (role = ANY (ARRAY[''builder''::text, ''gateway''::text, ''testbed''::text]))'),
+                ('fleet_enrollment_tokens_runtime', 'CHECK (runtime ~ ''^[a-z0-9][a-z0-9._-]{0,31}$''::text)')
+        ),
+        actual_constraints AS (
+            SELECT c.conname, pg_get_constraintdef(c.oid, true) AS condef,
+                   c.convalidated
+              FROM relation r
+              JOIN pg_constraint c ON c.conrelid = r.oid
+        ),
+        roster_layout(layout) AS (
+            SELECT 'legacy'::text
+             WHERE (SELECT c.relkind = 'r'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.computers'::regclass)
+               AND (SELECT c.relkind = 'r'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.fleet_workers'::regclass)
+            UNION ALL
+            SELECT 'unified'::text
+             WHERE to_regclass('public.fleet_nodes') IS NOT NULL
+               AND (SELECT c.relkind = 'r'
+                      FROM pg_class c
+                     WHERE c.oid = to_regclass('public.fleet_nodes'))
+               AND (SELECT c.relkind = 'v'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.computers'::regclass)
+               AND (SELECT c.relkind = 'v'
+                      FROM pg_class c
+                     WHERE c.oid = 'public.fleet_workers'::regclass)
+               AND btrim(regexp_replace(
+                       pg_get_viewdef('public.computers'::regclass, true),
+                       E'\\s+', ' ', 'g'
+                   )) = 'SELECT id, name, primary_ip, all_ips, hostname, mac_addresses, os_family, os_distribution, os_version, os_version_latest, os_upgrade_available, os_version_checked_at, cpu_cores, total_ram_gb, total_disk_gb, has_gpu, gpu_kind, gpu_count, gpu_model, gpu_vram_gb, gpu_total_vram_gb, cuda_version, metal_version, rocm_version, gpu_driver_version, ssh_user, ssh_port, ssh_public_key, enrolled_at, last_seen_at, offline_since, status_changed_at, status, metadata, network_scope, source_tree_path, build_archs, connectivity_mode, election_eligibility, reservation_state, reserved_reason, reserved_at, reservation_owner, reservation_expires_at, dispatch_tick_at FROM fleet_nodes;'
+               AND btrim(regexp_replace(
+                       pg_get_viewdef('public.fleet_workers'::regclass, true),
+                       E'\\s+', ' ', 'g'
+                   )) = 'SELECT name, ip, ssh_user, ram_gb, worker_cpu_cores AS cpu_cores, os, role, election_priority, hardware, alt_ips, capabilities, preferences, resources, worker_status AS status, registered_at, updated_at, runtime, models_dir, disk_quota_pct, sub_agent_count, gh_account, tooling FROM fleet_nodes;'
+        ),
+        token_expected_indexes(indexname, indexdef) AS (
+            VALUES
+                ('fleet_enrollment_tokens_pkey', 'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)'),
+                ('idx_fleet_enrollment_tokens_expiry', 'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
+                ('idx_fleet_enrollment_tokens_node', 'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)'),
+                ('idx_fleet_enrollment_tokens_pending_ip', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))'),
+                ('idx_fleet_enrollment_tokens_pending_name', 'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))')
+        ),
+        legacy_expected_indexes(indexname, indexdef) AS (
+            VALUES
+                ('idx_computers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))'),
+                ('idx_computers_enrollment_primary_ip', 'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)'),
+                ('idx_fleet_workers_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name ON public.fleet_workers USING btree (lower(name))'),
+                ('idx_fleet_workers_enrollment_ip', 'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip ON public.fleet_workers USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)')
+        ),
+        unified_expected_indexes(indexname, indexdef) AS (
+            VALUES
+                ('idx_fleet_nodes_enrollment_canonical_name', 'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_canonical_name ON public.fleet_nodes USING btree (lower(name))'),
+                ('idx_fleet_nodes_enrollment_primary_ip', 'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_primary_ip ON public.fleet_nodes USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)'),
+                ('idx_fleet_nodes_enrollment_worker_ip', 'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_worker_ip ON public.fleet_nodes USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)')
+        ),
+        expected_indexes AS (
+            SELECT * FROM token_expected_indexes
+            UNION ALL
+            SELECT l.*
+              FROM legacy_expected_indexes l
+             WHERE (SELECT layout FROM roster_layout) = 'legacy'
+            UNION ALL
+            SELECT u.*
+              FROM unified_expected_indexes u
+             WHERE (SELECT layout FROM roster_layout) = 'unified'
+        ),
+        actual_indexes AS (
+            SELECT i.relname AS indexname, x.indisvalid, x.indisready,
+                   pg_get_indexdef(x.indexrelid) AS indexdef
+              FROM pg_index x
+              JOIN pg_class i ON i.oid = x.indexrelid
+             WHERE x.indrelid = (SELECT oid FROM relation)
+                OR (x.indrelid = 'public.computers'::regclass
+                    AND i.relname IN (
+                        'idx_computers_enrollment_canonical_name',
+                        'idx_computers_enrollment_primary_ip'
+                    ))
+                OR (x.indrelid = 'public.fleet_workers'::regclass
+                    AND i.relname IN (
+                        'idx_fleet_workers_enrollment_canonical_name',
+                        'idx_fleet_workers_enrollment_ip'
+                    ))
+                OR (x.indrelid = to_regclass('public.fleet_nodes')
+                    AND i.relname IN (
+                        'idx_fleet_nodes_enrollment_canonical_name',
+                        'idx_fleet_nodes_enrollment_primary_ip',
+                        'idx_fleet_nodes_enrollment_worker_ip'
+                    ))
+        ),
+        token_index_count AS (
+            SELECT count(*) AS count
+              FROM relation r
+              JOIN pg_index x ON x.indrelid = r.oid
+        )
+        SELECT
+            (SELECT oid IS NOT NULL FROM relation)
+            AND (SELECT count(*) FROM actual_columns) = 15
+            AND NOT EXISTS (
+                SELECT attnum, attname, type_name, required, default_expr FROM expected_columns
+                EXCEPT
+                SELECT attnum, attname, type_name, required, default_expr FROM actual_columns
+            )
+            AND NOT EXISTS (
+                SELECT attnum, attname, type_name, required, default_expr FROM actual_columns
+                EXCEPT
+                SELECT attnum, attname, type_name, required, default_expr FROM expected_columns
+            )
+            AND (SELECT count(*) FROM actual_constraints) = 12
+            AND NOT EXISTS (
+                SELECT conname, condef FROM expected_constraints
+                EXCEPT SELECT conname, condef FROM actual_constraints
+            )
+            AND NOT EXISTS (
+                SELECT conname, condef FROM actual_constraints
+                EXCEPT SELECT conname, condef FROM expected_constraints
+            )
+            AND NOT EXISTS (SELECT 1 FROM actual_constraints WHERE NOT convalidated)
+            AND (SELECT count(*) FROM roster_layout) = 1
+            AND (SELECT count FROM token_index_count) = 5
+            AND (SELECT count(*) FROM actual_indexes) =
+                (SELECT count(*) FROM expected_indexes)
+            AND NOT EXISTS (
+                SELECT indexname, indexdef FROM expected_indexes
+                EXCEPT SELECT indexname, indexdef FROM actual_indexes
+            )
+            AND NOT EXISTS (
+                SELECT indexname, indexdef FROM actual_indexes
+                EXCEPT SELECT indexname, indexdef FROM expected_indexes
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM actual_indexes WHERE NOT indisvalid OR NOT indisready
+            )
+            AND obj_description(
+                    (SELECT oid FROM relation), 'pg_class'
+                ) = 'forgefleet secure enrollment authority schema v290; forward-only migrations only'
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+
+    if valid {
+        Ok(())
+    } else {
+        Err(DbError::Migration(
+            "fleet_enrollment_tokens is missing or not the exact reviewed v290 shape; run the controlled forward migration before enrollment".to_string(),
+        ))
+    }
+}
 
 /// Postgres advisory-lock key guarding the migration runner.
 ///
@@ -1393,13 +1785,62 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
         }
     }
 
+    // A missing migration below the current maximum is never an automatic
+    // backfill. In particular, the reviewed live fleet is at V290 with an
+    // exact empty partial V247; advancing V291-V294 first would destroy the
+    // bounded repair profile. Hold that exact state for the explicit V295
+    // transaction, and reject every unreviewed missing-V247 lineage.
+    if current >= 247 {
+        let applied = read_applied_postgres_migrations_conn(&mut *conn).await?;
+        if !applied.iter().any(|row| row.version == 247) {
+            let reviewed_hold = current == 290
+                && reviewed_live_v290_ledger_matches(&applied)
+                && reviewed_historical_schema_is_exact(&mut *conn).await?
+                && forward_compatibility_state(&mut *conn, "projects").await?
+                    == ForwardCompatibilityState::Absent
+                && forward_compatibility_state(&mut *conn, "work_item_leases").await?
+                    == ForwardCompatibilityState::Exact
+                && v247_schema_state(&mut *conn).await? == V247SchemaState::ReviewedEmptyPartial;
+            if reviewed_hold {
+                warn!(
+                    current_version = current,
+                    "holding reviewed legacy V290 for explicit V247/V295 reconciliation"
+                );
+                return Ok(current);
+            }
+            return Err(DbError::Migration(format!(
+                "v247 is missing below current v{current}; automatic migration advance is blocked"
+            )));
+        }
+    }
+
+    let applied_versions = read_applied_postgres_migrations_conn(&mut *conn)
+        .await?
+        .into_iter()
+        .map(|row| row.version)
+        .collect::<BTreeSet<_>>();
+    let v296_held_for_v295 = current < DEVSTRAL_CODE_CAPABILITY_MIGRATION
+        && !automatic_migration_prerequisites_satisfied(
+            DEVSTRAL_CODE_CAPABILITY_MIGRATION,
+            &applied_versions,
+        );
     let pending: Vec<&PgMigration> = PG_MIGRATIONS
         .iter()
         .filter(|m| m.version > current)
+        .filter(|m| automatic_migration_prerequisites_satisfied(m.version, &applied_versions))
         .collect();
 
     if pending.is_empty() {
-        debug!(current_version = current, "postgres database is up to date");
+        if v296_held_for_v295 {
+            warn!(
+                current_version = current,
+                required_version = RELEASE_ROLLOUT_AUTHORITY_MIGRATION,
+                held_version = DEVSTRAL_CODE_CAPABILITY_MIGRATION,
+                "holding automatic Devstral capability migration until explicit rollout authority is recorded"
+            );
+        } else {
+            debug!(current_version = current, "postgres database is up to date");
+        }
         return Ok(current);
     }
 
@@ -1505,11 +1946,876 @@ async fn run_postgres_migrations_locked(conn: &mut sqlx::PgConnection) -> Result
     Ok(final_version)
 }
 
+fn migration_descriptor(
+    migration: &PgMigration,
+    explicit_only: bool,
+) -> PostgresMigrationDescriptor {
+    PostgresMigrationDescriptor {
+        version: migration.version,
+        name: migration.name.to_string(),
+        explicit_only,
+    }
+}
+
+fn validate_explicit_apply_identity(
+    expected_source_commit: &str,
+    running_source_commit: &str,
+    running_git_state: &str,
+    applied_by: &str,
+) -> Result<()> {
+    let full_lower_sha = |value: &str| {
+        value.len() == 40
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    };
+    if !full_lower_sha(expected_source_commit) || !full_lower_sha(running_source_commit) {
+        return Err(DbError::Migration(
+            "explicit migration requires full lowercase 40-character source commits".to_string(),
+        ));
+    }
+    if expected_source_commit != running_source_commit {
+        return Err(DbError::Migration(format!(
+            "explicit migration source mismatch: requested {expected_source_commit}, running {running_source_commit}"
+        )));
+    }
+    if !matches!(running_git_state, "pushed" | "unpushed") {
+        return Err(DbError::Migration(format!(
+            "explicit migration refuses build state {running_git_state:?}; use a clean exact-source binary"
+        )));
+    }
+    if applied_by.is_empty()
+        || applied_by.len() > 128
+        || !applied_by
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b'-'))
+    {
+        return Err(DbError::Migration(
+            "explicit migration applied_by identity is not canonical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn postgres_migration_table_exists(pool: &PgPool) -> Result<bool> {
+    Ok(
+        sqlx::query_scalar("SELECT to_regclass('public._migrations') IS NOT NULL")
+            .fetch_one(pool)
+            .await?,
+    )
+}
+
+async fn read_applied_postgres_migrations(pool: &PgPool) -> Result<Vec<AppliedPostgresMigration>> {
+    if !postgres_migration_table_exists(pool).await? {
+        return Ok(Vec::new());
+    }
+    let has_provenance: bool = sqlx::query_scalar(
+        "SELECT count(*) = 2
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = '_migrations'
+            AND column_name IN ('source_commit', 'applied_by')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let rows: Vec<AppliedMigrationQueryRow> = if has_provenance {
+        sqlx::query_as(
+            "SELECT version, name, source_commit, applied_by, applied_at
+                   FROM _migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT version, name, NULL::text, NULL::text, applied_at
+                   FROM _migrations ORDER BY version",
+        )
+        .fetch_all(pool)
+        .await?
+    };
+    rows.into_iter()
+        .map(|(version, name, source_commit, applied_by, applied_at)| {
+            let version = u32::try_from(version).map_err(|_| {
+                DbError::Migration("_migrations contains a negative version".to_string())
+            })?;
+            Ok(AppliedPostgresMigration {
+                version,
+                name,
+                source_commit,
+                applied_by,
+                applied_at,
+            })
+        })
+        .collect()
+}
+
+async fn read_applied_postgres_migrations_conn(
+    conn: &mut sqlx::PgConnection,
+) -> Result<Vec<AppliedPostgresMigration>> {
+    let has_provenance: bool = sqlx::query_scalar(
+        "SELECT count(*) = 2
+           FROM information_schema.columns
+          WHERE table_schema = 'public'
+            AND table_name = '_migrations'
+            AND column_name IN ('source_commit', 'applied_by')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let rows: Vec<AppliedMigrationQueryRow> = if has_provenance {
+        sqlx::query_as(
+            "SELECT version, name, source_commit, applied_by, applied_at
+               FROM _migrations ORDER BY version",
+        )
+        .fetch_all(&mut *conn)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT version, name, NULL::text, NULL::text, applied_at
+               FROM _migrations ORDER BY version",
+        )
+        .fetch_all(&mut *conn)
+        .await?
+    };
+    rows.into_iter()
+        .map(|(version, name, source_commit, applied_by, applied_at)| {
+            Ok(AppliedPostgresMigration {
+                version: u32::try_from(version).map_err(|_| {
+                    DbError::Migration("_migrations contains a negative version".to_string())
+                })?,
+                name,
+                source_commit,
+                applied_by,
+                applied_at,
+            })
+        })
+        .collect()
+}
+
+fn reviewed_legacy_row_matches(
+    row: &AppliedPostgresMigration,
+    reviewed: &ReviewedLegacyLedgerRow,
+) -> bool {
+    row.version == reviewed.version
+        && row.name == reviewed.name
+        && row.source_commit.is_none()
+        && row.applied_by.is_none()
+        && row
+            .applied_at
+            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
+            == reviewed.applied_at
+}
+
+fn reviewed_live_v290_ledger_matches(applied: &[AppliedPostgresMigration]) -> bool {
+    applied.last().is_some_and(|row| row.version == 290)
+        && REVIEWED_LEGACY_LEDGER_ROWS.iter().all(|reviewed| {
+            applied
+                .iter()
+                .find(|row| row.version == reviewed.version)
+                .is_some_and(|row| reviewed_legacy_row_matches(row, reviewed))
+        })
+        && !applied.iter().any(|row| row.version == 247)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum V247SchemaState {
+    Exact,
+    ReviewedEmptyPartial,
+    Drift,
+}
+
+/// Classify V247 by its complete column/constraint/index shape. The partial
+/// branch is intentionally narrower than `CREATE TABLE IF NOT EXISTS`: it is
+/// the one observed empty fleet table and cannot absorb arbitrary drift.
+async fn v247_schema_state(conn: &mut sqlx::PgConnection) -> Result<V247SchemaState> {
+    let state: String = sqlx::query_scalar(
+        r#"
+        WITH error_columns AS (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_array(column_name, data_type, is_nullable, column_default)
+                    ORDER BY ordinal_position
+                ), '[]'::jsonb
+            ) AS shape
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'error_signatures'
+        ), error_constraints AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE conname = 'error_signatures_pkey'
+                         AND contype = 'p' AND conkey = ARRAY[1]::smallint[]
+                   ) AS exact_pk,
+                   count(*) FILTER (
+                       WHERE conname = 'error_signatures_state_check'
+                         AND contype = 'c' AND conkey = ARRAY[9]::smallint[]
+                         AND pg_get_constraintdef(oid, true) =
+                             'CHECK (state = ANY (ARRAY[''new''::text, ''filed''::text, ''fix_merged''::text, ''verifying''::text, ''resolved''::text, ''regressed''::text]))'
+                   ) AS exact_state
+              FROM pg_constraint
+             WHERE conrelid = to_regclass('public.error_signatures')
+        ), error_indexes AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE indexname = 'error_signatures_pkey'
+                         AND indexdef = 'CREATE UNIQUE INDEX error_signatures_pkey ON public.error_signatures USING btree (signature)'
+                   ) AS exact_pk
+              FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'error_signatures'
+        ), digest_columns AS (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_array(column_name, data_type, is_nullable, column_default)
+                    ORDER BY ordinal_position
+                ), '[]'::jsonb
+            ) AS shape
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'fleet_log_digest'
+        ), digest_constraints AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE conname = 'fleet_log_digest_pkey'
+                         AND contype = 'p' AND conkey = ARRAY[1]::smallint[]
+                   ) AS exact_pk,
+                   count(*) FILTER (
+                       WHERE conname = 'fleet_log_digest_node_day_level_line_class_key'
+                         AND contype = 'u' AND conkey = ARRAY[2,3,4,5]::smallint[]
+                   ) AS exact_unique
+              FROM pg_constraint
+             WHERE conrelid = to_regclass('public.fleet_log_digest')
+        ), digest_indexes AS (
+            SELECT count(*) AS total,
+                   count(*) FILTER (
+                       WHERE indexname = 'fleet_log_digest_pkey'
+                         AND indexdef = 'CREATE UNIQUE INDEX fleet_log_digest_pkey ON public.fleet_log_digest USING btree (id)'
+                   ) AS exact_pk,
+                   count(*) FILTER (
+                       WHERE indexname = 'fleet_log_digest_node_day_level_line_class_key'
+                         AND indexdef = 'CREATE UNIQUE INDEX fleet_log_digest_node_day_level_line_class_key ON public.fleet_log_digest USING btree (node, day, level, line_class)'
+                   ) AS exact_unique
+              FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'fleet_log_digest'
+        )
+        SELECT CASE
+            WHEN error_columns.shape =
+                '[["signature","text","NO",null],["error_class","text","YES",null],["first_seen","timestamp with time zone","NO","now()"],["last_seen","timestamp with time zone","NO","now()"],["count_24h","integer","NO","0"],["count_total","integer","NO","0"],["sample_text","text","YES",null],["affected_nodes","jsonb","YES",null],["state","text","NO","''new''::text"],["work_item_id","uuid","YES",null],["fix_commit_sha","text","YES",null],["resolved_at","timestamp with time zone","YES",null]]'::jsonb
+              AND error_constraints.total = 2
+              AND error_constraints.exact_pk = 1
+              AND error_constraints.exact_state = 1
+              AND error_indexes.total = 1 AND error_indexes.exact_pk = 1
+              AND digest_columns.shape =
+                '[["id","uuid","NO","gen_random_uuid()"],["node","text","NO",null],["day","date","NO",null],["level","text","NO",null],["line_class","text","NO",null],["count","integer","NO","0"],["sample","text","YES",null]]'::jsonb
+              AND digest_constraints.total = 2
+              AND digest_constraints.exact_pk = 1
+              AND digest_constraints.exact_unique = 1
+              AND digest_indexes.total = 2
+              AND digest_indexes.exact_pk = 1
+              AND digest_indexes.exact_unique = 1
+            THEN 'exact'
+            WHEN error_columns.shape =
+                '[["signature","text","NO",null],["error_class","text","YES",null],["first_seen","timestamp with time zone","YES","now()"],["last_seen","timestamp with time zone","YES","now()"],["count_24h","integer","YES","0"],["count_total","integer","YES","0"],["sample_text","text","YES",null],["affected_nodes","jsonb","YES",null],["state","text","YES","''new''::text"],["work_item_id","uuid","YES",null],["fix_commit_sha","text","YES",null],["resolved_at","timestamp with time zone","YES",null]]'::jsonb
+              AND error_constraints.total = 1
+              AND error_constraints.exact_pk = 1
+              AND error_constraints.exact_state = 0
+              AND error_indexes.total = 1 AND error_indexes.exact_pk = 1
+              AND to_regclass('public.fleet_log_digest') IS NULL
+            THEN 'reviewed_empty_partial_candidate'
+            ELSE 'drift'
+        END
+          FROM error_columns, error_constraints, error_indexes,
+               digest_columns, digest_constraints, digest_indexes
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if state == "reviewed_empty_partial_candidate" {
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM error_signatures")
+            .fetch_one(&mut *conn)
+            .await?;
+        return Ok(if rows == 0 {
+            V247SchemaState::ReviewedEmptyPartial
+        } else {
+            V247SchemaState::Drift
+        });
+    }
+    Ok(match state.as_str() {
+        "exact" => V247SchemaState::Exact,
+        _ => V247SchemaState::Drift,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardCompatibilityState {
+    Absent,
+    Exact,
+    Drift,
+}
+
+/// Validate the historical effects whose migration numbers were repurposed,
+/// plus the one deliberately unexecuted V280 roster layout.
+async fn reviewed_historical_schema_is_exact(conn: &mut sqlx::PgConnection) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        r#"
+        WITH scan_columns AS (
+            SELECT count(*) = 2
+                   AND bool_and(data_type = 'text' AND is_nullable = 'YES' AND column_default IS NULL)
+                   AS exact
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'project_repos'
+               AND column_name IN ('tech_stack', 'local_path')
+        ), health_columns AS (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_array(column_name, data_type, is_nullable, column_default)
+                    ORDER BY ordinal_position
+                ), '[]'::jsonb
+            ) = '[["worker_name","text","NO",null],["sampled_at","timestamp with time zone","NO","now()"],["mem_total_kb","bigint","NO",null],["mem_available_kb","bigint","NO",null],["mem_available_gb","double precision","NO",null],["swap_total_kb","bigint","NO","0"],["swap_free_kb","bigint","NO","0"],["load_avg_1m","double precision","YES",null],["load_avg_5m","double precision","YES",null],["load_avg_15m","double precision","YES",null],["service_rss_json","jsonb","NO","''[]''::jsonb"],["oom_kills_json","jsonb","NO","''[]''::jsonb"],["dmesg_cursor","text","YES",null],["pressure_state","text","NO","''healthy''::text"],["build_reserve_gb","double precision","NO","4.0"]]'::jsonb AS exact
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'node_health'
+        ), health_constraints AS (
+            SELECT count(*) = 3
+               AND count(*) FILTER (WHERE conname = 'node_health_pkey' AND contype = 'p' AND conkey = ARRAY[1,2]::smallint[]) = 1
+               AND count(*) FILTER (WHERE conname = 'node_health_worker_name_fkey' AND contype = 'f' AND conkey = ARRAY[1]::smallint[]) = 1
+               AND count(*) FILTER (
+                    WHERE conname = 'node_health_pressure_state_check' AND contype = 'c'
+                      AND conkey = ARRAY[14]::smallint[]
+                      AND pg_get_constraintdef(oid, true) = 'CHECK (pressure_state = ANY (ARRAY[''healthy''::text, ''build_paused''::text, ''critical''::text]))'
+               ) = 1 AS exact
+              FROM pg_constraint
+             WHERE conrelid = to_regclass('public.node_health')
+        ), health_indexes AS (
+            SELECT count(*) = 3
+               AND count(*) FILTER (WHERE indexname = 'node_health_pkey' AND indexdef = 'CREATE UNIQUE INDEX node_health_pkey ON public.node_health USING btree (worker_name, sampled_at)') = 1
+               AND count(*) FILTER (WHERE indexname = 'idx_node_health_latest' AND indexdef = 'CREATE INDEX idx_node_health_latest ON public.node_health USING btree (worker_name, sampled_at DESC)') = 1
+               AND count(*) FILTER (WHERE indexname = 'idx_node_health_pressure' AND indexdef = 'CREATE INDEX idx_node_health_pressure ON public.node_health USING btree (pressure_state, sampled_at DESC)') = 1 AS exact
+              FROM pg_indexes
+             WHERE schemaname = 'public' AND tablename = 'node_health'
+        ), roster AS (
+            SELECT count(*) = 2
+               AND count(*) FILTER (WHERE relname = 'computers' AND relkind = 'r') = 1
+               AND count(*) FILTER (WHERE relname = 'fleet_workers' AND relkind = 'r') = 1 AS exact
+              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = 'public'
+               AND relname IN ('computers', 'fleet_workers', 'fleet_nodes', 'fleet_workers_legacy')
+        )
+        SELECT scan_columns.exact AND health_columns.exact
+           AND health_constraints.exact AND health_indexes.exact AND roster.exact
+          FROM scan_columns, health_columns, health_constraints, health_indexes, roster
+        "#,
+    )
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+async fn forward_compatibility_state(
+    conn: &mut sqlx::PgConnection,
+    table_name: &str,
+) -> Result<ForwardCompatibilityState> {
+    let state: String = match table_name {
+        "projects" => sqlx::query_scalar(
+            r#"
+            WITH columns AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (WHERE column_name = 'workstream_id' AND data_type = 'text' AND is_nullable = 'YES' AND column_default IS NULL) AS workstream,
+                       count(*) FILTER (WHERE column_name = 'digest_template_id' AND data_type = 'jsonb' AND is_nullable = 'YES' AND column_default IS NULL) AS digest,
+                       count(*) FILTER (WHERE column_name = 'logo_url' AND data_type = 'text' AND is_nullable = 'YES' AND column_default IS NULL) AS logo
+                  FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'projects'
+                   AND column_name IN ('workstream_id', 'digest_template_id', 'logo_url')
+            ), indexes AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (
+                           WHERE indexname = 'idx_projects_workstream_id'
+                             AND indexdef = 'CREATE INDEX idx_projects_workstream_id ON public.projects USING btree (workstream_id) WHERE (workstream_id IS NOT NULL)'
+                       ) AS exact
+                  FROM pg_indexes
+                 WHERE schemaname = 'public' AND tablename = 'projects'
+                   AND indexname = 'idx_projects_workstream_id'
+            )
+            SELECT CASE
+                     WHEN columns.total = 0 AND indexes.total = 0 THEN 'absent'
+                     WHEN columns.total = 3 AND columns.workstream = 1
+                          AND columns.digest = 1 AND columns.logo = 1
+                          AND indexes.total = 1 AND indexes.exact = 1 THEN 'exact'
+                     ELSE 'drift'
+                   END
+              FROM columns, indexes
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await?,
+        "work_item_leases" => sqlx::query_scalar(
+            r#"
+            SELECT CASE
+                     WHEN count(*) = 0 THEN 'absent'
+                     WHEN count(*) = 1
+                      AND bool_and(data_type = 'timestamp with time zone'
+                                   AND is_nullable = 'YES' AND column_default IS NULL)
+                       THEN 'exact'
+                     ELSE 'drift'
+                   END
+              FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'work_item_leases'
+               AND column_name = 'build_started_at'
+            "#,
+        )
+        .fetch_one(&mut *conn)
+        .await?,
+        _ => unreachable!("fixed internal compatibility target"),
+    };
+    Ok(match state.as_str() {
+        "absent" => ForwardCompatibilityState::Absent,
+        "exact" => ForwardCompatibilityState::Exact,
+        _ => ForwardCompatibilityState::Drift,
+    })
+}
+
+/// Read migration state without creating tables, taking locks, or applying DDL.
+pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigrationStatus> {
+    let applied = read_applied_postgres_migrations(pool).await?;
+    let applied_versions = applied
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<BTreeSet<_>>();
+    let current_version = applied_versions.iter().next_back().copied().unwrap_or(0);
+    let mut schema_conn = pool.acquire().await?;
+    let v247_state = v247_schema_state(&mut schema_conn).await?;
+    let historical_schema_exact = reviewed_historical_schema_is_exact(&mut schema_conn).await?;
+    let project_forward_state = forward_compatibility_state(&mut schema_conn, "projects").await?;
+    let lease_forward_state =
+        forward_compatibility_state(&mut schema_conn, "work_item_leases").await?;
+    drop(schema_conn);
+    let embedded = PG_MIGRATIONS
+        .iter()
+        .map(|migration| (migration.version, (migration, false)))
+        .chain(
+            EXPLICIT_PG_MIGRATIONS
+                .iter()
+                .map(|migration| (migration.version, (migration, true))),
+        )
+        .collect::<BTreeMap<_, _>>();
+    let mut drift = Vec::new();
+    for row in &applied {
+        if let Some((expected, explicit)) = embedded.get(&row.version) {
+            if row.name != expected.name {
+                drift.push(format!(
+                    "v{} name drift: stored {:?}, embedded {:?}",
+                    row.version, row.name, expected.name
+                ));
+            }
+            if *explicit
+                && (row.source_commit.as_deref().is_none_or(|source| {
+                    source.len() != 40
+                        || !source
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                }) || row.applied_by.as_deref().is_none_or(str::is_empty))
+            {
+                drift.push(format!(
+                    "v{} explicit provenance is missing or invalid",
+                    row.version
+                ));
+            }
+        } else if row.version > BOOTSTRAP_BASELINE_VERSION {
+            let reviewed = REVIEWED_LEGACY_LEDGER_ROWS
+                .iter()
+                .find(|reviewed| reviewed.version == row.version);
+            if !REVIEWED_LEDGER_ONLY_VERSIONS.contains(&row.version)
+                || reviewed.is_none_or(|reviewed| !reviewed_legacy_row_matches(row, reviewed))
+            {
+                drift.push(format!(
+                    "v{} is applied but absent from this binary or differs from the exact reviewed legacy row",
+                    row.version
+                ));
+            }
+        }
+    }
+
+    // Once any ledger-only version is present, this is the reviewed legacy
+    // lineage. Bind every reviewed row to its exact microsecond and preserve
+    // its original NULL provenance; a matching name alone is insufficient.
+    let legacy_lineage = applied
+        .iter()
+        .any(|row| REVIEWED_LEDGER_ONLY_VERSIONS.contains(&row.version));
+    if legacy_lineage {
+        for reviewed in REVIEWED_LEGACY_LEDGER_ROWS {
+            match applied.iter().find(|row| row.version == reviewed.version) {
+                Some(row) if reviewed_legacy_row_matches(row, reviewed) => {}
+                Some(_) => drift.push(format!(
+                    "v{} reviewed legacy timestamp/name/provenance drift",
+                    reviewed.version
+                )),
+                None => drift.push(format!(
+                    "v{} reviewed legacy ledger row is missing",
+                    reviewed.version
+                )),
+            }
+        }
+    }
+
+    let reviewed_v247_repair_pending = reviewed_live_v290_ledger_matches(&applied)
+        && historical_schema_exact
+        && project_forward_state == ForwardCompatibilityState::Absent
+        && lease_forward_state == ForwardCompatibilityState::Exact
+        && v247_state == V247SchemaState::ReviewedEmptyPartial;
+    for (version, (expected, _)) in &embedded {
+        if *version > BOOTSTRAP_BASELINE_VERSION
+            && *version <= current_version
+            && !applied_versions.contains(version)
+            && (*version != 247 || !reviewed_v247_repair_pending)
+        {
+            drift.push(format!(
+                "v{version} ({}) is missing below current v{current_version}",
+                expected.name
+            ));
+        }
+    }
+
+    let pending_automatic = PG_MIGRATIONS
+        .iter()
+        .filter(|migration| migration.version > current_version && !reviewed_v247_repair_pending)
+        .map(|migration| migration_descriptor(migration, false))
+        .collect();
+    let pending_explicit = EXPLICIT_PG_MIGRATIONS
+        .iter()
+        .filter(|migration| !applied_versions.contains(&migration.version))
+        .map(|migration| migration_descriptor(migration, true))
+        .collect();
+    let rollout_schema_valid = if applied_versions.contains(&297) {
+        Some(crate::rollout_authority::release_rollout_schema_is_exact(pool).await?)
+    } else if applied_versions.contains(&295) {
+        // V295 is explicit and is the prerequisite for automatic V296/V297.
+        // Its own postcondition must remain observable before V297 exists;
+        // runtime rollout APIs separately require the full V297 predicate.
+        Some(crate::rollout_authority::release_rollout_authority_schema_is_exact(pool).await?)
+    } else {
+        None
+    };
+    if rollout_schema_valid == Some(false) {
+        drift.push("v295 rollout authority schema or committed data drifted".to_string());
+    }
+    let reconciliation_schema_valid = if applied_versions.contains(&295) {
+        Some(
+            v247_state == V247SchemaState::Exact
+                && historical_schema_exact
+                && project_forward_state == ForwardCompatibilityState::Exact
+                && lease_forward_state == ForwardCompatibilityState::Exact,
+        )
+    } else {
+        None
+    };
+    if reconciliation_schema_valid == Some(false) {
+        drift.push("v295 historical reconciliation schema drifted".to_string());
+    }
+
+    if let Some(v247) = applied.iter().find(|row| row.version == 247) {
+        if v247.source_commit.is_some() || v247.applied_by.is_some() {
+            let bound = applied
+                .iter()
+                .find(|row| row.version == 295)
+                .is_some_and(|v295| {
+                    v247.source_commit == v295.source_commit
+                        && v247.applied_by == v295.applied_by
+                        && v247.applied_at == v295.applied_at
+                });
+            if !bound {
+                drift.push(
+                    "late-applied v247 provenance/timestamp is not bound exactly to v295"
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    Ok(PostgresMigrationStatus {
+        current_version,
+        automatic_ceiling: LATEST_AUTOMATIC_POSTGRES_MIGRATION,
+        explicit_ceiling: LATEST_EXPLICIT_POSTGRES_MIGRATION,
+        pending_automatic,
+        pending_explicit,
+        applied,
+        drift,
+        rollout_schema_valid,
+        reviewed_v247_repair_pending,
+        reconciliation_schema_valid,
+    })
+}
+
+async fn explicit_migration_failures_exist(
+    conn: &mut sqlx::PgConnection,
+    target: u32,
+) -> Result<bool> {
+    let failures_table: bool =
+        sqlx::query_scalar("SELECT to_regclass('public._migration_failures') IS NOT NULL")
+            .fetch_one(&mut *conn)
+            .await?;
+    if !failures_table {
+        return Ok(false);
+    }
+    Ok(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM _migration_failures WHERE version <= $1",
+        )
+        .bind(
+            i32::try_from(target).map_err(|_| {
+                DbError::Migration("explicit migration target exceeds i32".to_string())
+            })?,
+        )
+        .fetch_one(&mut *conn)
+        .await?
+            > 0,
+    )
+}
+
+/// Apply through the one explicit migration ceiling under exact source
+/// provenance. Unlike the startup runner, every failure is fatal and rolls the
+/// current migration back; nothing is quarantined or marked applied on error.
+#[allow(clippy::too_many_arguments)]
+pub async fn apply_explicit_postgres_migrations(
+    pool: &PgPool,
+    target: u32,
+    expected_source_commit: &str,
+    running_source_commit: &str,
+    running_git_state: &str,
+    applied_by: &str,
+) -> Result<PostgresMigrationStatus> {
+    if target != LATEST_EXPLICIT_POSTGRES_MIGRATION {
+        return Err(DbError::Migration(format!(
+            "explicit migration target must be exactly v{LATEST_EXPLICIT_POSTGRES_MIGRATION}; got v{target}"
+        )));
+    }
+    validate_explicit_apply_identity(
+        expected_source_commit,
+        running_source_commit,
+        running_git_state,
+        applied_by,
+    )?;
+
+    let before = postgres_migration_status(pool).await?;
+    if !before.drift.is_empty() {
+        return Err(DbError::Migration(format!(
+            "migration authority drift: {}",
+            before.drift.join("; ")
+        )));
+    }
+    if before.current_version < 290 {
+        return Err(DbError::Migration(format!(
+            "explicit v{target} requires the reviewed v290-or-newer base; database is v{}",
+            before.current_version
+        )));
+    }
+
+    let mut conn = pool.acquire().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .fetch_one(&mut *conn)
+        .await?;
+    if !acquired {
+        return Err(DbError::Migration(
+            "another migration runner holds the migration lock".to_string(),
+        ));
+    }
+
+    let result = async {
+        ensure_pg_migrations_table(&mut conn).await?;
+        if explicit_migration_failures_exist(&mut conn, target).await? {
+            return Err(DbError::Migration(
+                "explicit migration refuses a database with quarantined migration failures"
+                    .to_string(),
+            ));
+        }
+
+        let mut tx = conn.begin().await?;
+        sqlx::query("LOCK TABLE _migrations IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let locked_applied = read_applied_postgres_migrations_conn(&mut tx).await?;
+        if locked_applied != before.applied {
+            return Err(DbError::Migration(
+                "migration ledger changed while acquiring the explicit lock; retry".to_string(),
+            ));
+        }
+        let locked_current = locked_applied
+            .last()
+            .map(|row| row.version)
+            .unwrap_or(0);
+        if locked_current != before.current_version {
+            return Err(DbError::Migration(format!(
+                "migration version changed from v{} to v{} while acquiring the explicit lock; retry",
+                before.current_version, locked_current
+            )));
+        }
+        if let Some(applied) = before.applied.iter().find(|row| row.version == target) {
+            if applied.source_commit.as_deref() != Some(expected_source_commit) {
+                return Err(DbError::Migration(format!(
+                    "v{target} provenance drift: stored {:?}, requested {expected_source_commit}",
+                    applied.source_commit
+                )));
+            }
+            tx.rollback().await?;
+            return Ok(());
+        }
+        if locked_current > target {
+            return Err(DbError::Migration(format!(
+                "database v{locked_current} is newer than bounded target v{target}, \
+                 but the exact source-attested v{target} ledger row is missing"
+            )));
+        }
+
+        if !reviewed_historical_schema_is_exact(&mut tx).await? {
+            return Err(DbError::Migration(
+                "reviewed V274/V277/V280 historical schema profile is not exact".to_string(),
+            ));
+        }
+        let project_state = forward_compatibility_state(&mut tx, "projects").await?;
+        let lease_state = forward_compatibility_state(&mut tx, "work_item_leases").await?;
+        if project_state == ForwardCompatibilityState::Drift
+            || lease_state == ForwardCompatibilityState::Drift
+        {
+            return Err(DbError::Migration(
+                "V295 forward-compatibility pre-state drifted".to_string(),
+            ));
+        }
+
+        let repair_v247 = before.reviewed_v247_repair_pending;
+        let locked_v247_state = v247_schema_state(&mut tx).await?;
+        if repair_v247 {
+            if !reviewed_live_v290_ledger_matches(&locked_applied)
+                || locked_v247_state != V247SchemaState::ReviewedEmptyPartial
+                || project_state != ForwardCompatibilityState::Absent
+                || lease_state != ForwardCompatibilityState::Exact
+            {
+                return Err(DbError::Migration(
+                    "reviewed V247 forward-repair pre-state changed under lock".to_string(),
+                ));
+            }
+            sqlx::raw_sql(schema::SCHEMA_V295_REPAIR_REVIEWED_EMPTY_V247)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    DbError::Migration(format!("explicit V247 forward repair failed: {error}"))
+                })?;
+        } else if locked_v247_state != V247SchemaState::Exact
+            || !locked_applied.iter().any(|row| row.version == 247)
+        {
+            return Err(DbError::Migration(
+                "V247 must be exact and recorded, or match the one reviewed repair profile"
+                    .to_string(),
+            ));
+        }
+
+        sqlx::raw_sql(schema::SCHEMA_V295_FORWARD_COMPATIBILITY_REPAIR)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| {
+                DbError::Migration(format!("explicit V295 compatibility repair failed: {error}"))
+            })?;
+        if v247_schema_state(&mut tx).await? != V247SchemaState::Exact
+            || forward_compatibility_state(&mut tx, "projects").await?
+                != ForwardCompatibilityState::Exact
+            || forward_compatibility_state(&mut tx, "work_item_leases").await?
+                != ForwardCompatibilityState::Exact
+        {
+            return Err(DbError::Migration(
+                "V295 compatibility repair postcondition is not exact".to_string(),
+            ));
+        }
+
+        let mut current = before.current_version;
+        let ordered = PG_MIGRATIONS
+            .iter()
+            .chain(EXPLICIT_PG_MIGRATIONS.iter())
+            .filter(|migration| migration.version > current && migration.version <= target)
+            .collect::<Vec<_>>();
+        for migration in ordered {
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| {
+                    DbError::Migration(format!(
+                        "explicit v{} ({}) failed: {error}",
+                        migration.version, migration.name
+                    ))
+                })?;
+            if migration.version == LATEST_EXPLICIT_POSTGRES_MIGRATION {
+                let applied_at: chrono::DateTime<chrono::Utc> =
+                    sqlx::query_scalar("SELECT clock_timestamp()")
+                        .fetch_one(&mut *tx)
+                        .await?;
+                if repair_v247 {
+                    sqlx::query(
+                        "INSERT INTO _migrations
+                            (version, name, applied_at, source_commit, applied_by)
+                         VALUES (247, 'error_miner_tables', $1, $2, $3)",
+                    )
+                    .bind(applied_at)
+                    .bind(expected_source_commit)
+                    .bind(applied_by)
+                    .execute(&mut *tx)
+                    .await?;
+                }
+                sqlx::query(
+                    "INSERT INTO _migrations
+                        (version, name, applied_at, source_commit, applied_by)
+                     VALUES ($1, $2, $3, $4, $5)",
+                )
+                .bind(i32::try_from(migration.version).expect("migration version fits i32"))
+                .bind(migration.name)
+                .bind(applied_at)
+                .bind(expected_source_commit)
+                .bind(applied_by)
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                    .bind(i32::try_from(migration.version).expect("migration version fits i32"))
+                    .bind(migration.name)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            current = migration.version;
+        }
+        if current != target {
+            return Err(DbError::Migration(format!(
+                "bounded explicit migration stopped at v{current}, expected v{target}"
+            )));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+
+    let unlocked = sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(MIGRATION_ADVISORY_LOCK_KEY)
+        .fetch_one(&mut *conn)
+        .await;
+    if !matches!(unlocked, Ok(true)) {
+        conn.close().await.ok();
+        return Err(DbError::Migration(format!(
+            "explicit migration lock release failed: {unlocked:?}"
+        )));
+    }
+    result?;
+
+    let after = postgres_migration_status(pool).await?;
+    let target_provenance_is_exact = after.applied.iter().any(|row| {
+        row.version == target && row.source_commit.as_deref() == Some(expected_source_commit)
+    });
+    if after.current_version < target || !target_provenance_is_exact || !after.drift.is_empty() {
+        return Err(DbError::Migration(format!(
+            "explicit migration postcondition failed at v{} (target provenance exact={}): {}",
+            after.current_version,
+            target_provenance_is_exact,
+            after.drift.join("; ")
+        )));
+    }
+    Ok(after)
+}
+
 #[cfg(test)]
 mod tests {
     use std::env;
 
     use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -1542,6 +2848,1206 @@ mod tests {
                 pair[1].name,
             );
         }
+    }
+
+    #[test]
+    fn v295_remains_explicit_only_and_v296_v297_wait_for_it() {
+        assert_eq!(LATEST_AUTOMATIC_POSTGRES_MIGRATION, 297);
+        assert_eq!(LATEST_EXPLICIT_POSTGRES_MIGRATION, 295);
+        assert_eq!(PG_MIGRATIONS.last().unwrap().version, 297);
+        assert!(
+            PG_MIGRATIONS
+                .iter()
+                .all(|migration| migration.version != 295)
+        );
+        assert_eq!(EXPLICIT_PG_MIGRATIONS.len(), 1);
+        assert_eq!(EXPLICIT_PG_MIGRATIONS[0].version, 295);
+        assert_eq!(EXPLICIT_PG_MIGRATIONS[0].name, "release_rollout_authority");
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 296)
+            .expect("V296 must be registered");
+        assert_eq!(migration.name, "devstral_code_capability_authority");
+        assert!(migration.sql.contains("INSERT INTO fleet_model_catalog"));
+        assert!(!migration.sql.contains("INSERT INTO model_catalog"));
+        assert!(!migration.sql.contains("UPDATE model_catalog"));
+        let rollback_migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 297)
+            .expect("V297 must be registered");
+        assert_eq!(
+            rollback_migration.name,
+            "release_rollout_post_success_rollback"
+        );
+        assert!(rollback_migration.sql.contains("OLD.state = 'succeeded'"));
+        assert!(
+            rollback_migration
+                .sql
+                .contains("NEW.state = 'rolling_back'")
+        );
+
+        assert!(!automatic_migration_prerequisites_satisfied(
+            296,
+            &BTreeSet::new()
+        ));
+        assert!(!automatic_migration_prerequisites_satisfied(
+            297,
+            &BTreeSet::new()
+        ));
+        assert!(automatic_migration_prerequisites_satisfied(
+            296,
+            &BTreeSet::from([295])
+        ));
+        assert!(automatic_migration_prerequisites_satisfied(
+            297,
+            &BTreeSet::from([295])
+        ));
+        assert!(automatic_migration_prerequisites_satisfied(
+            294,
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
+    fn explicit_apply_identity_requires_exact_clean_source() {
+        const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+        validate_explicit_apply_identity(SOURCE, SOURCE, "unpushed", "adele@host").unwrap();
+        assert!(validate_explicit_apply_identity(SOURCE, SOURCE, "pushed", "adele@host").is_ok());
+        assert!(
+            validate_explicit_apply_identity(SOURCE, &"a".repeat(40), "unpushed", "adele@host")
+                .is_err()
+        );
+        assert!(validate_explicit_apply_identity(SOURCE, SOURCE, "dirty", "adele@host").is_err());
+        assert!(
+            validate_explicit_apply_identity("short", SOURCE, "unpushed", "adele@host").is_err()
+        );
+        assert!(
+            validate_explicit_apply_identity(SOURCE, SOURCE, "unpushed", "bad operator").is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn v295_explicit_fresh_replay_drift_lock_and_rollout_authority() {
+        use crate::rollout_authority::{
+            ReleaseRolloutAuthoritySpec, RolloutArtifactAuthority,
+            RolloutAuthorityRegistrationOutcome, RolloutTargetAuthority,
+            RolloutTransactionBeginOutcome, pg_begin_release_rollout,
+            pg_cas_release_rollout_target_state, pg_cas_release_rollout_transaction_state,
+            pg_claim_succeeded_release_rollout_rollback,
+            pg_get_release_rollout_transaction_by_request_id,
+            pg_register_release_rollout_authority, release_rollout_schema_is_exact,
+        };
+
+        const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+        const TARGET_ID: Uuid = Uuid::from_u128(0xb5f0a59f_a46d_4e88_8113_847fa275f782);
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        let blank = postgres_migration_status(&pool).await.unwrap();
+        assert_eq!(blank.current_version, 0);
+        assert!(!postgres_migration_table_exists(&pool).await.unwrap());
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                SOURCE,
+                SOURCE,
+                "unpushed",
+                "test@v295",
+            )
+            .await
+            .expect_err("explicit rollout migration needs the reviewed v290 base")
+            .to_string()
+            .contains("v290-or-newer")
+        );
+        assert!(
+            !postgres_migration_table_exists(&pool).await.unwrap(),
+            "rejected fresh apply must not create migration state"
+        );
+
+        sqlx::raw_sql(schema::BOOTSTRAP_V161_SQL)
+            .execute(&pool)
+            .await
+            .expect("fresh baseline");
+        for migration in PG_MIGRATIONS.iter().filter(|migration| {
+            migration.version > BOOTSTRAP_BASELINE_VERSION && migration.version <= 290
+        }) {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("strict fresh v{} failed: {error}", migration.version)
+                });
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                .bind(migration.version as i32)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        // V280 is intentionally non-runnable; fresh replay retains the exact
+        // table-backed roster layout required by V291 and the reviewed fleet.
+        assert_eq!(
+            postgres_migration_status(&pool)
+                .await
+                .unwrap()
+                .current_version,
+            290
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.release_rollout_authorities')::text",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None,
+            "V290 must not contain v295 objects",
+        );
+
+        let mut lock_holder = pool.acquire().await.unwrap();
+        sqlx::query("SELECT pg_advisory_lock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_holder)
+            .await
+            .unwrap();
+        let lock_error =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect_err("concurrent explicit migration must fail fast");
+        assert!(
+            lock_error.to_string().contains("migration lock"),
+            "unexpected lock failure: {lock_error}"
+        );
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(MIGRATION_ADVISORY_LOCK_KEY)
+            .execute(&mut *lock_holder)
+            .await
+            .unwrap();
+        drop(lock_holder);
+
+        let applied =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect("apply exact v295");
+        assert_eq!(applied.current_version, 295);
+        assert_eq!(applied.rollout_schema_valid, Some(true));
+        assert_eq!(applied.reconciliation_schema_valid, Some(true));
+        assert!(applied.drift.is_empty());
+        assert!(
+            !release_rollout_schema_is_exact(&pool).await.unwrap(),
+            "runtime rollout APIs must fail closed until V297 is durably recorded"
+        );
+
+        let replay =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect("exact replay must be idempotent");
+        assert_eq!(replay.current_version, 295);
+
+        let advanced = run_postgres_migrations(&pool)
+            .await
+            .expect("automatic V296/V297 must follow recorded explicit V295");
+        assert_eq!(advanced, 297);
+        assert!(release_rollout_schema_is_exact(&pool).await.unwrap());
+        sqlx::query("UPDATE _migrations SET name = 'drifted_v297' WHERE version = 297")
+            .execute(&pool)
+            .await
+            .expect("drift V297 ledger fixture");
+        assert!(
+            !release_rollout_schema_is_exact(&pool).await.unwrap(),
+            "V297 ledger name drift must make runtime authority fail closed"
+        );
+        sqlx::query(
+            "UPDATE _migrations
+                SET name = 'release_rollout_post_success_rollback'
+              WHERE version = 297",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore exact V297 ledger fixture");
+        assert!(release_rollout_schema_is_exact(&pool).await.unwrap());
+        let drifted_v297 = schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK.replace(
+            "AND NEW.completed_at IS NULL",
+            "AND NEW.completed_at IS NOT NULL",
+        );
+        assert_ne!(
+            drifted_v297,
+            schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK,
+            "test must mutate a required V297 rollback clause"
+        );
+        sqlx::raw_sql(&drifted_v297)
+            .execute(&pool)
+            .await
+            .expect("install drifted V297 guard fixture");
+        assert!(
+            !release_rollout_schema_is_exact(&pool).await.unwrap(),
+            "V297 semantic drift must make runtime authority fail closed"
+        );
+        sqlx::raw_sql(schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK)
+            .execute(&pool)
+            .await
+            .expect("restore exact V297 guard");
+        assert!(release_rollout_schema_is_exact(&pool).await.unwrap());
+        let replay_after_v296 =
+            apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
+                .await
+                .expect("exact V295 replay must remain idempotent after V296");
+        assert_eq!(replay_after_v296.current_version, 297);
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                &"a".repeat(40),
+                &"a".repeat(40),
+                "unpushed",
+                "test@v295",
+            )
+            .await
+            .expect_err("stored provenance mismatch must fail")
+            .to_string()
+            .contains("provenance drift")
+        );
+
+        let mut partial = pool.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO release_rollout_authorities
+                (source_commit, expected_target_count, expected_artifact_count, created_by)
+             VALUES ($1, 1, 2, 'test@v295')",
+        )
+        .bind("3".repeat(40))
+        .execute(&mut *partial)
+        .await
+        .unwrap();
+        assert!(
+            partial.commit().await.is_err(),
+            "deferred authority validator must reject an unsealed partial authority"
+        );
+
+        sqlx::query(
+            "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, 'vinny', '192.0.2.9', 'macos', 'test')",
+        )
+        .bind(crate::rollout_authority::FORBIDDEN_VINNY_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let mut forbidden = pool.begin().await.unwrap();
+        let forbidden_authority: Uuid = sqlx::query_scalar(
+            "INSERT INTO release_rollout_authorities
+                (source_commit, expected_target_count, expected_artifact_count, created_by)
+             VALUES ($1, 1, 2, 'test@v295') RETURNING id",
+        )
+        .bind("4".repeat(40))
+        .fetch_one(&mut *forbidden)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(
+                "INSERT INTO release_rollout_authority_targets
+                    (authority_id, target_ordinal, computer_id, computer_name,
+                     target_triple, artifact_version)
+                 VALUES ($1, 0, $2, 'vinny', 'aarch64-unknown-linux-gnu', 'forbidden')",
+            )
+            .bind(forbidden_authority)
+            .bind(crate::rollout_authority::FORBIDDEN_VINNY_ID)
+            .execute(&mut *forbidden)
+            .await
+            .is_err(),
+            "database constraints must reject Vinny by exact name and UUID"
+        );
+        forbidden.rollback().await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO computers
+                (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, 'beyonce', '192.0.2.10', 'linux-ubuntu', 'test')",
+        )
+        .bind(TARGET_ID)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE computers SET status = 'online' WHERE id = $1")
+            .bind(TARGET_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO fleet_workers (name, ip, ssh_user, status)
+             VALUES ('beyonce', '192.0.2.10', 'test', 'online')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let artifact_version = format!("recovery.{SOURCE}.ubuntu24-arm64");
+        let ff_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO release_artifacts
+                (artifact_name, artifact_version, source_commit, target_triple, sha256, size_bytes)
+             VALUES ('ff', $1, $2, 'aarch64-unknown-linux-gnu', $3, 10)
+             RETURNING id",
+        )
+        .bind(&artifact_version)
+        .bind(SOURCE)
+        .bind("1".repeat(64))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let daemon_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO release_artifacts
+                (artifact_name, artifact_version, source_commit, target_triple, sha256, size_bytes)
+             VALUES ('forgefleetd', $1, $2, 'aarch64-unknown-linux-gnu', $3, 20)
+             RETURNING id",
+        )
+        .bind(&artifact_version)
+        .bind(SOURCE)
+        .bind("2".repeat(64))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let spec = ReleaseRolloutAuthoritySpec {
+            source_commit: SOURCE.to_string(),
+            created_by: "test@v295".to_string(),
+            targets: vec![RolloutTargetAuthority {
+                target_ordinal: 0,
+                computer_id: TARGET_ID,
+                computer_name: "beyonce".to_string(),
+                target_triple: "aarch64-unknown-linux-gnu".to_string(),
+                artifact_version,
+                artifacts: vec![
+                    RolloutArtifactAuthority {
+                        artifact_name: "ff".to_string(),
+                        artifact_id: ff_id,
+                    },
+                    RolloutArtifactAuthority {
+                        artifact_name: "forgefleetd".to_string(),
+                        artifact_id: daemon_id,
+                    },
+                ],
+            }],
+        };
+        let authority = pg_register_release_rollout_authority(&pool, &spec)
+            .await
+            .expect("seal complete exact authority");
+        assert_eq!(
+            authority.outcome,
+            RolloutAuthorityRegistrationOutcome::Inserted
+        );
+        assert_eq!(
+            pg_register_release_rollout_authority(&pool, &spec)
+                .await
+                .unwrap()
+                .outcome,
+            RolloutAuthorityRegistrationOutcome::ExactExisting,
+        );
+        let mut drifted = spec.clone();
+        drifted.created_by = "other@test".to_string();
+        assert!(
+            pg_register_release_rollout_authority(&pool, &drifted)
+                .await
+                .is_err()
+        );
+
+        let request_id = Uuid::new_v4();
+        let legacy_rollout_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO upgrade_rollouts (software_id, started_by, stages, status)
+             VALUES ('ff', 'legacy@test', $1, 'in_progress') RETURNING id",
+        )
+        .bind(serde_json::json!([{"stage_idx": 0, "target_names": ["beyonce"]}]))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let overlap_error =
+            pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30)
+                .await
+                .expect_err("active legacy UUID overlap must refuse artifact begin");
+        assert!(overlap_error.to_string().contains("overlaps"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM release_rollout_transactions WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "overlap refusal must happen before transaction creation"
+        );
+        sqlx::query("UPDATE upgrade_rollouts SET status = 'halted' WHERE id = $1")
+            .bind(legacy_rollout_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let begun =
+            pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30)
+                .await
+                .expect("begin complete leased transaction");
+        assert_eq!(begun.outcome, RolloutTransactionBeginOutcome::Inserted);
+        assert_eq!(
+            pg_get_release_rollout_transaction_by_request_id(&pool, request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            begun.transaction.id,
+            "request identity must recover the durable transaction read-only"
+        );
+        assert_eq!(
+            pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30,)
+                .await
+                .unwrap()
+                .outcome,
+            RolloutTransactionBeginOutcome::ExactExisting,
+        );
+        assert!(
+            pg_begin_release_rollout(
+                &pool,
+                Uuid::new_v4(),
+                authority.authority.id,
+                "test@v295",
+                30,
+            )
+            .await
+            .is_err(),
+            "one-active constraint must reject a second transaction"
+        );
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            begun.transaction.id,
+            TARGET_ID,
+            begun.transaction.lease_token,
+            0,
+            "pending",
+            "installing",
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("exact target CAS");
+        assert_eq!(target.cas_revision, 1);
+        assert!(
+            pg_cas_release_rollout_target_state(
+                &pool,
+                begun.transaction.id,
+                TARGET_ID,
+                begun.transaction.lease_token,
+                0,
+                "pending",
+                "installing",
+                None,
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "stale target CAS must be rejected"
+        );
+        let running = pg_cas_release_rollout_transaction_state(
+            &pool,
+            begun.transaction.id,
+            begun.transaction.lease_token,
+            begun.transaction.cas_revision,
+            "planned",
+            "running",
+        )
+        .await
+        .unwrap()
+        .expect("exact parent CAS");
+        assert_eq!(running.cas_revision, 1);
+
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            begun.transaction.id,
+            TARGET_ID,
+            running.lease_token,
+            target.cas_revision,
+            "installing",
+            "verifying",
+            Some("{\"phase\":\"rollback_proof\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target verifying CAS");
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            begun.transaction.id,
+            TARGET_ID,
+            running.lease_token,
+            target.cas_revision,
+            "verifying",
+            "succeeded",
+            Some("{\"phase\":\"succeeded\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target succeeded CAS");
+        let succeeded = pg_cas_release_rollout_transaction_state(
+            &pool,
+            begun.transaction.id,
+            running.lease_token,
+            running.cas_revision,
+            "running",
+            "succeeded",
+        )
+        .await
+        .unwrap()
+        .expect("parent succeeded CAS");
+
+        let unrotated_token = sqlx::query(
+            "UPDATE release_rollout_transactions
+                SET state = 'rolling_back', completed_at = NULL,
+                    lease_owner = 'rollback@test-malformed',
+                    lease_expires_at = clock_timestamp() + interval '30 seconds',
+                    cas_revision = cas_revision + 1
+              WHERE id = $1",
+        )
+        .bind(succeeded.id)
+        .execute(&pool)
+        .await;
+        assert!(
+            unrotated_token.is_err(),
+            "V297 must reject a succeeded rollback claim that does not rotate its lease token"
+        );
+        let retained_completion = sqlx::query(
+            "UPDATE release_rollout_transactions
+                SET state = 'rolling_back', lease_token = gen_random_uuid(),
+                    lease_owner = 'rollback@test-malformed',
+                    lease_expires_at = clock_timestamp() + interval '30 seconds',
+                    cas_revision = cas_revision + 1
+              WHERE id = $1",
+        )
+        .bind(succeeded.id)
+        .execute(&pool)
+        .await;
+        assert!(
+            retained_completion.is_err(),
+            "V297 must reject a succeeded rollback claim that retains completed_at"
+        );
+        let unchanged_after_malformed_claims: (String, i64, uuid::Uuid, bool) = sqlx::query_as(
+            "SELECT state, cas_revision, lease_token, completed_at IS NOT NULL
+                   FROM release_rollout_transactions
+                  WHERE id = $1",
+        )
+        .bind(succeeded.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            unchanged_after_malformed_claims,
+            (
+                "succeeded".to_string(),
+                succeeded.cas_revision,
+                succeeded.lease_token,
+                true,
+            ),
+            "malformed trigger attempts must make zero writes"
+        );
+
+        let claim_a = pg_claim_succeeded_release_rollout_rollback(
+            &pool,
+            succeeded.id,
+            succeeded.cas_revision,
+            "rollback@test-a",
+        );
+        let claim_b = pg_claim_succeeded_release_rollout_rollback(
+            &pool,
+            succeeded.id,
+            succeeded.cas_revision,
+            "rollback@test-b",
+        );
+        let (claim_a, claim_b) = tokio::join!(claim_a, claim_b);
+        let (claim_a, claim_b) = (claim_a.unwrap(), claim_b.unwrap());
+        let claimed = match (claim_a, claim_b) {
+            (Some(claimed), None) | (None, Some(claimed)) => claimed,
+            other => panic!("exactly one concurrent rollback claim must win: {other:?}"),
+        };
+        assert_eq!(claimed.state, "rolling_back");
+        assert_eq!(claimed.cas_revision, succeeded.cas_revision + 1);
+        assert_ne!(claimed.lease_token, succeeded.lease_token);
+        assert!(claimed.lease_expires_at > chrono::Utc::now());
+        let completed_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(
+            "SELECT completed_at FROM release_rollout_transactions WHERE id = $1",
+        )
+        .bind(claimed.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(completed_at.is_none());
+
+        let target = pg_cas_release_rollout_target_state(
+            &pool,
+            claimed.id,
+            TARGET_ID,
+            claimed.lease_token,
+            target.cas_revision,
+            "succeeded",
+            "rolling_back",
+            Some("{\"phase\":\"rolling_back\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target rollback claim CAS");
+        let _target = pg_cas_release_rollout_target_state(
+            &pool,
+            claimed.id,
+            TARGET_ID,
+            claimed.lease_token,
+            target.cas_revision,
+            "rolling_back",
+            "rolled_back",
+            Some("{\"phase\":\"rolled_back\"}"),
+        )
+        .await
+        .unwrap()
+        .expect("target rolled-back CAS");
+        let rolled_back = pg_cas_release_rollout_transaction_state(
+            &pool,
+            claimed.id,
+            claimed.lease_token,
+            claimed.cas_revision,
+            "rolling_back",
+            "rolled_back",
+        )
+        .await
+        .unwrap()
+        .expect("parent rolled-back CAS");
+        assert!(
+            pg_claim_succeeded_release_rollout_rollback(
+                &pool,
+                rolled_back.id,
+                rolled_back.cas_revision,
+                "rollback@test",
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "a completed rollback must refuse a second claim"
+        );
+
+        let cancelled = pg_begin_release_rollout(
+            &pool,
+            Uuid::new_v4(),
+            authority.authority.id,
+            "test@v295",
+            30,
+        )
+        .await
+        .unwrap()
+        .transaction;
+        let cancelled = pg_cas_release_rollout_transaction_state(
+            &pool,
+            cancelled.id,
+            cancelled.lease_token,
+            cancelled.cas_revision,
+            "planned",
+            "cancelled",
+        )
+        .await
+        .unwrap()
+        .expect("cancel fixture");
+        assert!(
+            pg_claim_succeeded_release_rollout_rollback(
+                &pool,
+                cancelled.id,
+                cancelled.cas_revision,
+                "rollback@test",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        let failed = pg_begin_release_rollout(
+            &pool,
+            Uuid::new_v4(),
+            authority.authority.id,
+            "test@v295",
+            30,
+        )
+        .await
+        .unwrap()
+        .transaction;
+        let failed = pg_cas_release_rollout_transaction_state(
+            &pool,
+            failed.id,
+            failed.lease_token,
+            failed.cas_revision,
+            "planned",
+            "running",
+        )
+        .await
+        .unwrap()
+        .expect("failed fixture running CAS");
+        let failed = pg_cas_release_rollout_transaction_state(
+            &pool,
+            failed.id,
+            failed.lease_token,
+            failed.cas_revision,
+            "running",
+            "failed",
+        )
+        .await
+        .unwrap()
+        .expect("failed fixture terminal CAS");
+        assert!(
+            pg_claim_succeeded_release_rollout_rollback(
+                &pool,
+                failed.id,
+                failed.cas_revision,
+                "rollback@test",
+            )
+            .await
+            .unwrap()
+            .is_none()
+        );
+
+        sqlx::query("DROP INDEX release_rollout_one_active_transaction")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let drift = postgres_migration_status(&pool).await.unwrap();
+        assert_eq!(drift.rollout_schema_valid, Some(false));
+        assert!(!drift.drift.is_empty());
+        assert!(apply_explicit_postgres_migrations(
+            &pool, 295, SOURCE, SOURCE, "unpushed", "test@v295",
+        )
+        .await
+        .expect_err("replay over schema drift must fail closed")
+        .to_string()
+        .contains("migration authority drift"));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v295_reconciles_only_the_exact_reviewed_legacy_v247_profile() {
+        const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_reviewed_legacy_v290(&pool).await;
+
+        let ready = postgres_migration_status(&pool).await.unwrap();
+        assert_eq!(ready.current_version, 290);
+        assert!(
+            ready.drift.is_empty(),
+            "unexpected drift: {:?}",
+            ready.drift
+        );
+        assert!(ready.reviewed_v247_repair_pending);
+        assert!(ready.pending_automatic.is_empty());
+        assert_eq!(
+            run_postgres_migrations(&pool)
+                .await
+                .expect("startup must hold the reviewed repair profile"),
+            290
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.release_artifacts')::text",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None,
+            "automatic V291-V294 must not advance ahead of V247 repair",
+        );
+
+        sqlx::query(
+            "UPDATE _migrations
+                SET applied_at = applied_at + interval '1 microsecond'
+              WHERE version = 260",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let timestamp_drift = postgres_migration_status(&pool).await.unwrap();
+        assert!(!timestamp_drift.reviewed_v247_repair_pending);
+        assert!(
+            timestamp_drift
+                .drift
+                .iter()
+                .any(|item| item.contains("v260"))
+        );
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                SOURCE,
+                SOURCE,
+                "unpushed",
+                "test@legacy",
+            )
+            .await
+            .expect_err("one-microsecond legacy drift must block")
+            .to_string()
+            .contains("migration authority drift")
+        );
+        sqlx::query(
+            "UPDATE _migrations
+                SET applied_at = '2026-07-24T20:49:10.028987Z'
+              WHERE version = 260",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            "INSERT INTO error_signatures (signature, state)
+             VALUES ('must-not-coerce', 'not-a-reviewed-state')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let nonempty = postgres_migration_status(&pool).await.unwrap();
+        assert!(!nonempty.reviewed_v247_repair_pending);
+        assert!(!nonempty.drift.is_empty());
+        sqlx::query("DELETE FROM error_signatures")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("ALTER TABLE error_signatures ALTER COLUMN count_24h SET DEFAULT 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !postgres_migration_status(&pool)
+                .await
+                .unwrap()
+                .reviewed_v247_repair_pending
+        );
+        sqlx::query("ALTER TABLE error_signatures ALTER COLUMN count_24h SET DEFAULT 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query("CREATE INDEX unreviewed_error_state_idx ON error_signatures(state)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !postgres_migration_status(&pool)
+                .await
+                .unwrap()
+                .reviewed_v247_repair_pending
+        );
+        sqlx::query("DROP INDEX unreviewed_error_state_idx")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Force a late V295 failure and prove V247 + V291-V295 + compatibility
+        // repairs share one rollback boundary.
+        sqlx::query("CREATE TABLE release_rollout_authorities (wrong INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let failed = apply_explicit_postgres_migrations(
+            &pool,
+            295,
+            SOURCE,
+            SOURCE,
+            "unpushed",
+            "test@legacy",
+        )
+        .await
+        .expect_err("conflicting V295 relation must roll the whole repair back");
+        assert!(failed.to_string().contains("explicit v295"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM _migrations WHERE version = 247")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM information_schema.columns
+                  WHERE table_schema='public' AND table_name='projects'
+                    AND column_name IN ('workstream_id','digest_template_id','logo_url')",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT to_regclass('public.release_artifacts')::text",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            None
+        );
+        let mut rolled_back = pool.acquire().await.unwrap();
+        assert_eq!(
+            v247_schema_state(&mut rolled_back).await.unwrap(),
+            V247SchemaState::ReviewedEmptyPartial
+        );
+        drop(rolled_back);
+        sqlx::query("DROP TABLE release_rollout_authorities")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let applied = apply_explicit_postgres_migrations(
+            &pool,
+            295,
+            SOURCE,
+            SOURCE,
+            "unpushed",
+            "test@legacy",
+        )
+        .await
+        .expect("exact reviewed legacy repair");
+        assert_eq!(applied.current_version, 295);
+        assert!(!applied.reviewed_v247_repair_pending);
+        assert_eq!(applied.reconciliation_schema_valid, Some(true));
+        assert!(applied.drift.is_empty());
+        for reviewed in REVIEWED_LEGACY_LEDGER_ROWS {
+            let row = applied
+                .applied
+                .iter()
+                .find(|row| row.version == reviewed.version)
+                .unwrap();
+            assert!(reviewed_legacy_row_matches(row, reviewed));
+        }
+        let repaired = applied
+            .applied
+            .iter()
+            .find(|row| row.version == 247)
+            .unwrap();
+        let authority = applied
+            .applied
+            .iter()
+            .find(|row| row.version == 295)
+            .unwrap();
+        assert_eq!(repaired.name, "error_miner_tables");
+        assert_eq!(repaired.source_commit.as_deref(), Some(SOURCE));
+        assert_eq!(repaired.applied_by.as_deref(), Some("test@legacy"));
+        assert_eq!(repaired.applied_at, authority.applied_at);
+        assert_eq!(repaired.source_commit, authority.source_commit);
+        assert_eq!(repaired.applied_by, authority.applied_by);
+
+        let replay = apply_explicit_postgres_migrations(
+            &pool,
+            295,
+            SOURCE,
+            SOURCE,
+            "unpushed",
+            "test@legacy",
+        )
+        .await
+        .expect("exact replay is idempotent");
+        assert_eq!(replay.current_version, 295);
+
+        sqlx::query(
+            "UPDATE _migrations
+                SET applied_at = applied_at + interval '1 microsecond'
+              WHERE version = 247",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let bound_drift = postgres_migration_status(&pool).await.unwrap();
+        assert!(
+            bound_drift
+                .drift
+                .iter()
+                .any(|item| item.contains("not bound"))
+        );
+        assert!(
+            apply_explicit_postgres_migrations(
+                &pool,
+                295,
+                SOURCE,
+                SOURCE,
+                "unpushed",
+                "test@legacy",
+            )
+            .await
+            .is_err()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v291_is_immutable_release_artifact_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 291)
+            .expect("v291 must be appended to PG_MIGRATIONS");
+        assert_eq!(migration.name, "release_artifact_custody");
+        for required in [
+            "CREATE TABLE release_artifacts",
+            "CREATE TABLE release_artifact_custody",
+            "UNIQUE (artifact_name, artifact_version, source_commit, target_triple)",
+            "CHECK (source_commit ~ '^[0-9a-f]{40}$')",
+            "CHECK (sha256 ~ '^[0-9a-f]{64}$')",
+            "CHECK (size_bytes > 0)",
+            "REFERENCES computers(id) ON DELETE RESTRICT",
+            "PRIMARY KEY (artifact_id, computer_id)",
+            "UNIQUE (computer_id, relative_path)",
+            "CREATE TRIGGER release_artifacts_immutable",
+            "CREATE TRIGGER release_artifact_custody_refresh_only",
+            "NEW.last_verified_at < OLD.last_verified_at",
+            "position(E'\\\\' in relative_path) = 0",
+        ] {
+            assert!(migration.sql.contains(required), "v291 missing {required}");
+        }
+        for forbidden in ["ON DELETE CASCADE", "ON DELETE SET NULL"] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v291 custody evidence must not be erasable through {forbidden}"
+            );
+        }
+        assert!(
+            !migration.sql.contains("IF NOT EXISTS"),
+            "a preexisting authority table must fail the migration, not be reused"
+        );
+    }
+
+    #[test]
+    fn v292_is_exact_fail_closed_james_alias_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 292)
+            .expect("v292 must be appended after v291");
+        assert_eq!(migration.name, "james_qwen_served_model_alias");
+        for required in [
+            "FOR UPDATE",
+            "jsonb_typeof(original_variants) IS DISTINCT FROM 'array'",
+            "matching_variant_count <> 1",
+            "alias_field_count = 0",
+            "alias_field_count = 1 AND matching_aliases = exact_aliases",
+            "WITH ORDINALITY",
+            "ORDER BY item.ordinality",
+            "variants = original_variants",
+            "final_variants IS DISTINCT FROM expected_variants",
+            "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf",
+        ] {
+            assert!(migration.sql.contains(required), "v292 missing {required}");
+        }
+        for forbidden in ["ILIKE", "LOWER(", "regexp_replace", "translate("] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v292 must not use fuzzy identity matching through {forbidden}"
+            );
+        }
+        let v292_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 292)
+            .expect("v292 position");
+        let v293_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 293)
+            .expect("v293 position");
+        assert_eq!(v293_position, v292_position + 1, "v293 must follow v292");
+    }
+
+    #[test]
+    fn v293_is_exact_fail_closed_smolvlm_variant_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 293)
+            .expect("v293 must be appended after v292");
+        assert_eq!(migration.name, "smolvlm_exact_variant_authority");
+        for required in [
+            "FOR UPDATE",
+            "catalog_row_count > 1",
+            "catalog_row_count = 0",
+            "INSERT INTO fleet_model_catalog",
+            "exact_nonvariant_state",
+            "nonvariant_state IS DISTINCT FROM exact_nonvariant_state",
+            "jsonb_typeof(original_variants) IS DISTINCT FROM 'array'",
+            "original_variants = '[]'::jsonb",
+            "original_variants IS DISTINCT FROM exact_variants",
+            "variants = original_variants",
+            "final_variants IS DISTINCT FROM exact_variants",
+            "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+            "ccd7aae53bcb1997355c2f094959e72b3642ce17",
+            "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+            "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+            "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        ] {
+            assert!(migration.sql.contains(required), "v293 missing {required}");
+        }
+        for forbidden in [
+            "ILIKE",
+            "LOWER(",
+            "regexp_replace",
+            "translate(",
+            "ON CONFLICT",
+            "DO UPDATE",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v293 must not repair or fuzz authority through {forbidden}"
+            );
+        }
+        let v293_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 293)
+            .expect("v293 position");
+        let v294_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 294)
+            .expect("v294 position");
+        assert_eq!(v294_position, v293_position + 1, "v294 must follow v293");
+    }
+
+    #[test]
+    fn v294_is_exact_fail_closed_ace_gemma4_mlx_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 294)
+            .expect("v294 must be appended after v293");
+        assert_eq!(migration.name, "ace_gemma4_mlx_exact_authority");
+        for required in [
+            "catalog_row_count = 0",
+            "catalog_row_count = 1",
+            "FOR UPDATE",
+            "actual_row IS DISTINCT FROM exact_row",
+            "found duplicate gemma4-e4b-it catalog rows",
+            "mlx-community/gemma-4-e4b-it-4bit",
+            "475b9088d29754a3379866cf5aeb6b41acd313c2",
+            "fee6332c1abaafb77f6f9624236c63aa2f1d0187",
+            "aarch64-apple-darwin",
+            "5179241512",
+            "932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff",
+            "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+        ] {
+            assert!(migration.sql.contains(required), "v294 missing {required}");
+        }
+        for forbidden in [
+            "ILIKE",
+            "LOWER(",
+            "ON CONFLICT",
+            "DO UPDATE",
+            "original_variants = '[]'",
+        ] {
+            assert!(
+                !migration.sql.contains(forbidden),
+                "v294 must not repair or fuzz authority through {forbidden}"
+            );
+        }
+        let v294_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 294)
+            .expect("V294 must be registered");
+        let v296_position = PG_MIGRATIONS
+            .iter()
+            .position(|migration| migration.version == 296)
+            .expect("automatic V296 must be registered");
+        assert_eq!(
+            v296_position,
+            v294_position + 1,
+            "automatic V296 must immediately follow V294; V295 is explicit-only"
+        );
     }
 
     #[test]
@@ -1591,29 +4097,16 @@ mod tests {
     }
 
     #[test]
-    fn v274_adds_project_workstream_digest_fields() {
+    fn v274_preserves_project_repo_scan_history() {
         let migration = PG_MIGRATIONS
             .iter()
             .find(|migration| migration.version == 274)
             .expect("V274 must be registered");
-        assert_eq!(migration.name, "project_digest_fields");
-        assert!(
-            migration
-                .sql
-                .contains("ADD COLUMN IF NOT EXISTS workstream_id TEXT")
-        );
-        assert!(
-            migration
-                .sql
-                .contains("ADD COLUMN IF NOT EXISTS digest_template_id JSONB")
-        );
-        assert!(
-            migration
-                .sql
-                .contains("ADD COLUMN IF NOT EXISTS logo_url TEXT")
-        );
-        assert!(migration.sql.contains("idx_projects_workstream_id"));
-        assert!(migration.sql.contains("Rollback:"));
+        assert_eq!(migration.name, "project_repo_scan_metadata");
+        assert!(migration.sql.contains("ALTER TABLE project_repos"));
+        assert!(migration.sql.contains("tech_stack TEXT"));
+        assert!(migration.sql.contains("local_path TEXT"));
+        assert!(!migration.sql.contains("workstream_id"));
     }
 
     #[test]
@@ -1737,6 +4230,68 @@ mod tests {
         Some((admin, pool, db_name))
     }
 
+    async fn prepare_reviewed_legacy_v290(pool: &PgPool) {
+        sqlx::raw_sql(schema::BOOTSTRAP_V161_SQL)
+            .execute(pool)
+            .await
+            .expect("fresh baseline");
+        for migration in PG_MIGRATIONS.iter().filter(|migration| {
+            migration.version > BOOTSTRAP_BASELINE_VERSION && migration.version <= 290
+        }) {
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::raw_sql(migration.sql)
+                .execute(&mut *tx)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("strict fresh v{} failed: {error}", migration.version)
+                });
+            sqlx::query("INSERT INTO _migrations (version, name) VALUES ($1, $2)")
+                .bind(migration.version as i32)
+                .bind(migration.name)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Reproduce the exact reviewed fleet evidence without touching the live
+        // database. This fixture intentionally uses DDL only in its disposable
+        // database so the production path can remain validation-first.
+        sqlx::raw_sql(
+            r#"
+            DELETE FROM _migrations WHERE version = 247;
+            DROP TABLE fleet_log_digest;
+            ALTER TABLE error_signatures
+                ALTER COLUMN first_seen DROP NOT NULL,
+                ALTER COLUMN last_seen DROP NOT NULL,
+                ALTER COLUMN count_24h DROP NOT NULL,
+                ALTER COLUMN count_total DROP NOT NULL,
+                ALTER COLUMN state DROP NOT NULL,
+                DROP CONSTRAINT error_signatures_state_check;
+            ALTER TABLE work_item_leases
+                ADD COLUMN build_started_at TIMESTAMPTZ;
+
+            UPDATE _migrations SET applied_at = '2026-07-20T16:39:14.109001Z'
+             WHERE version = 211;
+            UPDATE _migrations SET applied_at = '2026-07-26T05:54:24.449824Z'
+             WHERE version = 274;
+            UPDATE _migrations SET applied_at = '2026-07-26T18:23:36.239244Z'
+             WHERE version = 277;
+
+            INSERT INTO _migrations (version, name, applied_at) VALUES
+              (234, 'work_item_cortex_subgraph_id', '2026-07-22T04:50:37.318577Z'),
+              (236, 'work_item_context_and_cortex_subgraph', '2026-07-22T15:13:32.818634Z'),
+              (246, 'glm_45_air_ab_catalog', '2026-07-24T03:03:02.342428Z'),
+              (260, 'model_utilization_view', '2026-07-24T20:49:10.028987Z'),
+              (270, 'workstream_session_fields', '2026-07-25T19:04:23.380858Z'),
+              (280, 'merge_fleet_tables__QUARANTINED_MANUAL', '2026-07-27T06:28:42.086663Z');
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("construct exact reviewed legacy V290 fixture");
+    }
+
     async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
         pool.close().await;
         sqlx::query(
@@ -1754,6 +4309,1127 @@ mod tests {
             .await
             .expect("drop temp db");
         admin.close().await;
+    }
+
+    async fn prepare_v292_catalog_table(pool: &PgPool) {
+        let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+            .fetch_one(pool)
+            .await
+            .expect("read disposable postgres version");
+        let server_major = server_version_num
+            .parse::<u32>()
+            .expect("server_version_num must be numeric")
+            / 10_000;
+        assert_eq!(server_major, 16, "V292 must be proven on PostgreSQL 16");
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_model_catalog (\
+                 id TEXT PRIMARY KEY,\
+                 variants JSONB\
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create minimal V292 catalog authority");
+    }
+
+    async fn seed_v292_catalog(pool: &PgPool, variants: &serde_json::Value) {
+        sqlx::query("DELETE FROM fleet_model_catalog")
+            .execute(pool)
+            .await
+            .expect("reset V292 catalog fixture");
+        sqlx::query("INSERT INTO fleet_model_catalog (id, variants) VALUES ($1, $2)")
+            .bind("qwen3-vl-30b-a3b")
+            .bind(variants)
+            .execute(pool)
+            .await
+            .expect("seed V292 catalog fixture");
+    }
+
+    async fn v292_catalog_variants(pool: &PgPool) -> serde_json::Value {
+        sqlx::query_scalar("SELECT variants FROM fleet_model_catalog WHERE id = 'qwen3-vl-30b-a3b'")
+            .fetch_one(pool)
+            .await
+            .expect("read V292 catalog fixture")
+    }
+
+    async fn v292_rejection(pool: &PgPool) -> String {
+        sqlx::raw_sql(schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS)
+            .execute(pool)
+            .await
+            .expect_err("V292 fixture drift must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v292_adds_exact_alias_preserves_variants_and_is_idempotent_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let original = serde_json::json!([
+            {
+                "runtime": "mlx",
+                "quant": "4bit",
+                "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+                "size_gb": 18.0,
+                "metadata": {"keep": [1, 2, 3]}
+            },
+            {
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "size_gb": 18.0,
+                "context_window": 131072
+            },
+            {
+                "runtime": "vllm",
+                "quant": "fp16",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct",
+                "size_gb": 60.0
+            }
+        ]);
+        seed_v292_catalog(&pool, &original).await;
+
+        sqlx::raw_sql(schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS)
+            .execute(&pool)
+            .await
+            .expect("V292 must add the reviewed exact alias");
+        let after_add = v292_catalog_variants(&pool).await;
+        assert_eq!(after_add[0], original[0], "first variant must be unchanged");
+        assert_eq!(after_add[2], original[2], "last variant must be unchanged");
+        let mut expected_target = original[1].clone();
+        expected_target["served_model_aliases"] =
+            serde_json::json!(["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]);
+        assert_eq!(
+            after_add[1], expected_target,
+            "target must retain all prior keys and gain only the exact alias"
+        );
+        assert_eq!(after_add.as_array().unwrap().len(), 3);
+
+        sqlx::raw_sql(schema::SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS)
+            .execute(&pool)
+            .await
+            .expect("exact reviewed V292 end state must be an idempotent no-op");
+        assert_eq!(v292_catalog_variants(&pool).await, after_add);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_fresh_v161_bootstrap_converges_to_exact_alias_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+            .fetch_one(&pool)
+            .await
+            .expect("read disposable postgres version");
+        assert_eq!(
+            server_version_num.parse::<u32>().unwrap() / 10_000,
+            16,
+            "V292 must be proven on PostgreSQL 16"
+        );
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh V161 bootstrap plus forward migrations must converge");
+        assert_eq!(final_version, 294);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 292")
+                .fetch_one(&pool)
+                .await
+                .expect("V292 must be durably recorded");
+        assert_eq!(migration_name, "james_qwen_served_model_alias");
+        let exact_alias_variants: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)
+              FROM fleet_model_catalog catalog,
+                   jsonb_array_elements(catalog.variants) variant
+             WHERE catalog.id = 'qwen3-vl-30b-a3b'
+               AND variant->>'runtime' = 'llama.cpp'
+               AND variant->>'hf_repo' = 'Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF'
+               AND variant->>'quant' = 'Q4_K_M'
+               AND variant->'served_model_aliases'
+                   = '["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]'::jsonb
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read exact V292 bootstrap authority");
+        assert_eq!(exact_alias_variants, 1);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_missing_catalog_row_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+
+        let error = v292_rejection(&pool).await;
+        assert!(
+            error.contains("expected exactly one qwen3-vl-30b-a3b catalog row"),
+            "unexpected missing-row error: {error}"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM fleet_model_catalog")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_malformed_or_wrong_variant_selector_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let cases = [
+            serde_json::json!({"not": "an array"}),
+            serde_json::json!([42]),
+            serde_json::json!([{
+                "runtime": "vllm",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF"
+            }]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "other/Qwen3-VL-30B-A3B-Instruct-GGUF"
+            }]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q5_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF"
+            }]),
+        ];
+        for variants in cases {
+            seed_v292_catalog(&pool, &variants).await;
+            let error = v292_rejection(&pool).await;
+            assert!(
+                error.contains("variants must")
+                    || error.contains("expected exactly one reviewed qwen3-vl llama.cpp variant"),
+                "unexpected wrong-variant error: {error}"
+            );
+            assert_eq!(v292_catalog_variants(&pool).await, variants);
+        }
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_duplicate_exact_variant_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let exact = serde_json::json!({
+            "runtime": "llama.cpp",
+            "quant": "Q4_K_M",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+            "size_gb": 18.0
+        });
+        let variants = serde_json::json!([exact, exact]);
+        seed_v292_catalog(&pool, &variants).await;
+
+        let error = v292_rejection(&pool).await;
+        assert!(
+            error.contains("expected exactly one reviewed qwen3-vl llama.cpp variant"),
+            "unexpected duplicate error: {error}"
+        );
+        assert_eq!(v292_catalog_variants(&pool).await, variants);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v292_rejects_every_preexisting_alias_drift_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v292_catalog_table(&pool).await;
+        let exact = serde_json::json!({
+            "runtime": "llama.cpp",
+            "quant": "Q4_K_M",
+            "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+            "size_gb": 18.0
+        });
+        let other = serde_json::json!({
+            "runtime": "mlx",
+            "quant": "4bit",
+            "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit"
+        });
+        let drift_cases = [
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "served_model_aliases": []
+            }]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "served_model_aliases": [
+                    "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf",
+                    "extra.gguf"
+                ]
+            }]),
+            serde_json::json!([
+                exact,
+                {
+                    "runtime": "mlx",
+                    "quant": "4bit",
+                    "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+                    "served_model_aliases": ["unreviewed-mlx-alias"]
+                }
+            ]),
+            serde_json::json!([
+                {
+                    "runtime": "llama.cpp",
+                    "quant": "Q4_K_M",
+                    "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                    "served_model_aliases": [
+                        "Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"
+                    ]
+                },
+                {
+                    "runtime": "mlx",
+                    "quant": "4bit",
+                    "hf_repo": "mlx-community/Qwen3-VL-30B-A3B-Instruct-4bit",
+                    "served_model_aliases": ["unreviewed-mlx-alias"]
+                }
+            ]),
+            serde_json::json!([other, {
+                "runtime": "llama.cpp",
+                "quant": "Q4_K_M",
+                "hf_repo": "Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF",
+                "served_model_aliases": null
+            }]),
+        ];
+        for variants in drift_cases {
+            seed_v292_catalog(&pool, &variants).await;
+            let error = v292_rejection(&pool).await;
+            assert!(
+                error.contains("unreviewed served-model alias state"),
+                "unexpected alias-drift error: {error}"
+            );
+            assert_eq!(v292_catalog_variants(&pool).await, variants);
+        }
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    fn v293_expected_variants() -> serde_json::Value {
+        serde_json::json!([{
+            "runtime": "llama.cpp",
+            "quant": "Q8_0",
+            "hf_repo": "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+            "source_revision": "ccd7aae53bcb1997355c2f094959e72b3642ce17",
+            "size_gb": 0.545593888,
+            "model_file": "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+            "model_size_bytes": 436808704_i64,
+            "model_sha256": "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+            "mmproj_file": "mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+            "mmproj_size_bytes": 108785184_i64,
+            "mmproj_sha256": "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+            "served_model_aliases": ["SmolVLM2-500M-Video-Instruct-Q8_0.gguf"]
+        }])
+    }
+
+    fn v293_expected_row() -> serde_json::Value {
+        serde_json::json!({
+            "id": "smolvlm2-500m-video",
+            "name": "SmolVLM2 500M Video",
+            "family": "smolvlm",
+            "parameters": "500M",
+            "tier": 1,
+            "description": "SmolVLM2 500M - tiny video/vision understanding SLM (research lane)",
+            "gated": false,
+            "preferred_workloads": ["vision", "video", "multimodal", "slm"],
+            "variants": v293_expected_variants(),
+            "tool_calling": false,
+            "display_name": null,
+            "tasks": null,
+            "modalities": null,
+            "benchmarks": null,
+            "license": null,
+            "lifecycle": null
+        })
+    }
+
+    async fn prepare_v293_catalog_table(pool: &PgPool) {
+        let server_version_num: String = sqlx::query_scalar("SHOW server_version_num")
+            .fetch_one(pool)
+            .await
+            .expect("read disposable postgres version");
+        let server_major = server_version_num
+            .parse::<u32>()
+            .expect("server_version_num must be numeric")
+            / 10_000;
+        assert_eq!(server_major, 16, "V293 must be proven on PostgreSQL 16");
+        sqlx::raw_sql(
+            "CREATE TABLE fleet_model_catalog (\
+                 id TEXT NOT NULL,\
+                 name TEXT NOT NULL,\
+                 family TEXT NOT NULL,\
+                 parameters TEXT NOT NULL,\
+                 tier INTEGER NOT NULL,\
+                 description TEXT,\
+                 gated BOOLEAN NOT NULL,\
+                 preferred_workloads JSONB NOT NULL,\
+                 variants JSONB,\
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\
+                 tool_calling BOOLEAN NOT NULL,\
+                 display_name TEXT,\
+                 tasks JSONB,\
+                 modalities JSONB,\
+                 benchmarks JSONB,\
+                 license TEXT,\
+                 lifecycle TEXT,\
+                 sentinel JSONB NOT NULL DEFAULT '{}'::jsonb\
+             )",
+        )
+        .execute(pool)
+        .await
+        .expect("create minimal V293 catalog authority");
+    }
+
+    async fn seed_v293_catalog_row(
+        pool: &PgPool,
+        variants: &serde_json::Value,
+        sentinel: &serde_json::Value,
+    ) {
+        sqlx::query(
+            r#"
+            INSERT INTO fleet_model_catalog (
+                id, name, family, parameters, tier, description, gated,
+                preferred_workloads, variants, tool_calling, display_name,
+                tasks, modalities, benchmarks, license, lifecycle, sentinel
+            ) VALUES (
+                'smolvlm2-500m-video',
+                'SmolVLM2 500M Video',
+                'smolvlm',
+                '500M',
+                1,
+                'SmolVLM2 500M - tiny video/vision understanding SLM (research lane)',
+                false,
+                '["vision", "video", "multimodal", "slm"]',
+                $1,
+                false,
+                NULL, NULL, NULL, NULL, NULL, NULL,
+                $2
+            )
+            "#,
+        )
+        .bind(variants)
+        .bind(sentinel)
+        .execute(pool)
+        .await
+        .expect("seed exact V293 catalog metadata");
+    }
+
+    async fn v293_rejection(pool: &PgPool) -> String {
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(pool)
+            .await
+            .expect_err("V293 fixture drift must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v293_adds_exact_authority_is_idempotent_and_preserves_other_data_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        seed_v293_catalog_row(
+            &pool,
+            &serde_json::json!([]),
+            &serde_json::json!({"keep": "target"}),
+        )
+        .await;
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO fleet_model_catalog (
+                id, name, family, parameters, tier, description, gated,
+                preferred_workloads, variants, tool_calling, sentinel
+            ) VALUES (
+                'unrelated', 'Unrelated', 'test', '1B', 1, NULL, false,
+                '[]', '[{"leave":true}]', false, '{"keep":"other"}'
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated V293 row");
+        let target_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'variants' FROM fleet_model_catalog catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot target non-variant columns");
+        let unrelated_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot unrelated row");
+
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V293 must add exact reviewed authority");
+        let after_first: serde_json::Value = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read V293 authority");
+        assert_eq!(after_first, v293_expected_variants());
+
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("exact reviewed V293 state must be idempotent");
+        let target_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'variants' FROM fleet_model_catalog catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read target non-variant columns");
+        let unrelated_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read unrelated row");
+        assert_eq!(target_after, target_before);
+        assert_eq!(unrelated_after, unrelated_before);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v293_fresh_v161_bootstrap_converges_to_exact_authority_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh V161 bootstrap plus forward migrations must converge");
+        assert_eq!(final_version, 294);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 293")
+                .fetch_one(&pool)
+                .await
+                .expect("V293 must be durably recorded");
+        assert_eq!(migration_name, "smolvlm_exact_variant_authority");
+        let row: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' FROM fleet_model_catalog catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bootstrapped V293 authority");
+        assert_eq!(row, v293_expected_row());
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v293_seeds_missing_row_and_rejects_duplicate_catalog_rows_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+
+        sqlx::raw_sql(schema::SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V293 must seed the exact source-controlled row on fresh bootstrap");
+        let seeded: serde_json::Value = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read freshly seeded V293 row");
+        assert_eq!(seeded, v293_expected_variants());
+
+        sqlx::query("DELETE FROM fleet_model_catalog")
+            .execute(&pool)
+            .await
+            .expect("reset V293 duplicate fixture");
+        seed_v293_catalog_row(&pool, &serde_json::json!([]), &serde_json::json!({})).await;
+        seed_v293_catalog_row(&pool, &serde_json::json!([]), &serde_json::json!({})).await;
+        let duplicate_error = v293_rejection(&pool).await;
+        assert!(
+            duplicate_error.contains("found duplicate smolvlm2-500m-video catalog rows"),
+            "unexpected duplicate-row error: {duplicate_error}"
+        );
+        let variants: Vec<serde_json::Value> = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("read duplicate V293 rows");
+        assert_eq!(variants, vec![serde_json::json!([]), serde_json::json!([])]);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v293_rejects_malformed_duplicate_or_drifted_variants_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        let exact = v293_expected_variants()[0].clone();
+        let drift_cases = [
+            serde_json::json!(null),
+            serde_json::json!({"not": "an array"}),
+            serde_json::json!([42]),
+            serde_json::json!([exact.clone(), exact]),
+            serde_json::json!([{
+                "runtime": "llama.cpp",
+                "quant": "Q8_0",
+                "hf_repo": "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+                "source_revision": "wrong",
+                "served_model_aliases": ["SmolVLM2-500M-Video-Instruct-Q8_0.gguf"]
+            }]),
+        ];
+        for variants in drift_cases {
+            sqlx::query("DELETE FROM fleet_model_catalog")
+                .execute(&pool)
+                .await
+                .expect("reset V293 drift fixture");
+            seed_v293_catalog_row(&pool, &variants, &serde_json::json!({"keep": true})).await;
+            let error = v293_rejection(&pool).await;
+            assert!(
+                error.contains("variants must be a JSON array")
+                    || error.contains("unreviewed SmolVLM variant authority"),
+                "unexpected V293 drift error: {error}"
+            );
+            let after: serde_json::Value = sqlx::query_scalar(
+                "SELECT variants FROM fleet_model_catalog WHERE id = 'smolvlm2-500m-video'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read rejected V293 fixture");
+            assert_eq!(after, variants);
+        }
+
+        sqlx::query("DELETE FROM fleet_model_catalog")
+            .execute(&pool)
+            .await
+            .expect("reset V293 metadata drift fixture");
+        seed_v293_catalog_row(&pool, &serde_json::json!([]), &serde_json::json!({})).await;
+        sqlx::query(
+            "UPDATE fleet_model_catalog SET name = 'Drifted SmolVLM' \
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .execute(&pool)
+        .await
+        .expect("drift V293 metadata fixture");
+        let metadata_error = v293_rejection(&pool).await;
+        assert!(
+            metadata_error.contains("found unreviewed SmolVLM catalog metadata"),
+            "unexpected V293 metadata error: {metadata_error}"
+        );
+        let after_metadata_rejection: (String, serde_json::Value) = sqlx::query_as(
+            "SELECT name, variants FROM fleet_model_catalog \
+              WHERE id = 'smolvlm2-500m-video'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rejected V293 metadata fixture");
+        assert_eq!(after_metadata_rejection.0, "Drifted SmolVLM");
+        assert_eq!(after_metadata_rejection.1, serde_json::json!([]));
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    async fn v294_rejection(pool: &PgPool) -> String {
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(pool)
+            .await
+            .expect_err("V294 authority drift must fail closed")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn v294_absent_to_exact_is_idempotent_and_preserves_unrelated_rows_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO fleet_model_catalog (
+                id, name, family, parameters, tier, description, gated,
+                preferred_workloads, variants, tool_calling, sentinel
+            ) VALUES (
+                'unrelated-v294', 'Unrelated', 'test', '1B', 1, NULL, false,
+                '[]', '[{"keep":true}]', false, '{"keep":"other"}'
+            );
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("seed unrelated V294 row");
+        let unrelated_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated-v294'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot unrelated V294 row");
+
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V294 must insert an absent exact authority row");
+        let first: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' - 'sentinel'
+               FROM fleet_model_catalog catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read exact V294 row");
+        assert_eq!(first["id"], "gemma4-e4b-it");
+        assert_eq!(first["family"], "gemma");
+        assert_eq!(first["parameters"], "E4B");
+        assert_eq!(first["tool_calling"], false);
+        assert_eq!(first["variants"].as_array().unwrap().len(), 1);
+        let variant = &first["variants"][0];
+        assert_eq!(variant["runtime"], "mlx");
+        assert_eq!(variant["quant"], "4bit");
+        assert_eq!(
+            variant["source_revision"],
+            "475b9088d29754a3379866cf5aeb6b41acd313c2"
+        );
+        assert_eq!(variant["artifact_size_bytes"], 5_179_241_512_i64);
+        assert_eq!(variant["files"].as_array().unwrap().len(), 10);
+
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("exact final V294 state must be idempotent");
+        let after_replay: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' - 'sentinel'
+               FROM fleet_model_catalog catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed V294 row");
+        let unrelated_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog
+              WHERE id = 'unrelated-v294'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read unrelated V294 row");
+        assert_eq!(after_replay, first);
+        assert_eq!(unrelated_after, unrelated_before);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v294_rejects_empty_partial_metadata_and_duplicate_states_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        prepare_v293_catalog_table(&pool).await;
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("seed exact V294 authority");
+
+        sqlx::query("UPDATE fleet_model_catalog SET variants = '[]' WHERE id = 'gemma4-e4b-it'")
+            .execute(&pool)
+            .await
+            .expect("create empty V294 variant drift");
+        let empty_error = v294_rejection(&pool).await;
+        assert!(
+            empty_error.contains("found unreviewed Gemma 4 E4B authority state"),
+            "unexpected empty-state error: {empty_error}"
+        );
+        let variants_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT variants FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read rejected empty V294 state");
+        assert_eq!(variants_after, serde_json::json!([]));
+
+        sqlx::query("DELETE FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'")
+            .execute(&pool)
+            .await
+            .expect("reset V294 drift fixture");
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("restore exact V294 authority");
+        sqlx::query(
+            "UPDATE fleet_model_catalog SET name = 'Drifted Gemma' WHERE id = 'gemma4-e4b-it'",
+        )
+        .execute(&pool)
+        .await
+        .expect("create V294 metadata drift");
+        let metadata_error = v294_rejection(&pool).await;
+        assert!(metadata_error.contains("found unreviewed Gemma 4 E4B authority state"));
+        let name_after: String =
+            sqlx::query_scalar("SELECT name FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'")
+                .fetch_one(&pool)
+                .await
+                .expect("read rejected V294 metadata drift");
+        assert_eq!(name_after, "Drifted Gemma");
+
+        sqlx::query("DELETE FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'")
+            .execute(&pool)
+            .await
+            .expect("reset V294 duplicate fixture");
+        sqlx::raw_sql(schema::SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("restore exact V294 row for duplicate fixture");
+        sqlx::query(
+            "INSERT INTO fleet_model_catalog
+             SELECT * FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .execute(&pool)
+        .await
+        .expect("create duplicate exact V294 row");
+        let duplicate_error = v294_rejection(&pool).await;
+        assert!(
+            duplicate_error.contains("found duplicate gemma4-e4b-it catalog rows"),
+            "unexpected duplicate-state error: {duplicate_error}"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v294_fresh_v161_bootstrap_converges_to_exact_authority_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh V161 bootstrap plus V294 must converge");
+        assert_eq!(final_version, 294);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 294")
+                .fetch_one(&pool)
+                .await
+                .expect("V294 must be durably recorded");
+        assert_eq!(migration_name, "ace_gemma4_mlx_exact_authority");
+        let exact_files: i32 = sqlx::query_scalar(
+            "SELECT jsonb_array_length(variants->0->'files')
+               FROM fleet_model_catalog WHERE id = 'gemma4-e4b-it'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read bootstrapped V294 authority");
+        assert_eq!(exact_files, 10);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v296_v297_wait_for_v295_then_apply_in_order_on_pg16() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        let held_version = run_postgres_migrations(&pool)
+            .await
+            .expect("fresh automatic migrations must stop before gated V296");
+        assert_eq!(held_version, 294);
+        let absent_before_v295: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM fleet_model_catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count fresh Devstral rows before V295");
+        assert_eq!(absent_before_v295, 0);
+        let v296_before_v295: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM _migrations WHERE version = 296")
+                .fetch_one(&pool)
+                .await
+                .expect("read held V296 ledger state");
+        assert_eq!(v296_before_v295, 0);
+
+        sqlx::query(
+            "INSERT INTO _migrations (version, name) \
+             VALUES (295, 'release_rollout_authority')",
+        )
+        .execute(&pool)
+        .await
+        .expect("record reviewed V295 prerequisite fixture");
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("V296/V297 must run once explicit V295 is recorded");
+        assert_eq!(final_version, 297);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 296")
+                .fetch_one(&pool)
+                .await
+                .expect("V296 must be durably recorded");
+        assert_eq!(migration_name, "devstral_code_capability_authority");
+        let rollback_migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 297")
+                .fetch_one(&pool)
+                .await
+                .expect("V297 must be durably recorded");
+        assert_eq!(
+            rollback_migration_name,
+            "release_rollout_post_success_rollback"
+        );
+
+        let seeded: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read seeded Devstral authority");
+        assert_eq!(
+            seeded,
+            serde_json::json!({
+                "id": "devstral-small-2-24b",
+                "name": "Devstral Small 2 24B",
+                "family": "devstral",
+                "parameters": "24B",
+                "tier": 2,
+                "description": "Mistral dense 24B - multi-file coding/agentic specialist",
+                "gated": false,
+                "preferred_workloads": ["reasoning", "tool_calling", "code"],
+                "variants": [{
+                    "runtime": "llama.cpp",
+                    "quant": "UD-Q4_K_XL",
+                    "hf_repo": "unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF",
+                    "size_gb": 14
+                }],
+                "tool_calling": true,
+                "display_name": null,
+                "tasks": null,
+                "modalities": null,
+                "benchmarks": null,
+                "license": null,
+                "lifecycle": null
+            })
+        );
+
+        sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("exact seeded V296 authority must replay idempotently");
+        let seeded_after_replay: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'updated_at' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed seeded authority");
+        assert_eq!(seeded_after_replay, seeded);
+
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO fleet_model_catalog (id, name, family, parameters, tier)
+            VALUES ('v296-unrelated', 'Unrelated', 'test', '1B', 4);
+
+            UPDATE fleet_model_catalog
+               SET name = 'Operator Devstral',
+                   family = 'operator-family',
+                   parameters = '99B',
+                   tier = 4,
+                   description = 'operator description',
+                   gated = true,
+                   preferred_workloads = '["reasoning", "tool_calling"]',
+                   variants = '[{"operator":true}]',
+                   updated_at = '2026-01-02T03:04:05Z',
+                   tool_calling = false,
+                   display_name = 'Operator Display',
+                   tasks = '["operator-task"]',
+                   modalities = '["operator-modality"]',
+                   benchmarks = '{"operator":99}',
+                   license = 'operator-license',
+                   lifecycle = 'candidate'
+             WHERE id = 'devstral-small-2-24b';
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install upgraded-database preservation fixture");
+        let nonworkload_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) - 'preferred_workloads' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot every non-workload column");
+        let unrelated_before: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+              WHERE id = 'v296-unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("snapshot unrelated row");
+
+        sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("V296 must append the missing code capability");
+        let repaired: (serde_json::Value, serde_json::Value) = sqlx::query_as(
+            "SELECT preferred_workloads, to_jsonb(catalog) - 'preferred_workloads' \
+               FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read repaired upgraded row");
+        assert_eq!(
+            repaired.0,
+            serde_json::json!(["reasoning", "tool_calling", "code"])
+        );
+        assert_eq!(repaired.1, nonworkload_before);
+
+        sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+            .execute(&pool)
+            .await
+            .expect("repaired upgraded state must replay idempotently");
+        let repaired_after_replay: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+              WHERE id = 'devstral-small-2-24b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read replayed repaired row");
+        assert_eq!(
+            repaired_after_replay["preferred_workloads"],
+            serde_json::json!(["reasoning", "tool_calling", "code"])
+        );
+
+        for protected_workloads in [
+            serde_json::json!(["reasoning", "CoDe"]),
+            serde_json::json!("code"),
+            serde_json::json!({"code": true}),
+        ] {
+            sqlx::query(
+                "UPDATE fleet_model_catalog SET preferred_workloads = $1 \
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .bind(&protected_workloads)
+            .execute(&pool)
+            .await
+            .expect("install protected workload fixture");
+            let before: serde_json::Value = sqlx::query_scalar(
+                "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("snapshot protected workload fixture");
+            sqlx::raw_sql(schema::SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY)
+                .execute(&pool)
+                .await
+                .expect("V296 protected workload replay");
+            let after: serde_json::Value = sqlx::query_scalar(
+                "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+                  WHERE id = 'devstral-small-2-24b'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("read protected workload fixture");
+            assert_eq!(after, before);
+        }
+
+        let unrelated_after: serde_json::Value = sqlx::query_scalar(
+            "SELECT to_jsonb(catalog) FROM fleet_model_catalog catalog \
+              WHERE id = 'v296-unrelated'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("read unrelated row after V296 replays");
+        assert_eq!(unrelated_after, unrelated_before);
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    async fn reset_enrollment_authority_to_original_v289(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            DROP TABLE public.fleet_enrollment_tokens CASCADE;
+            DROP INDEX IF EXISTS public.idx_computers_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_computers_enrollment_primary_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_workers_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_fleet_workers_enrollment_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_primary_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_worker_ip;
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("remove hardened enrollment authority");
+        sqlx::raw_sql(schema::SCHEMA_V289_SECURE_ENROLLMENT_TOKENS)
+            .execute(pool)
+            .await
+            .expect("recreate immutable V289 enrollment authority");
+        sqlx::query("DELETE FROM _migrations WHERE version >= 290")
+            .execute(pool)
+            .await
+            .expect("rewind V290 and every later test marker");
+    }
+
+    async fn switch_test_roster_to_legacy_tables(pool: &PgPool) {
+        let already_legacy: bool = sqlx::query_scalar(
+            "SELECT count(*) = 2
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'public' AND c.relkind = 'r'
+                AND c.relname IN ('computers', 'fleet_workers')",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("inspect test roster relations");
+        if already_legacy {
+            return;
+        }
+        sqlx::raw_sql(
+            r#"
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_canonical_name;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_primary_ip;
+            DROP INDEX IF EXISTS public.idx_fleet_nodes_enrollment_worker_ip;
+            ALTER VIEW public.computers RENAME TO computers_unified_test;
+            ALTER VIEW public.fleet_workers RENAME TO fleet_workers_unified_test;
+            CREATE TABLE public.computers (
+                name TEXT NOT NULL,
+                primary_ip TEXT
+            );
+            CREATE TABLE public.fleet_workers (
+                name TEXT NOT NULL,
+                ip TEXT
+            );
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("replace unified test projections with legacy roster tables");
     }
 
     #[tokio::test]
@@ -1842,7 +5518,7 @@ mod tests {
         .expect("insert test skill");
 
         for _ in 0..2 {
-            sqlx::query(schema::SCHEMA_V275_FF_CAPABILITIES)
+            sqlx::raw_sql(schema::SCHEMA_V275_FF_CAPABILITIES)
                 .execute(&pool)
                 .await
                 .expect("capability backfill is rerunnable");
@@ -1964,8 +5640,9 @@ mod tests {
             .expect("migrations should apply on fresh DB");
 
         let first_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, total_ram_gb)
-             VALUES ('v227-old-name', '10.0.0.227', 32)
+            "INSERT INTO computers
+                (name, primary_ip, total_ram_gb, os_family, ssh_user)
+             VALUES ('v227-old-name', '10.0.0.227', 32, 'linux-ubuntu', 'test')
              RETURNING id",
         )
         .fetch_one(&pool)
@@ -1973,8 +5650,9 @@ mod tests {
         .expect("insert initial computer");
 
         let upserted_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, total_ram_gb)
-             VALUES ('v227-new-name', '10.0.0.227', 64)
+            "INSERT INTO computers
+                (name, primary_ip, total_ram_gb, os_family, ssh_user)
+             VALUES ('v227-new-name', '10.0.0.227', 64, 'linux-ubuntu', 'test')
              ON CONFLICT (primary_ip) WHERE btrim(primary_ip) <> ''
              DO UPDATE SET name = EXCLUDED.name,
                            total_ram_gb = EXCLUDED.total_ram_gb
@@ -2263,8 +5941,10 @@ mod tests {
             .await
             .expect("migrations should apply on fresh DB");
         let computer_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, total_ram_gb)
-             VALUES ('v184-metrics-node', '127.0.0.184', 64) RETURNING id",
+            "INSERT INTO computers
+                (name, primary_ip, total_ram_gb, os_family, ssh_user)
+             VALUES ('v184-metrics-node', '127.0.0.184', 64, 'linux-ubuntu', 'test')
+             RETURNING id",
         )
         .fetch_one(&pool)
         .await
@@ -2397,7 +6077,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v211_decommissions_vinny_github_identity() {
+    async fn v211_preserves_taylor_github_identity_history() {
         // CI has no Postgres. Keep this integration test optional on both
         // supported database URL variables.
         let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
@@ -2410,7 +6090,7 @@ mod tests {
         let aliases: Vec<(String, bool)> = sqlx::query_as(
             "SELECT alias_name, is_canonical
                FROM github_ssh_aliases
-              WHERE alias_name IN ('github.com-venkat', 'github.com-vinny')
+              WHERE alias_name IN ('github.com-venkat', 'github.com-taylor')
               ORDER BY alias_name",
         )
         .fetch_all(&pool)
@@ -2420,7 +6100,7 @@ mod tests {
 
         let legacy_secrets: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM fleet_secrets
-              WHERE key IN ('github_ssh_id_vinny_priv', 'github_ssh_id_vinny_pub')",
+              WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub')",
         )
         .fetch_one(&pool)
         .await
@@ -2449,8 +6129,8 @@ mod tests {
         .await
         .expect("insert test worker");
         let computer_id: uuid::Uuid = sqlx::query_scalar(
-            "INSERT INTO computers (name, primary_ip, os_family)
-             VALUES ('v215-test-node', '10.0.0.215', 'linux-ubuntu')
+            "INSERT INTO computers (name, primary_ip, os_family, ssh_user)
+             VALUES ('v215-test-node', '10.0.0.215', 'linux-ubuntu', 'test')
              RETURNING id",
         )
         .fetch_one(&pool)
@@ -2474,6 +6154,13 @@ mod tests {
                 .expect("read initial statuses");
         assert_eq!(initial, vec![(1, "idle".into()), (2, "busy".into())]);
 
+        // Slot synchronization expands the stored capacity while rows are
+        // inserted. Reassert the simulated daemon-computed capacity before
+        // exercising V215's release boundary.
+        sqlx::query("UPDATE fleet_workers SET sub_agent_count = 2 WHERE name = 'v215-test-node'")
+            .execute(&pool)
+            .await
+            .expect("restore bounded test capacity");
         sqlx::query("UPDATE sub_agents SET status = 'idle' WHERE slot = 2")
             .execute(&pool)
             .await
@@ -2591,11 +6278,14 @@ mod tests {
             .expect("migrations should apply on a fresh database");
 
         let computer_id = uuid::Uuid::new_v4();
-        sqlx::query("INSERT INTO computers (id, name) VALUES ($1, 'v244-testbox')")
-            .bind(computer_id)
-            .execute(&pool)
-            .await
-            .expect("insert computers row");
+        sqlx::query(
+            "INSERT INTO computers (id, name, primary_ip, os_family, ssh_user)
+             VALUES ($1, 'v244-testbox', '127.0.0.244', 'linux-ubuntu', 'test')",
+        )
+        .bind(computer_id)
+        .execute(&pool)
+        .await
+        .expect("insert computers row");
 
         let row: crate::models::Slot = sqlx::query_as(
             "INSERT INTO sub_agents
@@ -2712,60 +6402,23 @@ mod tests {
     }
 
     #[test]
-    fn v280_merges_fleet_tables() {
-        let migration = PG_MIGRATIONS
+    fn v277_is_node_health_and_v280_is_not_runnable() {
+        let v277 = PG_MIGRATIONS
             .iter()
-            .find(|migration| migration.version == 280)
-            .expect("V280 must be registered");
-        assert_eq!(migration.name, "merge_fleet_tables");
+            .find(|migration| migration.version == 277)
+            .expect("historical V277 must be registered");
+        assert_eq!(v277.name, "node_health");
+        assert!(v277.sql.contains("CREATE TABLE IF NOT EXISTS node_health"));
+        assert!(!v277.sql.contains("build_started_at"));
         assert!(
-            migration
-                .sql
-                .contains("ALTER TABLE computers RENAME TO fleet_nodes")
+            PG_MIGRATIONS
+                .iter()
+                .all(|migration| migration.version != 280)
         );
-        assert!(
-            migration
-                .sql
-                .contains("DROP TABLE fleet_workers_legacy RESTRICT")
-        );
-    }
-
-    #[tokio::test]
-    async fn v280_applies_and_is_idempotent() {
-        // CI commonly has no Postgres; the helper checks both supported URL vars.
-        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
-            return;
-        };
-        run_postgres_migrations(&pool)
-            .await
-            .expect("migrations should apply on a fresh database");
-
-        let relations: Vec<(String, String)> = sqlx::query_as(
-            "SELECT relname, relkind::text
-               FROM pg_class c
-               JOIN pg_namespace n ON n.oid = c.relnamespace
-              WHERE n.nspname = 'public'
-                AND relname IN ('fleet_nodes', 'computers', 'fleet_workers')
-              ORDER BY relname",
-        )
-        .fetch_all(&pool)
-        .await
-        .expect("read merged fleet relations");
-        assert_eq!(
-            relations,
-            vec![
-                ("computers".into(), "v".into()),
-                ("fleet_nodes".into(), "r".into()),
-                ("fleet_workers".into(), "v".into()),
-            ]
-        );
-
-        sqlx::raw_sql(schema::SCHEMA_V280_MERGE_FLEET_TABLES)
-            .execute(&pool)
-            .await
-            .expect("V280 should be idempotent");
-
-        drop_temp_db(admin, pool, &db_name).await;
+        assert!(schema::SCHEMA_V280_MERGE_FLEET_TABLES.contains("RENAME TO fleet_nodes"));
+        assert!(REVIEWED_LEGACY_LEDGER_ROWS.iter().any(|row| {
+            row.version == 280 && row.name == "merge_fleet_tables__QUARANTINED_MANUAL"
+        }));
     }
 
     #[test]
@@ -3073,5 +6726,238 @@ mod tests {
                 .sql
                 .contains("guard_project_digest_cursor_regression")
         );
+    }
+
+    #[test]
+    fn v286_seeds_oauth_distribution_gate_without_overwriting_operator_state() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 286)
+            .expect("V286 must be registered");
+        assert_eq!(migration.name, "oauth_distribution_gate");
+        assert!(migration.sql.contains("'oauth_distribution_enabled'"));
+        assert!(migration.sql.contains("'true'"));
+        assert!(migration.sql.contains("ON CONFLICT (key) DO NOTHING"));
+    }
+
+    #[test]
+    fn v287_seeds_ssh_mesh_auto_repair_gate_without_overwriting_operator_state() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 287)
+            .expect("V287 must be registered");
+        assert_eq!(migration.name, "ssh_mesh_auto_repair_gate");
+        assert!(migration.sql.contains("'ssh_mesh_auto_repair_enabled'"));
+        assert!(migration.sql.contains("'true'"));
+        assert!(migration.sql.contains("ON CONFLICT (key) DO NOTHING"));
+    }
+
+    #[test]
+    fn v288_registers_ubuntu_2604_detection_idempotently() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 288)
+            .expect("V288 must be registered");
+        assert_eq!(migration.name, "ubuntu_2604_software_projection");
+        assert!(migration.sql.contains("'os-ubuntu-26.04'"));
+        assert!(migration.sql.contains("'Ubuntu 26.04 LTS'"));
+        assert!(migration.sql.contains("\"method\":\"os_release\""));
+        assert!(
+            migration
+                .sql
+                .contains("\"expected_version_prefix\":\"26.04\"")
+        );
+        assert!(migration.sql.contains("ON CONFLICT (id) DO UPDATE SET"));
+        assert!(
+            migration
+                .sql
+                .contains("COALESCE(software_registry.detection")
+        );
+    }
+
+    #[tokio::test]
+    async fn v290_runner_repairs_database_already_recorded_at_original_v289() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("prepare a current schema");
+        switch_test_roster_to_legacy_tables(&pool).await;
+        reset_enrollment_authority_to_original_v289(&pool).await;
+
+        let prior_version: i32 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _migrations")
+                .fetch_one(&pool)
+                .await
+                .expect("read rewound migration version");
+        assert_eq!(prior_version, 289);
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("V290 runner repair should apply");
+        assert_eq!(final_version, 294);
+        let migration_name: String =
+            sqlx::query_scalar("SELECT name FROM _migrations WHERE version = 290")
+                .fetch_one(&pool)
+                .await
+                .expect("V290 should be durably recorded");
+        assert_eq!(migration_name, "secure_enrollment_hardening");
+        validate_secure_enrollment_schema(&pool)
+            .await
+            .expect("V290 repair must produce the exact reviewed authority");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v290_accepts_already_hardened_v289_shape_idempotently() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("prepare a current schema");
+        switch_test_roster_to_legacy_tables(&pool).await;
+        sqlx::raw_sql(
+            r#"
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_canonical_name
+                ON computers (lower(name));
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_primary_ip
+                ON computers (primary_ip)
+                WHERE NULLIF(primary_ip, '') IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_canonical_name
+                ON fleet_workers (lower(name));
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_ip
+                ON fleet_workers (ip)
+                WHERE NULLIF(ip, '') IS NOT NULL;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("simulate the already-hardened legacy roster indexes");
+        sqlx::query(
+            "COMMENT ON TABLE fleet_enrollment_tokens IS \
+             'forgefleet secure enrollment authority schema v289; forward-only migrations only'",
+        )
+        .execute(&pool)
+        .await
+        .expect("simulate the already-hardened V289 deployment");
+        sqlx::query("DELETE FROM _migrations WHERE version >= 290")
+            .execute(&pool)
+            .await
+            .expect("rewind V290 and every later test marker");
+
+        let final_version = run_postgres_migrations(&pool)
+            .await
+            .expect("V290 should accept the reviewed hardened V289 shape");
+        assert_eq!(final_version, 294);
+        validate_secure_enrollment_schema(&pool)
+            .await
+            .expect("idempotent V290 must preserve the exact authority");
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn v290_rejects_familiar_named_but_weakened_index_drift() {
+        let Some((admin, pool, db_name)) = create_fresh_temp_db().await else {
+            return;
+        };
+
+        run_postgres_migrations(&pool)
+            .await
+            .expect("prepare a current schema");
+        sqlx::raw_sql(
+            r#"
+            DROP INDEX public.idx_fleet_enrollment_tokens_pending_ip;
+            CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip
+                ON fleet_enrollment_tokens (intended_ip)
+                WHERE consumed_at IS NULL;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("install familiar-named weak test index");
+
+        let error = sqlx::raw_sql(schema::SCHEMA_V290_SECURE_ENROLLMENT_HARDENING)
+            .execute(&pool)
+            .await
+            .expect_err("V290 must reject drift instead of guessing a repair");
+        assert!(
+            error
+                .to_string()
+                .contains("neither immutable v289 nor reviewed hardened authority"),
+            "unexpected V290 drift error: {error}"
+        );
+        assert!(
+            validate_secure_enrollment_schema(&pool).await.is_err(),
+            "the validator must also reject the weakened familiar-named index"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[test]
+    fn v289_remains_the_immutable_original_enrollment_authority() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 289)
+            .expect("V289 must be registered");
+        assert_eq!(migration.name, "secure_enrollment_tokens");
+        for required in [
+            "token_hash       BYTEA PRIMARY KEY",
+            "octet_length(token_hash) = 32",
+            "CREATE TABLE IF NOT EXISTS fleet_enrollment_tokens",
+            "WHERE consumed_at IS NULL",
+        ] {
+            assert!(
+                migration.sql.contains(required),
+                "immutable V289 lacks original schema contract: {required}"
+            );
+        }
+        for hardened_only in [
+            "revoked_at",
+            "idx_fleet_enrollment_tokens_pending_name",
+            "idx_fleet_enrollment_tokens_pending_ip",
+            "fleet_enrollment_tokens_canonical_leader",
+            "fleet_enrollment_tokens_revocation",
+        ] {
+            assert!(
+                !migration.sql.contains(hardened_only),
+                "immutable V289 was rewritten with V290 artifact: {hardened_only}"
+            );
+        }
+        assert!(!migration.sql.contains("plaintext"));
+        assert!(!migration.sql.contains("token_value"));
+    }
+
+    #[test]
+    fn v290_is_exact_shape_forward_enrollment_repair() {
+        let migration = PG_MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 290)
+            .expect("V290 must be registered");
+        assert_eq!(migration.name, "secure_enrollment_hardening");
+        for required in [
+            "is_old_v289",
+            "is_hardened",
+            "neither immutable v289 nor reviewed hardened authority",
+            "ADD COLUMN revoked_at",
+            "fleet_enrollment_tokens_canonical_leader",
+            "fleet_enrollment_tokens_revocation",
+            "DROP INDEX public.idx_fleet_enrollment_tokens_expiry",
+            "idx_fleet_enrollment_tokens_pending_name",
+            "idx_fleet_enrollment_tokens_pending_ip",
+            "schema v290; forward-only migrations only",
+        ] {
+            assert!(
+                migration.sql.contains(required),
+                "V290 lacks controlled repair contract: {required}"
+            );
+        }
+        assert!(!migration.sql.contains("token_value"));
     }
 }

@@ -11528,8 +11528,11 @@ FROM cloud_budget_buckets b;
 "#;
 
 /// V211 — Make venkatyarl the sole permanent fleet GitHub identity and remove
-/// the retired vinny-oclaw credentials from the fleet-wide registry.
-pub const SCHEMA_V211_DECOMMISSION_VINNY_GITHUB_IDENTITY: &str = r#"
+/// the retired taylor-oclaw credentials from the fleet-wide registry.
+///
+/// Historical migrations are immutable: the later Taylor -> Vinny node rename
+/// must not rename this already-applied migration or rewrite its SQL.
+pub const SCHEMA_V211_DECOMMISSION_TAYLOR_GITHUB_IDENTITY: &str = r#"
 UPDATE github_ssh_aliases
 SET is_canonical = (alias_name = 'github.com-venkat'),
     description = CASE
@@ -11541,10 +11544,10 @@ SET is_canonical = (alias_name = 'github.com-venkat'),
 WHERE hostname = 'github.com';
 
 DELETE FROM github_ssh_aliases
-WHERE alias_name = 'github.com-vinny';
+WHERE alias_name = 'github.com-taylor';
 
 DELETE FROM fleet_secrets
-WHERE key IN ('github_ssh_id_vinny_priv', 'github_ssh_id_vinny_pub');
+WHERE key IN ('github_ssh_id_taylor_priv', 'github_ssh_id_taylor_pub');
 "#;
 
 /// V212 — One bounded read interface across raw, hourly, and daily computer
@@ -12254,6 +12257,7 @@ CREATE TABLE IF NOT EXISTS fleet_log_digest (
 ///   - `purpose` — coarse tag for what the turn was FOR (build | review |
 ///     decompose | research | council | dreamer | ...), orthogonal to
 ///     `channel` (which records WHERE the turn came from).
+///
 /// Backfill is intentionally not required — old rows stay NULL.
 pub const SCHEMA_V250_FF_INTERACTIONS_EPISODIC_TAGGING: &str = r#"
 ALTER TABLE ff_interactions
@@ -12325,10 +12329,13 @@ INSERT INTO cloud_backends (backend, refresher_node) VALUES
 ON CONFLICT (backend) DO NOTHING;
 "#;
 
-/// Optional project metadata used to attach projects to workstreams and create
-/// their initial digest configuration.
-pub const SCHEMA_V274_PROJECT_DIGEST_FIELDS: &str =
-    include_str!("migrations/20260725000000_add_workstream_digest_fields.sql");
+/// V274's immutable historical meaning: metadata populated by project scans.
+/// The later project digest fields are a separate forward repair in V295.
+pub const SCHEMA_V274_PROJECT_REPO_SCAN_METADATA: &str = r#"
+ALTER TABLE project_repos
+    ADD COLUMN IF NOT EXISTS tech_stack TEXT,
+    ADD COLUMN IF NOT EXISTS local_path TEXT;
+"#;
 
 /// First-class capability store. Skills are copied, not moved, so existing
 /// consumers remain compatible while capability-aware consumers gain one
@@ -12439,17 +12446,41 @@ LEFT JOIN work_items w ON w.id = b.work_item_id
 GROUP BY b.builder;
 "#;
 
-/// Immutable start of actual execution for data-derived lease timeouts.
-pub const SCHEMA_V277_WORK_ITEM_LEASE_BUILD_STARTED_AT: &str = r#"
-ALTER TABLE work_item_leases
-    ADD COLUMN IF NOT EXISTS build_started_at TIMESTAMPTZ;
+/// V277's immutable historical meaning: per-node resource-health snapshots.
+pub const SCHEMA_V277_NODE_HEALTH: &str = r#"
+CREATE TABLE IF NOT EXISTS node_health (
+    worker_name          TEXT NOT NULL REFERENCES fleet_workers(name) ON DELETE CASCADE,
+    sampled_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    mem_total_kb         BIGINT NOT NULL,
+    mem_available_kb     BIGINT NOT NULL,
+    mem_available_gb     DOUBLE PRECISION NOT NULL,
+    swap_total_kb        BIGINT NOT NULL DEFAULT 0,
+    swap_free_kb         BIGINT NOT NULL DEFAULT 0,
+    load_avg_1m          DOUBLE PRECISION,
+    load_avg_5m          DOUBLE PRECISION,
+    load_avg_15m         DOUBLE PRECISION,
+    service_rss_json     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    oom_kills_json       JSONB NOT NULL DEFAULT '[]'::jsonb,
+    dmesg_cursor         TEXT,
+    pressure_state       TEXT NOT NULL DEFAULT 'healthy'
+        CHECK (pressure_state IN ('healthy', 'build_paused', 'critical')),
+    build_reserve_gb     DOUBLE PRECISION NOT NULL DEFAULT 4.0,
+    PRIMARY KEY (worker_name, sampled_at)
+);
+
+CREATE INDEX IF NOT EXISTS idx_node_health_latest
+    ON node_health (worker_name, sampled_at DESC);
+CREATE INDEX IF NOT EXISTS idx_node_health_pressure
+    ON node_health (pressure_state, sampled_at DESC);
 "#;
 
 /// Append-only store for fleet node log lines.
 pub const SCHEMA_V279_FLEET_LOGS: &str =
     include_str!("migrations/20260727000000_create_fleet_logs.sql");
 
-/// Merge the physical computer and worker registries into `fleet_nodes`.
+/// Retired V280 proposal. This SQL is retained for archaeology and tests only;
+/// it is deliberately absent from every runnable migration list because the
+/// live fleet recorded V280 as `merge_fleet_tables__QUARANTINED_MANUAL`.
 pub const SCHEMA_V280_MERGE_FLEET_TABLES: &str =
     include_str!("migrations/20260728000000_merge_fleet_tables.sql");
 
@@ -12585,6 +12616,1861 @@ pub const SCHEMA_V284_MODEL_LOAD_RESERVATIONS: &str =
 pub const SCHEMA_V285_RING_SAFE_FABRIC: &str = r#"
 ALTER TABLE fabric_pairs
     ADD COLUMN IF NOT EXISTS endpoints_explicit BOOLEAN NOT NULL DEFAULT FALSE;
+"#;
+
+/// v286: emergency kill switch for autonomous OAuth refresh/distribution task
+/// producers. Existing fleets keep the historical enabled posture, while
+/// `ff secrets disable-gate oauth_distribution_enabled ...` can fence every
+/// producer during credential recovery. Never overwrite an operator-set row.
+pub const SCHEMA_V286_OAUTH_DISTRIBUTION_GATE: &str = r#"
+INSERT INTO fleet_secrets (key, value, description, updated_by)
+VALUES (
+    'oauth_distribution_enabled',
+    'true',
+    'Allow autonomous OAuth repush/distribution fleet task creation',
+    'migration-v286'
+)
+ON CONFLICT (key) DO NOTHING;
+"#;
+
+/// v287: emergency kill switch for the autonomous leader SSH mesh-repair task
+/// producer. Existing fleets keep the historical enabled posture, while
+/// `ff secrets disable-gate ssh_mesh_auto_repair_enabled ...` can fence the
+/// producer during recovery. Never overwrite an operator-set row.
+pub const SCHEMA_V287_SSH_MESH_AUTO_REPAIR_GATE: &str = r#"
+INSERT INTO fleet_secrets (key, value, description, updated_by)
+VALUES (
+    'ssh_mesh_auto_repair_enabled',
+    'true',
+    'Allow autonomous leader SSH mesh auto-repair fleet task creation',
+    'migration-v287'
+)
+ON CONFLICT (key) DO NOTHING;
+"#;
+
+/// v288: register Ubuntu 26.04 as a data-driven software projection. The
+/// collector reads these rules from Postgres; without this FK-owned registry
+/// row a correct 26.04 beat cannot be materialized at all.
+pub const SCHEMA_V288_UBUNTU_2604_SOFTWARE_PROJECTION: &str = r#"
+INSERT INTO software_registry (
+    id,
+    display_name,
+    kind,
+    applies_to_os_family,
+    version_source,
+    upgrade_playbook,
+    requires_restart,
+    requires_reboot,
+    detection
+)
+VALUES (
+    'os-ubuntu-26.04',
+    'Ubuntu 26.04 LTS',
+    'os',
+    'linux-ubuntu',
+    '{"method":"apt_dist"}'::jsonb,
+    '{"linux-ubuntu":"sudo apt-get update && sudo apt-get -y dist-upgrade"}'::jsonb,
+    TRUE,
+    TRUE,
+    '{"method":"os_release","expected_id":"ubuntu","expected_version_prefix":"26.04"}'::jsonb
+)
+ON CONFLICT (id) DO UPDATE SET
+    detection = COALESCE(software_registry.detection, EXCLUDED.detection),
+    applies_to_os_family = COALESCE(
+        software_registry.applies_to_os_family,
+        EXCLUDED.applies_to_os_family
+    );
+"#;
+
+/// v289: single-use, leader-epoch-fenced credentials for the dedicated TLS
+/// enrollment listener. Only SHA-256 digests are persisted; plaintext bearer
+/// tokens exist solely in the issuing CLI and enrolling client processes.
+pub const SCHEMA_V289_SECURE_ENROLLMENT_TOKENS: &str = r#"
+CREATE TABLE IF NOT EXISTS fleet_enrollment_tokens (
+    token_hash       BYTEA PRIMARY KEY,
+    node_name        TEXT NOT NULL,
+    intended_ip      INET NOT NULL,
+    ssh_user         TEXT NOT NULL,
+    role             TEXT NOT NULL,
+    runtime          TEXT NOT NULL,
+    purpose          TEXT NOT NULL DEFAULT 'node-enrollment',
+    leader_name      TEXT NOT NULL,
+    leader_epoch     BIGINT NOT NULL,
+    expires_at       TIMESTAMPTZ NOT NULL,
+    consumed_at      TIMESTAMPTZ,
+    consumed_peer_ip INET,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    created_by       TEXT,
+    CONSTRAINT fleet_enrollment_tokens_hash_length
+        CHECK (octet_length(token_hash) = 32),
+    CONSTRAINT fleet_enrollment_tokens_canonical_name
+        CHECK (node_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    CONSTRAINT fleet_enrollment_tokens_canonical_ssh_user
+        CHECK (ssh_user ~ '^[a-z_][a-z0-9_-]{0,63}$'),
+    CONSTRAINT fleet_enrollment_tokens_role
+        CHECK (role IN ('builder', 'gateway', 'testbed')),
+    CONSTRAINT fleet_enrollment_tokens_runtime
+        CHECK (runtime ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
+    CONSTRAINT fleet_enrollment_tokens_purpose
+        CHECK (purpose = 'node-enrollment'),
+    CONSTRAINT fleet_enrollment_tokens_epoch
+        CHECK (leader_epoch >= 0),
+    CONSTRAINT fleet_enrollment_tokens_expiry
+        CHECK (expires_at > created_at
+            AND expires_at <= created_at + interval '15 minutes'),
+    CONSTRAINT fleet_enrollment_tokens_consumption
+        CHECK ((consumed_at IS NULL AND consumed_peer_ip IS NULL)
+            OR (consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL))
+);
+
+CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_expiry
+    ON fleet_enrollment_tokens (expires_at)
+    WHERE consumed_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_node
+    ON fleet_enrollment_tokens (node_name, created_at DESC);
+"#;
+
+/// v290: forward-only repair for databases that had already recorded the
+/// original v289 before the enrollment authority was hardened. The migration
+/// accepts exactly that immutable v289 shape or the reviewed hardened shape;
+/// every other preexisting shape fails closed.
+pub const SCHEMA_V290_SECURE_ENROLLMENT_HARDENING: &str = r#"
+DO $secure_enrollment_v290_preflight$
+DECLARE
+    actual_columns TEXT[];
+    actual_defaults TEXT[];
+    actual_constraint_defs TEXT[];
+    actual_index_defs TEXT[];
+    actual_comment TEXT;
+    all_constraints_validated BOOLEAN;
+    old_columns CONSTANT TEXT[] := ARRAY[
+        'token_hash:bytea:required',
+        'node_name:text:required',
+        'intended_ip:inet:required',
+        'ssh_user:text:required',
+        'role:text:required',
+        'runtime:text:required',
+        'purpose:text:required',
+        'leader_name:text:required',
+        'leader_epoch:bigint:required',
+        'expires_at:timestamp with time zone:required',
+        'consumed_at:timestamp with time zone:nullable',
+        'consumed_peer_ip:inet:nullable',
+        'created_at:timestamp with time zone:required',
+        'created_by:text:nullable'
+    ];
+    hardened_columns CONSTANT TEXT[] := old_columns ||
+        ARRAY['revoked_at:timestamp with time zone:nullable'];
+    expected_defaults CONSTANT TEXT[] := ARRAY[
+        'created_at:clock_timestamp()',
+        'purpose:''node-enrollment''::text'
+    ];
+    old_constraint_defs CONSTANT TEXT[] := ARRAY[
+        'fleet_enrollment_tokens_canonical_name:CHECK (node_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_ssh_user:CHECK (ssh_user ~ ''^[a-z_][a-z0-9_-]{0,63}$''::text)',
+        'fleet_enrollment_tokens_consumption:CHECK (consumed_at IS NULL AND consumed_peer_ip IS NULL OR consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)',
+        'fleet_enrollment_tokens_epoch:CHECK (leader_epoch >= 0)',
+        'fleet_enrollment_tokens_expiry:CHECK (expires_at > created_at AND expires_at <= (created_at + ''00:15:00''::interval))',
+        'fleet_enrollment_tokens_hash_length:CHECK (octet_length(token_hash) = 32)',
+        'fleet_enrollment_tokens_pkey:PRIMARY KEY (token_hash)',
+        'fleet_enrollment_tokens_purpose:CHECK (purpose = ''node-enrollment''::text)',
+        'fleet_enrollment_tokens_role:CHECK (role = ANY (ARRAY[''builder''::text, ''gateway''::text, ''testbed''::text]))',
+        'fleet_enrollment_tokens_runtime:CHECK (runtime ~ ''^[a-z0-9][a-z0-9._-]{0,31}$''::text)'
+    ];
+    hardened_constraint_defs CONSTANT TEXT[] := ARRAY[
+        'fleet_enrollment_tokens_canonical_leader:CHECK (leader_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_name:CHECK (node_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_ssh_user:CHECK (ssh_user ~ ''^[a-z_][a-z0-9_-]{0,63}$''::text)',
+        'fleet_enrollment_tokens_consumption:CHECK (consumed_at IS NULL AND consumed_peer_ip IS NULL OR consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)',
+        'fleet_enrollment_tokens_epoch:CHECK (leader_epoch >= 0)',
+        'fleet_enrollment_tokens_expiry:CHECK (expires_at > created_at AND expires_at <= (created_at + ''00:15:00''::interval))',
+        'fleet_enrollment_tokens_hash_length:CHECK (octet_length(token_hash) = 32)',
+        'fleet_enrollment_tokens_pkey:PRIMARY KEY (token_hash)',
+        'fleet_enrollment_tokens_purpose:CHECK (purpose = ''node-enrollment''::text)',
+        'fleet_enrollment_tokens_revocation:CHECK (revoked_at IS NULL OR consumed_at IS NULL AND revoked_at >= created_at)',
+        'fleet_enrollment_tokens_role:CHECK (role = ANY (ARRAY[''builder''::text, ''gateway''::text, ''testbed''::text]))',
+        'fleet_enrollment_tokens_runtime:CHECK (runtime ~ ''^[a-z0-9][a-z0-9._-]{0,31}$''::text)'
+    ];
+    old_index_defs CONSTANT TEXT[] := ARRAY[
+        'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE (consumed_at IS NULL)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)'
+    ];
+    hardened_index_defs CONSTANT TEXT[] := ARRAY[
+        'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)',
+        'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name ON public.fleet_workers USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip ON public.fleet_workers USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)'
+    ];
+    unified_hardened_index_defs CONSTANT TEXT[] := ARRAY[
+        'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_canonical_name ON public.fleet_nodes USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_primary_ip ON public.fleet_nodes USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)',
+        'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_worker_ip ON public.fleet_nodes USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)'
+    ];
+    legacy_roster_layout BOOLEAN;
+    unified_roster_layout BOOLEAN;
+    is_old_v289 BOOLEAN;
+    is_hardened BOOLEAN;
+BEGIN
+    IF to_regclass('public.fleet_enrollment_tokens') IS NULL THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v290 requires the immutable v289 enrollment authority table',
+            HINT = 'restore or apply the reviewed v289 migration before v290; do not synthesize authority state';
+    END IF;
+
+    SELECT array_agg(
+               a.attname || ':' || format_type(a.atttypid, a.atttypmod) || ':' ||
+               CASE WHEN a.attnotnull THEN 'required' ELSE 'nullable' END
+               ORDER BY a.attnum
+           )
+      INTO actual_columns
+      FROM pg_attribute a
+     WHERE a.attrelid = 'public.fleet_enrollment_tokens'::regclass
+       AND a.attnum > 0
+       AND NOT a.attisdropped;
+
+    SELECT array_agg(
+               a.attname || ':' || pg_get_expr(d.adbin, d.adrelid)
+               ORDER BY a.attname
+           )
+      INTO actual_defaults
+      FROM pg_attribute a
+      JOIN pg_attrdef d
+        ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+     WHERE a.attrelid = 'public.fleet_enrollment_tokens'::regclass
+       AND a.attnum > 0
+       AND NOT a.attisdropped;
+
+    SELECT array_agg(
+               c.conname || ':' || pg_get_constraintdef(c.oid, true)
+               ORDER BY c.conname
+           ),
+           bool_and(c.convalidated)
+      INTO actual_constraint_defs, all_constraints_validated
+      FROM pg_constraint c
+     WHERE c.conrelid = 'public.fleet_enrollment_tokens'::regclass;
+
+    SELECT array_agg(pg_get_indexdef(x.indexrelid) ORDER BY i.relname)
+      INTO actual_index_defs
+      FROM pg_index x
+      JOIN pg_class i ON i.oid = x.indexrelid
+     WHERE x.indrelid = 'public.fleet_enrollment_tokens'::regclass
+        OR (x.indrelid = 'public.computers'::regclass
+            AND i.relname IN (
+                'idx_computers_enrollment_canonical_name',
+                'idx_computers_enrollment_primary_ip'
+            ))
+        OR (x.indrelid = 'public.fleet_workers'::regclass
+            AND i.relname IN (
+                'idx_fleet_workers_enrollment_canonical_name',
+                'idx_fleet_workers_enrollment_ip'
+            ))
+        OR (x.indrelid = to_regclass('public.fleet_nodes')
+            AND i.relname IN (
+                'idx_fleet_nodes_enrollment_canonical_name',
+                'idx_fleet_nodes_enrollment_primary_ip',
+                'idx_fleet_nodes_enrollment_worker_ip'
+            ));
+
+    SELECT obj_description('public.fleet_enrollment_tokens'::regclass, 'pg_class')
+      INTO actual_comment;
+
+    SELECT
+        (SELECT c.relkind = 'r'
+           FROM pg_class c
+          WHERE c.oid = 'public.computers'::regclass)
+        AND (SELECT c.relkind = 'r'
+               FROM pg_class c
+              WHERE c.oid = 'public.fleet_workers'::regclass)
+      INTO legacy_roster_layout;
+
+    SELECT
+        to_regclass('public.fleet_nodes') IS NOT NULL
+        AND (SELECT c.relkind = 'r'
+               FROM pg_class c
+              WHERE c.oid = to_regclass('public.fleet_nodes'))
+        AND (SELECT c.relkind = 'v'
+               FROM pg_class c
+              WHERE c.oid = 'public.computers'::regclass)
+        AND (SELECT c.relkind = 'v'
+               FROM pg_class c
+              WHERE c.oid = 'public.fleet_workers'::regclass)
+        AND btrim(regexp_replace(
+                pg_get_viewdef('public.computers'::regclass, true),
+                E'\\s+', ' ', 'g'
+            )) = 'SELECT id, name, primary_ip, all_ips, hostname, mac_addresses, os_family, os_distribution, os_version, os_version_latest, os_upgrade_available, os_version_checked_at, cpu_cores, total_ram_gb, total_disk_gb, has_gpu, gpu_kind, gpu_count, gpu_model, gpu_vram_gb, gpu_total_vram_gb, cuda_version, metal_version, rocm_version, gpu_driver_version, ssh_user, ssh_port, ssh_public_key, enrolled_at, last_seen_at, offline_since, status_changed_at, status, metadata, network_scope, source_tree_path, build_archs, connectivity_mode, election_eligibility, reservation_state, reserved_reason, reserved_at, reservation_owner, reservation_expires_at, dispatch_tick_at FROM fleet_nodes;'
+        AND btrim(regexp_replace(
+                pg_get_viewdef('public.fleet_workers'::regclass, true),
+                E'\\s+', ' ', 'g'
+            )) = 'SELECT name, ip, ssh_user, ram_gb, worker_cpu_cores AS cpu_cores, os, role, election_priority, hardware, alt_ips, capabilities, preferences, resources, worker_status AS status, registered_at, updated_at, runtime, models_dir, disk_quota_pct, sub_agent_count, gh_account, tooling FROM fleet_nodes;'
+      INTO unified_roster_layout;
+
+    is_old_v289 :=
+        actual_columns IS NOT DISTINCT FROM old_columns
+        AND actual_defaults IS NOT DISTINCT FROM expected_defaults
+        AND actual_constraint_defs IS NOT DISTINCT FROM old_constraint_defs
+        AND actual_index_defs IS NOT DISTINCT FROM old_index_defs
+        AND all_constraints_validated
+        AND (legacy_roster_layout OR unified_roster_layout)
+        AND actual_comment IS NULL;
+
+    is_hardened :=
+        actual_columns IS NOT DISTINCT FROM hardened_columns
+        AND actual_defaults IS NOT DISTINCT FROM expected_defaults
+        AND actual_constraint_defs IS NOT DISTINCT FROM hardened_constraint_defs
+        AND (
+            (legacy_roster_layout
+             AND actual_index_defs IS NOT DISTINCT FROM hardened_index_defs)
+            OR (unified_roster_layout
+                AND actual_index_defs IS NOT DISTINCT FROM unified_hardened_index_defs)
+        )
+        AND all_constraints_validated
+        AND actual_comment IN (
+            'forgefleet secure enrollment authority schema v289; forward-only migrations only',
+            'forgefleet secure enrollment authority schema v290; forward-only migrations only'
+        );
+
+    IF is_old_v289 THEN
+        ALTER TABLE public.fleet_enrollment_tokens
+            ADD COLUMN revoked_at TIMESTAMPTZ,
+            ADD CONSTRAINT fleet_enrollment_tokens_canonical_leader
+                CHECK (leader_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+            ADD CONSTRAINT fleet_enrollment_tokens_revocation
+                CHECK (revoked_at IS NULL
+                    OR (consumed_at IS NULL AND revoked_at >= created_at));
+        DROP INDEX public.idx_fleet_enrollment_tokens_expiry;
+    ELSIF NOT is_hardened THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'preexisting fleet_enrollment_tokens is neither immutable v289 nor reviewed hardened authority',
+            DETAIL = format(
+                'columns %s, defaults %s, constraints %s, indexes %s, comment %s',
+                actual_columns, actual_defaults, actual_constraint_defs,
+                actual_index_defs, actual_comment
+            ),
+            HINT = 'repair the drift with a separately reviewed forward-only migration; v290 never guesses';
+    END IF;
+END
+$secure_enrollment_v290_preflight$;
+
+DO $secure_enrollment_migration$
+DECLARE
+    actual_columns TEXT[];
+    expected_columns CONSTANT TEXT[] := ARRAY[
+        'token_hash:bytea:required',
+        'node_name:text:required',
+        'intended_ip:inet:required',
+        'ssh_user:text:required',
+        'role:text:required',
+        'runtime:text:required',
+        'purpose:text:required',
+        'leader_name:text:required',
+        'leader_epoch:bigint:required',
+        'expires_at:timestamp with time zone:required',
+        'consumed_at:timestamp with time zone:nullable',
+        'consumed_peer_ip:inet:nullable',
+        'created_at:timestamp with time zone:required',
+        'created_by:text:nullable',
+        'revoked_at:timestamp with time zone:nullable'
+    ];
+    actual_defaults TEXT[];
+    expected_defaults CONSTANT TEXT[] := ARRAY[
+        'created_at:clock_timestamp()',
+        'purpose:''node-enrollment''::text'
+    ];
+    actual_constraints TEXT[];
+    expected_constraints CONSTANT TEXT[] := ARRAY[
+        'fleet_enrollment_tokens_canonical_leader',
+        'fleet_enrollment_tokens_canonical_name',
+        'fleet_enrollment_tokens_canonical_ssh_user',
+        'fleet_enrollment_tokens_consumption',
+        'fleet_enrollment_tokens_epoch',
+        'fleet_enrollment_tokens_expiry',
+        'fleet_enrollment_tokens_hash_length',
+        'fleet_enrollment_tokens_pkey',
+        'fleet_enrollment_tokens_purpose',
+        'fleet_enrollment_tokens_revocation',
+        'fleet_enrollment_tokens_role',
+        'fleet_enrollment_tokens_runtime'
+    ];
+    actual_constraint_defs TEXT[];
+    expected_constraint_defs CONSTANT TEXT[] := ARRAY[
+        'fleet_enrollment_tokens_canonical_leader:CHECK (leader_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_name:CHECK (node_name ~ ''^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$''::text)',
+        'fleet_enrollment_tokens_canonical_ssh_user:CHECK (ssh_user ~ ''^[a-z_][a-z0-9_-]{0,63}$''::text)',
+        'fleet_enrollment_tokens_consumption:CHECK (consumed_at IS NULL AND consumed_peer_ip IS NULL OR consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)',
+        'fleet_enrollment_tokens_epoch:CHECK (leader_epoch >= 0)',
+        'fleet_enrollment_tokens_expiry:CHECK (expires_at > created_at AND expires_at <= (created_at + ''00:15:00''::interval))',
+        'fleet_enrollment_tokens_hash_length:CHECK (octet_length(token_hash) = 32)',
+        'fleet_enrollment_tokens_pkey:PRIMARY KEY (token_hash)',
+        'fleet_enrollment_tokens_purpose:CHECK (purpose = ''node-enrollment''::text)',
+        'fleet_enrollment_tokens_revocation:CHECK (revoked_at IS NULL OR consumed_at IS NULL AND revoked_at >= created_at)',
+        'fleet_enrollment_tokens_role:CHECK (role = ANY (ARRAY[''builder''::text, ''gateway''::text, ''testbed''::text]))',
+        'fleet_enrollment_tokens_runtime:CHECK (runtime ~ ''^[a-z0-9][a-z0-9._-]{0,31}$''::text)'
+    ];
+BEGIN
+    IF to_regclass('public.fleet_enrollment_tokens') IS NULL THEN
+        CREATE TABLE public.fleet_enrollment_tokens (
+            token_hash       BYTEA PRIMARY KEY,
+            node_name        TEXT NOT NULL,
+            intended_ip      INET NOT NULL,
+            ssh_user         TEXT NOT NULL,
+            role             TEXT NOT NULL,
+            runtime          TEXT NOT NULL,
+            purpose          TEXT NOT NULL DEFAULT 'node-enrollment',
+            leader_name      TEXT NOT NULL,
+            leader_epoch     BIGINT NOT NULL,
+            expires_at       TIMESTAMPTZ NOT NULL,
+            consumed_at      TIMESTAMPTZ,
+            consumed_peer_ip INET,
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            created_by       TEXT,
+            revoked_at       TIMESTAMPTZ,
+            CONSTRAINT fleet_enrollment_tokens_hash_length
+                CHECK (octet_length(token_hash) = 32),
+            CONSTRAINT fleet_enrollment_tokens_canonical_name
+                CHECK (node_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+            CONSTRAINT fleet_enrollment_tokens_canonical_ssh_user
+                CHECK (ssh_user ~ '^[a-z_][a-z0-9_-]{0,63}$'),
+            CONSTRAINT fleet_enrollment_tokens_role
+                CHECK (role IN ('builder', 'gateway', 'testbed')),
+            CONSTRAINT fleet_enrollment_tokens_runtime
+                CHECK (runtime ~ '^[a-z0-9][a-z0-9._-]{0,31}$'),
+            CONSTRAINT fleet_enrollment_tokens_purpose
+                CHECK (purpose = 'node-enrollment'),
+            CONSTRAINT fleet_enrollment_tokens_canonical_leader
+                CHECK (leader_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+            CONSTRAINT fleet_enrollment_tokens_epoch
+                CHECK (leader_epoch >= 0),
+            CONSTRAINT fleet_enrollment_tokens_expiry
+                CHECK (expires_at > created_at
+                    AND expires_at <= created_at + interval '15 minutes'),
+            CONSTRAINT fleet_enrollment_tokens_consumption
+                CHECK ((consumed_at IS NULL AND consumed_peer_ip IS NULL)
+                    OR (consumed_at IS NOT NULL AND consumed_peer_ip IS NOT NULL)),
+            CONSTRAINT fleet_enrollment_tokens_revocation
+                CHECK (revoked_at IS NULL
+                    OR (consumed_at IS NULL AND revoked_at >= created_at))
+        );
+    ELSE
+        SELECT array_agg(
+                   a.attname || ':' || format_type(a.atttypid, a.atttypmod) || ':' ||
+                   CASE WHEN a.attnotnull THEN 'required' ELSE 'nullable' END
+                   ORDER BY a.attnum
+               )
+          INTO actual_columns
+          FROM pg_attribute a
+         WHERE a.attrelid = 'public.fleet_enrollment_tokens'::regclass
+           AND a.attnum > 0
+           AND NOT a.attisdropped;
+        IF actual_columns IS DISTINCT FROM expected_columns THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'preexisting fleet_enrollment_tokens has an unsafe shape',
+                DETAIL = format(
+                    'expected columns %s, found %s',
+                    expected_columns, actual_columns
+                ),
+                HINT = 'use a reviewed forward-only enrollment schema repair migration; onboarding never repairs authority tables';
+        END IF;
+
+        SELECT array_agg(
+                   a.attname || ':' || pg_get_expr(d.adbin, d.adrelid)
+                   ORDER BY a.attname
+               )
+          INTO actual_defaults
+          FROM pg_attribute a
+          JOIN pg_attrdef d
+            ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+         WHERE a.attrelid = 'public.fleet_enrollment_tokens'::regclass
+           AND a.attnum > 0
+           AND NOT a.attisdropped;
+        IF actual_defaults IS DISTINCT FROM expected_defaults THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'preexisting fleet_enrollment_tokens has unsafe defaults',
+                DETAIL = format(
+                    'expected defaults %s, found %s',
+                    expected_defaults, actual_defaults
+                ),
+                HINT = 'use a reviewed forward-only enrollment schema repair migration; onboarding never repairs authority tables';
+        END IF;
+
+        SELECT array_agg(c.conname ORDER BY c.conname),
+               array_agg(
+                   c.conname || ':' || pg_get_constraintdef(c.oid, true)
+                   ORDER BY c.conname
+               )
+          INTO actual_constraints, actual_constraint_defs
+          FROM pg_constraint c
+         WHERE c.conrelid = 'public.fleet_enrollment_tokens'::regclass;
+        IF actual_constraints IS DISTINCT FROM expected_constraints
+           OR actual_constraint_defs IS DISTINCT FROM expected_constraint_defs
+           OR EXISTS (
+               SELECT 1 FROM pg_constraint c
+                WHERE c.conrelid = 'public.fleet_enrollment_tokens'::regclass
+                  AND NOT c.convalidated
+           ) THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'preexisting fleet_enrollment_tokens has unsafe constraints',
+                DETAIL = format(
+                    'expected constraints %s, found names %s, definitions %s',
+                    expected_constraint_defs, actual_constraints, actual_constraint_defs
+                ),
+                HINT = 'use a reviewed forward-only enrollment schema repair migration; onboarding never repairs authority tables';
+        END IF;
+    END IF;
+END
+$secure_enrollment_migration$;
+
+-- Enrollment allocates one canonical name/IP across both roster projections.
+-- PostgreSQL cannot express cross-table uniqueness, so the transaction also
+-- takes the shared enrollment advisory lock and checks both tables together;
+-- these indexes make each projection independently race-safe.
+DO $secure_enrollment_roster_indexes$
+BEGIN
+    IF (SELECT c.relkind = 'r'
+          FROM pg_class c
+         WHERE c.oid = 'public.computers'::regclass)
+       AND (SELECT c.relkind = 'r'
+              FROM pg_class c
+             WHERE c.oid = 'public.fleet_workers'::regclass)
+    THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_canonical_name
+            ON computers (lower(name));
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_computers_enrollment_primary_ip
+            ON computers (primary_ip)
+            WHERE NULLIF(primary_ip, '') IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_canonical_name
+            ON fleet_workers (lower(name));
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_workers_enrollment_ip
+            ON fleet_workers (ip)
+            WHERE NULLIF(ip, '') IS NOT NULL;
+    ELSIF (SELECT c.relkind = 'v'
+             FROM pg_class c
+            WHERE c.oid = 'public.computers'::regclass)
+          AND (SELECT c.relkind = 'v'
+                 FROM pg_class c
+                WHERE c.oid = 'public.fleet_workers'::regclass)
+          AND (SELECT c.relkind = 'r'
+                 FROM pg_class c
+                WHERE c.oid = to_regclass('public.fleet_nodes'))
+    THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_nodes_enrollment_canonical_name
+            ON fleet_nodes (lower(name));
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_nodes_enrollment_primary_ip
+            ON fleet_nodes (primary_ip)
+            WHERE NULLIF(primary_ip, '') IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_nodes_enrollment_worker_ip
+            ON fleet_nodes (ip)
+            WHERE NULLIF(ip, '') IS NOT NULL;
+    ELSE
+        RAISE EXCEPTION
+            'enrollment roster authority is neither reviewed legacy tables nor unified fleet_nodes projections';
+    END IF;
+END
+$secure_enrollment_roster_indexes$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_pending_name
+    ON fleet_enrollment_tokens (lower(node_name))
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_pending_ip
+    ON fleet_enrollment_tokens (intended_ip)
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_expiry
+    ON fleet_enrollment_tokens (expires_at)
+    WHERE consumed_at IS NULL AND revoked_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_fleet_enrollment_tokens_node
+    ON fleet_enrollment_tokens (node_name, created_at DESC);
+
+COMMENT ON TABLE fleet_enrollment_tokens IS
+    'forgefleet secure enrollment authority schema v290; forward-only migrations only';
+
+DO $secure_enrollment_indexes$
+DECLARE
+    actual_index_defs TEXT[];
+    expected_index_defs TEXT[];
+    legacy_index_defs CONSTANT TEXT[] := ARRAY[
+        'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)',
+        'CREATE UNIQUE INDEX idx_computers_enrollment_canonical_name ON public.computers USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_computers_enrollment_primary_ip ON public.computers USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_canonical_name ON public.fleet_workers USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_fleet_workers_enrollment_ip ON public.fleet_workers USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)'
+    ];
+    unified_index_defs CONSTANT TEXT[] := ARRAY[
+        'CREATE UNIQUE INDEX fleet_enrollment_tokens_pkey ON public.fleet_enrollment_tokens USING btree (token_hash)',
+        'CREATE INDEX idx_fleet_enrollment_tokens_expiry ON public.fleet_enrollment_tokens USING btree (expires_at) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE INDEX idx_fleet_enrollment_tokens_node ON public.fleet_enrollment_tokens USING btree (node_name, created_at DESC)',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_ip ON public.fleet_enrollment_tokens USING btree (intended_ip) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_enrollment_tokens_pending_name ON public.fleet_enrollment_tokens USING btree (lower(node_name)) WHERE ((consumed_at IS NULL) AND (revoked_at IS NULL))',
+        'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_canonical_name ON public.fleet_nodes USING btree (lower(name))',
+        'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_primary_ip ON public.fleet_nodes USING btree (primary_ip) WHERE (NULLIF(primary_ip, ''''::text) IS NOT NULL)',
+        'CREATE UNIQUE INDEX idx_fleet_nodes_enrollment_worker_ip ON public.fleet_nodes USING btree (ip) WHERE (NULLIF(ip, ''''::text) IS NOT NULL)'
+    ];
+BEGIN
+    IF (SELECT c.relkind = 'r'
+          FROM pg_class c
+         WHERE c.oid = 'public.computers'::regclass)
+       AND (SELECT c.relkind = 'r'
+              FROM pg_class c
+             WHERE c.oid = 'public.fleet_workers'::regclass)
+    THEN
+        expected_index_defs := legacy_index_defs;
+    ELSIF (SELECT c.relkind = 'v'
+             FROM pg_class c
+            WHERE c.oid = 'public.computers'::regclass)
+          AND (SELECT c.relkind = 'v'
+                 FROM pg_class c
+                WHERE c.oid = 'public.fleet_workers'::regclass)
+          AND (SELECT c.relkind = 'r'
+                 FROM pg_class c
+                WHERE c.oid = to_regclass('public.fleet_nodes'))
+    THEN
+        expected_index_defs := unified_index_defs;
+    ELSE
+        RAISE EXCEPTION
+            'enrollment roster authority changed during v290 index validation';
+    END IF;
+
+    SELECT array_agg(pg_get_indexdef(x.indexrelid) ORDER BY i.relname)
+      INTO actual_index_defs
+      FROM pg_index x
+      JOIN pg_class i ON i.oid = x.indexrelid
+     WHERE x.indrelid = 'public.fleet_enrollment_tokens'::regclass
+        OR (x.indrelid = 'public.computers'::regclass
+            AND i.relname IN (
+                'idx_computers_enrollment_canonical_name',
+                'idx_computers_enrollment_primary_ip'
+            ))
+        OR (x.indrelid = 'public.fleet_workers'::regclass
+            AND i.relname IN (
+                'idx_fleet_workers_enrollment_canonical_name',
+                'idx_fleet_workers_enrollment_ip'
+            ))
+        OR (x.indrelid = to_regclass('public.fleet_nodes')
+            AND i.relname IN (
+                'idx_fleet_nodes_enrollment_canonical_name',
+                'idx_fleet_nodes_enrollment_primary_ip',
+                'idx_fleet_nodes_enrollment_worker_ip'
+            ));
+    IF actual_index_defs IS DISTINCT FROM expected_index_defs
+       OR (SELECT count(*) FROM pg_index
+            WHERE indrelid = 'public.fleet_enrollment_tokens'::regclass) <> 5
+       OR EXISTS (
+           SELECT 1
+             FROM pg_index x
+             JOIN pg_class i ON i.oid = x.indexrelid
+            WHERE pg_get_indexdef(x.indexrelid) = ANY(expected_index_defs)
+              AND (NOT x.indisvalid OR NOT x.indisready)
+       ) THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'fleet_enrollment_tokens indexes do not match the reviewed authority schema',
+            DETAIL = format(
+                'expected indexes %s, found %s',
+                expected_index_defs, actual_index_defs
+            ),
+            HINT = 'use a reviewed forward-only enrollment schema repair migration';
+    END IF;
+END
+$secure_enrollment_indexes$;
+"#;
+
+/// v291: immutable release-artifact authority plus per-computer custody.
+///
+/// `release_artifacts` is the canonical content identity.  A release identity
+/// can acquire more custodians, but its digest and size are never rewritten.
+/// `release_artifact_custody` records the exact relative path verified on each
+/// holder.  The application exposes insert-or-verify APIs only; the RESTRICT
+/// foreign keys also prevent ordinary computer cleanup from erasing custody
+/// evidence accidentally.
+pub const SCHEMA_V291_RELEASE_ARTIFACT_CUSTODY: &str = r#"
+CREATE TABLE release_artifacts (
+    id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    artifact_name    TEXT NOT NULL,
+    artifact_version TEXT NOT NULL,
+    source_commit    TEXT NOT NULL,
+    target_triple    TEXT NOT NULL,
+    sha256           TEXT NOT NULL,
+    size_bytes       BIGINT NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CONSTRAINT release_artifacts_canonical_name
+        CHECK (artifact_name ~ '^[a-z0-9][a-z0-9._+-]{0,127}$'),
+    CONSTRAINT release_artifacts_canonical_version
+        CHECK (artifact_version ~ '^[a-z0-9][a-z0-9._+-]{0,127}$'),
+    CONSTRAINT release_artifacts_source_commit
+        CHECK (source_commit ~ '^[0-9a-f]{40}$'),
+    CONSTRAINT release_artifacts_target_triple
+        CHECK (target_triple ~ '^[a-z0-9_]+(-[a-z0-9_.]+){2,4}$'),
+    CONSTRAINT release_artifacts_sha256
+        CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT release_artifacts_positive_size
+        CHECK (size_bytes > 0),
+    CONSTRAINT release_artifacts_identity
+        UNIQUE (artifact_name, artifact_version, source_commit, target_triple)
+);
+
+CREATE INDEX idx_release_artifacts_sha256
+    ON release_artifacts (sha256);
+
+CREATE TABLE release_artifact_custody (
+    artifact_id                 UUID NOT NULL
+        REFERENCES release_artifacts(id) ON DELETE RESTRICT,
+    computer_id                 UUID NOT NULL
+        REFERENCES computers(id) ON DELETE RESTRICT,
+    holder_name_at_registration TEXT NOT NULL,
+    relative_path               TEXT NOT NULL,
+    first_verified_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    last_verified_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (artifact_id, computer_id),
+    CONSTRAINT release_artifact_custody_canonical_holder
+        CHECK (holder_name_at_registration ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    CONSTRAINT release_artifact_custody_normal_relative_path
+        CHECK (relative_path <> ''
+            AND left(relative_path, 1) <> '/'
+            AND right(relative_path, 1) <> '/'
+            AND relative_path !~ '(^|/)\.\.?(/|$)'
+            AND relative_path !~ '//'
+            AND position(E'\\' in relative_path) = 0),
+    CONSTRAINT release_artifact_custody_time_order
+        CHECK (last_verified_at >= first_verified_at),
+    CONSTRAINT release_artifact_custody_path_identity
+        UNIQUE (computer_id, relative_path)
+);
+
+CREATE INDEX idx_release_artifact_custody_computer
+    ON release_artifact_custody (computer_id, last_verified_at DESC);
+
+COMMENT ON TABLE release_artifacts IS
+    'Immutable canonical release-binary identity; content fields are compare-only after insert.';
+COMMENT ON TABLE release_artifact_custody IS
+    'Verified local custody under the holder release-build root; re-registration refreshes only last_verified_at.';
+
+CREATE FUNCTION forbid_release_artifact_mutation()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_artifact_immutable$
+BEGIN
+    RAISE EXCEPTION 'release artifact content is immutable';
+    RETURN NULL;
+END
+$release_artifact_immutable$;
+
+CREATE TRIGGER release_artifacts_immutable
+    BEFORE UPDATE OR DELETE ON release_artifacts
+    FOR EACH ROW EXECUTE FUNCTION forbid_release_artifact_mutation();
+
+CREATE FUNCTION enforce_release_custody_refresh_only()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_custody_immutable$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'release artifact custody is immutable';
+    END IF;
+    IF NEW.artifact_id IS DISTINCT FROM OLD.artifact_id
+       OR NEW.computer_id IS DISTINCT FROM OLD.computer_id
+       OR NEW.holder_name_at_registration IS DISTINCT FROM OLD.holder_name_at_registration
+       OR NEW.relative_path IS DISTINCT FROM OLD.relative_path
+       OR NEW.first_verified_at IS DISTINCT FROM OLD.first_verified_at
+       OR NEW.last_verified_at < OLD.last_verified_at
+    THEN
+        RAISE EXCEPTION 'release artifact custody permits only monotonic verification refresh';
+    END IF;
+    RETURN NEW;
+END
+$release_custody_immutable$;
+
+CREATE TRIGGER release_artifact_custody_refresh_only
+    BEFORE UPDATE OR DELETE ON release_artifact_custody
+    FOR EACH ROW EXECUTE FUNCTION enforce_release_custody_refresh_only();
+"#;
+
+/// v292: authorize James's exact llama.cpp served-model spelling.
+///
+/// The resolver accepts aliases only when they are attached to the exact
+/// runtime/artifact variant in catalog authority. This migration refuses to
+/// guess through catalog drift: it locks and validates the one reviewed row,
+/// accepts only the absent state or the exact final state, preserves every
+/// existing variant key and array position, and verifies the computed result.
+pub const SCHEMA_V292_JAMES_QWEN_SERVED_MODEL_ALIAS: &str = r#"
+DO $v292_james_qwen_served_alias$
+DECLARE
+    target_catalog_id CONSTANT TEXT := 'qwen3-vl-30b-a3b';
+    target_runtime CONSTANT TEXT := 'llama.cpp';
+    target_hf_repo CONSTANT TEXT := 'Qwen/Qwen3-VL-30B-A3B-Instruct-GGUF';
+    target_quant CONSTANT TEXT := 'Q4_K_M';
+    exact_aliases CONSTANT JSONB := '["Qwen3VL-30B-A3B-Instruct-Q4_K_M.gguf"]'::jsonb;
+    catalog_row_count BIGINT;
+    matching_variant_count BIGINT;
+    alias_field_count BIGINT;
+    matching_ordinal BIGINT;
+    original_variants JSONB;
+    expected_variants JSONB;
+    final_variants JSONB;
+    matching_aliases JSONB;
+    updated_rows BIGINT;
+BEGIN
+    SELECT count(*)
+      INTO catalog_row_count
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF catalog_row_count <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 expected exactly one qwen3-vl-30b-a3b catalog row',
+            DETAIL = format('found %s rows', catalog_row_count);
+    END IF;
+
+    SELECT variants
+      INTO original_variants
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id
+       FOR UPDATE;
+
+    IF jsonb_typeof(original_variants) IS DISTINCT FROM 'array' THEN
+        RAISE EXCEPTION 'v292 qwen3-vl-30b-a3b variants must be a JSON array';
+    END IF;
+    IF EXISTS (
+        SELECT 1
+          FROM jsonb_array_elements(original_variants) AS item(value)
+         WHERE jsonb_typeof(item.value) IS DISTINCT FROM 'object'
+    ) THEN
+        RAISE EXCEPTION 'v292 qwen3-vl-30b-a3b variants must contain only JSON objects';
+    END IF;
+
+    SELECT count(*), min(item.ordinality)
+      INTO matching_variant_count, matching_ordinal
+      FROM jsonb_array_elements(original_variants)
+           WITH ORDINALITY AS item(value, ordinality)
+     WHERE item.value->>'runtime' = target_runtime
+       AND item.value->>'hf_repo' = target_hf_repo
+       AND item.value->>'quant' = target_quant;
+    IF matching_variant_count <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 expected exactly one reviewed qwen3-vl llama.cpp variant',
+            DETAIL = format('found %s exact variants', matching_variant_count);
+    END IF;
+
+    SELECT count(*) FILTER (WHERE item.value ? 'served_model_aliases')
+      INTO alias_field_count
+      FROM jsonb_array_elements(original_variants)
+           WITH ORDINALITY AS item(value, ordinality);
+    SELECT item.value->'served_model_aliases'
+      INTO matching_aliases
+      FROM jsonb_array_elements(original_variants)
+           WITH ORDINALITY AS item(value, ordinality)
+     WHERE item.ordinality = matching_ordinal;
+
+    IF alias_field_count = 0 THEN
+        SELECT jsonb_agg(
+                   CASE
+                       WHEN item.ordinality = matching_ordinal
+                       THEN jsonb_set(
+                           item.value,
+                           '{served_model_aliases}',
+                           exact_aliases,
+                           true
+                       )
+                       ELSE item.value
+                   END
+                   ORDER BY item.ordinality
+               )
+          INTO expected_variants
+          FROM jsonb_array_elements(original_variants)
+               WITH ORDINALITY AS item(value, ordinality);
+    ELSIF alias_field_count = 1 AND matching_aliases = exact_aliases THEN
+        expected_variants := original_variants;
+    ELSE
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 found unreviewed served-model alias state',
+            DETAIL = format(
+                'alias fields=%s matching alias=%s',
+                alias_field_count,
+                COALESCE(matching_aliases::text, '<absent>')
+            );
+    END IF;
+
+    IF original_variants IS DISTINCT FROM expected_variants THEN
+        UPDATE fleet_model_catalog
+           SET variants = expected_variants
+         WHERE id = target_catalog_id
+           AND variants = original_variants;
+        GET DIAGNOSTICS updated_rows = ROW_COUNT;
+        IF updated_rows <> 1 THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v292 failed to update exactly one locked catalog row',
+                DETAIL = format('updated %s rows', updated_rows);
+        END IF;
+    END IF;
+
+    SELECT variants
+      INTO final_variants
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF final_variants IS DISTINCT FROM expected_variants THEN
+        RAISE EXCEPTION 'v292 postcondition failed: catalog variants differ from reviewed result';
+    END IF;
+
+    SELECT count(*) FILTER (
+               WHERE item.value->>'runtime' = target_runtime
+                 AND item.value->>'hf_repo' = target_hf_repo
+                 AND item.value->>'quant' = target_quant
+                 AND item.value->'served_model_aliases' = exact_aliases
+           ),
+           count(*) FILTER (WHERE item.value ? 'served_model_aliases')
+      INTO matching_variant_count, alias_field_count
+      FROM jsonb_array_elements(final_variants) AS item(value);
+    IF matching_variant_count <> 1 OR alias_field_count <> 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v292 postcondition failed: exact alias authority is not unique',
+            DETAIL = format(
+                'exact variants=%s alias fields=%s',
+                matching_variant_count,
+                alias_field_count
+            );
+    END IF;
+END
+$v292_james_qwen_served_alias$;
+"#;
+
+/// v293: authorize the exact SmolVLM2 Q8_0 llama.cpp artifact identity.
+///
+/// The live catalog row predates source-controlled authority and therefore has
+/// an empty `variants` array; a fresh bootstrap has no row at all. The
+/// downloaded model and projector were independently hashed on every fleet
+/// holder and matched to the pinned upstream revision. This migration seeds an
+/// absent row exactly, upgrades only the exact reviewed live row, accepts the
+/// exact final state idempotently, and fails closed on every partial or drifted
+/// state.
+pub const SCHEMA_V293_SMOLVLM_EXACT_VARIANT_AUTHORITY: &str = r#"
+DO $v293_smolvlm_exact_variant_authority$
+DECLARE
+    target_catalog_id CONSTANT TEXT := 'smolvlm2-500m-video';
+    exact_nonvariant_state CONSTANT JSONB := '{
+        "id": "smolvlm2-500m-video",
+        "name": "SmolVLM2 500M Video",
+        "family": "smolvlm",
+        "parameters": "500M",
+        "tier": 1,
+        "description": "SmolVLM2 500M - tiny video/vision understanding SLM (research lane)",
+        "gated": false,
+        "preferred_workloads": ["vision", "video", "multimodal", "slm"],
+        "tool_calling": false,
+        "display_name": null,
+        "tasks": null,
+        "modalities": null,
+        "benchmarks": null,
+        "license": null,
+        "lifecycle": null
+    }'::jsonb;
+    exact_variants CONSTANT JSONB := '[{
+        "runtime": "llama.cpp",
+        "quant": "Q8_0",
+        "hf_repo": "ggml-org/SmolVLM2-500M-Video-Instruct-GGUF",
+        "source_revision": "ccd7aae53bcb1997355c2f094959e72b3642ce17",
+        "size_gb": 0.545593888,
+        "model_file": "SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        "model_size_bytes": 436808704,
+        "model_sha256": "6f67b8036b2469fcd71728702720c6b51aebd759b78137a8120733b4d66438bc",
+        "mmproj_file": "mmproj-SmolVLM2-500M-Video-Instruct-Q8_0.gguf",
+        "mmproj_size_bytes": 108785184,
+        "mmproj_sha256": "921dc7e259f308e5b027111fa185efcbf33db13f6e35749ddf7f5cdb60ef520b",
+        "served_model_aliases": ["SmolVLM2-500M-Video-Instruct-Q8_0.gguf"]
+    }]'::jsonb;
+    catalog_row_count BIGINT;
+    original_variants JSONB;
+    nonvariant_state JSONB;
+    final_variants JSONB;
+    updated_rows BIGINT;
+BEGIN
+    SELECT count(*)
+      INTO catalog_row_count
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF catalog_row_count > 1 THEN
+        RAISE EXCEPTION USING
+            MESSAGE = 'v293 found duplicate smolvlm2-500m-video catalog rows',
+            DETAIL = format('found %s rows', catalog_row_count);
+    END IF;
+
+    IF catalog_row_count = 0 THEN
+        INSERT INTO fleet_model_catalog (
+            id, name, family, parameters, tier, description, gated,
+            preferred_workloads, variants, tool_calling, display_name,
+            tasks, modalities, benchmarks, license, lifecycle
+        ) VALUES (
+            target_catalog_id,
+            'SmolVLM2 500M Video',
+            'smolvlm',
+            '500M',
+            1,
+            'SmolVLM2 500M - tiny video/vision understanding SLM (research lane)',
+            false,
+            '["vision", "video", "multimodal", "slm"]'::jsonb,
+            exact_variants,
+            false,
+            NULL, NULL, NULL, NULL, NULL, NULL
+        );
+        GET DIAGNOSTICS updated_rows = ROW_COUNT;
+        IF updated_rows <> 1 THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v293 failed to seed exactly one canonical catalog row',
+                DETAIL = format('inserted %s rows', updated_rows);
+        END IF;
+    ELSE
+        SELECT variants,
+               jsonb_build_object(
+                   'id', id,
+                   'name', name,
+                   'family', family,
+                   'parameters', parameters,
+                   'tier', tier,
+                   'description', description,
+                   'gated', gated,
+                   'preferred_workloads', preferred_workloads,
+                   'tool_calling', tool_calling,
+                   'display_name', display_name,
+                   'tasks', tasks,
+                   'modalities', modalities,
+                   'benchmarks', benchmarks,
+                   'license', license,
+                   'lifecycle', lifecycle
+               )
+          INTO original_variants, nonvariant_state
+          FROM fleet_model_catalog
+         WHERE id = target_catalog_id
+           FOR UPDATE;
+
+        IF nonvariant_state IS DISTINCT FROM exact_nonvariant_state THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v293 found unreviewed SmolVLM catalog metadata',
+                DETAIL = format('metadata=%s', nonvariant_state::text);
+        END IF;
+        IF jsonb_typeof(original_variants) IS DISTINCT FROM 'array' THEN
+            RAISE EXCEPTION 'v293 smolvlm2-500m-video variants must be a JSON array';
+        END IF;
+
+        IF original_variants = '[]'::jsonb THEN
+            UPDATE fleet_model_catalog
+               SET variants = exact_variants
+             WHERE id = target_catalog_id
+               AND variants = original_variants;
+            GET DIAGNOSTICS updated_rows = ROW_COUNT;
+            IF updated_rows <> 1 THEN
+                RAISE EXCEPTION USING
+                    MESSAGE = 'v293 failed to update exactly one locked catalog row',
+                    DETAIL = format('updated %s rows', updated_rows);
+            END IF;
+        ELSIF original_variants IS DISTINCT FROM exact_variants THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v293 found unreviewed SmolVLM variant authority',
+                DETAIL = format('variants=%s', original_variants::text);
+        END IF;
+    END IF;
+
+    SELECT variants,
+           jsonb_build_object(
+               'id', id,
+               'name', name,
+               'family', family,
+               'parameters', parameters,
+               'tier', tier,
+               'description', description,
+               'gated', gated,
+               'preferred_workloads', preferred_workloads,
+               'tool_calling', tool_calling,
+               'display_name', display_name,
+               'tasks', tasks,
+               'modalities', modalities,
+               'benchmarks', benchmarks,
+               'license', license,
+               'lifecycle', lifecycle
+           )
+      INTO final_variants, nonvariant_state
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF final_variants IS DISTINCT FROM exact_variants
+       OR nonvariant_state IS DISTINCT FROM exact_nonvariant_state
+    THEN
+        RAISE EXCEPTION 'v293 postcondition failed: catalog row differs from reviewed authority';
+    END IF;
+END
+$v293_smolvlm_exact_variant_authority$;
+"#;
+
+/// v294: authorize Ace's exact Gemma 4 E4B MLX artifact.
+///
+/// This is a new catalog identity, so there is no reviewed legacy row to
+/// repair.  The migration accepts only an absent row (which it inserts) or the
+/// exact final row (idempotent replay).  Every partial or drifted state fails
+/// closed.  The variant carries the complete bounded upstream manifest used by
+/// the Ace importer; a repo name or revision alone is not artifact authority.
+pub const SCHEMA_V294_ACE_GEMMA4_MLX_EXACT_AUTHORITY: &str = r#"
+DO $v294_ace_gemma4_mlx_exact_authority$
+DECLARE
+    target_catalog_id CONSTANT TEXT := 'gemma4-e4b-it';
+    exact_row CONSTANT JSONB := '{
+        "id": "gemma4-e4b-it",
+        "name": "Gemma 4 E4B Instruct",
+        "family": "gemma",
+        "parameters": "E4B",
+        "tier": 1,
+        "description": "Gemma 4 E4B instruction-tuned multimodal MLX 4-bit artifact pinned for Apple Silicon",
+        "gated": false,
+        "preferred_workloads": ["chat", "vision", "audio", "video", "multimodal"],
+        "variants": [{
+            "runtime": "mlx",
+            "quant": "4bit",
+            "hf_repo": "mlx-community/gemma-4-e4b-it-4bit",
+            "source_revision": "475b9088d29754a3379866cf5aeb6b41acd313c2",
+            "base_hf_repo": "google/gemma-4-E4B-it",
+            "base_source_revision": "fee6332c1abaafb77f6f9624236c63aa2f1d0187",
+            "target_triple": "aarch64-apple-darwin",
+            "artifact_size_bytes": 5179241512,
+            "files": [
+                {"name": ".gitattributes", "size_bytes": 1570, "sha256": "34448b82c17d60fec9b65b1f093c115ddbaadc04beb1b0140b6bfed2e012a930"},
+                {"name": "README.md", "size_bytes": 593, "sha256": "8e9717df49219943b8992eeccecd8050535318d34fffbbaeaac924ed01f27155"},
+                {"name": "chat_template.jinja", "size_bytes": 17336, "sha256": "2f1b4d75d067bae3fe44e676721c7f077d243bc007156cb9c2f8b5836613d082"},
+                {"name": "config.json", "size_bytes": 6628, "sha256": "780ccb3a514a5f1ced161d383f948fc22eca9b84b752ca19494f625bd9bad7a6"},
+                {"name": "generation_config.json", "size_bytes": 208, "sha256": "d4226bbe3117d2d253ba4609720ba82c6c4ce4627a9a6ae05387c78983ac03de"},
+                {"name": "model.safetensors", "size_bytes": 5146800534, "sha256": "932b8271fc3fe65adcc78b96c10c6268bbfb13e8f67d1358727c0d6ee97e1eff"},
+                {"name": "model.safetensors.index.json", "size_bytes": 240961, "sha256": "f8accac59ee7efe87e0c298c854610b262c3cadd477407503147c71209ff0093"},
+                {"name": "processor_config.json", "size_bytes": 1316, "sha256": "de3e580aebdc98272d4c4547daffe6525fcbae18a83a0e0bcf0d7444d4ee6f37"},
+                {"name": "tokenizer.json", "size_bytes": 32169626, "sha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f"},
+                {"name": "tokenizer_config.json", "size_bytes": 2740, "sha256": "080d9e1aff284e2f6043889cd05367966f7c7b80e025fbc0b06745e218158656"}
+            ]
+        }],
+        "tool_calling": false,
+        "display_name": null,
+        "tasks": null,
+        "modalities": null,
+        "benchmarks": null,
+        "license": "gemma",
+        "lifecycle": "active"
+    }'::jsonb;
+    catalog_row_count BIGINT;
+    actual_row JSONB;
+    inserted_rows BIGINT;
+BEGIN
+    SELECT count(*)
+      INTO catalog_row_count
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+
+    IF catalog_row_count = 0 THEN
+        INSERT INTO fleet_model_catalog (
+            id, name, family, parameters, tier, description, gated,
+            preferred_workloads, variants, tool_calling, display_name,
+            tasks, modalities, benchmarks, license, lifecycle
+        ) VALUES (
+            target_catalog_id,
+            'Gemma 4 E4B Instruct',
+            'gemma',
+            'E4B',
+            1,
+            'Gemma 4 E4B instruction-tuned multimodal MLX 4-bit artifact pinned for Apple Silicon',
+            false,
+            '["chat", "vision", "audio", "video", "multimodal"]'::jsonb,
+            exact_row->'variants',
+            false,
+            NULL, NULL, NULL, NULL,
+            'gemma',
+            'active'
+        );
+        GET DIAGNOSTICS inserted_rows = ROW_COUNT;
+        IF inserted_rows <> 1 THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v294 failed to insert exactly one Gemma 4 E4B authority row',
+                DETAIL = format('inserted %s rows', inserted_rows);
+        END IF;
+    ELSIF catalog_row_count = 1 THEN
+        SELECT jsonb_build_object(
+                   'id', id,
+                   'name', name,
+                   'family', family,
+                   'parameters', parameters,
+                   'tier', tier,
+                   'description', description,
+                   'gated', gated,
+                   'preferred_workloads', preferred_workloads,
+                   'variants', variants,
+                   'tool_calling', tool_calling,
+                   'display_name', display_name,
+                   'tasks', tasks,
+                   'modalities', modalities,
+                   'benchmarks', benchmarks,
+                   'license', license,
+                   'lifecycle', lifecycle
+               )
+          INTO actual_row
+          FROM fleet_model_catalog
+         WHERE id = target_catalog_id
+           FOR UPDATE;
+        IF actual_row IS DISTINCT FROM exact_row THEN
+            RAISE EXCEPTION USING
+                MESSAGE = 'v294 found unreviewed Gemma 4 E4B authority state',
+                DETAIL = format('catalog row=%s', actual_row::text);
+        END IF;
+    ELSE
+        RAISE EXCEPTION USING
+            MESSAGE = 'v294 found duplicate gemma4-e4b-it catalog rows',
+            DETAIL = format('found %s rows', catalog_row_count);
+    END IF;
+
+    SELECT jsonb_build_object(
+               'id', id,
+               'name', name,
+               'family', family,
+               'parameters', parameters,
+               'tier', tier,
+               'description', description,
+               'gated', gated,
+               'preferred_workloads', preferred_workloads,
+               'variants', variants,
+               'tool_calling', tool_calling,
+               'display_name', display_name,
+               'tasks', tasks,
+               'modalities', modalities,
+               'benchmarks', benchmarks,
+               'license', license,
+               'lifecycle', lifecycle
+           )
+      INTO actual_row
+      FROM fleet_model_catalog
+     WHERE id = target_catalog_id;
+    IF actual_row IS DISTINCT FROM exact_row THEN
+        RAISE EXCEPTION 'v294 postcondition failed: catalog row differs from exact authority';
+    END IF;
+END
+$v294_ace_gemma4_mlx_exact_authority$;
+"#;
+
+/// Exact forward repair for the one reviewed empty, partial V247 deployment.
+/// Callers must validate the complete legacy ledger and this exact pre-shape
+/// under the migration lock before executing it.
+pub const SCHEMA_V295_REPAIR_REVIEWED_EMPTY_V247: &str = r#"
+ALTER TABLE error_signatures
+    ALTER COLUMN first_seen SET NOT NULL,
+    ALTER COLUMN last_seen SET NOT NULL,
+    ALTER COLUMN count_24h SET NOT NULL,
+    ALTER COLUMN count_total SET NOT NULL,
+    ALTER COLUMN state SET NOT NULL;
+
+ALTER TABLE error_signatures
+    ADD CONSTRAINT error_signatures_state_check
+        CHECK (state IN ('new', 'filed', 'fix_merged', 'verifying', 'resolved', 'regressed'));
+
+CREATE TABLE fleet_log_digest (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    node       TEXT NOT NULL,
+    day        DATE NOT NULL,
+    level      TEXT NOT NULL,
+    line_class TEXT NOT NULL,
+    count      INT NOT NULL DEFAULT 0,
+    sample     TEXT,
+    UNIQUE (node, day, level, line_class)
+);
+"#;
+
+/// Current consumers require these later branch effects. Their historical
+/// migration numbers were already owned, so V295 carries them forward rather
+/// than rewriting V274/V277.
+pub const SCHEMA_V295_FORWARD_COMPATIBILITY_REPAIR: &str = r#"
+ALTER TABLE projects
+    ADD COLUMN IF NOT EXISTS workstream_id TEXT,
+    ADD COLUMN IF NOT EXISTS digest_template_id JSONB,
+    ADD COLUMN IF NOT EXISTS logo_url TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_projects_workstream_id
+    ON projects (workstream_id)
+    WHERE workstream_id IS NOT NULL;
+
+ALTER TABLE work_item_leases
+    ADD COLUMN IF NOT EXISTS build_started_at TIMESTAMPTZ;
+"#;
+
+/// v295: immutable exact release-rollout authority and leased execution state.
+///
+/// This migration is explicit-only. Ordinary daemon/startup migration paths
+/// must never apply it. Authority is assembled and sealed in one transaction;
+/// the deferred validators prevent any partial authority or transaction target
+/// set from becoming visible. V291 release rows remain the content authority.
+pub const SCHEMA_V295_RELEASE_ROLLOUT_AUTHORITY: &str = r#"
+ALTER TABLE _migrations
+    ADD COLUMN source_commit TEXT,
+    ADD COLUMN applied_by TEXT,
+    ADD CONSTRAINT migrations_v295_source_commit
+        CHECK (
+            (version <> 295 AND (version <> 247 OR source_commit IS NULL))
+            OR (source_commit IS NOT NULL AND source_commit ~ '^[0-9a-f]{40}$')
+        ),
+    ADD CONSTRAINT migrations_v295_applied_by
+        CHECK (
+            (version <> 295 AND (version <> 247 OR applied_by IS NULL))
+            OR (applied_by IS NOT NULL AND applied_by ~ '^[A-Za-z0-9._@-]{1,128}$')
+        );
+
+CREATE TABLE release_rollout_authorities (
+    id                      UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source_commit           TEXT NOT NULL UNIQUE,
+    expected_target_count   INTEGER NOT NULL,
+    expected_artifact_count INTEGER NOT NULL,
+    created_by              TEXT NOT NULL,
+    created_at              TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    sealed_at               TIMESTAMPTZ,
+    CONSTRAINT release_rollout_authority_source
+        CHECK (source_commit ~ '^[0-9a-f]{40}$'),
+    CONSTRAINT release_rollout_authority_target_count
+        CHECK (expected_target_count BETWEEN 1 AND 64),
+    CONSTRAINT release_rollout_authority_artifact_count
+        CHECK (expected_artifact_count = expected_target_count * 2),
+    CONSTRAINT release_rollout_authority_creator
+        CHECK (created_by ~ '^[A-Za-z0-9._@-]{1,128}$')
+);
+
+CREATE TABLE release_rollout_authority_targets (
+    authority_id      UUID NOT NULL
+        REFERENCES release_rollout_authorities(id) ON DELETE RESTRICT,
+    target_ordinal    INTEGER NOT NULL,
+    computer_id       UUID NOT NULL REFERENCES computers(id) ON DELETE RESTRICT,
+    computer_name     TEXT NOT NULL,
+    target_triple     TEXT NOT NULL,
+    artifact_version  TEXT NOT NULL,
+    PRIMARY KEY (authority_id, computer_id),
+    CONSTRAINT release_rollout_target_ordinal_unique
+        UNIQUE (authority_id, target_ordinal),
+    CONSTRAINT release_rollout_target_name_unique
+        UNIQUE (authority_id, computer_name),
+    CONSTRAINT release_rollout_target_ordinal
+        CHECK (target_ordinal BETWEEN 0 AND 63),
+    CONSTRAINT release_rollout_target_name
+        CHECK (computer_name ~ '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$'),
+    CONSTRAINT release_rollout_target_triple
+        CHECK (target_triple ~ '^[a-z0-9_]+(-[a-z0-9_.]+){2,4}$'),
+    CONSTRAINT release_rollout_target_version
+        CHECK (artifact_version ~ '^[a-z0-9][a-z0-9._+-]{0,127}$'),
+    CONSTRAINT release_rollout_target_not_vinny_name
+        CHECK (lower(computer_name) <> 'vinny'),
+    CONSTRAINT release_rollout_target_not_vinny_id
+        CHECK (computer_id <> 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+);
+
+CREATE TABLE release_rollout_authority_artifacts (
+    authority_id UUID NOT NULL,
+    computer_id  UUID NOT NULL,
+    artifact_name TEXT NOT NULL,
+    artifact_id  UUID NOT NULL REFERENCES release_artifacts(id) ON DELETE RESTRICT,
+    PRIMARY KEY (authority_id, computer_id, artifact_name),
+    CONSTRAINT release_rollout_authority_artifact_target
+        FOREIGN KEY (authority_id, computer_id)
+        REFERENCES release_rollout_authority_targets(authority_id, computer_id)
+        ON DELETE RESTRICT,
+    CONSTRAINT release_rollout_required_artifact_name
+        CHECK (artifact_name IN ('ff', 'forgefleetd'))
+);
+
+CREATE TABLE release_rollout_transactions (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    request_id            UUID NOT NULL UNIQUE,
+    authority_id          UUID NOT NULL
+        REFERENCES release_rollout_authorities(id) ON DELETE RESTRICT,
+    state                 TEXT NOT NULL DEFAULT 'planned',
+    lease_token           UUID NOT NULL DEFAULT gen_random_uuid(),
+    lease_owner           TEXT NOT NULL,
+    lease_expires_at      TIMESTAMPTZ NOT NULL,
+    lease_seconds         INTEGER NOT NULL,
+    cas_revision          BIGINT NOT NULL DEFAULT 0,
+    expected_target_count INTEGER NOT NULL,
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    completed_at          TIMESTAMPTZ,
+    CONSTRAINT release_rollout_transaction_state
+        CHECK (state IN (
+            'planned', 'running', 'rolling_back',
+            'succeeded', 'failed', 'rolled_back', 'cancelled'
+        )),
+    CONSTRAINT release_rollout_transaction_owner
+        CHECK (lease_owner ~ '^[A-Za-z0-9._@-]{1,128}$'),
+    CONSTRAINT release_rollout_transaction_lease_seconds
+        CHECK (lease_seconds BETWEEN 30 AND 3600),
+    CONSTRAINT release_rollout_transaction_lease_time
+        CHECK (lease_expires_at > created_at),
+    CONSTRAINT release_rollout_transaction_revision
+        CHECK (cas_revision >= 0),
+    CONSTRAINT release_rollout_transaction_target_count
+        CHECK (expected_target_count BETWEEN 1 AND 64),
+    CONSTRAINT release_rollout_transaction_completion
+        CHECK ((state IN ('succeeded', 'failed', 'rolled_back', 'cancelled'))
+               = (completed_at IS NOT NULL))
+);
+
+CREATE UNIQUE INDEX release_rollout_one_active_transaction
+    ON release_rollout_transactions ((1))
+    WHERE state IN ('planned', 'running', 'rolling_back');
+
+CREATE TABLE release_rollout_target_states (
+    transaction_id   UUID NOT NULL
+        REFERENCES release_rollout_transactions(id) ON DELETE RESTRICT,
+    computer_id      UUID NOT NULL REFERENCES computers(id) ON DELETE RESTRICT,
+    computer_name    TEXT NOT NULL,
+    target_ordinal   INTEGER NOT NULL,
+    target_triple    TEXT NOT NULL,
+    artifact_version TEXT NOT NULL,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    cas_revision     BIGINT NOT NULL DEFAULT 0,
+    detail           TEXT,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (transaction_id, computer_id),
+    CONSTRAINT release_rollout_state_ordinal_unique
+        UNIQUE (transaction_id, target_ordinal),
+    CONSTRAINT release_rollout_target_state
+        CHECK (state IN (
+            'pending', 'installing', 'verifying', 'succeeded',
+            'failed', 'rolling_back', 'rolled_back', 'skipped'
+        )),
+    CONSTRAINT release_rollout_target_state_revision CHECK (cas_revision >= 0),
+    CONSTRAINT release_rollout_state_not_vinny_name
+        CHECK (lower(computer_name) <> 'vinny'),
+    CONSTRAINT release_rollout_state_not_vinny_id
+        CHECK (computer_id <> 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+);
+
+CREATE FUNCTION release_rollout_authority_mutation_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_authority_mutation_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'sealed rollout authority cannot be deleted';
+    END IF;
+    IF OLD.sealed_at IS NULL
+       AND NEW.sealed_at IS NOT NULL
+       AND NEW.id = OLD.id
+       AND NEW.source_commit = OLD.source_commit
+       AND NEW.expected_target_count = OLD.expected_target_count
+       AND NEW.expected_artifact_count = OLD.expected_artifact_count
+       AND NEW.created_by = OLD.created_by
+       AND NEW.created_at = OLD.created_at
+    THEN
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION 'rollout authority permits only one exact seal transition';
+END
+$release_rollout_authority_mutation_guard$;
+
+CREATE TRIGGER release_rollout_authorities_immutable
+    BEFORE UPDATE OR DELETE ON release_rollout_authorities
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_authority_mutation_guard();
+
+CREATE FUNCTION release_rollout_child_mutation_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_child_mutation_guard$
+DECLARE
+    parent_id UUID;
+    parent_sealed_at TIMESTAMPTZ;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        parent_id := NEW.authority_id;
+    ELSE
+        parent_id := OLD.authority_id;
+        IF TG_OP = 'UPDATE' AND NEW.authority_id <> OLD.authority_id THEN
+            RAISE EXCEPTION 'rollout authority child cannot move between parents';
+        END IF;
+    END IF;
+    SELECT sealed_at INTO parent_sealed_at
+      FROM release_rollout_authorities
+     WHERE id = parent_id
+     FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rollout authority parent is missing';
+    END IF;
+    IF parent_sealed_at IS NOT NULL THEN
+        RAISE EXCEPTION 'sealed rollout authority children are immutable';
+    END IF;
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$release_rollout_child_mutation_guard$;
+
+CREATE TRIGGER release_rollout_targets_immutable_after_seal
+    BEFORE INSERT OR UPDATE OR DELETE ON release_rollout_authority_targets
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_child_mutation_guard();
+CREATE TRIGGER release_rollout_artifacts_immutable_after_seal
+    BEFORE INSERT OR UPDATE OR DELETE ON release_rollout_authority_artifacts
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_child_mutation_guard();
+
+CREATE FUNCTION validate_release_rollout_authority()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $validate_release_rollout_authority$
+DECLARE
+    authority release_rollout_authorities%ROWTYPE;
+    target_count BIGINT;
+    artifact_count BIGINT;
+BEGIN
+    SELECT * INTO authority
+      FROM release_rollout_authorities
+     WHERE id = NEW.id;
+    IF NOT FOUND OR authority.sealed_at IS NULL THEN
+        RAISE EXCEPTION 'partial rollout authority cannot commit unsealed';
+    END IF;
+
+    SELECT count(*) INTO target_count
+      FROM release_rollout_authority_targets
+     WHERE authority_id = authority.id;
+    SELECT count(*) INTO artifact_count
+      FROM release_rollout_authority_artifacts
+     WHERE authority_id = authority.id;
+    IF target_count <> authority.expected_target_count
+       OR artifact_count <> authority.expected_artifact_count
+    THEN
+        RAISE EXCEPTION 'partial rollout authority count mismatch';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM release_rollout_authority_targets target
+          LEFT JOIN computers computer ON computer.id = target.computer_id
+         WHERE target.authority_id = authority.id
+           AND (computer.id IS NULL
+                OR computer.name IS DISTINCT FROM target.computer_name
+                OR lower(computer.name) = 'vinny'
+                OR computer.id = 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+    ) THEN
+        RAISE EXCEPTION 'rollout target identity drift or forbidden Vinny target';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+          FROM release_rollout_authority_targets target
+          LEFT JOIN release_rollout_authority_artifacts exact_artifact
+            ON exact_artifact.authority_id = target.authority_id
+           AND exact_artifact.computer_id = target.computer_id
+          LEFT JOIN release_artifacts artifact ON artifact.id = exact_artifact.artifact_id
+         WHERE target.authority_id = authority.id
+         GROUP BY target.authority_id, target.computer_id,
+                  target.target_triple, target.artifact_version
+        HAVING count(exact_artifact.*) <> 2
+            OR count(*) FILTER (WHERE exact_artifact.artifact_name = 'ff') <> 1
+            OR count(*) FILTER (WHERE exact_artifact.artifact_name = 'forgefleetd') <> 1
+            OR bool_or(artifact.id IS NULL)
+            OR bool_or(artifact.artifact_name IS DISTINCT FROM exact_artifact.artifact_name)
+            OR bool_or(artifact.source_commit IS DISTINCT FROM authority.source_commit)
+            OR bool_or(artifact.target_triple IS DISTINCT FROM target.target_triple)
+            OR bool_or(artifact.artifact_version IS DISTINCT FROM target.artifact_version)
+    ) THEN
+        RAISE EXCEPTION 'rollout release identity is partial or drifted';
+    END IF;
+    RETURN NEW;
+END
+$validate_release_rollout_authority$;
+
+CREATE CONSTRAINT TRIGGER release_rollout_authority_exact_at_commit
+    AFTER INSERT OR UPDATE ON release_rollout_authorities
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION validate_release_rollout_authority();
+
+CREATE FUNCTION release_rollout_transaction_update_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_transaction_update_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'rollout transaction evidence cannot be deleted';
+    END IF;
+    IF OLD.state IN ('succeeded', 'failed', 'rolled_back', 'cancelled') THEN
+        RAISE EXCEPTION 'terminal rollout transaction evidence is immutable';
+    END IF;
+    IF NEW.id <> OLD.id
+       OR NEW.request_id <> OLD.request_id
+       OR NEW.authority_id <> OLD.authority_id
+       OR NEW.expected_target_count <> OLD.expected_target_count
+       OR NEW.created_at <> OLD.created_at
+       OR NEW.lease_seconds <> OLD.lease_seconds
+       OR NEW.cas_revision <> OLD.cas_revision + 1
+    THEN
+        RAISE EXCEPTION 'rollout transaction identity/CAS drift';
+    END IF;
+    IF NEW.lease_token = OLD.lease_token THEN
+        IF OLD.lease_expires_at <= clock_timestamp() THEN
+            RAISE EXCEPTION 'expired rollout lease cannot renew or mutate state';
+        END IF;
+        IF NEW.lease_owner <> OLD.lease_owner
+           OR NEW.lease_expires_at < OLD.lease_expires_at
+        THEN
+            RAISE EXCEPTION 'rollout lease renewal drift';
+        END IF;
+    ELSIF NEW.state <> OLD.state
+          OR NEW.completed_at IS DISTINCT FROM OLD.completed_at
+          OR OLD.lease_expires_at > clock_timestamp()
+          OR OLD.state NOT IN ('planned', 'running', 'rolling_back')
+    THEN
+        RAISE EXCEPTION 'rollout lease takeover requires an expired active lease';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state = 'planned' AND NEW.state IN ('running', 'failed', 'cancelled')) OR
+        (OLD.state = 'running' AND NEW.state IN ('rolling_back', 'succeeded', 'failed', 'cancelled')) OR
+        (OLD.state = 'rolling_back' AND NEW.state IN ('rolled_back', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid rollout transaction state transition';
+    END IF;
+    RETURN NEW;
+END
+$release_rollout_transaction_update_guard$;
+
+CREATE TRIGGER release_rollout_transactions_guard
+    BEFORE UPDATE OR DELETE ON release_rollout_transactions
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_transaction_update_guard();
+
+CREATE FUNCTION release_rollout_target_state_update_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_target_state_update_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'rollout target evidence cannot be deleted';
+    END IF;
+    IF NEW.transaction_id <> OLD.transaction_id
+       OR NEW.computer_id <> OLD.computer_id
+       OR NEW.computer_name <> OLD.computer_name
+       OR NEW.target_ordinal <> OLD.target_ordinal
+       OR NEW.target_triple <> OLD.target_triple
+       OR NEW.artifact_version <> OLD.artifact_version
+       OR NEW.cas_revision <> OLD.cas_revision + 1
+    THEN
+        RAISE EXCEPTION 'rollout target identity/CAS drift';
+    END IF;
+    PERFORM 1
+      FROM release_rollout_transactions rollout
+     WHERE rollout.id = OLD.transaction_id
+       AND rollout.state IN ('planned', 'running', 'rolling_back')
+       AND rollout.lease_expires_at > clock_timestamp()
+     FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'rollout target update requires a live active parent lease';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state = 'pending' AND NEW.state IN ('installing', 'skipped', 'failed')) OR
+        (OLD.state = 'installing' AND NEW.state IN ('verifying', 'failed', 'rolling_back')) OR
+        (OLD.state = 'verifying' AND NEW.state IN ('succeeded', 'failed', 'rolling_back')) OR
+        (OLD.state = 'succeeded' AND NEW.state = 'rolling_back') OR
+        (OLD.state = 'failed' AND NEW.state = 'rolling_back') OR
+        (OLD.state = 'rolling_back' AND NEW.state IN ('rolled_back', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid rollout target state transition';
+    END IF;
+    NEW.updated_at := clock_timestamp();
+    RETURN NEW;
+END
+$release_rollout_target_state_update_guard$;
+
+CREATE TRIGGER release_rollout_target_states_guard
+    BEFORE UPDATE OR DELETE ON release_rollout_target_states
+    FOR EACH ROW EXECUTE FUNCTION release_rollout_target_state_update_guard();
+
+CREATE FUNCTION validate_release_rollout_transaction_targets()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $validate_release_rollout_transaction_targets$
+BEGIN
+    IF (SELECT count(*) FROM release_rollout_target_states
+         WHERE transaction_id = NEW.id) <> NEW.expected_target_count
+       OR EXISTS (
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_authority_targets
+             WHERE authority_id = NEW.authority_id)
+           EXCEPT
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_target_states
+             WHERE transaction_id = NEW.id)
+       )
+       OR EXISTS (
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_target_states
+             WHERE transaction_id = NEW.id)
+           EXCEPT
+           (SELECT computer_id, computer_name, target_ordinal, target_triple, artifact_version
+              FROM release_rollout_authority_targets
+             WHERE authority_id = NEW.authority_id)
+       )
+    THEN
+        RAISE EXCEPTION 'partial or drifted rollout transaction target set';
+    END IF;
+    RETURN NEW;
+END
+$validate_release_rollout_transaction_targets$;
+
+CREATE CONSTRAINT TRIGGER release_rollout_transaction_targets_exact_at_commit
+    AFTER INSERT ON release_rollout_transactions
+    DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW EXECUTE FUNCTION validate_release_rollout_transaction_targets();
+
+CREATE FUNCTION forbid_release_rollout_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $forbid_release_rollout_truncate$
+BEGIN
+    RAISE EXCEPTION 'release rollout authority and evidence cannot be truncated';
+END
+$forbid_release_rollout_truncate$;
+
+CREATE TRIGGER release_rollout_authorities_no_truncate
+    BEFORE TRUNCATE ON release_rollout_authorities
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_targets_no_truncate
+    BEFORE TRUNCATE ON release_rollout_authority_targets
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_artifacts_no_truncate
+    BEFORE TRUNCATE ON release_rollout_authority_artifacts
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_transactions_no_truncate
+    BEFORE TRUNCATE ON release_rollout_transactions
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+CREATE TRIGGER release_rollout_target_states_no_truncate
+    BEFORE TRUNCATE ON release_rollout_target_states
+    FOR EACH STATEMENT EXECUTE FUNCTION forbid_release_rollout_truncate();
+
+COMMENT ON TABLE release_rollout_authorities IS
+    'Sealed exact source/release/target rollout authority; explicit V295 migration only.';
+COMMENT ON TABLE release_rollout_transactions IS
+    'One-active leased rollout transaction with request idempotency and CAS revision.';
+"#;
+
+/// v296: make Devstral's proven code capability durable in the canonical
+/// catalog without treating the compatibility `model_catalog` view as a
+/// second authority.
+///
+/// A fresh database has no Devstral seed, so the absent-row path installs the
+/// exact reviewed live catalog identity whose endpoints passed the direct code
+/// probe audit. An upgraded database keeps every existing column and workload
+/// element in place; only a missing, case-insensitive `code` capability is
+/// appended. Malformed workload metadata is left alone for operator review
+/// rather than guessed at.
+pub const SCHEMA_V296_DEVSTRAL_CODE_CAPABILITY_AUTHORITY: &str = r#"
+INSERT INTO fleet_model_catalog (
+    id, name, family, parameters, tier, description, gated,
+    preferred_workloads, variants, tool_calling
+) VALUES (
+    'devstral-small-2-24b',
+    'Devstral Small 2 24B',
+    'devstral',
+    '24B',
+    2,
+    'Mistral dense 24B - multi-file coding/agentic specialist',
+    false,
+    '["reasoning", "tool_calling", "code"]'::jsonb,
+    '[{"runtime":"llama.cpp","quant":"UD-Q4_K_XL","hf_repo":"unsloth/Devstral-Small-2-24B-Instruct-2512-GGUF","size_gb":14}]'::jsonb,
+    true
+)
+ON CONFLICT (id) DO UPDATE
+SET preferred_workloads =
+    fleet_model_catalog.preferred_workloads || '["code"]'::jsonb
+WHERE jsonb_typeof(fleet_model_catalog.preferred_workloads) = 'array'
+  AND NOT EXISTS (
+      SELECT 1
+        FROM jsonb_array_elements_text(
+                 CASE
+                   WHEN jsonb_typeof(fleet_model_catalog.preferred_workloads) = 'array'
+                   THEN fleet_model_catalog.preferred_workloads
+                   ELSE '[]'::jsonb
+                 END
+             ) AS workload(value)
+       WHERE lower(workload.value) = 'code'
+  );
+"#;
+
+/// v297: permit one exact, lease-fenced operator rollback claim after a
+/// completed V295 rollout while preserving terminal evidence immutability.
+///
+/// The runtime claim remains a single CAS update. This guard change admits
+/// only `succeeded -> rolling_back`, clears the terminal timestamp, rotates a
+/// live lease, and leaves every identity field and lease duration unchanged.
+/// All other terminal mutations remain forbidden.
+pub const SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK: &str = r#"
+CREATE OR REPLACE FUNCTION release_rollout_transaction_update_guard()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $release_rollout_transaction_update_guard$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION 'rollout transaction evidence cannot be deleted';
+    END IF;
+
+    IF OLD.state = 'succeeded' THEN
+        IF NEW.state = 'rolling_back'
+           AND OLD.completed_at IS NOT NULL
+           AND NEW.completed_at IS NULL
+           AND NEW.id = OLD.id
+           AND NEW.request_id = OLD.request_id
+           AND NEW.authority_id = OLD.authority_id
+           AND NEW.expected_target_count = OLD.expected_target_count
+           AND NEW.created_at = OLD.created_at
+           AND NEW.lease_seconds = OLD.lease_seconds
+           AND NEW.cas_revision = OLD.cas_revision + 1
+           AND NEW.lease_token <> OLD.lease_token
+           AND NEW.lease_owner ~ '^[A-Za-z0-9._@-]{1,128}$'
+           AND NEW.lease_expires_at > clock_timestamp()
+        THEN
+            RETURN NEW;
+        END IF;
+        RAISE EXCEPTION 'succeeded rollout permits only one exact post-success rollback claim';
+    END IF;
+
+    IF OLD.state IN ('failed', 'rolled_back', 'cancelled') THEN
+        RAISE EXCEPTION 'terminal rollout transaction evidence is immutable';
+    END IF;
+    IF NEW.id <> OLD.id
+       OR NEW.request_id <> OLD.request_id
+       OR NEW.authority_id <> OLD.authority_id
+       OR NEW.expected_target_count <> OLD.expected_target_count
+       OR NEW.created_at <> OLD.created_at
+       OR NEW.lease_seconds <> OLD.lease_seconds
+       OR NEW.cas_revision <> OLD.cas_revision + 1
+    THEN
+        RAISE EXCEPTION 'rollout transaction identity/CAS drift';
+    END IF;
+    IF NEW.lease_token = OLD.lease_token THEN
+        IF OLD.lease_expires_at <= clock_timestamp() THEN
+            RAISE EXCEPTION 'expired rollout lease cannot renew or mutate state';
+        END IF;
+        IF NEW.lease_owner <> OLD.lease_owner
+           OR NEW.lease_expires_at < OLD.lease_expires_at
+        THEN
+            RAISE EXCEPTION 'rollout lease renewal drift';
+        END IF;
+    ELSIF NEW.state <> OLD.state
+          OR NEW.completed_at IS DISTINCT FROM OLD.completed_at
+          OR OLD.lease_expires_at > clock_timestamp()
+          OR OLD.state NOT IN ('planned', 'running', 'rolling_back')
+    THEN
+        RAISE EXCEPTION 'rollout lease takeover requires an expired active lease';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state = 'planned' AND NEW.state IN ('running', 'failed', 'cancelled')) OR
+        (OLD.state = 'running' AND NEW.state IN ('rolling_back', 'succeeded', 'failed', 'cancelled')) OR
+        (OLD.state = 'rolling_back' AND NEW.state IN ('rolled_back', 'failed'))
+    ) THEN
+        RAISE EXCEPTION 'invalid rollout transaction state transition';
+    END IF;
+    RETURN NEW;
+END
+$release_rollout_transaction_update_guard$;
+
+COMMENT ON FUNCTION release_rollout_transaction_update_guard() IS
+    'V297: terminal evidence is immutable except one exact CAS+lease-fenced succeeded-to-rolling_back claim.';
 "#;
 
 /// Squashed Postgres bootstrap through migration v161.

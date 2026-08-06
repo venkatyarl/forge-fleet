@@ -11,9 +11,14 @@ pub async fn handle_memory(cmd: crate::MemoryCommand) -> Result<()> {
     let pool = ff_agent::fleet_info::get_fleet_pool()
         .await
         .map_err(|e| anyhow::anyhow!("connect Postgres: {e}"))?;
-    ff_db::run_postgres_migrations(&pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    // Compact's default preview is strictly read-only and must not apply
+    // unrelated schema migrations as a side effect. Apply is deliberately
+    // narrow too; it operates only on the already-existing Scratchpad tables.
+    if !matches!(&cmd, crate::MemoryCommand::Compact { .. }) {
+        ff_db::run_postgres_migrations(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("run_postgres_migrations: {e}"))?;
+    }
 
     match cmd {
         crate::MemoryCommand::Get {
@@ -90,19 +95,79 @@ pub async fn handle_memory(cmd: crate::MemoryCommand) -> Result<()> {
             };
             println!("{CYAN}✓ cap for {target} set to {cap_bytes} bytes{RESET}");
         }
+        crate::MemoryCommand::Compact {
+            scope_type,
+            scope_key,
+            apply,
+        } => {
+            let (scope_type, scope_key) = auto_scope(scope_type, scope_key);
+            let result = scratchpad::memory_compact(&pool, &scope_type, &scope_key, apply)
+                .await
+                .map_err(|error| anyhow::anyhow!("compact {scope_type}:{scope_key}: {error}"))?;
+            print!("{}", render_compact_result(&result));
+        }
     }
     Ok(())
 }
 
-fn print_write(r: &scratchpad::WriteResult) {
-    let flag = if r.consolidated {
-        " (consolidated — over cap, summarized)"
+fn render_compact_result(result: &scratchpad::MemoryCompactResult) -> String {
+    let mode = if result.applied { "apply" } else { "dry-run" };
+    let mut out = format!(
+        "Scratchpad compact {mode}\n  scope: {}:{}\n  bytes: {} -> {} / {} cap\n",
+        result.scope_type,
+        result.scope_key,
+        result.before_bytes,
+        result.after_bytes,
+        result.cap_bytes,
+    );
+    out.push_str(&format!(
+        "  eligible blocks ({}):\n",
+        result.eligible_blocks.len()
+    ));
+    if result.eligible_blocks.is_empty() {
+        out.push_str("    (none)\n");
     } else {
-        ""
+        for block in &result.eligible_blocks {
+            let policy = if block.hard_trim_eligible {
+                "summary + archive-before-hard-trim"
+            } else {
+                "summary only (never hard-trimmed)"
+            };
+            out.push_str(&format!(
+                "    {}: {} bytes — {policy}\n",
+                block.block, block.bytes
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "  result: status={} changed={} data_loss={} still_over_cap={}\n",
+        result.status, result.changed, result.data_loss, result.still_over_cap
+    ));
+    out.push_str(&format!(
+        "  durable evidence: evictions={} (+{}), Brain candidates={} (+{})\n",
+        result.eviction_evidence,
+        result.evictions_created,
+        result.brain_evidence,
+        result.brain_candidates_created,
+    ));
+    if !result.applied {
+        out.push_str("  no changes made; rerun with --apply to compact this exact scope\n");
+    }
+    out
+}
+
+fn print_write(r: &scratchpad::WriteResult) {
+    let flag = match (r.over_cap, r.data_loss, r.consolidated) {
+        (true, true, _) => " (over cap; destructive trim occurred)",
+        (true, false, true) => " (still over cap after consolidation)",
+        (true, false, false) => " (over cap)",
+        (false, true, _) => " (destructive trim occurred)",
+        (false, false, true) => " (consolidated)",
+        (false, false, false) => "",
     };
     println!(
-        "{CYAN}✓ {}:{} / {} — {}/{} bytes{}{RESET}",
-        r.scope_type, r.scope_key, r.block, r.bytes_used, r.cap_bytes, flag
+        "{CYAN}✓ {}:{} / {} — {}/{} bytes — {}{}{RESET}",
+        r.scope_type, r.scope_key, r.block, r.bytes_used, r.cap_bytes, r.status, flag
     );
 }
 
@@ -120,4 +185,42 @@ fn auto_scope(scope_type: String, scope_key: String) -> (String, String) {
         return ("project".to_string(), id);
     }
     (scope_type, scope_key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_result_render_reports_scope_flags_and_durable_evidence() {
+        let result = scratchpad::MemoryCompactResult {
+            scope_type: "project".to_string(),
+            scope_key: "forge-fleet".to_string(),
+            before_bytes: 8_000,
+            after_bytes: 6_000,
+            cap_bytes: 6_144,
+            eligible_blocks: vec![scratchpad::CompactEligibleBlock {
+                block: "scratch".to_string(),
+                bytes: 2_000,
+                hard_trim_eligible: true,
+            }],
+            applied: true,
+            changed: true,
+            data_loss: false,
+            still_over_cap: false,
+            eviction_evidence: 4,
+            brain_evidence: 3,
+            evictions_created: 1,
+            brain_candidates_created: 1,
+            status: "compacted".to_string(),
+        };
+        let rendered = render_compact_result(&result);
+        assert!(rendered.contains("scope: project:forge-fleet"));
+        assert!(rendered.contains("bytes: 8000 -> 6000 / 6144 cap"));
+        assert!(rendered.contains("scratch: 2000 bytes"));
+        assert!(
+            rendered.contains("status=compacted changed=true data_loss=false still_over_cap=false")
+        );
+        assert!(rendered.contains("evictions=4 (+1), Brain candidates=3 (+1)"));
+    }
 }

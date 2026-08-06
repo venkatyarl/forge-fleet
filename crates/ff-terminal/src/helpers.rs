@@ -1,9 +1,7 @@
 //! Misc CLI helpers that don't fit into a specific command domain.
 
-use anyhow::Result;
-use std::time::Duration;
-
 use crate::{GREEN, RESET};
+use anyhow::Result;
 
 /// Detect if input is a dropped file/folder path and wrap with appropriate context.
 pub fn detect_dropped_content(input: &str) -> String {
@@ -64,117 +62,6 @@ pub fn detect_dropped_content(input: &str) -> String {
             }
         }
     }
-}
-
-/// Pick a healthy AGENT-CAPABLE endpoint (tool-calling + `usable_agent_ctx >=
-/// min_ctx`) from `fleet_model_deployments`, so `ff run` agent-mode routes to
-/// an endpoint whose per-slot context actually fits the tool-schema system
-/// prompt — instead of the inference router's local-first pick, which can be a
-/// small per-slot-ctx endpoint that overflows on turn 1 (P0.1, surfaced
-/// 2026-06-08). Returns `None` on any error / no DB / no match, so the caller
-/// falls back to its existing routing. Fail-closed — never worse than today.
-pub async fn pick_agent_capable_url(config_path: &std::path::Path, min_ctx: i32) -> Option<String> {
-    let toml_str = tokio::fs::read_to_string(config_path).await.ok()?;
-    let config = toml::from_str::<ff_core::config::FleetConfig>(&toml_str).ok()?;
-    let db_url = config.database.url.trim();
-    if db_url.is_empty() {
-        return None;
-    }
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .acquire_timeout(Duration::from_secs(3))
-        .connect(db_url)
-        .await
-        .ok()?;
-    ff_db::pg_pick_agent_endpoint(&pool, min_ctx, &[])
-        .await
-        .ok()
-        .flatten()
-        .map(|c| c.endpoint)
-}
-
-/// Detect the best LLM endpoint by querying Postgres for fleet nodes + models,
-/// then probing each for a healthy connection. Falls back to localhost:55000.
-pub async fn detect_llm_from_db_or_local(config_path: &std::path::Path) -> String {
-    // Try to load fleet.toml to get the database URL
-    if let Ok(toml_str) = tokio::fs::read_to_string(config_path).await
-        && let Ok(config) = toml::from_str::<ff_core::config::FleetConfig>(&toml_str)
-    {
-        let db_url = config.database.url.trim();
-        if !db_url.is_empty() {
-            // Query Postgres for fleet nodes and their model ports
-            if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(1)
-                .acquire_timeout(Duration::from_secs(3))
-                .connect(db_url)
-                .await
-                && let Ok(nodes) = ff_db::pg_list_nodes(&pool).await
-            {
-                // Also get models to find ports
-                let models = ff_db::pg_list_models(&pool).await.unwrap_or_default();
-
-                // Build (ip, port, cores, supports_tools) pairs
-                // Prefer models that support tool calling (Qwen) over those that don't (Gemma)
-                let mut endpoints: Vec<(String, u16, i32, bool)> = Vec::new();
-                for node in &nodes {
-                    let node_models: Vec<_> = models
-                        .iter()
-                        .filter(|m| m.worker_name == node.name)
-                        .collect();
-                    if node_models.is_empty() {
-                        endpoints.push((node.ip.clone(), 55000, node.cpu_cores, true));
-                    } else {
-                        for m in node_models {
-                            // Tool-capability heuristic for endpoint preference.
-                            // EXCLUDE gemma: gemma-4 (MLX) does not reliably tool-call,
-                            // and routing an agent there hangs it silently
-                            // (feedback_gemma4_no_tools); inference_router's
-                            // `model_supports_tools` agrees. Qwen / MiniMax / Mistral /
-                            // Llama-3 are the tool-capable local families. This was the
-                            // source-of-truth split flagged in the 2026-06-17 deep review
-                            // (helpers said gemma-4 tool-capable; the router said no).
-                            let fam = m.family.to_lowercase();
-                            let supports_tools = !fam.contains("gemma")
-                                && (fam.contains("qwen")
-                                    || fam.contains("minimax")
-                                    || fam.contains("mistral")
-                                    || fam.contains("llama-3")
-                                    || fam.contains("llama3"));
-                            endpoints.push((
-                                node.ip.clone(),
-                                m.port as u16,
-                                node.cpu_cores,
-                                supports_tools,
-                            ));
-                        }
-                    }
-                }
-                // Sort: tool-calling models first, then by cores descending
-                endpoints.sort_by(|a, b| b.3.cmp(&a.3).then(b.2.cmp(&a.2)));
-
-                for (ip, port, _, _) in &endpoints {
-                    if let Ok(addr) = format!("{ip}:{port}").parse()
-                        && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200))
-                            .is_ok()
-                    {
-                        tracing::info!(ip = %ip, port, "auto-detected LLM endpoint from database");
-                        return format!("http://{ip}:{port}");
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback: probe localhost
-    for port in [55000, 55001, 11434] {
-        if let Ok(addr) = format!("127.0.0.1:{port}").parse()
-            && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok()
-        {
-            return format!("http://127.0.0.1:{port}");
-        }
-    }
-
-    "http://localhost:55000".into()
 }
 
 /// `ff nodes` — list fleet nodes with hardware/GPU from Postgres.

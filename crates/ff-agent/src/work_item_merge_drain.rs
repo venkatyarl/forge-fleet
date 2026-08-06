@@ -22,12 +22,6 @@ use uuid::Uuid;
 use crate::project_github_sync::parse_owner_repo;
 use crate::reconciliation_audit::{PgAuditStore, ReconciliationAction, ReconciliationAuditor};
 
-/// Short per-review-backend caps so a dead reviewer cannot stall the serial
-/// merge drain on one PR for minutes at a time.
-const REVIEW_480B_TIMEOUT: Duration = Duration::from_secs(60);
-const REVIEW_LOCAL_POOL_TIMEOUT: Duration = Duration::from_secs(60);
-const REVIEW_CLOUD_TIMEOUT: Duration = Duration::from_secs(75);
-const REVIEW_LOCAL_FIX_ATTEMPTS: u32 = 2;
 const SEMANTIC_MERGE_RESET_MARKER: &str =
     "semantic merge conflict (compile failure after clean merge) — auto-reset for rebuild";
 
@@ -83,12 +77,24 @@ fn terminal_pr_action(state: Option<&str>) -> Option<TerminalPrAction> {
     }
 }
 
+/// The periodic reconciler owns an item while it is awaiting review, and it
+/// also owns a terminal item whose matching queue receipt was left active by
+/// an out-of-band merge/close race.  All other terminal rows are immutable.
+fn orphaned_review_candidate(status: &str, has_active_receipt: bool) -> bool {
+    status == "in_review" || (has_active_receipt && matches!(status, "merged" | "cancelled"))
+}
+
 pub async fn evaluate_merge_queue(
     pg: &PgPool,
     unknown_defers: &mut HashMap<Uuid, u32>,
     auditor: &ReconciliationAuditor,
 ) -> Result<usize> {
-    let Some(item) = ff_db::pg_next_merge_queue_item(pg).await? else {
+    // A CI-green row remains visible as `mergeable` while the operator gate is
+    // off, but it must not consume the serial-drain head or block queued/CI
+    // work behind it. If the gate is later enabled, original position order is
+    // restored. The merge path rechecks the gate immediately before mutation.
+    let include_mergeable = automerge_enabled(pg).await;
+    let Some(item) = ff_db::pg_next_merge_queue_item(pg, include_mergeable).await? else {
         return Ok(0);
     };
     let Some(pr_url) = item.pr_url.clone().filter(|u| !u.trim().is_empty()) else {
@@ -468,611 +474,16 @@ pub async fn evaluate_merge_queue(
     }
 }
 
-async fn run_pr_review(
-    pg: &PgPool,
-    pr_url: &str,
-    work_item_id: uuid::Uuid,
-) -> anyhow::Result<(bool, String)> {
-    let distributed = crate::fleet_info::distributed_review_mode_enabled();
-    tracing::debug!(
-        pr = %pr_url,
-        work_item = %work_item_id,
-        distributed_review_mode = distributed,
-        "run_pr_review: fleet_secrets.distributed_review_mode read"
-    );
-
-    let (title, description): (String, Option<String>) =
-        sqlx::query_as("SELECT title, description FROM work_items WHERE id = $1")
-            .bind(work_item_id)
-            .fetch_one(pg)
-            .await
-            .context("fetch work_item intent for PR review")?;
-
-    if review_ladder_mode(pg).await != "cost_optimal" {
-        let prompt = build_pr_review_prompt(pr_url, &title, description.as_deref()).await?;
-        return legacy_review_ladder(pg, work_item_id, pr_url, &prompt).await;
-    }
-    review_ladder(pg, work_item_id, pr_url, &title, description.as_deref()).await
-}
-
-async fn build_pr_review_prompt(
-    pr_url: &str,
-    title: &str,
-    description: Option<&str>,
-) -> Result<String> {
-    let mut diff_cmd = gh_cmd().await;
-    diff_cmd.args(["pr", "diff", pr_url]);
-    let diff_out = diff_cmd.output().await.context("spawn gh pr diff")?;
-    if !diff_out.status.success() {
-        anyhow::bail!(
-            "gh pr diff failed: {}",
-            String::from_utf8_lossy(&diff_out.stderr)
-                .trim()
-                .chars()
-                .take(500)
-                .collect::<String>()
-        );
-    }
-    let diff = truncate_chars(&String::from_utf8_lossy(&diff_out.stdout), 40_000);
-    Ok(format!(
-        "You are reviewing a pull request opened by an autonomous coding fleet.\n\
-         Judge whether the change correctly and cleanly implements the requested work item.\n\n\
-         Work item title:\n{title}\n\n\
-         Work item description:\n{description}\n\n\
-         Requirements for approval:\n\
-         - The diff matches the stated intent.\n\
-         - The diff introduces no regressions.\n\
-         - The diff does NOT DEGRADE existing code, documentation, comments, tests, or behavior; \
-           for example, replacing a good detailed doc comment or working logic with something \
-           worse, shorter, less clear, or less complete is a rejection.\n\
-         - The diff is a real, complete change rather than a placeholder, superficial edit, or \
-           partial implementation.\n\n\
-         Answer with exactly APPROVE or REJECT on the first line. Put a one-line reason on the \
-         next line.\n\n\
-         Pull request diff (truncated to 40000 chars if needed):\n```diff\n{diff}\n```",
-        description = description.unwrap_or_default(),
-    ))
-}
-
-/// Review with the primary 480B ring, falling back to another working reviewer.
-///
-/// A 480B approval stands alone. A rejection is independently confirmed by the
-/// local 30B pool or a cloud CLI so one local misjudgement cannot fail a good
-/// PR. If the 480B ring is unavailable, the same local-to-cloud fallback keeps
-/// the drain moving; exhausting the ladder returns an error for manual review.
-async fn legacy_review_ladder(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    pr_url: &str,
-    prompt: &str,
-) -> Result<(bool, String)> {
-    match review_via_480b(pg, work_item_id, prompt).await {
-        Ok((true, reason)) => Ok((true, format!("480b: {reason}"))),
-        Ok((false, reason_480b)) => {
-            info!(
-                pr = %pr_url,
-                reason = %reason_480b,
-                "merge_drain: 480b rejected — confirming with another reviewer before failing"
-            );
-            let (approved, reason, backend) = fallback_review(pg, work_item_id, prompt)
-                .await
-                .context("confirm 480b rejection")?;
-            if approved {
-                Ok((
-                    true,
-                    format!("{backend} overturned 480b rejection ({reason_480b}): {reason}"),
-                ))
-            } else {
-                Ok((
-                    false,
-                    format!("480b: {reason_480b}; confirmed by {backend}: {reason}"),
-                ))
-            }
-        }
-        Err(e) => {
-            warn!(
-                pr = %pr_url,
-                error = %e,
-                "merge_drain: 480b reviewer unavailable — falling back to another reviewer"
-            );
-            let (approved, reason, backend) = fallback_review(pg, work_item_id, prompt)
-                .await
-                .context("fallback PR review")?;
-            Ok((approved, format!("{backend}: {reason}")))
-        }
-    }
-}
-
-/// Cost-optimal ladder: a strong local approval is final; a weak local
-/// approval gets one cloud confirmation. Rejections never spend cloud money:
-/// a local coder repairs the PR head and the refreshed diff is reviewed again.
-async fn review_ladder(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    pr_url: &str,
-    title: &str,
-    description: Option<&str>,
-) -> Result<(bool, String)> {
-    let mut fix_attempt = 0;
-    loop {
-        let prompt = build_pr_review_prompt(pr_url, title, description).await?;
-        let (approved, reason, reviewer, strong) = match review_via_480b(pg, work_item_id, &prompt)
-            .await
-        {
-            Ok((approved, reason)) => (approved, reason, "480b".to_string(), true),
-            Err(e) => {
-                warn!(pr = %pr_url, error = %e, "merge_drain: 480b unavailable — reviewing with local 30b");
-                let (approved, reason, model) =
-                    local_pool_review(pg, work_item_id, &prompt).await?;
-                (approved, reason, format!("local:{model}"), false)
-            }
-        };
-
-        let rejection = if approved && strong {
-            return Ok((true, format!("{reviewer}: {reason}")));
-        } else if approved {
-            info!(pr = %pr_url, reviewer = %reviewer, "merge_drain: weak local approval — requesting one cloud confirmation");
-            let (confirmed, cloud_reason, backend) =
-                cloud_cli_review(pg, work_item_id, &prompt, "cloud_confirm")
-                    .await
-                    .context("cloud confirmation of local approval")?;
-            if confirmed {
-                return Ok((
-                    true,
-                    format!("{reviewer}: {reason}; confirmed by {backend}: {cloud_reason}"),
-                ));
-            }
-            format!("{backend} overturned {reviewer} approval: {cloud_reason}")
-        } else {
-            format!("{reviewer}: {reason}")
-        };
-
-        if fix_attempt >= REVIEW_LOCAL_FIX_ATTEMPTS {
-            return Ok((
-                false,
-                format!("local fix budget exhausted after {fix_attempt} attempt(s): {rejection}"),
-            ));
-        }
-        fix_attempt += 1;
-        if let Err(e) = local_fix_pr(
-            pg,
-            work_item_id,
-            pr_url,
-            title,
-            description,
-            &rejection,
-            fix_attempt,
-        )
-        .await
-        {
-            warn!(pr = %pr_url, attempt = fix_attempt, error = %e, "merge_drain: local PR fix attempt failed");
-            if fix_attempt >= REVIEW_LOCAL_FIX_ATTEMPTS {
-                return Ok((
-                    false,
-                    format!(
-                        "local fix budget exhausted after {fix_attempt} attempt(s): {rejection}; last fix error: {e}"
-                    ),
-                ));
-            }
-        }
-    }
-}
-
-async fn review_ladder_mode(pg: &PgPool) -> String {
-    ff_db::pg_read_gate_value(pg, "review_ladder_mode", "cost_optimal", "cost_optimal")
-        .await
-        .ok()
-        .unwrap_or_else(|| "cost_optimal".to_string())
-}
-
-/// Repair the PR head in an isolated checkout. The original builder slot is
-/// released when the PR enters the queue and may already contain another
-/// task, so it is never safe for the merge drain to mutate that path.
-#[allow(clippy::too_many_arguments)]
-async fn local_fix_pr(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    pr_url: &str,
-    title: &str,
-    description: Option<&str>,
-    rejection: &str,
-    attempt: u32,
-) -> Result<()> {
-    let (owner, repo) =
-        parse_owner_repo(pr_url).with_context(|| format!("unrecognized PR url: {pr_url}"))?;
-    let checkout = std::env::temp_dir().join(format!(
-        "forgefleet-review-fix-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let checkout_arg = checkout.to_string_lossy().to_string();
-    let repo_slug = format!("{owner}/{repo}");
-
-    let result = async {
-        run_fix_command(
-            "gh",
-            &[
-                "repo",
-                "clone",
-                &repo_slug,
-                &checkout_arg,
-                "--",
-                "--no-tags",
-            ],
-            None,
-        )
-        .await
-        .context("clone repository for local PR fix")?;
-        run_fix_command(
-            "gh",
-            &["pr", "checkout", pr_url, "--force"],
-            Some(&checkout),
-        )
-        .await
-        .context("checkout PR head for local fix")?;
-
-        let task = format!(
-            "Fix the current PR branch in place after a reviewer rejection.\n\
-             Preserve all correct existing work and make the smallest complete fix.\n\
-             Work item: {title}\n\
-             Description: {}\n\
-             Reviewer rejection: {rejection}",
-            description.unwrap_or_default()
-        );
-        let outcome = crate::codegen_apply::codegen_apply(
-            pg,
-            &checkout,
-            &task,
-            Some("qwen3-coder"),
-            1,
-            Some(work_item_id),
-        )
-        .await
-        .context("local coder PR repair")?;
-        record_fix_interaction(pg, work_item_id, &task, &outcome, attempt).await;
-        if !outcome.applied {
-            anyhow::bail!(
-                "local coder did not produce a verified fix: {}",
-                outcome
-                    .error
-                    .unwrap_or_else(|| "no applicable edit".to_string())
-            );
-        }
-
-        run_fix_command(
-            "git",
-            &["config", "user.name", "ForgeFleet"],
-            Some(&checkout),
-        )
-        .await?;
-        run_fix_command(
-            "git",
-            &["config", "user.email", "fleet@forgefleet.local"],
-            Some(&checkout),
-        )
-        .await?;
-        run_fix_command("git", &["add", "-A"], Some(&checkout)).await?;
-        let message = format!("fix: address local review (attempt {attempt})");
-        run_fix_command("git", &["commit", "-m", &message], Some(&checkout)).await?;
-        run_fix_command("git", &["push", "origin", "HEAD"], Some(&checkout)).await?;
-        Ok(())
-    }
-    .await;
-
-    if let Err(e) = std::fs::remove_dir_all(&checkout) {
-        warn!(path = %checkout.display(), error = %e, "merge_drain: failed to clean local-fix checkout");
-    }
-    result
-}
-
-async fn run_fix_command(
-    program: &str,
-    args: &[&str],
-    cwd: Option<&std::path::Path>,
-) -> Result<()> {
-    let mut command = tokio::process::Command::new(program);
-    command.args(args);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
-    if program == "gh" {
-        if let Some(token) = crate::fleet_info::fetch_secret("github_gh_token").await {
-            command.env("GH_TOKEN", token);
-        }
-    }
-    let output = command
-        .output()
-        .await
-        .with_context(|| format!("spawn {program}"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "{program} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .take(500)
-                .collect::<String>()
-        );
-    }
-    Ok(())
-}
-
-async fn record_fix_interaction(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    prompt: &str,
-    outcome: &crate::codegen_apply::CodegenOutcome,
-    attempt: u32,
-) {
-    let engine = outcome
-        .builder_catalog_id
-        .as_deref()
-        .filter(|id| !id.trim().is_empty())
-        .map(|id| format!("local:{}", id.trim()))
-        .unwrap_or_else(|| "local:qwen3-coder".to_string());
-    let rec = ff_db::InteractionRecord {
-        channel: "merge_drain_review".to_string(),
-        work_item_id: Some(work_item_id),
-        purpose: Some("build".to_string()),
-        request_text: prompt.chars().take(16000).collect(),
-        request_meta: serde_json::json!({ "stage": "local_fix", "attempt": attempt }),
-        engine: Some(crate::llm_attribution::engine_label(&engine)),
-        response_text: format!(
-            "applied={} rounds={} error={}",
-            outcome.applied,
-            outcome.rounds,
-            outcome.error.as_deref().unwrap_or("")
-        ),
-        cost_usd: 0.0,
-        outcome: if outcome.applied {
-            "success"
-        } else {
-            "failure"
-        }
-        .to_string(),
-        ..Default::default()
-    };
-    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
-        warn!(error = %e, "merge_drain: failed to log local-fix interaction (non-fatal)");
-    }
-}
-
-/// Fallback review ladder after the primary 480B reviewer: try the local 30B
-/// pool first, then cloud CLIs. A working local review beats burning the whole
-/// tick on cloud backends while a healthy on-fleet coder sits idle.
-async fn fallback_review(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    prompt: &str,
-) -> Result<(bool, String, String)> {
-    match local_pool_review(pg, work_item_id, prompt).await {
-        Ok((approved, reason, model)) => return Ok((approved, reason, format!("local:{model}"))),
-        Err(local_err) => {
-            warn!(
-                error = %local_err,
-                "merge_drain: local pool review unavailable — trying cloud reviewers"
-            );
-        }
-    }
-    let (approved, reason, backend) =
-        cloud_cli_review(pg, work_item_id, prompt, "legacy_cloud_review").await?;
-    Ok((approved, reason, backend))
-}
-
-/// PR review on ANY healthy local model (typically the 30B coder pool).
-/// Routes via `fleet_oneshot` with a coder hint; a short timeout keeps a slow
-/// node from stalling the drain.
-async fn local_pool_review(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    prompt: &str,
-) -> Result<(bool, String, String)> {
-    let resp = crate::fleet_oneshot::fleet_oneshot_for(
-        pg,
-        prompt,
-        Some("qwen3-coder"),
-        Some(REVIEW_LOCAL_POOL_TIMEOUT),
-        Some("code"),
-    )
-    .await
-    .context("local pool PR review")?;
-    record_review_interaction(
-        pg,
-        work_item_id,
-        "local_review_30b",
-        &resp.model,
-        prompt,
-        &resp.text,
-        resp.tokens_in,
-        resp.tokens_out,
-        i32::try_from(resp.latency_ms).ok(),
-        Some(resp.worker_name.clone()),
-        Some(resp.endpoint.clone()),
-    )
-    .await;
-    let (approved, reason) = parse_review_response(&resp.text);
-    Ok((approved, reason, resp.model))
-}
-
 /// Substring identifying the primary autonomous reviewer — the qwen3-coder-480b
-/// ring (single fleet instance). Used both as the `fleet_oneshot` routing hint
-/// and to verify which model actually served the call, because `fleet_oneshot`
-/// fails over to OTHER deployments when the hinted one is down — a review from
-/// a weaker fallback model must not be mistaken for a 480B verdict.
+/// ring (single fleet instance). The in-place dispatch review uses it to verify
+/// that a fallback model is not mistaken for a 480B verdict.
 const REVIEWER_480B_HINT: &str = "480b";
-
-/// Primary PR review on the 480B ring. `Err` means the ring is unavailable
-/// (routing failed, timed out, or `fleet_oneshot` failed over to some other
-/// model) — the caller falls back to the cloud review path.
-async fn review_via_480b(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    prompt: &str,
-) -> Result<(bool, String)> {
-    let _permit = crate::dispatch_concurrency::acquire_480b_permit()
-        .await
-        .expect("480b review gate is never closed");
-    let resp = crate::fleet_oneshot::fleet_oneshot_for(
-        pg,
-        prompt,
-        Some(REVIEWER_480B_HINT),
-        Some(REVIEW_480B_TIMEOUT),
-        Some("code"),
-    )
-    .await
-    .context("480b PR review")?;
-    if !served_by_480b(&resp.model) {
-        anyhow::bail!(
-            "480b ring unavailable — fleet_oneshot failed over to {} on {}",
-            resp.model,
-            resp.worker_name
-        );
-    }
-    record_review_interaction(
-        pg,
-        work_item_id,
-        "local_review_480b",
-        &resp.model,
-        prompt,
-        &resp.text,
-        resp.tokens_in,
-        resp.tokens_out,
-        i32::try_from(resp.latency_ms).ok(),
-        Some(resp.worker_name.clone()),
-        Some(resp.endpoint.clone()),
-    )
-    .await;
-    Ok(parse_review_response(&resp.text))
-}
 
 /// True when the model name that served a call is the 480B ring. `pub(crate)`
 /// because the in-place dispatch review makes the same failed-over-to-a-weaker-
 /// model check before trusting a verdict as a 480B verdict.
 pub(crate) fn served_by_480b(model: &str) -> bool {
     model.to_lowercase().contains(REVIEWER_480B_HINT)
-}
-
-/// One cloud CLI review pass — first backend that produces output wins, so a
-/// leader node missing one vendor CLI still gets a review. Returns
-/// `(approved, reason, backend)`.
-async fn cloud_cli_review(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    prompt: &str,
-    stage: &str,
-) -> Result<(bool, String, String)> {
-    let mut last_err: Option<anyhow::Error> = None;
-    let backends: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT backend FROM computer_backends \
-          WHERE installed AND authenticated ORDER BY backend",
-    )
-    .fetch_all(pg)
-    .await
-    .context("load authenticated cloud review backends")?;
-    for backend in backends {
-        let budget = crate::cloud_budget::provider_budget(pg, &backend).await;
-        if crate::cloud_budget::is_exhausted(budget.as_ref(), chrono::Utc::now()) {
-            warn!(
-                backend,
-                exhausted_until = ?budget.as_ref().and_then(|row| row.window_exhausted_until),
-                "merge_drain: skipping quota-exhausted cloud reviewer"
-            );
-            continue;
-        }
-        match crate::cli_executor::execute_cli(&backend, prompt, &[], Some(REVIEW_CLOUD_TIMEOUT))
-            .await
-        {
-            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
-                crate::cloud_budget::record_success(
-                    pg,
-                    &backend,
-                    budget.as_ref().and_then(|row| row.window_exhausted_until),
-                )
-                .await;
-                let (tin, tout) = crate::llm_attribution::parse_cli_token_counts(&format!(
-                    "{}\n{}",
-                    res.stdout, res.stderr
-                ));
-                record_review_interaction(
-                    pg,
-                    work_item_id,
-                    stage,
-                    &backend,
-                    prompt,
-                    &res.stdout,
-                    tin,
-                    tout,
-                    i32::try_from(res.duration_ms).ok(),
-                    None,
-                    Some(format!("ff cli {backend}")),
-                )
-                .await;
-                let (approved, reason) = parse_review_response(&res.stdout);
-                return Ok((approved, reason, backend.to_string()));
-            }
-            Ok(res) => {
-                let e = anyhow::anyhow!(
-                    "{backend} exited {}: {}",
-                    res.exit_code,
-                    res.stderr.trim().chars().take(300).collect::<String>()
-                );
-                warn!(backend, error = %e, "merge_drain: cloud review backend failed — trying next");
-                last_err = Some(e);
-            }
-            Err(e) => {
-                warn!(backend, error = %e, "merge_drain: cloud review backend unavailable — trying next");
-                last_err = Some(e);
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("no cloud CLI review backend available")))
-}
-
-/// Best-effort `ff_interactions` row for one autonomous review turn (training
-/// data — part of the point of routing review through the fleet). Never fails
-/// the drain.
-#[allow(clippy::too_many_arguments)]
-async fn record_review_interaction(
-    pg: &PgPool,
-    work_item_id: uuid::Uuid,
-    stage: &str,
-    engine: &str,
-    prompt: &str,
-    response: &str,
-    tokens_in: i32,
-    tokens_out: i32,
-    latency_ms: Option<i32>,
-    worker_name: Option<String>,
-    endpoint: Option<String>,
-) {
-    // Canonical engine (cloud CLI name or local:<catalog_id>), flagged chars/4
-    // estimate when the caller had no reported counts, and config-driven cost.
-    let engine = crate::llm_attribution::engine_label(engine);
-    let (tokens_in, tokens_out, tokens_estimated) =
-        crate::llm_attribution::tokens_or_estimate(tokens_in, tokens_out, prompt, response);
-    let cost_usd = crate::llm_attribution::cost_usd(&engine, tokens_in, tokens_out);
-    let rec = ff_db::InteractionRecord {
-        channel: "merge_drain_review".to_string(),
-        work_item_id: Some(work_item_id),
-        purpose: Some("review".to_string()),
-        request_text: prompt.chars().take(16000).collect(),
-        request_meta: serde_json::json!({
-            "stage": stage,
-            "tokens_estimated": tokens_estimated
-        }),
-        engine: Some(engine),
-        response_text: response.chars().take(16000).collect(),
-        tokens_in,
-        tokens_out,
-        cost_usd,
-        latency_ms,
-        outcome: "success".to_string(),
-        worker_name,
-        endpoint,
-        ..Default::default()
-    };
-    if let Err(e) = ff_db::pg_record_interaction(pg, &rec).await {
-        warn!(error = %e, "merge_drain: failed to log review interaction (non-fatal)");
-    }
 }
 
 /// Parse a reviewer's `APPROVE`/`REJECT` first-line verdict + reason. Shared
@@ -1210,71 +621,6 @@ enum PrMergeState {
     /// Everything else (BLOCKED/UNSTABLE or a gh/API error) — take no
     /// special action; the normal CI→review→merge path decides.
     Other,
-}
-
-/// An existing review verdict on the PR, from GitHub's `reviewDecision`.
-#[derive(Debug, PartialEq, Eq)]
-enum PrReviewVerdict {
-    /// `reviewDecision == APPROVED` — someone already signed off; the drain
-    /// skips its own autonomous review.
-    Approved,
-    /// `reviewDecision == CHANGES_REQUESTED` — the PR was rejected; the string
-    /// is the rejecting review's reason (its body), surfaced into the
-    /// work_item's `last_error` so a retry has the context.
-    ChangesRequested(String),
-    /// No verdict yet (`REVIEW_REQUIRED` / empty) — the drain runs its own
-    /// autonomous review as before.
-    None,
-}
-
-/// `gh pr view <url> --json reviewDecision,latestReviews`. Any gh/parse error
-/// maps to `None` so a hiccup can never fail a healthy item or block the
-/// drain — worst case the drain just runs its own review.
-async fn pr_review_verdict(pr_url: &str) -> PrReviewVerdict {
-    let mut cmd = gh_cmd().await;
-    cmd.args([
-        "pr",
-        "view",
-        pr_url,
-        "--json",
-        "reviewDecision,latestReviews",
-    ]);
-    let out = match cmd.output().await {
-        Ok(o) if o.status.success() => o,
-        _ => return PrReviewVerdict::None,
-    };
-    serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .map(|v| parse_review_verdict(&v))
-        .unwrap_or(PrReviewVerdict::None)
-}
-
-/// Pure mapping of `gh pr view --json reviewDecision,latestReviews` output to
-/// a verdict. On CHANGES_REQUESTED the reason is the most recent rejecting
-/// review's non-empty body (bounded so it fits `last_error`).
-fn parse_review_verdict(v: &serde_json::Value) -> PrReviewVerdict {
-    match v.get("reviewDecision").and_then(|d| d.as_str()) {
-        Some("APPROVED") => PrReviewVerdict::Approved,
-        Some("CHANGES_REQUESTED") => {
-            let reason = v
-                .get("latestReviews")
-                .and_then(|r| r.as_array())
-                .and_then(|reviews| {
-                    reviews
-                        .iter()
-                        .rev()
-                        .filter(|r| {
-                            r.get("state").and_then(|s| s.as_str()) == Some("CHANGES_REQUESTED")
-                        })
-                        .filter_map(|r| r.get("body").and_then(|b| b.as_str()))
-                        .map(str::trim)
-                        .find(|body| !body.is_empty())
-                        .map(str::to_string)
-                })
-                .unwrap_or_else(|| "no reason given".to_string());
-            PrReviewVerdict::ChangesRequested(truncate_chars(&reason, 1000))
-        }
-        _ => PrReviewVerdict::None,
-    }
 }
 
 /// `gh pr view <url> --json mergeStateStatus`. Any error maps to `Other` so a
@@ -1654,23 +1000,6 @@ async fn gh_delete_branch(pr_url: &str) -> Result<()> {
     );
 }
 
-async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
-    let mut cmd = gh_cmd().await;
-    cmd.args(["pr", "comment", pr_url, "--body", body]);
-    let out = cmd.output().await.context("spawn gh pr comment")?;
-    if out.status.success() {
-        return Ok(());
-    }
-    anyhow::bail!(
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-            .trim()
-            .chars()
-            .take(500)
-            .collect::<String>()
-    );
-}
-
 /// Reconcile work_items stranded in `in_review` whose PR was merged or closed
 /// out-of-band — hand-merged by the operator, or merged by any path other than
 /// [`evaluate_merge_queue`] (e.g. a plain `gh pr merge` in a terminal, which
@@ -1678,23 +1007,47 @@ async fn gh_pr_comment(pr_url: &str, body: &str) -> Result<()> {
 /// forever and the queue/ETA never reflects that they actually shipped.
 ///
 /// Bounded (25 rows/pass) and leader-gated by the caller. Best-effort: a `gh`
-/// failure for one PR is logged and skipped — it never aborts the pass. Only
-/// rows that are still `in_review` at UPDATE time are flipped (guards against a
-/// racing drain that already claimed the row).
+/// failure for one PR is logged and skipped — it never aborts the pass. Item
+/// and receipt updates share one transaction and retain status predicates, so
+/// a racing drain becomes an idempotent no-op. Terminal items are candidates
+/// only when their own queue receipt is still active.
 async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor) -> Result<usize> {
-    let rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
-        "SELECT id, pr_url FROM work_items \
-         WHERE status = 'in_review' AND pr_url IS NOT NULL AND pr_url LIKE '%github.com%' \
-         ORDER BY COALESCE(started_at, created_at) ASC LIMIT 25",
+    let rows: Vec<(uuid::Uuid, String, String, Option<uuid::Uuid>)> = sqlx::query_as(
+        "SELECT w.id, w.pr_url, w.status, q.id \
+           FROM work_items w \
+           LEFT JOIN LATERAL ( \
+               SELECT mq.id \
+                 FROM work_item_merge_queue mq \
+                WHERE mq.work_item_id = w.id \
+                  AND mq.status IN ('queued', 'ci_running', 'mergeable') \
+                ORDER BY mq.position ASC \
+                LIMIT 1 \
+           ) q ON TRUE \
+          WHERE w.pr_url IS NOT NULL \
+            AND w.pr_url LIKE '%github.com%' \
+            AND (w.status = 'in_review' \
+                 OR (w.status IN ('merged', 'cancelled') AND q.id IS NOT NULL)) \
+          ORDER BY COALESCE(w.started_at, w.created_at) ASC \
+          LIMIT 25",
     )
     .fetch_all(pg)
     .await
-    .context("query in_review work_items for reconcile")?;
+    .context("query out-of-band review reconciliation candidates")?;
 
     let mut reconciled = 0usize;
-    for (id, pr_url) in rows {
+    for (id, pr_url, item_status, active_queue_id) in rows {
+        debug_assert!(orphaned_review_candidate(
+            &item_status,
+            active_queue_id.is_some()
+        ));
         let mut cmd = gh_cmd().await;
-        cmd.args(["pr", "view", &pr_url, "--json", "state,mergedAt"]);
+        cmd.args([
+            "pr",
+            "view",
+            &pr_url,
+            "--json",
+            "state,mergedAt,mergeCommit,mergedBy",
+        ]);
         let out = match cmd.output().await {
             Ok(o) if o.status.success() => o,
             Ok(o) => {
@@ -1713,27 +1066,122 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
                 continue;
             }
         };
-        let merged = v.get("mergedAt").and_then(|m| m.as_str()).is_some();
+        let merged_at = v
+            .get("mergedAt")
+            .and_then(|m| m.as_str())
+            .map(str::to_owned);
         let state = v.get("state").and_then(|s| s.as_str()).unwrap_or("");
-        let new_status = if merged {
-            "merged"
-        } else if state.eq_ignore_ascii_case("CLOSED") {
-            "cancelled"
+        let action = if merged_at.is_some() {
+            Some(TerminalPrAction::MarkMerged)
         } else {
-            continue; // still OPEN — nothing to reconcile
+            terminal_pr_action(Some(state))
         };
-        let affected = sqlx::query(
-            "UPDATE work_items SET status = $2, \
-             completed_at = COALESCE(completed_at, NOW()), last_error = NULL \
-             WHERE id = $1 AND status = 'in_review'",
-        )
-        .bind(id)
-        .bind(new_status)
-        .execute(pg)
-        .await
-        .context("reconcile update work_item status")?
-        .rows_affected();
-        if affected > 0 {
+        let Some(action) = action else {
+            continue;
+        };
+        let merge_commit_sha = v
+            .get("mergeCommit")
+            .and_then(|commit| commit.get("oid"))
+            .and_then(|oid| oid.as_str())
+            .map(str::to_owned);
+        let merged_by = v
+            .get("mergedBy")
+            .and_then(|actor| actor.get("login"))
+            .and_then(|login| login.as_str())
+            .map(str::to_owned);
+
+        let mut tx = pg.begin().await.context("begin out-of-band reconcile")?;
+        let (new_status, work_item_affected, receipt_affected) = match action {
+            TerminalPrAction::MarkMerged => {
+                let work_item_affected = sqlx::query(
+                    "UPDATE work_items \
+                        SET status = 'merged', \
+                            completed_at = COALESCE(completed_at, $2::timestamptz, NOW()), \
+                            last_error = NULL \
+                      WHERE id = $1 AND status = 'in_review'",
+                )
+                .bind(id)
+                .bind(merged_at.as_deref())
+                .execute(&mut *tx)
+                .await
+                .context("reconcile merged work_item")?
+                .rows_affected();
+                let receipt_affected = if let Some(queue_id) = active_queue_id {
+                    sqlx::query(
+                        "UPDATE work_item_merge_queue \
+                            SET status = 'merged', \
+                                merged_at = COALESCE(merged_at, $3::timestamptz, NOW()), \
+                                failed_at = NULL, failure_reason = NULL \
+                          WHERE id = $1 AND work_item_id = $2 \
+                            AND status IN ('queued', 'ci_running', 'mergeable')",
+                    )
+                    .bind(queue_id)
+                    .bind(id)
+                    .bind(merged_at.as_deref())
+                    .execute(&mut *tx)
+                    .await
+                    .context("reconcile merged queue receipt")?
+                    .rows_affected()
+                } else {
+                    0
+                };
+                if work_item_affected + receipt_affected > 0 {
+                    sqlx::query(
+                        "INSERT INTO work_item_provenance \
+                             (work_item_id, merged_by, merged_at) \
+                         VALUES ($1, $2, COALESCE($3::timestamptz, NOW())) \
+                         ON CONFLICT (work_item_id) DO UPDATE SET \
+                             merged_by = EXCLUDED.merged_by, \
+                             merged_at = EXCLUDED.merged_at, updated_at = NOW()",
+                    )
+                    .bind(id)
+                    .bind(merged_by.as_deref().unwrap_or("out-of-band-reconcile"))
+                    .bind(merged_at.as_deref())
+                    .execute(&mut *tx)
+                    .await
+                    .context("record out-of-band merge provenance")?;
+                }
+                ("merged", work_item_affected, receipt_affected)
+            }
+            TerminalPrAction::FailClosed => {
+                let work_item_affected = sqlx::query(
+                    "UPDATE work_items \
+                        SET status = 'cancelled', \
+                            completed_at = COALESCE(completed_at, NOW()), \
+                            last_error = NULL \
+                      WHERE id = $1 AND status = 'in_review'",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .context("reconcile closed work_item")?
+                .rows_affected();
+                let receipt_affected = if let Some(queue_id) = active_queue_id {
+                    sqlx::query(
+                        "UPDATE work_item_merge_queue \
+                            SET status = 'failed', \
+                                failed_at = COALESCE(failed_at, NOW()), \
+                                failure_reason = COALESCE( \
+                                    failure_reason, \
+                                    'PR closed unmerged (out-of-band)') \
+                          WHERE id = $1 AND work_item_id = $2 \
+                            AND status IN ('queued', 'ci_running', 'mergeable')",
+                    )
+                    .bind(queue_id)
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .context("reconcile closed queue receipt")?
+                    .rows_affected()
+                } else {
+                    0
+                };
+                ("cancelled", work_item_affected, receipt_affected)
+            }
+        };
+        tx.commit().await.context("commit out-of-band reconcile")?;
+
+        if work_item_affected + receipt_affected > 0 {
             info!(work_item = %id, pr = %pr_url, status = new_status, "reconcile: flipped orphaned in_review");
             auditor.record(
                 ReconciliationAction::StatusReconciled,
@@ -1742,14 +1190,18 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
                 serde_json::json!({
                     "pr_url": pr_url,
                     "work_item_id": id.to_string(),
+                    "previous_item_status": item_status,
                     "new_status": new_status,
+                    "queue_id": active_queue_id.map(|queue_id| queue_id.to_string()),
+                    "work_item_updated": work_item_affected == 1,
+                    "queue_receipt_updated": receipt_affected == 1,
+                    "merge_commit_sha": merge_commit_sha,
+                    "merged_by": merged_by,
+                    "merged_at": merged_at,
                 }),
             );
             reconciled += 1;
         } else {
-            // A racing drain (or the merge path itself) already flipped this
-            // row between our SELECT and UPDATE — the duplicate flip was
-            // skipped by the `status = 'in_review'` guard.
             auditor.record(
                 ReconciliationAction::DuplicateSkipped,
                 &id.to_string(),
@@ -1760,6 +1212,7 @@ async fn reconcile_orphaned_reviews(pg: &PgPool, auditor: &ReconciliationAuditor
                     "skipped": "orphaned_review_flip",
                     "cause": "row_claimed_by_racing_drain",
                     "intended_status": new_status,
+                    "queue_id": active_queue_id.map(|queue_id| queue_id.to_string()),
                 }),
             );
         }
@@ -1871,10 +1324,9 @@ async fn db_confirms_leader(pg: &PgPool, worker_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        PrMergeState, PrReviewVerdict, TerminalPrAction, github_actions_run_id,
-        is_semantic_merge_compile_failure, parse_merge_state, parse_review_response,
-        parse_review_verdict, pr_is_draft_from_json, served_by_480b, terminal_pr_action,
-        update_branch_api_path,
+        PrMergeState, TerminalPrAction, github_actions_run_id, is_semantic_merge_compile_failure,
+        orphaned_review_candidate, parse_merge_state, parse_review_response, pr_is_draft_from_json,
+        served_by_480b, terminal_pr_action, update_branch_api_path,
     };
 
     #[test]
@@ -1898,6 +1350,19 @@ mod tests {
         assert_eq!(terminal_pr_action(Some("OPEN")), None);
         assert_eq!(terminal_pr_action(Some("whatever")), None);
         assert_eq!(terminal_pr_action(None), None);
+    }
+
+    #[test]
+    fn orphaned_review_candidates_include_only_owned_or_split_receipts() {
+        assert!(orphaned_review_candidate("in_review", false));
+        assert!(orphaned_review_candidate("in_review", true));
+        assert!(orphaned_review_candidate("merged", true));
+        assert!(orphaned_review_candidate("cancelled", true));
+
+        assert!(!orphaned_review_candidate("merged", false));
+        assert!(!orphaned_review_candidate("cancelled", false));
+        assert!(!orphaned_review_candidate("ready", true));
+        assert!(!orphaned_review_candidate("failed", true));
     }
 
     #[test]
@@ -1981,53 +1446,6 @@ mod tests {
     }
 
     #[test]
-    fn approved_review_verdict_skips_own_review() {
-        let v = serde_json::json!({
-            "reviewDecision": "APPROVED",
-            "latestReviews": [{"state": "APPROVED", "body": "lgtm"}],
-        });
-        assert_eq!(parse_review_verdict(&v), PrReviewVerdict::Approved);
-    }
-
-    #[test]
-    fn changes_requested_verdict_carries_the_latest_rejection_reason() {
-        let v = serde_json::json!({
-            "reviewDecision": "CHANGES_REQUESTED",
-            "latestReviews": [
-                {"state": "CHANGES_REQUESTED", "body": "older reason"},
-                {"state": "APPROVED", "body": "lgtm"},
-                {"state": "CHANGES_REQUESTED", "body": "  breaks the scheduler tick  "},
-            ],
-        });
-        assert_eq!(
-            parse_review_verdict(&v),
-            PrReviewVerdict::ChangesRequested("breaks the scheduler tick".to_string())
-        );
-
-        // Empty bodies fall back to a placeholder rather than an empty reason.
-        let v = serde_json::json!({
-            "reviewDecision": "CHANGES_REQUESTED",
-            "latestReviews": [{"state": "CHANGES_REQUESTED", "body": ""}],
-        });
-        assert_eq!(
-            parse_review_verdict(&v),
-            PrReviewVerdict::ChangesRequested("no reason given".to_string())
-        );
-    }
-
-    #[test]
-    fn missing_or_pending_review_verdict_runs_own_review() {
-        for v in [
-            serde_json::json!({}),
-            serde_json::json!({"reviewDecision": ""}),
-            serde_json::json!({"reviewDecision": "REVIEW_REQUIRED"}),
-            serde_json::json!({"reviewDecision": null}),
-        ] {
-            assert_eq!(parse_review_verdict(&v), PrReviewVerdict::None, "{v}");
-        }
-    }
-
-    #[test]
     fn malformed_pr_urls_are_rejected() {
         for bad in [
             "https://github.com/venkatyarl/forge-fleet",
@@ -2053,6 +1471,30 @@ mod tests {
         for other in ["BLOCKED", "UNSTABLE", "HAS_HOOKS", "", "clean"] {
             assert_eq!(parse_merge_state(other), PrMergeState::Other, "{other}");
         }
+    }
+
+    #[test]
+    fn automerge_gate_is_rechecked_after_queue_selection_before_merge_mutation() {
+        let source = include_str!("work_item_merge_drain.rs");
+        let start = source
+            .find("pub async fn evaluate_merge_queue")
+            .expect("merge queue evaluator");
+        let end = source[start..]
+            .find("pub(crate) fn parse_review_response")
+            .map(|offset| start + offset)
+            .expect("end of merge queue evaluator");
+        let evaluator = &source[start..end];
+        let select = evaluator
+            .find("pg_next_merge_queue_item(pg, include_mergeable)")
+            .expect("gate-aware queue selection");
+        let recheck = evaluator[select..]
+            .find("if !automerge_enabled(pg).await")
+            .map(|offset| select + offset)
+            .expect("fresh automerge gate check");
+        let merge = evaluator
+            .find("gh_merge_squash(&pr_url)")
+            .expect("merge mutation");
+        assert!(select < recheck && recheck < merge);
     }
 }
 

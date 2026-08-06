@@ -7,10 +7,9 @@
 //!   GET  /api/fleet/check-ip                — server-side ping probe (for verify actions)
 //!   GET  /api/fleet/check-tcp               — server-side TCP probe
 //!
-//! These endpoints are *complementary* to the existing `/api/fleet/enroll` (which
-//! only upserts `fleet_worker_runtime`). Self-enroll handles first-join flow: it
-//! creates the `fleet_workers` row, stashes the SSH identity, records hardware/
-//! tooling metadata, and kicks off mesh-propagation via the deferred queue.
+//! The legacy `/api/fleet/enroll` compatibility route is also quarantined on
+//! the ordinary HTTP listener. New-node admission is owned exclusively by the
+//! dedicated server-verified TLS enrollment listener.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,7 +17,7 @@ use std::time::Duration;
 use axum::{
     Json,
     extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
@@ -26,45 +25,26 @@ use serde_json::{Value, json};
 
 use crate::server::GatewayState;
 
-/// Resolve the enrollment policy, falling back to the canonical
-/// `enrollment.shared_secret` in the fleet vault (`fleet_secrets`) when the
-/// local fleet.toml/env has none. Without this, only nodes with a hand-wired
-/// `FORGEFLEET_ENROLLMENT_TOKEN` could serve onboarding — every other
-/// gateway 503'd `/onboard/bootstrap.sh` (found live 2026-08-03: zero of 17
-/// nodes could onboard vinny until adele was hand-configured).
-pub async fn resolve_enrollment_policy(
-    state: &GatewayState,
-) -> ff_core::config::EnrollmentEnforcement {
-    let policy = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock.read().await.enrollment.enforcement_policy(),
-        None => ff_core::config::EnrollmentEnforcement::MisconfiguredRequired,
-    };
-    if !matches!(
-        policy,
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired
-    ) {
-        return policy;
-    }
-    if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool())
-        && let Ok(Some(secret)) = ff_db::pg_get_secret(pool, "enrollment.shared_secret").await
-        && !secret.trim().is_empty()
-    {
-        return ff_core::config::EnrollmentEnforcement::Required(secret);
-    }
-    policy
-}
-
 // ─── Bootstrap script rendering ──────────────────────────────────────────
 
-const BOOTSTRAP_TEMPLATE: &str = include_str!("../../../scripts/bootstrap-computer-template.sh");
+pub(crate) const BOOTSTRAP_TEMPLATE: &str =
+    include_str!("../../../scripts/bootstrap-computer-template.sh");
 
-const BOOTSTRAP_TEMPLATE_PS1: &str =
-    include_str!("../../../scripts/bootstrap-computer-template.ps1");
+/// The ordinary gateway listener has no connection-level TLS evidence. Keep
+/// every credential-bearing handler on that listener quarantined; only the
+/// dedicated TLS enrollment server may admit nodes. Do not replace this with
+/// an environment flag or forwarding header: either would let a plaintext LAN
+/// caller self-assert that its request was secure.
+fn secure_onboarding_transport_available() -> bool {
+    false
+}
+
+const ONBOARDING_TRANSPORT_QUARANTINE: &str =
+    "new-node onboarding is quarantined until the gateway has server-verified TLS transport";
 
 /// Query params accepted by GET /onboard/bootstrap.sh
 #[derive(Debug, Deserialize)]
 pub struct BootstrapQuery {
-    pub token: Option<String>,
     pub name: Option<String>,
     pub ip: Option<String>,
     pub ssh_user: Option<String>,
@@ -76,73 +56,40 @@ pub struct BootstrapQuery {
     pub ram_hint: Option<u32>,
 }
 
-pub async fn bootstrap_script(
-    State(state): State<Arc<GatewayState>>,
-    headers: HeaderMap,
-    Query(q): Query<BootstrapQuery>,
+pub async fn bootstrap_script() -> axum::response::Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        ONBOARDING_TRANSPORT_QUARANTINE,
+    )
+        .into_response()
+}
+
+pub(crate) struct SecureBootstrapRender<'a> {
+    pub leader_host: &'a str,
+    pub tls_server_name: &'a str,
+    pub tls_ca_pem_b64: &'a str,
+    pub tls_spki_pin: &'a str,
+    pub name: &'a str,
+    pub ip: &'a str,
+    pub ssh_user: &'a str,
+    pub role: &'a str,
+    pub runtime: &'a str,
+}
+
+/// Render the Unix bootstrap only after the dedicated TLS handler has
+/// authenticated the one-time token, peer IP, canonical node name, and leader
+/// epoch. The ordinary HTTP route above never calls this helper.
+pub(crate) async fn render_secure_bootstrap_script(
+    state: &GatewayState,
+    claim: &SecureBootstrapRender<'_>,
 ) -> axum::response::Response {
-    // Resolve enrollment policy (config/env, with fleet-vault fallback).
-    let policy = resolve_enrollment_policy(&state).await;
-    let expected_token = match &policy {
-        ff_core::config::EnrollmentEnforcement::Disabled => {
-            tracing::warn!(
-                endpoint = "/onboard/bootstrap.sh",
-                "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
-            );
-            String::new()
-        }
-        ff_core::config::EnrollmentEnforcement::Required(tok) => tok.clone(),
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "# enrollment shared secret not configured\n",
-            )
-                .into_response();
-        }
-    };
-
-    let token = q.token.clone().unwrap_or_else(|| expected_token.clone());
-    if matches!(policy, ff_core::config::EnrollmentEnforcement::Required(_))
-        && (token.is_empty() || token != expected_token)
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "enrollment token missing or invalid\n",
-        )
-            .into_response();
-    }
-
-    // Leader host: derive from the operator's browser connection if possible;
-    // else fall back to env / config.
-    let leader_host =
-        std::env::var("FORGEFLEET_LEADER_HOST").unwrap_or_else(|_| "192.168.5.100".to_string());
-    let leader_port =
-        std::env::var("FORGEFLEET_LEADER_PORT").unwrap_or_else(|_| "51002".to_string());
-
-    // Caller's LAN IP: prefer explicit query param, fall back to
-    // X-Forwarded-For / X-Real-IP headers (if a reverse proxy added them),
-    // then to a generic placeholder the script will override with `hostname -I`.
-    let ip =
-        q.ip.filter(|s| !s.is_empty())
-            .or_else(|| {
-                headers
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.split(',').next())
-                    .map(|s| s.trim().to_string())
-            })
-            .or_else(|| {
-                headers
-                    .get("x-real-ip")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| "auto".to_string());
-
-    let name = q.name.unwrap_or_else(|| "newnode".into());
-    let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
-    let role = q.role.unwrap_or_else(|| "builder".into());
-    let runtime = q.runtime.unwrap_or_else(|| "auto".into());
+    let leader_host = claim.leader_host;
+    let leader_port = "51443";
+    let name = claim.name;
+    let ssh_user = claim.ssh_user;
+    let role = claim.role;
+    let runtime = claim.runtime;
+    let ip = claim.ip;
 
     // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
     fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
@@ -167,11 +114,11 @@ pub async fn bootstrap_script(
             valid
         }
     }
-    let name = sanitize_bootstrap_value(&name, 64);
-    let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
-    let role = sanitize_bootstrap_value(&role, 32);
-    let runtime = sanitize_bootstrap_value(&runtime, 32);
-    let ip = sanitize_bootstrap_value(&ip, 64);
+    let name = sanitize_bootstrap_value(name, 64);
+    let ssh_user = sanitize_bootstrap_value(ssh_user, 64);
+    let role = sanitize_bootstrap_value(role, 32);
+    let runtime = sanitize_bootstrap_value(runtime, 32);
+    let ip = sanitize_bootstrap_value(ip, 64);
     let is_vinny = if name.eq_ignore_ascii_case("vinny") || ip == "192.168.5.100" {
         "true"
     } else {
@@ -232,7 +179,11 @@ pub async fn bootstrap_script(
                 .url
                 .strip_prefix("redis://")
                 .unwrap_or(&cfg.redis.url);
-            if let Some((h, p)) = redis_rest.split('/').next().and_then(|s| s.rsplit_once(':')) {
+            if let Some((h, p)) = redis_rest
+                .split('/')
+                .next()
+                .and_then(|s| s.rsplit_once(':'))
+            {
                 if !h.is_empty() {
                     rd_h = h.to_string();
                 }
@@ -245,165 +196,43 @@ pub async fn bootstrap_script(
     };
 
     let script = BOOTSTRAP_TEMPLATE
-        .replace("{{LEADER_HOST}}", &leader_host)
-        .replace("{{LEADER_PORT}}", &leader_port)
+        .replace("{{LEADER_HOST}}", leader_host)
+        .replace("{{LEADER_PORT}}", leader_port)
+        .replace("{{TLS_SERVER_NAME}}", claim.tls_server_name)
+        .replace("{{TLS_CA_PEM_B64}}", claim.tls_ca_pem_b64)
+        .replace("{{TLS_SPKI_PIN}}", claim.tls_spki_pin)
         .replace("{{DB_HOST}}", &db_host)
         .replace("{{DB_PORT}}", &db_port)
         .replace("{{REDIS_HOST}}", &redis_host)
         .replace("{{REDIS_PORT}}", &redis_port)
-        .replace("{{TOKEN}}", &token)
         .replace("{{COMPUTER_NAME}}", &name)
         .replace("{{COMPUTER_IP}}", &ip)
         .replace("{{SSH_USER}}", &ssh_user)
         .replace("{{ROLE}}", &role)
         .replace("{{RUNTIME}}", &runtime)
         .replace("{{GITHUB_OWNER}}", &github_owner)
-        .replace("{{GITHUB_PAT_SECRET_KEY}}", "github.venkat_pat")
         .replace("{{IS_VINNY}}", is_vinny);
 
     (
         StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/x-shellscript; charset=utf-8",
-        )],
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/x-shellscript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
         script,
     )
         .into_response()
 }
 
 /// GET /onboard/bootstrap.ps1 — Windows PowerShell equivalent of bootstrap.sh.
-/// Same query params, same placeholder substitutions, different template.
-pub async fn bootstrap_script_ps1(
-    State(state): State<Arc<GatewayState>>,
-    headers: HeaderMap,
-    Query(q): Query<BootstrapQuery>,
-) -> axum::response::Response {
-    let policy = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock.read().await.enrollment.enforcement_policy(),
-        None => ff_core::config::EnrollmentEnforcement::MisconfiguredRequired,
-    };
-    let expected_token = match &policy {
-        ff_core::config::EnrollmentEnforcement::Disabled => {
-            tracing::warn!(
-                endpoint = "/onboard/bootstrap.ps1",
-                "enrollment token check DISABLED (require_shared_secret=false) — serving script without auth"
-            );
-            String::new()
-        }
-        ff_core::config::EnrollmentEnforcement::Required(tok) => tok.clone(),
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "# enrollment shared secret not configured\n",
-            )
-                .into_response();
-        }
-    };
-    let token = q.token.clone().unwrap_or_else(|| expected_token.clone());
-    if matches!(policy, ff_core::config::EnrollmentEnforcement::Required(_))
-        && (token.is_empty() || token != expected_token)
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            "# enrollment token missing or invalid\n",
-        )
-            .into_response();
-    }
-
-    let leader_host =
-        std::env::var("FORGEFLEET_LEADER_HOST").unwrap_or_else(|_| "192.168.5.100".to_string());
-    let leader_port =
-        std::env::var("FORGEFLEET_LEADER_PORT").unwrap_or_else(|_| "51002".to_string());
-    let ip =
-        q.ip.filter(|s| !s.is_empty())
-            .or_else(|| {
-                headers
-                    .get("x-forwarded-for")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.split(',').next())
-                    .map(|s| s.trim().to_string())
-            })
-            .unwrap_or_else(|| "auto".to_string());
-    let name = q.name.unwrap_or_else(|| "newnode".into());
-    let ssh_user = q.ssh_user.unwrap_or_else(|| name.clone());
-    let role = q.role.unwrap_or_else(|| "builder".into());
-    let runtime = q.runtime.unwrap_or_else(|| "auto".into());
-
-    // Sanitize bootstrap parameters to prevent shell injection in the rendered script.
-    fn sanitize_bootstrap_value(s: &str, max_len: usize) -> String {
-        let trimmed = s.trim();
-        let valid: String = trimmed
-            .chars()
-            .take(max_len)
-            .filter(|&c| {
-                c.is_alphanumeric()
-                    || c == '-'
-                    || c == '_'
-                    || c == '.'
-                    || c == '@'
-                    || c == '+'
-                    || c == ':'
-                    || c == '/'
-            })
-            .collect();
-        if valid.is_empty() {
-            "unknown".into()
-        } else {
-            valid
-        }
-    }
-    let name = sanitize_bootstrap_value(&name, 64);
-    let ssh_user = sanitize_bootstrap_value(&ssh_user, 64);
-    let role = sanitize_bootstrap_value(&role, 32);
-    let runtime = sanitize_bootstrap_value(&runtime, 32);
-    let ip = sanitize_bootstrap_value(&ip, 64);
-
-    let is_vinny = if name.eq_ignore_ascii_case("vinny") || ip == "192.168.5.100" {
-        "true"
-    } else {
-        "false"
-    };
-    let github_owner: String = {
-        let mut found: Option<String> = None;
-        if let Some(pool) = state.operational_store.as_ref().and_then(|os| os.pg_pool()) {
-            if let Ok(Some(v)) = ff_db::pg_get_setting(pool, "github.default_owner").await
-                && let Some(s) = v.as_str()
-            {
-                found = Some(s.to_string());
-            }
-            if found.is_none()
-                && let Ok(Some(s)) = ff_db::pg_get_secret(pool, "github.default_owner").await
-                && !s.is_empty()
-            {
-                found = Some(s);
-            }
-        }
-        found
-            .or_else(|| std::env::var("FORGEFLEET_GITHUB_OWNER").ok())
-            .unwrap_or_else(|| "venkatyarl".to_string())
-    };
-
-    let script = BOOTSTRAP_TEMPLATE_PS1
-        .replace("{{LEADER_HOST}}", &leader_host)
-        .replace("{{LEADER_PORT}}", &leader_port)
-        .replace("{{TOKEN}}", &token)
-        .replace("{{COMPUTER_NAME}}", &name)
-        .replace("{{COMPUTER_IP}}", &ip)
-        .replace("{{SSH_USER}}", &ssh_user)
-        .replace("{{ROLE}}", &role)
-        .replace("{{RUNTIME}}", &runtime)
-        .replace("{{GITHUB_OWNER}}", &github_owner)
-        .replace("{{GITHUB_PAT_SECRET_KEY}}", "github.venkat_pat")
-        .replace("{{IS_VINNY}}", is_vinny);
-
+/// The legacy plaintext listener never renders a credential-bearing script.
+pub async fn bootstrap_script_ps1() -> axum::response::Response {
     (
-        StatusCode::OK,
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "text/plain; charset=utf-8",
-        )],
-        script,
+        StatusCode::SERVICE_UNAVAILABLE,
+        ONBOARDING_TRANSPORT_QUARANTINE,
     )
         .into_response()
 }
@@ -412,6 +241,10 @@ pub async fn bootstrap_script_ps1(
 
 #[derive(Debug, Deserialize)]
 pub struct SelfEnrollPayload {
+    /// Legacy body field retained for rolling wire compatibility. The secure
+    /// TLS handler requires it to be empty and authenticates only from the
+    /// Authorization header.
+    #[serde(default)]
     pub token: String,
     pub name: String,
     pub hostname: Option<String>,
@@ -448,7 +281,7 @@ pub struct SelfEnrollPayload {
 ///   4. `os_id=="ubuntu"` or `os_id` starts with `linux-ubuntu` → `"linux-ubuntu"`
 ///   5. `os_id=="windows"` → `"windows"`
 ///   6. fallback: whatever `os_id` was, or `"linux"`
-fn derive_os_family(os_id: Option<&str>, kernel: Option<&str>) -> String {
+pub(crate) fn derive_os_family(os_id: Option<&str>, kernel: Option<&str>) -> String {
     let os = os_id.unwrap_or("").to_ascii_lowercase();
     if os == "macos" || os == "darwin" {
         return "macos".into();
@@ -495,266 +328,13 @@ pub struct PeerSshIdentity {
     pub host_public_keys: Vec<String>,
 }
 
-pub async fn self_enroll(
-    State(state): State<Arc<GatewayState>>,
-    Json(payload): Json<SelfEnrollPayload>,
-) -> Result<Json<SelfEnrollResponse>, (StatusCode, Json<Value>)> {
-    let pool = state
-        .operational_store
-        .as_ref()
-        .and_then(|os| os.pg_pool())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"postgres pool not available"})),
-            )
-        })?;
-
-    // Consult enrollment policy (require_shared_secret flag + resolved secret).
-    let policy = state
-        .fleet_config
-        .as_ref()
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"fleet config not loaded"})),
-            )
-        })?
-        .read()
-        .await
-        .enrollment
-        .enforcement_policy();
-
-    match &policy {
-        ff_core::config::EnrollmentEnforcement::Disabled => {
-            tracing::warn!(
-                endpoint = "/api/fleet/self-enroll",
-                node = %payload.name,
-                "enrollment token check DISABLED (require_shared_secret=false) — accepting request without auth"
-            );
-        }
-        ff_core::config::EnrollmentEnforcement::MisconfiguredRequired => {
-            return Err((
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"enrollment secret not configured"})),
-            ));
-        }
-        ff_core::config::EnrollmentEnforcement::Required(expected) => {
-            if &payload.token != expected {
-                return Err((
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error":"invalid enrollment token"})),
-                ));
-            }
-        }
-    }
-
-    let name = payload.name.trim().to_lowercase();
-    if name.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"name is required"})),
-        ));
-    }
-
-    // Determine election_priority = max(existing) + 10 (workers only).
-    let nodes = ff_db::pg_list_nodes(pool)
-        .await
-        .map_err(|e| db_err("pg_list_nodes", e))?;
-    let next_priority = nodes
-        .iter()
-        .map(|n| n.election_priority)
-        .max()
-        .unwrap_or(100)
-        + 10;
-
-    // Compute default sub_agent_count if the script didn't supply one.
-    let sub_agent_count = payload.sub_agent_count.unwrap_or_else(|| {
-        compute_default_sub_agents(
-            payload.cpu_cores,
-            payload.ram_gb,
-            payload.has_nvidia.unwrap_or(false),
-        )
-    });
-
-    // Build FleetNodeRow — mostly defaults; runtime/os/ip from payload.
-    let node_row = ff_db::FleetNodeRow {
-        name: name.clone(),
-        ip: payload.ip.clone(),
-        ssh_user: payload.ssh_user.clone(),
-        ram_gb: payload.ram_gb,
-        cpu_cores: payload.cpu_cores,
-        os: payload.os.clone(),
-        role: payload.role.clone().unwrap_or_else(|| "builder".into()),
-        election_priority: next_priority,
-        hardware: payload.os_id.clone().unwrap_or_default(),
-        alt_ips: json!([]),
-        capabilities: json!({}),
-        preferences: json!({}),
-        resources: json!({
-            "has_nvidia": payload.has_nvidia.unwrap_or(false),
-        }),
-        status: "online".into(),
-        runtime: payload.runtime.clone(),
-        models_dir: "~/models".into(),
-        disk_quota_pct: 80,
-        sub_agent_count,
-        gh_account: payload.gh_account.clone(),
-        tooling: json!({}),
-        // Read-only hardware fields (joined from `computers` on read); not
-        // written through the worker upsert.
-        gpu_kind: None,
-        gpu_model: None,
-        gpu_vram_gb: None,
-        gpu_total_vram_gb: None,
-        has_gpu: None,
-        computer_ram_gb: None,
-        computer_cpu_cores: None,
-        computer_status: None,
-    };
-
-    ff_db::pg_upsert_node(pool, &node_row)
-        .await
-        .map_err(|e| db_err("pg_upsert_node", e))?;
-
-    // UPSERT the `computers` row so Pulse v2 has a row to check against on
-    // first beat (without this, forgefleetd logs "no computers row for this
-    // host; Pulse v2 disabled until enrollment" and never publishes). We
-    // also derive canonical os_family here rather than trusting whatever
-    // string the client sent — the bootstrap script often sends "linux" for
-    // DGX Sparks since /etc/dgx-release is absent on Blackwell; we detect
-    // via `uname -r` ending in `-nvidia` instead. (Closes #114.)
-    let os_family = derive_os_family(payload.os_id.as_deref(), payload.kernel.as_deref());
-    let default_source_tree_path = if node_row.role.eq_ignore_ascii_case("leader") {
-        "~/projects/forge-fleet"
-    } else {
-        "~/.forgefleet/sub-agents/sub-agent-0/forge-fleet"
-    };
-    let has_gpu = payload.has_nvidia.unwrap_or(false);
-    let _ = sqlx::query(
-        "INSERT INTO computers (
-            name, primary_ip, os_family, os_distribution, os_version,
-            cpu_cores, total_ram_gb, has_gpu, gpu_kind,
-            ssh_user, status, source_tree_path, metadata
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
-         ON CONFLICT (name) DO UPDATE SET
-            primary_ip       = EXCLUDED.primary_ip,
-            os_family        = EXCLUDED.os_family,
-            os_distribution  = COALESCE(computers.os_distribution, EXCLUDED.os_distribution),
-            os_version       = COALESCE(computers.os_version, EXCLUDED.os_version),
-            cpu_cores        = EXCLUDED.cpu_cores,
-            total_ram_gb     = EXCLUDED.total_ram_gb,
-            has_gpu          = EXCLUDED.has_gpu,
-            gpu_kind         = COALESCE(computers.gpu_kind, EXCLUDED.gpu_kind),
-            ssh_user         = EXCLUDED.ssh_user,
-            status           = EXCLUDED.status,
-            source_tree_path = COALESCE(computers.source_tree_path, EXCLUDED.source_tree_path)",
-    )
-    .bind(&name)
-    .bind(&payload.ip)
-    .bind(&os_family)
-    .bind(payload.os_id.as_deref())
-    .bind(&payload.os)
-    .bind(payload.cpu_cores)
-    .bind(payload.ram_gb)
-    .bind(has_gpu)
-    .bind(if has_gpu { Some("nvidia") } else { None })
-    .bind(&payload.ssh_user)
-    .bind("online")
-    .bind(default_source_tree_path)
-    .bind(json!({
-        "kernel":         payload.kernel,
-        "enrolled_via":   "self_enroll",
-        "runtime":        payload.runtime,
-    }))
-    .execute(pool)
-    .await;
-
-    // Stash SSH identity.
-    let user_pub = payload.ssh_identity.user_public_key.trim();
-    if !user_pub.is_empty() {
-        let (key_type, fingerprint) = parse_pubkey_meta(user_pub);
-        ff_db::pg_insert_node_ssh_key(pool, &name, "user", user_pub, &key_type, &fingerprint)
-            .await
-            .map_err(|e| db_err("pg_insert_node_ssh_key(user)", e))?;
-    }
-    for host_pub in &payload.ssh_identity.host_public_keys {
-        let host_pub = host_pub.trim();
-        if host_pub.is_empty() {
-            continue;
-        }
-        let (key_type, fingerprint) = parse_pubkey_meta(host_pub);
-        ff_db::pg_insert_node_ssh_key(pool, &name, "host", host_pub, &key_type, &fingerprint)
-            .await
-            .map_err(|e| db_err("pg_insert_node_ssh_key(host)", e))?;
-    }
-
-    // Kick off mesh-propagation deferred task. Runs on leader with SSH access
-    // to every existing peer; appends new node's user pubkey to each peer's
-    // authorized_keys and host keys to known_hosts, then ssh-tests reachability.
-    // Implementation of the shell command lives in Phase 3 (ff-agent::mesh_check).
-    let mesh_payload = json!({
-        "new_node": name,
-        "new_node_ip": payload.ip,
-        "new_node_ssh_user": payload.ssh_user,
-        "user_public_key": user_pub,
-        "host_public_keys": payload.ssh_identity.host_public_keys,
-    });
-    let _ = ff_db::pg_enqueue_deferred(
-        pool,
-        &format!("Mesh propagate SSH for {name}"),
-        "internal", // new kind; executor handles via mesh_check module
-        &mesh_payload,
-        "now",
-        &json!({}),
-        Some("vinny"), // leader only
-        &json!([]),
-        Some("self-enroll"),
-        Some(5),
-    )
-    .await
-    .map_err(|e| db_err("pg_enqueue_deferred(mesh)", e))?;
-
-    // Assemble peer_ssh_identities for the response so the new node can
-    // populate its own authorized_keys + known_hosts.
-    let mut peers = Vec::with_capacity(nodes.len());
-    for peer in &nodes {
-        let user_key = ff_db::pg_list_node_ssh_keys(pool, &peer.name, Some("user"))
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .next()
-            .map(|k| k.public_key);
-        let host_keys: Vec<String> = ff_db::pg_list_node_ssh_keys(pool, &peer.name, Some("host"))
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|k| k.public_key)
-            .collect();
-        peers.push(PeerSshIdentity {
-            name: peer.name.clone(),
-            ip: peer.ip.clone(),
-            ssh_user: peer.ssh_user.clone(),
-            user_public_key: user_key,
-            host_public_keys: host_keys,
-        });
-    }
-
-    // Best-effort: announce the new node via Redis so the dashboard sees it live.
-    let _ = ff_agent::fleet_events::publish_node_online(&name).await;
-
-    Ok(Json(SelfEnrollResponse {
-        assigned_name: name,
-        peer_ssh_identities: peers,
-        // #44: never hand out this gateway's own DSN env — it pins the
-        // enrolling node to the CURRENT primary's IP outside fleet.toml (the
-        // vinny-death time bomb: 12 nodes carried a dead .100 DSN in their
-        // units). Nodes derive the DSN from fleet.toml + dsn_failover; the
-        // fields stay for response-shape compatibility but are always None.
-        // No client-side consumer reads them (verified 2026-07-17).
-        postgres_url: None,
-        redis_url: None,
-    }))
+/// Plaintext/web enrollment is permanently quarantined. The dedicated TLS
+/// listener owns the only supported self-enrollment route.
+pub async fn self_enroll() -> Result<Json<SelfEnrollResponse>, (StatusCode, Json<Value>)> {
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": ONBOARDING_TRANSPORT_QUARANTINE})),
+    ))
 }
 
 // ─── Enrollment progress (script → dashboard) ────────────────────────────
@@ -772,6 +352,9 @@ pub async fn enrollment_progress(
     State(_state): State<Arc<GatewayState>>,
     Json(payload): Json<EnrollmentProgress>,
 ) -> impl IntoResponse {
+    if !secure_onboarding_transport_available() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
     // Lightweight pass-through: publish to Redis so the dashboard's WS can
     // relay without doing its own Postgres poll. Do NOT block on Redis error.
     let channel = format!("fleet:enrollment:{}", payload.name);
@@ -903,74 +486,19 @@ pub async fn check_tcp(Query(q): Query<CheckTcpQuery>) -> Json<Value> {
     Json(json!({"ip": q.ip, "port": q.port, "reachable": reachable}))
 }
 
-// ─── Secret peek (one-shot bootstrap lookup gated by enrollment token) ──
+// ─── Secret peek quarantine ──────────────────────────────────────────────
 //
-// Used by scripts/bootstrap-computer-template.sh §5b to fetch the GitHub PAT
-// before `ff` is installed. The enrollment token doubles as auth — it's
-// the same gate as self-enroll, so no weaker surface is exposed.
-
-#[derive(Debug, Deserialize)]
-pub struct SecretPeekQuery {
-    pub token: String,
-    pub key: String,
-}
-
-pub async fn secret_peek(
-    State(state): State<Arc<GatewayState>>,
-    Query(q): Query<SecretPeekQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Secret peek always requires a valid token — even when
-    // require_shared_secret=false. Exposing secrets without auth would be a
-    // fleet-wide leak, so this endpoint stays locked regardless of the flag.
-    let expected = match state.fleet_config.as_ref() {
-        Some(cfg_lock) => cfg_lock
-            .read()
-            .await
-            .enrollment
-            .resolve_shared_secret()
-            .unwrap_or_default(),
-        None => String::new(),
-    };
-    if expected.is_empty() || q.token != expected {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "invalid enrollment token"})),
-        ));
-    }
-    // Whitelist which keys are allowed — never expose arbitrary secrets.
-    let allowed = [
-        "github.venkat_pat",
-        "github.default_owner",
-        "github_ssh_id_venkat_priv",
-        "github_ssh_id_venkat_pub",
-        "anthropic.oauth_token",
-        "openai.oauth_token",
-        "moonshot.oauth_token",
-        "anthropic.oauth_token.credentials",
-        "openai.oauth_token.credentials",
-        "moonshot.oauth_token.credentials",
-    ];
-    if !allowed.contains(&q.key.as_str()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "key not allowed for bootstrap peek"})),
-        ));
-    }
-    let pool = state
-        .operational_store
-        .as_ref()
-        .and_then(|os| os.pg_pool())
-        .ok_or_else(|| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"postgres pool not available"})),
-            )
-        })?;
-    let value = ff_db::pg_get_secret(pool, &q.key)
-        .await
-        .map_err(|e| db_err("pg_get_secret", e))?
-        .unwrap_or_default();
-    Ok(Json(json!({"key": q.key, "value": value})))
+// Retain the legacy route temporarily so old bootstrap clients receive an
+// explicit terminal response, but never consult enrollment policy, Postgres,
+// or another secret authority. Unix onboarding reads directly from 1Password;
+// the insecure Windows flow is quarantined until it can do the same.
+pub async fn secret_peek() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::GONE,
+        Json(json!({
+            "error": "bootstrap secret retrieval is disabled; use direct 1Password authority"
+        })),
+    )
 }
 
 // ─── Fleet tooling matrix (for /versions dashboard page) ────────────────
@@ -1098,7 +626,7 @@ fn db_err(op: &str, e: impl std::fmt::Display) -> (StatusCode, Json<Value>) {
 /// Parse the type and fingerprint of an OpenSSH public-key string. Returns
 /// ("unknown", sha256-of-key-body) if parsing fails — good enough for DB
 /// dedup via unique constraint on (worker_name, fingerprint).
-fn parse_pubkey_meta(pubkey: &str) -> (String, String) {
+pub(crate) fn parse_pubkey_meta(pubkey: &str) -> (String, String) {
     use sha2::{Digest, Sha256};
     let mut parts = pubkey.split_whitespace();
     let key_type = parts.next().unwrap_or("unknown").to_string();
@@ -1122,7 +650,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Compute default sub_agent_count: `max(1, min(cores/2, ram_gb/16, 4))`,
 /// softcap bumped to 8 if the node has an NVIDIA GPU and ≥ 64 GB RAM.
-fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 {
+pub(crate) fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 {
     let from_cores = (cores / 2).max(1);
     let from_ram = (ram_gb / 16).max(1);
     let soft_cap = if has_nvidia && ram_gb >= 64 { 8 } else { 4 };
@@ -1136,7 +664,7 @@ fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 
 /// Lightweight Redis publish; no dedicated crate import — we shell out to a
 /// tiny helper to avoid adding another dep on ff-gateway (ff-pulse has the
 /// redis crate). Best-effort: failures are logged, not raised.
-async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
+pub(crate) async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
     // Read redis URL from env; default localhost:56379.
     let url = std::env::var("FORGEFLEET_REDIS_URL")
         .unwrap_or_else(|_| "redis://192.168.5.100:56379".into());
@@ -1175,9 +703,21 @@ fn parse_redis_hostport(url: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod bootstrap_lifecycle_tests {
-    use super::BOOTSTRAP_TEMPLATE;
+    use super::{
+        BOOTSTRAP_TEMPLATE, ONBOARDING_TRANSPORT_QUARANTINE, bootstrap_script,
+        bootstrap_script_ps1, secret_peek, secure_onboarding_transport_available, self_enroll,
+    };
+    use axum::{
+        Json, Router,
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+        routing::{get, post},
+    };
+    use serde_json::json;
+    use tower::ServiceExt;
 
     const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleetd.service");
+    const MCP_SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/forgefleet-mcp.service");
 
     #[test]
     fn linux_bootstrap_uses_canonical_redis_port() {
@@ -1195,6 +735,10 @@ mod bootstrap_lifecycle_tests {
             "user_systemctl restart forgefleetd.service",
             "user_systemctl is-enabled forgefleetd.service",
             "user_systemctl is-active forgefleetd.service",
+            "user_systemctl enable forgefleetd.service forgefleet-mcp.service",
+            "user_systemctl restart forgefleet-mcp.service",
+            "user_systemctl is-enabled forgefleet-mcp.service",
+            "user_systemctl is-active forgefleet-mcp.service",
         ] {
             assert!(
                 BOOTSTRAP_TEMPLATE.contains(required),
@@ -1216,5 +760,291 @@ mod bootstrap_lifecycle_tests {
         assert!(SYSTEMD_UNIT.contains("Restart=on-failure"));
         assert!(SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
         assert!(SYSTEMD_UNIT.contains("ExecStart=%h/.local/bin/forgefleetd start"));
+        assert!(MCP_SYSTEMD_UNIT.contains("Restart=always"));
+        assert!(MCP_SYSTEMD_UNIT.contains("[Install]\nWantedBy=default.target"));
+        assert!(
+            MCP_SYSTEMD_UNIT
+                .contains("ExecStart=%h/.local/bin/forgefleetd mcp --listen 0.0.0.0:50001")
+        );
+    }
+
+    #[test]
+    fn mac_bootstrap_installs_and_loads_a_separate_mcp_launch_agent() {
+        for required in [
+            "com.forgefleet.forgefleet-mcp.plist",
+            "<string>com.forgefleet.forgefleet-mcp</string>",
+            "<string>mcp</string>",
+            "<string>--listen</string>",
+            "<string>0.0.0.0:50001</string>",
+            "launchctl bootstrap \"gui/$USER_UID\" \"$MCP_PLIST_TARGET\"",
+            "launchctl enable \"$MCP_GUI_DOMAIN\"",
+            "launchctl kickstart -k \"$MCP_GUI_DOMAIN\"",
+            "launchctl print \"$MCP_GUI_DOMAIN\"",
+            "die \"launchd did not register the separate ForgeFleet MCP agent\"",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing separate macOS MCP service step: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn mac_mcp_launch_agent_is_linted_and_atomically_published_before_restart() {
+        let stage = BOOTSTRAP_TEMPLATE
+            .find("MCP_PLIST_TMP=\"")
+            .expect("same-directory MCP plist staging");
+        let mcp = &BOOTSTRAP_TEMPLATE[stage..];
+        let lint = mcp
+            .find("plutil -lint \"$MCP_PLIST_TMP\"")
+            .expect("plutil lint");
+        let publish = mcp
+            .find("mv -f \"$MCP_PLIST_TMP\" \"$MCP_PLIST_TARGET\"")
+            .expect("atomic plist publish");
+        let bootout = mcp
+            .find("launchctl bootout \"gui/$USER_UID\" \"$MCP_PLIST_TARGET\"")
+            .expect("launchd bootout");
+        let bootstrap = mcp
+            .find("launchctl bootstrap \"gui/$USER_UID\" \"$MCP_PLIST_TARGET\"")
+            .expect("launchd bootstrap");
+        assert!(lint < publish && publish < bootout && bootout < bootstrap);
+        assert!(mcp.contains("mktemp \"$PLIST_TARGET_DIR/.com.forgefleet.forgefleet-mcp.XXXXXX\""));
+        assert!(!mcp.contains("cat > '$MCP_PLIST_TARGET'"));
+    }
+
+    #[test]
+    fn bootstrap_verifies_mcp_listener_and_tools_before_client_install() {
+        let health = BOOTSTRAP_TEMPLATE
+            .find("http://127.0.0.1:50001/mcp/health")
+            .expect("MCP health probe");
+        let tools = BOOTSTRAP_TEMPLATE
+            .find("\\\"method\\\":\\\"tools/list\\\"")
+            .expect("MCP tools/list probe");
+        let install = BOOTSTRAP_TEMPLATE
+            .find("mcp install --for all --no-instructions")
+            .expect("MCP client install");
+        assert!(health < tools && tools < install);
+        assert!(BOOTSTRAP_TEMPLATE.contains("die \"separate ForgeFleet MCP returned no tools\""));
+    }
+
+    #[test]
+    fn linux_bootstrap_restricts_fleet_toml_for_new_and_existing_files() {
+        assert!(BOOTSTRAP_TEMPLATE.contains("umask 077\ncat > '$FLEET_TOML'"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("run_as_user chmod 600 \"$FLEET_TOML\""));
+        assert!(BOOTSTRAP_TEMPLATE.contains("failed to restrict $FLEET_TOML to mode 0600"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("$FLEET_TOML_RESULT; mode=0600"));
+    }
+
+    #[test]
+    fn linux_bootstrap_delegates_mcp_config_to_typed_installer() {
+        assert!(BOOTSTRAP_TEMPLATE.contains(
+            "run_as_user \"$USER_HOME/.local/bin/ff\" mcp install --for all --no-instructions"
+        ));
+        assert!(BOOTSTRAP_TEMPLATE.contains("grep -Fq '✗'"));
+        assert!(
+            BOOTSTRAP_TEMPLATE
+                .contains("report \"mcp-config\" failed \"canonical installer reported")
+        );
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains(
+                "die \"ff mcp install reported one or more client configuration failures\""
+            )
+        );
+        assert!(BOOTSTRAP_TEMPLATE.contains("die \"ff mcp install failed\""));
+        for stale_writer in [
+            "CLAUDE_MCP_FILE",
+            "CODEX_CONFIG_FILE",
+            "GEMINI_FILE",
+            "claude mcp add forgefleet",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(stale_writer),
+                "bootstrap still contains bespoke MCP writer: {stale_writer}"
+            );
+        }
+    }
+
+    #[test]
+    fn linux_bootstrap_installs_official_1password_cli_for_host_architecture() {
+        for required in [
+            "https://downloads.1password.com/linux/keys/1password.asc",
+            "OP_DEB_ARCH=\"$(dpkg --print-architecture)\"",
+            "https://downloads.1password.com/linux/debian/%s stable main",
+            "apt-get install -y 1password-cli",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing 1Password prerequisite: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn bootstrap_never_receives_vault_or_centralized_credentials() {
+        for forbidden in [
+            "peek_secret",
+            "/api/fleet/secret-peek",
+            "secret-peek?token=",
+            "fleet_secrets",
+            "ff github sync",
+            "github_ssh_id_venkat_priv",
+            "github_ssh_id_venkat_pub",
+            "anthropic.oauth_token.credentials",
+            "openai.oauth_token.credentials",
+            "moonshot.oauth_token.credentials",
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "OP_VAULT_REF",
+            "CREDENTIAL_DOCUMENT_REF",
+            "id_venkat.private",
+            ".credentials.json",
+            ".codex/auth.json",
+            ".kimi/credentials",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(forbidden),
+                "bootstrap still contains target-side credential path: {forbidden}"
+            );
+        }
+        assert!(BOOTSTRAP_TEMPLATE.contains("https://github.com/${GITHUB_OWNER}/forge-fleet.git"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("auth deferred to fleet distributor"));
+    }
+
+    #[test]
+    fn bootstrap_defers_cloud_auth_until_after_admission() {
+        assert!(BOOTSTRAP_TEMPLATE.contains("authentication remains post-enrollment"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("auth deferred to fleet distributor"));
+        for forbidden in ["atomic_install_json_credential", "document get", "op://"] {
+            assert!(!BOOTSTRAP_TEMPLATE.contains(forbidden));
+        }
+    }
+
+    #[test]
+    fn bootstrap_uses_public_https_clone_and_retains_pinned_future_host_trust() {
+        for required in [
+            "https://github.com/${GITHUB_OWNER}/forge-fleet.git",
+            "UserKnownHostsFile ~/.ssh/known_hosts.github",
+            "GlobalKnownHostsFile /dev/null",
+            "StrictHostKeyChecking yes",
+            "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s",
+            "SHA256:p2QAMXNIC1TJYWeIOttrVc98/R1BUFWu3/LiyKgUfQM",
+            "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU",
+        ] {
+            assert!(
+                BOOTSTRAP_TEMPLATE.contains(required),
+                "bootstrap is missing GitHub SSH verification contract: {required}"
+            );
+        }
+        assert!(!BOOTSTRAP_TEMPLATE.contains("ssh-keyscan"));
+        assert!(!BOOTSTRAP_TEMPLATE.contains("id_venkat.private"));
+        assert!(!BOOTSTRAP_TEMPLATE.contains("git@github.com-venkat"));
+    }
+
+    #[tokio::test]
+    async fn legacy_secret_peek_route_is_permanently_fail_closed() {
+        let (status, Json(body)) = secret_peek().await;
+        assert_eq!(status, StatusCode::GONE);
+        assert_eq!(
+            body,
+            json!({
+                "error": "bootstrap secret retrieval is disabled; use direct 1Password authority"
+            })
+        );
+        assert!(body.get("value").is_none());
+        assert!(body.get("key").is_none());
+    }
+
+    #[test]
+    fn credential_bearing_onboarding_stays_quarantined_without_server_tls_evidence() {
+        assert!(!secure_onboarding_transport_available());
+        assert!(ONBOARDING_TRANSPORT_QUARANTINE.contains("server-verified TLS"));
+        assert_eq!(
+            ONBOARDING_TRANSPORT_QUARANTINE,
+            "new-node onboarding is quarantined until the gateway has server-verified TLS transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_http_ps1_and_web_enrollment_are_quarantined_over_real_http() {
+        let router = Router::new()
+            .route("/onboard/bootstrap.sh", get(bootstrap_script))
+            .route("/onboard/bootstrap.ps1", get(bootstrap_script_ps1))
+            .route("/api/fleet/self-enroll", post(self_enroll));
+
+        for (method, path) in [
+            ("GET", "/onboard/bootstrap.sh"),
+            ("GET", "/onboard/bootstrap.ps1"),
+            ("POST", "/api/fleet/self-enroll"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("legacy onboarding request"),
+                )
+                .await
+                .expect("legacy onboarding response");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+            let body = to_bytes(response.into_body(), 16 * 1024)
+                .await
+                .expect("legacy onboarding response body");
+            let body = String::from_utf8(body.to_vec()).expect("UTF-8 quarantine response");
+            assert!(body.contains("server-verified TLS"), "{path}: {body}");
+            assert!(
+                !body.contains("FORGEFLEET_ENROLLMENT_TOKEN"),
+                "{path}: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_bootstrap_does_not_embed_the_enrollment_secret() {
+        assert!(!BOOTSTRAP_TEMPLATE.contains("{{TOKEN}}"));
+        assert!(BOOTSTRAP_TEMPLATE.contains("TOKEN=\"${FORGEFLEET_ENROLLMENT_TOKEN:-}\""));
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains("a valid one-time FORGEFLEET_ENROLLMENT_TOKEN is required")
+        );
+        assert!(BOOTSTRAP_TEMPLATE.contains("--data-binary @-"));
+        assert!(
+            BOOTSTRAP_TEMPLATE.contains("unset ENROLL_PAYLOAD TOKEN FORGEFLEET_ENROLLMENT_TOKEN")
+        );
+        assert!(!BOOTSTRAP_TEMPLATE.contains("--data \"$ENROLL_PAYLOAD\""));
+    }
+
+    #[test]
+    fn service_account_token_is_absent_from_joining_node_script() {
+        for forbidden in [
+            "OP_SERVICE_ACCOUNT_TOKEN",
+            "--preserve-env=FORGEFLEET_ENROLLMENT_TOKEN,",
+            "document get",
+            "op://",
+            "private_key",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(forbidden),
+                "joining-node bootstrap still contains broad credential path: {forbidden}"
+            );
+        }
+        assert!(BOOTSTRAP_TEMPLATE.contains("export -n FORGEFLEET_ENROLLMENT_TOKEN"));
+    }
+
+    #[test]
+    fn linux_bootstrap_never_fetches_or_persists_github_pat() {
+        assert!(
+            BOOTSTRAP_TEMPLATE
+                .contains("API token is injected on demand from fleet/1Password authority")
+        );
+        for forbidden in [
+            "GITHUB_PAT_SECRET_KEY",
+            "PAT_VALUE",
+            "gh auth login --with-token",
+        ] {
+            assert!(
+                !BOOTSTRAP_TEMPLATE.contains(forbidden),
+                "bootstrap still contains plaintext PAT path: {forbidden}"
+            );
+        }
     }
 }

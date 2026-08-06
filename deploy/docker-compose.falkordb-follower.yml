@@ -1,0 +1,71 @@
+services:
+  falkordb-replica:
+    image: falkordb/falkordb@sha256:9042fdc4e53f5390ca5a3993aa71506523970efb40ffb9a98e6a4b1a9a4f8862
+    pull_policy: never
+    container_name: forgefleet-falkordb-replica
+    restart: unless-stopped
+    network_mode: host
+    # The pinned image's run.sh appends `--protected-mode no` after REDIS_ARGS.
+    # Invoke the verified server binary directly so `yes` is the sole/final value.
+    entrypoint:
+      - /usr/local/bin/redis-server
+    command:
+      - --port
+      - "63380"
+      - --bind
+      - 127.0.0.1
+      - --replicaof
+      - "${FALKORDB_PRIMARY_HOST:?set FALKORDB_PRIMARY_HOST}"
+      - "63379"
+      - --replica-read-only
+      - "yes"
+      - --replica-serve-stale-data
+      - "no"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - "60 1"
+      - --dir
+      - /var/lib/falkordb/data
+      - --loadmodule
+      - /var/lib/falkordb/bin/falkordb.so
+      - THREAD_COUNT
+      - "8"
+      - CACHE_SIZE
+      - "100"
+      - --protected-mode
+      - "yes"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,nodev,nosuid,noexec,size=64m
+    volumes:
+      - forgefleet-falkordb-replica-data:/var/lib/falkordb/data
+    environment:
+      BROWSER: "0"
+      REDIS_ARGS: >-
+        --port 63380
+        --bind 127.0.0.1
+        --replicaof ${FALKORDB_PRIMARY_HOST:?set FALKORDB_PRIMARY_HOST} 63379
+        --replica-read-only yes
+        --replica-serve-stale-data no
+        --appendonly yes
+        --appendfsync everysec
+        --save 60 1
+        --protected-mode yes
+      FALKORDB_ARGS: "THREAD_COUNT 8 CACHE_SIZE 100"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "63380", "PING"]
+      interval: 5s
+      timeout: 3s
+      retries: 24
+      start_period: 30s
+
+volumes:
+  forgefleet-falkordb-replica-data:
+    name: forgefleet-falkordb-replica-data

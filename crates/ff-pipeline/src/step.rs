@@ -66,6 +66,12 @@ pub enum StepKind {
         prompt: String,
         model: Option<String>,
         max_tokens: Option<u32>,
+        /// Optional OpenAI-compatible endpoint for this step.
+        ///
+        /// When present, this is authoritative and the executor must not fall
+        /// back to its global endpoint if it is invalid or unreachable.
+        #[serde(default)]
+        endpoint: Option<String>,
     },
     /// Make an HTTP call.
     HttpCall {
@@ -369,5 +375,31 @@ mod tests {
         let json = serde_json::to_string(&step).unwrap();
         let back: Step = serde_json::from_str(&json).unwrap();
         assert_eq!(back.id, step.id);
+    }
+
+    #[test]
+    fn legacy_llm_prompt_without_endpoint_deserializes() {
+        let json = r#"{
+            "id": "llm",
+            "name": "Legacy prompt",
+            "kind": {
+                "type": "llm_prompt",
+                "prompt": "hello",
+                "model": null,
+                "max_tokens": 128
+            },
+            "config": {
+                "timeout": 30,
+                "retries": 0,
+                "retry_delay": 1,
+                "allow_failure": false
+            }
+        }"#;
+
+        let step: Step = serde_json::from_str(json).unwrap();
+        assert!(matches!(
+            step.kind,
+            StepKind::LlmPrompt { endpoint: None, .. }
+        ));
     }
 }

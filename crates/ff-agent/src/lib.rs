@@ -1,10 +1,12 @@
 #![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
 
+pub mod ace_mlx_import;
 pub mod agent_coordinator;
 pub mod agent_hint;
 pub mod agent_loop;
 pub mod agent_roles;
 pub mod arbiter;
+pub mod artifact_registry;
 pub mod auto_backlog_feeder;
 pub mod auto_upgrade;
 pub mod autoscaler;
@@ -16,9 +18,12 @@ pub mod dispatch_concurrency;
 pub mod dispatch_context;
 pub mod dispatcher;
 pub mod notification;
+pub mod release_artifact_activation;
+pub mod release_rollout_coordinator;
 pub mod research;
 pub mod retry_policy;
 pub mod review_pipeline;
+pub mod runtime_artifact;
 pub mod skill_catalog;
 pub mod skill_evidence;
 pub mod slm;
@@ -1015,6 +1020,7 @@ fn build_pipeline_graph(
                 ),
                 model: task.model.clone(),
                 max_tokens: task.max_tokens.or(Some(512)),
+                endpoint: None,
             },
         };
 

@@ -8,6 +8,7 @@ StartLimitBurst=100
 Type=simple
 ExecStart=%h/.local/bin/forgefleetd mcp --listen 0.0.0.0:50001
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=SSH_AUTH_SOCK=
 Restart=always
 RestartSec=2
 StandardOutput=append:%h/.forgefleet/logs/forgefleet-mcp.log

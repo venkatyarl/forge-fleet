@@ -1,0 +1,1104 @@
+//! Exact V295 release-rollout authority and leased/CAS execution APIs.
+//!
+//! V291 owns immutable artifact bytes. This module binds exactly two V291
+//! artifacts (`ff`, `forgefleetd`) to each exact target identity, seals the
+//! complete set atomically, and exposes only lease-fenced CAS state changes.
+
+use std::collections::BTreeSet;
+
+use sqlx::{PgPool, Row};
+use uuid::Uuid;
+
+use crate::error::{DbError, Result};
+
+pub const FORBIDDEN_VINNY_NAME: &str = "vinny";
+pub const FORBIDDEN_VINNY_ID: Uuid = Uuid::from_u128(0xe7f5d063_d7b7_4338_bd6e_5d02d74770ad);
+pub const RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY: i64 = 0x4646_524f_4c4c_4155;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutArtifactAuthority {
+    pub artifact_name: String,
+    pub artifact_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutTargetAuthority {
+    pub target_ordinal: u32,
+    pub computer_id: Uuid,
+    pub computer_name: String,
+    pub target_triple: String,
+    pub artifact_version: String,
+    pub artifacts: Vec<RolloutArtifactAuthority>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRolloutAuthoritySpec {
+    pub source_commit: String,
+    pub created_by: String,
+    pub targets: Vec<RolloutTargetAuthority>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutAuthorityRegistrationOutcome {
+    Inserted,
+    ExactExisting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRolloutAuthorityRow {
+    pub id: Uuid,
+    pub source_commit: String,
+    pub expected_target_count: i32,
+    pub expected_artifact_count: i32,
+    pub created_by: String,
+    pub sealed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutAuthorityRegistration {
+    pub authority: ReleaseRolloutAuthorityRow,
+    pub outcome: RolloutAuthorityRegistrationOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReleaseRolloutTransactionRow {
+    pub id: Uuid,
+    pub request_id: Uuid,
+    pub authority_id: Uuid,
+    pub state: String,
+    pub lease_token: Uuid,
+    pub lease_owner: String,
+    pub lease_expires_at: chrono::DateTime<chrono::Utc>,
+    pub lease_seconds: i32,
+    pub cas_revision: i64,
+    pub expected_target_count: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutTransactionBeginOutcome {
+    Inserted,
+    ExactExisting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RolloutTransactionBegin {
+    pub transaction: ReleaseRolloutTransactionRow,
+    pub outcome: RolloutTransactionBeginOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleaseRolloutTargetStateRow {
+    pub transaction_id: Uuid,
+    pub computer_id: Uuid,
+    pub computer_name: String,
+    pub state: String,
+    pub cas_revision: i64,
+    pub detail: Option<String>,
+}
+
+fn is_full_lower_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn canonical_operator(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'@' | b'-'))
+}
+
+fn canonical_computer_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value.as_bytes()[value.len() - 1].is_ascii_alphanumeric()
+}
+
+fn canonical_target_triple(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    (3..=5).contains(&parts.len())
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'.')
+                })
+        })
+}
+
+fn canonical_artifact_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b'+' | b'-')
+        })
+}
+
+fn validate_authority_spec(spec: &ReleaseRolloutAuthoritySpec) -> Result<()> {
+    if !is_full_lower_sha(&spec.source_commit) {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout authority requires a full lowercase source commit".to_string(),
+        ));
+    }
+    if !canonical_operator(&spec.created_by) {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout authority creator is not canonical".to_string(),
+        ));
+    }
+    if spec.targets.is_empty() || spec.targets.len() > 64 {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout authority requires 1-64 exact targets".to_string(),
+        ));
+    }
+    let mut ids = BTreeSet::new();
+    let mut names = BTreeSet::new();
+    let mut ordinals = BTreeSet::new();
+    for (expected_ordinal, target) in spec.targets.iter().enumerate() {
+        if target.computer_id == FORBIDDEN_VINNY_ID
+            || target
+                .computer_name
+                .eq_ignore_ascii_case(FORBIDDEN_VINNY_NAME)
+        {
+            return Err(DbError::ArtifactIntegrity(
+                "release rollout authority forbids Vinny by exact name and UUID".to_string(),
+            ));
+        }
+        if !canonical_computer_name(&target.computer_name)
+            || !canonical_target_triple(&target.target_triple)
+            || !canonical_artifact_version(&target.artifact_version)
+        {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "rollout target {} has non-canonical identity",
+                target.computer_name
+            )));
+        }
+        if target.target_ordinal as usize != expected_ordinal
+            || !ordinals.insert(target.target_ordinal)
+            || !ids.insert(target.computer_id)
+            || !names.insert(target.computer_name.as_str())
+        {
+            return Err(DbError::ArtifactIntegrity(
+                "rollout targets contain duplicate or non-contiguous identity".to_string(),
+            ));
+        }
+        if target.artifacts.len() != 2 {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "rollout target {} requires exactly two artifacts",
+                target.computer_name
+            )));
+        }
+        let artifact_names = target
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.artifact_name.as_str())
+            .collect::<BTreeSet<_>>();
+        if artifact_names != BTreeSet::from(["ff", "forgefleetd"])
+            || target.artifacts[0].artifact_id == target.artifacts[1].artifact_id
+        {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "rollout target {} artifact set is not exactly ff + forgefleetd",
+                target.computer_name
+            )));
+        }
+    }
+    if ordinals != (0..spec.targets.len() as u32).collect() {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout target ordinals must be contiguous from zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn authority_from_row(row: &sqlx::postgres::PgRow) -> ReleaseRolloutAuthorityRow {
+    ReleaseRolloutAuthorityRow {
+        id: row.get("id"),
+        source_commit: row.get("source_commit"),
+        expected_target_count: row.get("expected_target_count"),
+        expected_artifact_count: row.get("expected_artifact_count"),
+        created_by: row.get("created_by"),
+        sealed: row
+            .get::<Option<chrono::DateTime<chrono::Utc>>, _>("sealed_at")
+            .is_some(),
+    }
+}
+
+fn transaction_from_row(row: &sqlx::postgres::PgRow) -> ReleaseRolloutTransactionRow {
+    ReleaseRolloutTransactionRow {
+        id: row.get("id"),
+        request_id: row.get("request_id"),
+        authority_id: row.get("authority_id"),
+        state: row.get("state"),
+        lease_token: row.get("lease_token"),
+        lease_owner: row.get("lease_owner"),
+        lease_expires_at: row.get("lease_expires_at"),
+        lease_seconds: row.get("lease_seconds"),
+        cas_revision: row.get("cas_revision"),
+        expected_target_count: row.get("expected_target_count"),
+    }
+}
+
+/// Look up one rollout transaction by the operator-supplied idempotency key.
+///
+/// This is deliberately read-only: it lets an operator recover the durable
+/// transaction identity after a client disconnects immediately after begin.
+pub async fn pg_get_release_rollout_transaction_by_request_id(
+    pool: &PgPool,
+    request_id: Uuid,
+) -> Result<Option<ReleaseRolloutTransactionRow>> {
+    if !release_rollout_schema_is_exact(pool).await? {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout authority or post-success rollback schema drifted".to_string(),
+        ));
+    }
+    let row = sqlx::query(
+        "SELECT id, request_id, authority_id, state, lease_token, lease_owner,
+                lease_expires_at, lease_seconds, cas_revision, expected_target_count
+           FROM release_rollout_transactions
+          WHERE request_id = $1",
+    )
+    .bind(request_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(transaction_from_row))
+}
+
+async fn exact_existing_authority(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    row: ReleaseRolloutAuthorityRow,
+    spec: &ReleaseRolloutAuthoritySpec,
+) -> Result<RolloutAuthorityRegistration> {
+    if row.source_commit != spec.source_commit
+        || row.created_by != spec.created_by
+        || row.expected_target_count != spec.targets.len() as i32
+        || row.expected_artifact_count != (spec.targets.len() * 2) as i32
+        || !row.sealed
+    {
+        return Err(DbError::ArtifactIntegrity(
+            "existing rollout authority parent drifted".to_string(),
+        ));
+    }
+    let targets = sqlx::query(
+        "SELECT target_ordinal, computer_id, computer_name, target_triple, artifact_version
+           FROM release_rollout_authority_targets
+          WHERE authority_id = $1 ORDER BY target_ordinal",
+    )
+    .bind(row.id)
+    .fetch_all(&mut **transaction)
+    .await?;
+    if targets.len() != spec.targets.len() {
+        return Err(DbError::ArtifactIntegrity(
+            "existing rollout authority target count drifted".to_string(),
+        ));
+    }
+    for (stored, expected) in targets.iter().zip(&spec.targets) {
+        if stored.get::<i32, _>("target_ordinal") != expected.target_ordinal as i32
+            || stored.get::<Uuid, _>("computer_id") != expected.computer_id
+            || stored.get::<String, _>("computer_name") != expected.computer_name
+            || stored.get::<String, _>("target_triple") != expected.target_triple
+            || stored.get::<String, _>("artifact_version") != expected.artifact_version
+        {
+            return Err(DbError::ArtifactIntegrity(
+                "existing rollout authority target identity drifted".to_string(),
+            ));
+        }
+        let artifacts = sqlx::query(
+            "SELECT artifact_name, artifact_id
+               FROM release_rollout_authority_artifacts
+              WHERE authority_id = $1 AND computer_id = $2
+              ORDER BY artifact_name",
+        )
+        .bind(row.id)
+        .bind(expected.computer_id)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let mut expected_artifacts = expected.artifacts.clone();
+        expected_artifacts.sort_by(|a, b| a.artifact_name.cmp(&b.artifact_name));
+        if artifacts.len() != expected_artifacts.len()
+            || artifacts
+                .iter()
+                .zip(expected_artifacts)
+                .any(|(stored, expected)| {
+                    stored.get::<String, _>("artifact_name") != expected.artifact_name
+                        || stored.get::<Uuid, _>("artifact_id") != expected.artifact_id
+                })
+        {
+            return Err(DbError::ArtifactIntegrity(
+                "existing rollout authority release identity drifted".to_string(),
+            ));
+        }
+    }
+    Ok(RolloutAuthorityRegistration {
+        authority: row,
+        outcome: RolloutAuthorityRegistrationOutcome::ExactExisting,
+    })
+}
+
+/// Insert and seal one exact source/release/target authority, or return the
+/// byte-for-byte equivalent sealed authority for an idempotent retry.
+pub async fn pg_register_release_rollout_authority(
+    pool: &PgPool,
+    spec: &ReleaseRolloutAuthoritySpec,
+) -> Result<RolloutAuthorityRegistration> {
+    validate_authority_spec(spec)?;
+    if !release_rollout_schema_is_exact(pool).await? {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout authority schema or committed authority data drifted".to_string(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY)
+        .execute(&mut *transaction)
+        .await?;
+    if let Some(existing) = sqlx::query(
+        "SELECT id, source_commit, expected_target_count, expected_artifact_count,
+                created_by, sealed_at
+           FROM release_rollout_authorities
+          WHERE source_commit = $1 FOR UPDATE",
+    )
+    .bind(&spec.source_commit)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        let result =
+            exact_existing_authority(&mut transaction, authority_from_row(&existing), spec).await?;
+        transaction.commit().await?;
+        return Ok(result);
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO release_rollout_authorities
+            (source_commit, expected_target_count, expected_artifact_count, created_by)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, source_commit, expected_target_count, expected_artifact_count,
+                   created_by, sealed_at",
+    )
+    .bind(&spec.source_commit)
+    .bind(spec.targets.len() as i32)
+    .bind((spec.targets.len() * 2) as i32)
+    .bind(&spec.created_by)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let authority_id: Uuid = inserted.get("id");
+    for target in &spec.targets {
+        sqlx::query(
+            "INSERT INTO release_rollout_authority_targets
+                (authority_id, target_ordinal, computer_id, computer_name,
+                 target_triple, artifact_version)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(authority_id)
+        .bind(target.target_ordinal as i32)
+        .bind(target.computer_id)
+        .bind(&target.computer_name)
+        .bind(&target.target_triple)
+        .bind(&target.artifact_version)
+        .execute(&mut *transaction)
+        .await?;
+        for artifact in &target.artifacts {
+            sqlx::query(
+                "INSERT INTO release_rollout_authority_artifacts
+                    (authority_id, computer_id, artifact_name, artifact_id)
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(authority_id)
+            .bind(target.computer_id)
+            .bind(&artifact.artifact_name)
+            .bind(artifact.artifact_id)
+            .execute(&mut *transaction)
+            .await?;
+        }
+    }
+    let sealed = sqlx::query(
+        "UPDATE release_rollout_authorities SET sealed_at = clock_timestamp()
+          WHERE id = $1 AND sealed_at IS NULL
+          RETURNING id, source_commit, expected_target_count, expected_artifact_count,
+                    created_by, sealed_at",
+    )
+    .bind(authority_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(RolloutAuthorityRegistration {
+        authority: authority_from_row(&sealed),
+        outcome: RolloutAuthorityRegistrationOutcome::Inserted,
+    })
+}
+
+/// Atomically create a leased transaction and its complete exact target-state
+/// set. `request_id` is the idempotency key; a mismatched replay fails closed.
+pub async fn pg_begin_release_rollout(
+    pool: &PgPool,
+    request_id: Uuid,
+    authority_id: Uuid,
+    lease_owner: &str,
+    lease_seconds: i32,
+) -> Result<RolloutTransactionBegin> {
+    if !canonical_operator(lease_owner) || !(30..=3600).contains(&lease_seconds) {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout lease owner or duration is invalid".to_string(),
+        ));
+    }
+    if !release_rollout_schema_is_exact(pool).await? {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout authority schema or committed authority data drifted".to_string(),
+        ));
+    }
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY)
+        .execute(&mut *transaction)
+        .await?;
+    if let Some(existing) = sqlx::query(
+        "SELECT id, request_id, authority_id, state, lease_token, lease_owner,
+                lease_expires_at, lease_seconds, cas_revision, expected_target_count
+           FROM release_rollout_transactions WHERE request_id = $1 FOR UPDATE",
+    )
+    .bind(request_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    {
+        let existing = transaction_from_row(&existing);
+        if existing.authority_id != authority_id
+            || existing.lease_owner != lease_owner
+            || existing.lease_seconds != lease_seconds
+        {
+            return Err(DbError::ArtifactIntegrity(
+                "rollout request id replay drifted".to_string(),
+            ));
+        }
+        transaction.commit().await?;
+        return Ok(RolloutTransactionBegin {
+            transaction: existing,
+            outcome: RolloutTransactionBeginOutcome::ExactExisting,
+        });
+    }
+    let target_count: i32 = sqlx::query_scalar(
+        "SELECT expected_target_count
+           FROM release_rollout_authorities
+          WHERE id = $1 AND sealed_at IS NOT NULL FOR KEY SHARE",
+    )
+    .bind(authority_id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(|| {
+        DbError::ArtifactIntegrity("rollout authority is missing or unsealed".to_string())
+    })?;
+
+    // Re-attest the sealed name+UUID pairs against both live registries while
+    // the global rollout authority lock is held.  The sealed rows remain the
+    // only target authority; registry extras are never derived into this set.
+    let live_targets = sqlx::query(
+        "SELECT target.computer_id, target.computer_name,
+                computer.id AS live_computer_id, computer.name AS live_computer_name,
+                computer.status AS computer_status, worker.status AS worker_status
+           FROM release_rollout_authority_targets target
+           LEFT JOIN computers computer
+             ON computer.id = target.computer_id
+            AND computer.name = target.computer_name
+           LEFT JOIN fleet_workers worker ON worker.name = target.computer_name
+          WHERE target.authority_id = $1
+          ORDER BY target.target_ordinal",
+    )
+    .bind(authority_id)
+    .fetch_all(&mut *transaction)
+    .await?;
+    if live_targets.len() != target_count as usize {
+        return Err(DbError::ArtifactIntegrity(
+            "sealed rollout target roster is partial".to_string(),
+        ));
+    }
+    let mut sealed_target_ids = BTreeSet::new();
+    for target in &live_targets {
+        let sealed_id: Uuid = target.get("computer_id");
+        let sealed_name: String = target.get("computer_name");
+        let live_id: Option<Uuid> = target.get("live_computer_id");
+        let live_name: Option<String> = target.get("live_computer_name");
+        let computer_status: Option<String> = target.get("computer_status");
+        let worker_status: Option<String> = target.get("worker_status");
+        if live_id != Some(sealed_id)
+            || live_name.as_deref() != Some(sealed_name.as_str())
+            || !computer_status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "active" | "online"))
+            || !worker_status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "active" | "online"))
+        {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "sealed rollout target {sealed_name} drifted or is not active in both registries"
+            )));
+        }
+        sealed_target_ids.insert(sealed_id);
+    }
+
+    // The legacy staged rollout and this exact-artifact rollout use the same
+    // advisory lock.  Parse every active legacy roster while holding it, map
+    // names through the live computer registry, and refuse UUID overlap before
+    // creating the artifact transaction.  Malformed active legacy authority is
+    // unprovable and therefore also fails closed.
+    let active_legacy = sqlx::query(
+        "SELECT id, stages
+           FROM upgrade_rollouts
+          WHERE status = 'in_progress'
+          ORDER BY id
+          FOR SHARE",
+    )
+    .fetch_all(&mut *transaction)
+    .await?;
+    let mut legacy_names = BTreeSet::new();
+    for legacy in active_legacy {
+        let rollout_id: Uuid = legacy.get("id");
+        let stages: Option<serde_json::Value> = legacy.get("stages");
+        let stages = stages
+            .as_ref()
+            .and_then(serde_json::Value::as_array)
+            .filter(|stages| !stages.is_empty())
+            .ok_or_else(|| {
+                DbError::ArtifactIntegrity(format!(
+                    "active legacy rollout {rollout_id} has malformed stages"
+                ))
+            })?;
+        for stage in stages {
+            let target_names = stage
+                .as_object()
+                .and_then(|stage| stage.get("target_names"))
+                .and_then(serde_json::Value::as_array)
+                .filter(|target_names| !target_names.is_empty())
+                .ok_or_else(|| {
+                    DbError::ArtifactIntegrity(format!(
+                        "active legacy rollout {rollout_id} has malformed target_names"
+                    ))
+                })?;
+            for name in target_names {
+                let name = name
+                    .as_str()
+                    .filter(|name| canonical_computer_name(name))
+                    .ok_or_else(|| {
+                        DbError::ArtifactIntegrity(format!(
+                            "active legacy rollout {rollout_id} has a non-canonical target"
+                        ))
+                    })?;
+                legacy_names.insert(name.to_string());
+            }
+        }
+    }
+    if !legacy_names.is_empty() {
+        let names = legacy_names.into_iter().collect::<Vec<_>>();
+        let legacy_ids = sqlx::query_scalar::<_, Uuid>(
+            "SELECT id FROM computers WHERE name = ANY($1) ORDER BY id",
+        )
+        .bind(&names)
+        .fetch_all(&mut *transaction)
+        .await?;
+        if legacy_ids.len() != names.len() {
+            return Err(DbError::ArtifactIntegrity(
+                "active legacy rollout target identity is missing from the live registry"
+                    .to_string(),
+            ));
+        }
+        if let Some(overlap) = legacy_ids
+            .into_iter()
+            .find(|computer_id| sealed_target_ids.contains(computer_id))
+        {
+            return Err(DbError::ArtifactIntegrity(format!(
+                "artifact rollout target {overlap} overlaps an active legacy upgrade rollout"
+            )));
+        }
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO release_rollout_transactions
+            (request_id, authority_id, lease_owner, lease_expires_at,
+             lease_seconds, expected_target_count)
+         VALUES ($1, $2, $3, clock_timestamp() + make_interval(secs => $4), $4, $5)
+         RETURNING id, request_id, authority_id, state, lease_token, lease_owner,
+                   lease_expires_at, lease_seconds, cas_revision, expected_target_count",
+    )
+    .bind(request_id)
+    .bind(authority_id)
+    .bind(lease_owner)
+    .bind(lease_seconds)
+    .bind(target_count)
+    .fetch_one(&mut *transaction)
+    .await?;
+    let rollout = transaction_from_row(&inserted);
+    sqlx::query(
+        "INSERT INTO release_rollout_target_states
+            (transaction_id, computer_id, computer_name, target_ordinal,
+             target_triple, artifact_version)
+         SELECT $1, computer_id, computer_name, target_ordinal,
+                target_triple, artifact_version
+           FROM release_rollout_authority_targets
+          WHERE authority_id = $2
+          ORDER BY target_ordinal",
+    )
+    .bind(rollout.id)
+    .bind(authority_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(RolloutTransactionBegin {
+        transaction: rollout,
+        outcome: RolloutTransactionBeginOutcome::Inserted,
+    })
+}
+
+/// Renew one live lease under its exact token and CAS revision.
+pub async fn pg_renew_release_rollout_lease(
+    pool: &PgPool,
+    transaction_id: Uuid,
+    lease_token: Uuid,
+    expected_revision: i64,
+) -> Result<Option<ReleaseRolloutTransactionRow>> {
+    let row = sqlx::query(
+        "UPDATE release_rollout_transactions
+            SET lease_expires_at = clock_timestamp() + make_interval(secs => lease_seconds),
+                cas_revision = cas_revision + 1
+          WHERE id = $1 AND lease_token = $2 AND cas_revision = $3
+            AND lease_expires_at > clock_timestamp()
+            AND state IN ('planned', 'running', 'rolling_back')
+          RETURNING id, request_id, authority_id, state, lease_token, lease_owner,
+                    lease_expires_at, lease_seconds, cas_revision, expected_target_count",
+    )
+    .bind(transaction_id)
+    .bind(lease_token)
+    .bind(expected_revision)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(transaction_from_row))
+}
+
+/// Take over one expired active lease under CAS, rotating the token.
+pub async fn pg_take_over_release_rollout_lease(
+    pool: &PgPool,
+    transaction_id: Uuid,
+    expected_revision: i64,
+    lease_owner: &str,
+) -> Result<Option<ReleaseRolloutTransactionRow>> {
+    if !canonical_operator(lease_owner) {
+        return Err(DbError::ArtifactIntegrity(
+            "rollout lease owner is not canonical".to_string(),
+        ));
+    }
+    let row = sqlx::query(
+        "UPDATE release_rollout_transactions
+            SET lease_token = gen_random_uuid(), lease_owner = $3,
+                lease_expires_at = clock_timestamp() + make_interval(secs => lease_seconds),
+                cas_revision = cas_revision + 1
+          WHERE id = $1 AND cas_revision = $2
+            AND lease_expires_at <= clock_timestamp()
+            AND state IN ('planned', 'running', 'rolling_back')
+          RETURNING id, request_id, authority_id, state, lease_token, lease_owner,
+                    lease_expires_at, lease_seconds, cas_revision, expected_target_count",
+    )
+    .bind(transaction_id)
+    .bind(expected_revision)
+    .bind(lease_owner)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(transaction_from_row))
+}
+
+/// CAS the parent rollout state while the caller's exact lease remains live.
+pub async fn pg_cas_release_rollout_transaction_state(
+    pool: &PgPool,
+    transaction_id: Uuid,
+    lease_token: Uuid,
+    expected_revision: i64,
+    expected_state: &str,
+    new_state: &str,
+) -> Result<Option<ReleaseRolloutTransactionRow>> {
+    let terminal = matches!(
+        new_state,
+        "succeeded" | "failed" | "rolled_back" | "cancelled"
+    );
+    let row = sqlx::query(
+        "UPDATE release_rollout_transactions
+            SET state = $5,
+                completed_at = CASE WHEN $6 THEN clock_timestamp() ELSE NULL END,
+                cas_revision = cas_revision + 1
+          WHERE id = $1 AND lease_token = $2 AND cas_revision = $3
+            AND state = $4 AND lease_expires_at > clock_timestamp()
+            AND state IN ('planned', 'running', 'rolling_back')
+          RETURNING id, request_id, authority_id, state, lease_token, lease_owner,
+                    lease_expires_at, lease_seconds, cas_revision, expected_target_count",
+    )
+    .bind(transaction_id)
+    .bind(lease_token)
+    .bind(expected_revision)
+    .bind(expected_state)
+    .bind(new_state)
+    .bind(terminal)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(transaction_from_row))
+}
+
+/// Atomically claim a completed successful rollout for explicit operator
+/// rollback. This is deliberately separate from the active-state CAS API:
+/// terminal rows have no borrowable live lease, so the winning claimant must
+/// rotate a fresh lease in the same `succeeded -> rolling_back` transition.
+///
+/// The expected revision is the concurrency fence. V297's trigger independently
+/// audits the same identity, completion, CAS, lease-rotation, and live-expiry
+/// invariants. A stale, repeated, unsafe-terminal, or concurrent losing claim
+/// returns `None`; the one-active-rollout index rejects conflicting live work.
+pub async fn pg_claim_succeeded_release_rollout_rollback(
+    pool: &PgPool,
+    transaction_id: Uuid,
+    expected_revision: i64,
+    lease_owner: &str,
+) -> Result<Option<ReleaseRolloutTransactionRow>> {
+    if expected_revision < 0 || !canonical_operator(lease_owner) {
+        return Err(DbError::ArtifactIntegrity(
+            "post-success rollback claim fence or lease owner is invalid".to_string(),
+        ));
+    }
+    let row = sqlx::query(
+        "UPDATE release_rollout_transactions
+            SET state = 'rolling_back', completed_at = NULL,
+                lease_token = gen_random_uuid(), lease_owner = $3,
+                lease_expires_at = clock_timestamp() + make_interval(secs => lease_seconds),
+                cas_revision = cas_revision + 1
+          WHERE id = $1 AND cas_revision = $2
+            AND state = 'succeeded' AND completed_at IS NOT NULL
+            AND lease_seconds BETWEEN 30 AND 3600
+          RETURNING id, request_id, authority_id, state, lease_token, lease_owner,
+                    lease_expires_at, lease_seconds, cas_revision, expected_target_count",
+    )
+    .bind(transaction_id)
+    .bind(expected_revision)
+    .bind(lease_owner)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(transaction_from_row))
+}
+
+/// CAS one per-target state while the exact parent lease is live.
+#[allow(clippy::too_many_arguments)]
+pub async fn pg_cas_release_rollout_target_state(
+    pool: &PgPool,
+    transaction_id: Uuid,
+    computer_id: Uuid,
+    lease_token: Uuid,
+    expected_revision: i64,
+    expected_state: &str,
+    new_state: &str,
+    detail: Option<&str>,
+) -> Result<Option<ReleaseRolloutTargetStateRow>> {
+    let row = sqlx::query(
+        "UPDATE release_rollout_target_states target
+            SET state = $6, detail = $7, cas_revision = target.cas_revision + 1
+           FROM release_rollout_transactions rollout
+          WHERE target.transaction_id = $1 AND target.computer_id = $2
+            AND target.cas_revision = $4 AND target.state = $5
+            AND rollout.id = target.transaction_id AND rollout.lease_token = $3
+            AND rollout.lease_expires_at > clock_timestamp()
+            AND rollout.state IN ('planned', 'running', 'rolling_back')
+          RETURNING target.transaction_id, target.computer_id, target.computer_name,
+                    target.state, target.cas_revision, target.detail",
+    )
+    .bind(transaction_id)
+    .bind(computer_id)
+    .bind(lease_token)
+    .bind(expected_revision)
+    .bind(expected_state)
+    .bind(new_state)
+    .bind(detail)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.as_ref().map(|row| ReleaseRolloutTargetStateRow {
+        transaction_id: row.get("transaction_id"),
+        computer_id: row.get("computer_id"),
+        computer_name: row.get("computer_name"),
+        state: row.get("state"),
+        cas_revision: row.get("cas_revision"),
+        detail: row.get("detail"),
+    }))
+}
+
+/// Read-only V295 structure/data predicate used while the explicit migration
+/// has been applied but its gated automatic V296/V297 successors have not.
+pub(crate) async fn release_rollout_authority_schema_is_exact(pool: &PgPool) -> Result<bool> {
+    let required_objects_exist: bool = sqlx::query_scalar(
+        r#"
+        SELECT
+            to_regclass('public._migrations') IS NOT NULL
+        AND to_regclass('public.release_rollout_authorities') IS NOT NULL
+        AND to_regclass('public.release_rollout_authority_targets') IS NOT NULL
+        AND to_regclass('public.release_rollout_authority_artifacts') IS NOT NULL
+        AND to_regclass('public.release_rollout_transactions') IS NOT NULL
+        AND to_regclass('public.release_rollout_target_states') IS NOT NULL
+        AND to_regclass('public.release_rollout_one_active_transaction') IS NOT NULL
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if !required_objects_exist {
+        return Ok(false);
+    }
+
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT
+            (SELECT count(*) FROM pg_trigger
+              WHERE tgrelid IN (
+                    'release_rollout_authorities'::regclass,
+                    'release_rollout_authority_targets'::regclass,
+                    'release_rollout_authority_artifacts'::regclass,
+                    'release_rollout_transactions'::regclass,
+                    'release_rollout_target_states'::regclass)
+                AND NOT tgisinternal
+                AND tgenabled = 'O') = 12
+        AND NOT EXISTS (
+            SELECT 1 FROM release_rollout_authorities authority
+             WHERE authority.sealed_at IS NULL
+                OR (SELECT count(*) FROM release_rollout_authority_targets target
+                     WHERE target.authority_id = authority.id)
+                    <> authority.expected_target_count
+                OR (SELECT count(*) FROM release_rollout_authority_artifacts artifact
+                     WHERE artifact.authority_id = authority.id)
+                    <> authority.expected_artifact_count)
+        AND NOT EXISTS (
+            SELECT 1 FROM release_rollout_authority_targets target
+             LEFT JOIN computers computer ON computer.id = target.computer_id
+             WHERE computer.id IS NULL
+                OR computer.name IS DISTINCT FROM target.computer_name
+                OR lower(target.computer_name) = 'vinny'
+                OR target.computer_id = 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+        AND NOT EXISTS (
+            SELECT 1
+              FROM release_rollout_authority_targets target
+              JOIN release_rollout_authorities authority ON authority.id = target.authority_id
+              LEFT JOIN release_rollout_authority_artifacts exact_artifact
+                ON exact_artifact.authority_id = target.authority_id
+               AND exact_artifact.computer_id = target.computer_id
+              LEFT JOIN release_artifacts artifact ON artifact.id = exact_artifact.artifact_id
+             GROUP BY target.authority_id, target.computer_id,
+                      target.target_triple, target.artifact_version,
+                      authority.source_commit
+            HAVING count(exact_artifact.*) <> 2
+                OR count(*) FILTER (WHERE exact_artifact.artifact_name = 'ff') <> 1
+                OR count(*) FILTER (WHERE exact_artifact.artifact_name = 'forgefleetd') <> 1
+                OR bool_or(artifact.id IS NULL)
+                OR bool_or(artifact.artifact_name IS DISTINCT FROM exact_artifact.artifact_name)
+                OR bool_or(artifact.source_commit IS DISTINCT FROM authority.source_commit)
+                OR bool_or(artifact.target_triple IS DISTINCT FROM target.target_triple)
+                OR bool_or(artifact.artifact_version IS DISTINCT FROM target.artifact_version)
+        )
+        AND NOT EXISTS (
+            SELECT 1 FROM release_rollout_target_states target
+             WHERE lower(target.computer_name) = 'vinny'
+                OR target.computer_id = 'e7f5d063-d7b7-4338-bd6e-5d02d74770ad'::uuid)
+        "#,
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+fn normalize_function_body(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn expected_v297_function_body() -> Option<String> {
+    const TAG: &str = "$release_rollout_transaction_update_guard$";
+    let sql = crate::schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK;
+    let (_, after_opening_tag) = sql.split_once(TAG)?;
+    let (body, _) = after_opening_tag.split_once(TAG)?;
+    Some(normalize_function_body(body))
+}
+
+/// Read-only exact V295+V297 schema/data predicate used by every runtime
+/// rollout API.  Function identity and `prosrc` are checked directly instead
+/// of hashing `pg_get_functiondef`, whose formatting is version-sensitive.
+pub async fn release_rollout_schema_is_exact(pool: &PgPool) -> Result<bool> {
+    if !release_rollout_authority_schema_is_exact(pool).await? {
+        return Ok(false);
+    }
+
+    let ledger_is_exact: bool = sqlx::query_scalar(
+        r#"
+        SELECT
+            (SELECT count(*) FROM _migrations WHERE version = 295) = 1
+        AND (SELECT count(*) FROM _migrations
+              WHERE version = 295 AND name = 'release_rollout_authority') = 1
+        AND (SELECT count(*) FROM _migrations WHERE version = 297) = 1
+        AND (SELECT count(*) FROM _migrations
+              WHERE version = 297 AND name = 'release_rollout_post_success_rollback') = 1
+        "#,
+    )
+    .fetch_one(pool)
+    .await?;
+    if !ledger_is_exact {
+        return Ok(false);
+    }
+
+    let Some(function) = sqlx::query(
+        r#"
+        SELECT namespace.nspname AS schema_name, procedure.proname AS function_name,
+               pg_get_function_identity_arguments(procedure.oid) AS identity_arguments,
+               pg_get_function_result(procedure.oid) AS result_type,
+               language.lanname AS language_name,
+               procedure.provolatile::text AS volatility,
+               procedure.prosecdef AS security_definer,
+               procedure.proisstrict AS strict,
+               procedure.proleakproof AS leakproof,
+               procedure.proparallel::text AS parallel_safety,
+               procedure.proconfig AS runtime_config,
+               procedure.prokind::text AS function_kind,
+               obj_description(procedure.oid, 'pg_proc') AS function_comment,
+               procedure.prosrc AS function_body
+          FROM pg_proc procedure
+          JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+          JOIN pg_language language ON language.oid = procedure.prolang
+         WHERE namespace.nspname = 'public'
+           AND procedure.proname = 'release_rollout_transaction_update_guard'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(false);
+    };
+    let expected_body = expected_v297_function_body().ok_or_else(|| {
+        DbError::ArtifactIntegrity("embedded V297 function body is malformed".to_string())
+    })?;
+    let function_is_exact = function.get::<String, _>("schema_name") == "public"
+        && function.get::<String, _>("function_name") == "release_rollout_transaction_update_guard"
+        && function.get::<String, _>("identity_arguments").is_empty()
+        && function.get::<String, _>("result_type") == "trigger"
+        && function.get::<String, _>("language_name") == "plpgsql"
+        && function.get::<String, _>("volatility") == "v"
+        && !function.get::<bool, _>("security_definer")
+        && !function.get::<bool, _>("strict")
+        && !function.get::<bool, _>("leakproof")
+        && function.get::<String, _>("parallel_safety") == "u"
+        && function
+            .get::<Option<Vec<String>>, _>("runtime_config")
+            .is_none()
+        && function.get::<String, _>("function_kind") == "f"
+        && function
+            .get::<Option<String>, _>("function_comment")
+            .as_deref()
+            == Some(
+                "V297: terminal evidence is immutable except one exact CAS+lease-fenced succeeded-to-rolling_back claim.",
+            )
+        && normalize_function_body(&function.get::<String, _>("function_body")) == expected_body;
+    if !function_is_exact {
+        return Ok(false);
+    }
+
+    Ok(sqlx::query_scalar(
+        r#"
+        SELECT count(*) = 1
+          FROM pg_trigger trigger
+          JOIN pg_class relation ON relation.oid = trigger.tgrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+          JOIN pg_proc procedure ON procedure.oid = trigger.tgfoid
+          JOIN pg_namespace procedure_namespace ON procedure_namespace.oid = procedure.pronamespace
+         WHERE namespace.nspname = 'public'
+           AND relation.relname = 'release_rollout_transactions'
+           AND trigger.tgname = 'release_rollout_transactions_guard'
+           AND NOT trigger.tgisinternal
+           AND trigger.tgenabled = 'O'
+           AND trigger.tgtype = 27
+           AND trigger.tgconstraint = 0
+           AND trigger.tgqual IS NULL
+           AND trigger.tgoldtable IS NULL
+           AND trigger.tgnewtable IS NULL
+           AND octet_length(trigger.tgargs) = 0
+           AND procedure_namespace.nspname = 'public'
+           AND procedure.proname = 'release_rollout_transaction_update_guard'
+           AND pg_get_function_identity_arguments(procedure.oid) = ''
+        "#,
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
+
+    #[test]
+    fn rollout_advisory_lock_key_is_stable_and_shared() {
+        let key = std::hint::black_box(RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY);
+        assert_eq!(key, 0x4646_524f_4c4c_4155);
+    }
+
+    fn artifact(name: &str, id: u128) -> RolloutArtifactAuthority {
+        RolloutArtifactAuthority {
+            artifact_name: name.to_string(),
+            artifact_id: Uuid::from_u128(id),
+        }
+    }
+
+    fn target(name: &str, id: Uuid) -> RolloutTargetAuthority {
+        RolloutTargetAuthority {
+            target_ordinal: 0,
+            computer_id: id,
+            computer_name: name.to_string(),
+            target_triple: "aarch64-unknown-linux-gnu".to_string(),
+            artifact_version: format!("recovery.{SOURCE}.ubuntu24-arm64"),
+            artifacts: vec![artifact("ff", 1), artifact("forgefleetd", 2)],
+        }
+    }
+
+    #[test]
+    fn exact_authority_validation_accepts_one_bounded_target() {
+        let spec = ReleaseRolloutAuthoritySpec {
+            source_commit: SOURCE.to_string(),
+            created_by: "operator@adele".to_string(),
+            targets: vec![target("beyonce", Uuid::from_u128(3))],
+        };
+        validate_authority_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn authority_rejects_vinny_by_name_and_uuid_without_override() {
+        let base = ReleaseRolloutAuthoritySpec {
+            source_commit: SOURCE.to_string(),
+            created_by: "operator@adele".to_string(),
+            targets: vec![target("vinny", Uuid::from_u128(3))],
+        };
+        assert!(validate_authority_spec(&base).is_err());
+        let mut by_id = base;
+        by_id.targets[0].computer_name = "ace".to_string();
+        by_id.targets[0].computer_id = FORBIDDEN_VINNY_ID;
+        assert!(validate_authority_spec(&by_id).is_err());
+    }
+
+    #[test]
+    fn authority_rejects_partial_duplicate_and_noncontiguous_sets() {
+        let mut spec = ReleaseRolloutAuthoritySpec {
+            source_commit: SOURCE.to_string(),
+            created_by: "operator@adele".to_string(),
+            targets: vec![target("beyonce", Uuid::from_u128(3))],
+        };
+        spec.targets[0].artifacts.pop();
+        assert!(validate_authority_spec(&spec).is_err());
+
+        let mut duplicate = target("lily", Uuid::from_u128(4));
+        duplicate.target_ordinal = 0;
+        let duplicate_spec = ReleaseRolloutAuthoritySpec {
+            source_commit: SOURCE.to_string(),
+            created_by: "operator@adele".to_string(),
+            targets: vec![target("beyonce", Uuid::from_u128(3)), duplicate],
+        };
+        assert!(validate_authority_spec(&duplicate_spec).is_err());
+    }
+}

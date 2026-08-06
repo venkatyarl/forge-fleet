@@ -54,7 +54,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use ff_db::leader_state::pg_get_current_leader;
-use ff_db::{pg_enqueue_deferred, pg_enqueue_deferred_delayed};
+use ff_db::{pg_enqueue_deferred, pg_enqueue_deferred_delayed, pg_enqueue_deferred_dependent};
 use ff_db::{pg_get_secret, pg_set_secret};
 
 /// fleet_secrets key that stores the age X25519 recipient (public key).
@@ -94,6 +94,11 @@ const FALKORDB_CONTAINER: &str = "forgefleet-falkordb";
 /// Offsite fan-out width when `fleet_backup_config.dest_hosts` is empty:
 /// a kind's backups go to this many OTHER computers (never the source).
 const OFFSITE_DEST_COUNT: i64 = 2;
+/// Automatic destinations need positive, current Pulse evidence. Five minutes
+/// is the fleet's conservative online window for health-sensitive placement:
+/// beats normally arrive every few seconds, so this tolerates transient misses
+/// without treating a host seen earlier in the day as a viable backup target.
+const AUTO_DESTINATION_FRESHNESS: &str = "5 minutes";
 /// Delay before the first tick after daemon startup (avoid racing
 /// Postgres/Redis containers still coming up).
 const STARTUP_DELAY_SECS: u64 = 300;
@@ -133,6 +138,16 @@ const SOURCE_KEEP_FLOOR: usize = RECENT_RETENTION + DAILY_RETENTION + WEEKLY_RET
 const PRUNE_INTERVAL_SECS: u64 = 3600;
 /// How often each node checks its OWN backup directory for stale replicas.
 const FRESHNESS_CHECK_INTERVAL_SECS: u64 = 60;
+/// Receipt proof older than this must be refreshed before a remote drill may
+/// trust that the destination still owns decryptable bytes.
+pub const BACKUP_RECEIPT_MAX_AGE_SECS: i64 = 24 * 60 * 60;
+/// Closed receipt schema understood by the producer and remote-drill gate.
+pub const BACKUP_RECEIPT_VERSION: i64 = 1;
+/// Reconciliation is deliberately bounded: catalog inspection is cheap, while
+/// hashing/decrypt-probing multi-GiB artifacts is not.
+const RECEIPT_RECONCILE_SCAN_LIMIT: i64 = 128;
+const RECEIPT_RECONCILE_BATCH_SIZE: usize = 5;
+const BACKUP_RECEIPT_FUTURE_SKEW_SECS: i64 = 5 * 60;
 /// Alert policy seeded by DB migration V181.
 const STALE_LOCAL_BACKUP_POLICY_NAME: &str = "stale_local_backup";
 
@@ -155,6 +170,45 @@ const DISTRIBUTION_WAVE_STAGGER_SECS: i64 = 45;
 /// `w * DISTRIBUTION_WAVE_STAGGER_SECS`. Pure so the wave schedule is unit-testable.
 fn distribution_stagger_secs(idx: usize) -> i64 {
     (idx / DISTRIBUTION_WAVE_SIZE) as i64 * DISTRIBUTION_WAVE_STAGGER_SECS
+}
+
+/// Which source an automatic backup-destination query must exclude.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutoDestinationSource {
+    ComputerId,
+    ComputerName,
+    FleetLeader,
+}
+
+/// Build the canonical automatic-destination query.
+///
+/// Explicit `dest_hosts` never use this path. Automatic selection fails closed
+/// to peers with positive recent Pulse evidence that are not reserved/drained.
+/// `connectivity_mode` is deliberately not a gate: roaming and Tailscale peers
+/// can be valid offsite holders, while that metadata does not prove rsync data-
+/// plane reachability. Ordering remains stable across backup, WAL, and local-
+/// freshness expectation paths.
+fn auto_destination_sql(source: AutoDestinationSource) -> String {
+    let (source_predicate, limit_parameter) = match source {
+        AutoDestinationSource::ComputerId => ("c.id <> $1", "$2"),
+        AutoDestinationSource::ComputerName => ("LOWER(c.name) <> LOWER($1)", "$2"),
+        AutoDestinationSource::FleetLeader => (
+            "c.id <> (SELECT computer_id FROM fleet_leader_state LIMIT 1)",
+            "$1",
+        ),
+    };
+
+    format!(
+        "SELECT c.name
+           FROM computers c
+          WHERE {source_predicate}
+            AND c.status = 'online'
+            AND c.last_seen_at IS NOT NULL
+            AND c.last_seen_at >= NOW() - INTERVAL '{AUTO_DESTINATION_FRESHNESS}'
+            AND c.reservation_state = 'available'
+          ORDER BY c.last_seen_at DESC, c.name ASC
+          LIMIT {limit_parameter}"
+    )
 }
 
 /// Errors emitted by [`BackupOrchestrator`].
@@ -188,6 +242,50 @@ pub struct BackupArtifactEvidence {
     /// `None` for plaintext artifacts, `Some(true)` only after an age reader
     /// unwraps the file key and reads a bounded plaintext probe.
     pub decrypt_probe_ok: Option<bool>,
+}
+
+/// Successful host-local proof persisted into `backups.distribution_status`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BackupReceiptReport {
+    pub backup_id: Uuid,
+    pub computer_id: Uuid,
+    pub host: String,
+    pub expected_checksum: String,
+    pub observed_checksum: String,
+    pub verified_at: chrono::DateTime<Utc>,
+    pub receipt: serde_json::Value,
+}
+
+/// Parse the complete typed receipt payload. Extra fields are rejected so a
+/// task cannot smuggle a host, path, key, evidence result, or timestamp across
+/// the trust boundary.
+pub fn parse_backup_receipt_payload(
+    payload: &serde_json::Value,
+) -> Result<(Uuid, String), BackupError> {
+    let object = payload
+        .as_object()
+        .ok_or_else(|| BackupError::Cmd("backup receipt payload must be an object".to_string()))?;
+    if object.len() != 2
+        || !object.contains_key("backup_id")
+        || !object.contains_key("expected_checksum")
+    {
+        return Err(BackupError::Cmd(
+            "backup receipt payload permits only backup_id and expected_checksum".to_string(),
+        ));
+    }
+    let backup_id = object
+        .get("backup_id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| BackupError::Cmd("backup receipt backup_id must be a UUID string".into()))?
+        .parse::<Uuid>()?;
+    let checksum = object
+        .get("expected_checksum")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            BackupError::Cmd("backup receipt expected_checksum must be a string".into())
+        })?;
+    validate_expected_sha256(checksum)?;
+    Ok((backup_id, checksum.to_ascii_lowercase()))
 }
 
 /// Per-kind backup policy from the `fleet_backup_config` table (schema V163).
@@ -369,14 +467,11 @@ impl BackupOrchestrator {
         my_node_name: String,
         backup_dir: Option<PathBuf>,
     ) -> Self {
-        let default_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".forgefleet/backups");
         Self {
             pg,
             my_computer_id,
             my_node_name,
-            backup_dir: backup_dir.unwrap_or(default_dir),
+            backup_dir: backup_dir.unwrap_or_else(default_backup_dir),
             postgres_interval_hours: DEFAULT_POSTGRES_INTERVAL_HOURS,
             redis_interval_hours: DEFAULT_REDIS_INTERVAL_HOURS,
         }
@@ -662,7 +757,7 @@ impl BackupOrchestrator {
             .await?;
 
         let targets = self
-            .enqueue_distribution("postgres", &file_name, cfg)
+            .enqueue_distribution("postgres", &file_name, backup_id, &sha256, cfg)
             .await?;
         if let Err(e) = self.enqueue_wal_archive_distribution(cfg).await {
             warn!(error = %e, "postgres WAL archive fan-out failed");
@@ -692,29 +787,11 @@ impl BackupOrchestrator {
         let file_name = format!("redis-{ts}.rdb.zst{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
-        // 1) Ask Redis to write an RDB snapshot. BGSAVE is async but
-        //    with appendonly yes the RDB may trail the AOF; that's fine
-        //    for our recovery model (AOF replays on restore anyway).
-        let bgsave = Command::new("docker")
-            .args(["exec", "forgefleet-redis", "redis-cli", "BGSAVE"])
-            .output()
-            .await?;
-        if !bgsave.status.success() {
-            return Err(BackupError::Cmd(format!(
-                "redis BGSAVE failed: {}",
-                String::from_utf8_lossy(&bgsave.stderr).trim()
-            )));
-        }
-
-        // 2) Wait for LASTSAVE to advance (short poll — 60s max).
-        let before_ts = container_lastsave("forgefleet-redis").await.unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if container_lastsave("forgefleet-redis").await.unwrap_or(0) > before_ts {
-                break;
-            }
-        }
+        // 1) Ask Redis to write an RDB snapshot and prove that this exact
+        //    request completed before exporting bytes. BGSAVE is async but
+        //    this Redis backup contains only the resulting RDB, so the
+        //    completion fence below is required before it can be trusted.
+        bgsave_and_wait("forgefleet-redis", "redis").await?;
 
         // 3) Stream the dump out of the container through zstd + age
         //    into the target file. `docker cp` would copy to a temp
@@ -753,7 +830,7 @@ impl BackupOrchestrator {
                 .insert_backup_row("redis", &file_name_gz, size_bytes, &sha256)
                 .await?;
             let targets = self
-                .enqueue_distribution("redis", &file_name_gz, cfg)
+                .enqueue_distribution("redis", &file_name_gz, backup_id, &sha256, cfg)
                 .await?;
             return Ok(BackupReport {
                 kind: "redis".into(),
@@ -775,7 +852,9 @@ impl BackupOrchestrator {
         let backup_id = self
             .insert_backup_row("redis", &file_name, size_bytes, &sha256)
             .await?;
-        let targets = self.enqueue_distribution("redis", &file_name, cfg).await?;
+        let targets = self
+            .enqueue_distribution("redis", &file_name, backup_id, &sha256, cfg)
+            .await?;
 
         Ok(BackupReport {
             kind: "redis".into(),
@@ -793,7 +872,7 @@ impl BackupOrchestrator {
 
     /// FalkorDB is a Redis module, so the same BGSAVE/RDB/AOF machinery
     /// applies — but unlike redis we also capture the multi-part AOF dir
-    /// (`/data/appendonlydir`), tar both out of the container, compress,
+    /// (under the Redis-configured `dir`), tar both out of the container, compress,
     /// and encrypt per policy into
     /// `~/.forgefleet/backups/FalkorDB/falkordb-<ts>.tar.zst[.age]`.
     /// Runs only on the configured `source_host` (the node whose docker
@@ -804,35 +883,20 @@ impl BackupOrchestrator {
 
         let recipients = self.encryption_recipients(cfg).await?;
 
-        // 1) Ask FalkorDB to write an RDB snapshot.
-        let bgsave = Command::new("docker")
-            .args(["exec", FALKORDB_CONTAINER, "redis-cli", "BGSAVE"])
-            .output()
-            .await?;
-        if !bgsave.status.success() {
-            return Err(BackupError::Cmd(format!(
-                "falkordb BGSAVE failed (is the {FALKORDB_CONTAINER} container \
-                 running on this host?): {}",
-                String::from_utf8_lossy(&bgsave.stderr).trim()
-            )));
-        }
+        // 1) Produce and prove a new snapshot before reading the data directory.
+        bgsave_and_wait(FALKORDB_CONTAINER, "falkordb").await?;
 
-        // 2) Wait for LASTSAVE to advance (short poll — 60s max).
-        let before_ts = container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0);
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        while tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if container_lastsave(FALKORDB_CONTAINER).await.unwrap_or(0) > before_ts {
-                break;
-            }
-        }
+        // FalkorDB images do not consistently use Redis' conventional /data.
+        // Ask the running service for the authoritative directory instead of
+        // archiving a compose mount that may not contain the live dataset.
+        let data_dir = container_redis_config(FALKORDB_CONTAINER, "dir").await?;
 
         let ts = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
         let file_name = format!("falkordb-{ts}.tar.zst{}", age_ext(cfg.encrypt));
         let path = out_dir.join(&file_name);
 
         // 3) tar dump.rdb + AOF dir out of the container, compress, encrypt.
-        let shell_cmd = falkordb_dump_cmd(&recipients, &path.to_string_lossy());
+        let shell_cmd = falkordb_dump_cmd(&recipients, &path.to_string_lossy(), &data_dir);
         info!(path = %path.display(), "running falkordb tar | zstd | age");
         let status = run_pipeline(&shell_cmd).await?;
         if !status.success() {
@@ -851,7 +915,7 @@ impl BackupOrchestrator {
             .insert_backup_row("falkordb", &file_name, size_bytes, &sha256)
             .await?;
         let targets = self
-            .enqueue_distribution("falkordb", &file_name, cfg)
+            .enqueue_distribution("falkordb", &file_name, backup_id, &sha256, cfg)
             .await?;
 
         Ok(BackupReport {
@@ -947,8 +1011,11 @@ impl BackupOrchestrator {
         &self,
         kind: &str,
         file_name: &str,
+        backup_id: Uuid,
+        expected_checksum: &str,
         cfg: &BackupKindConfig,
     ) -> Result<Vec<String>, BackupError> {
+        validate_expected_sha256(expected_checksum)?;
         // Look up my own IP + SSH user so peers know where + as whom
         // to rsync from. REDIS.1 part 2 (2026-05-19): the original code
         // built the source as `<ip>:/path` with no user prefix, so each
@@ -981,19 +1048,21 @@ impl BackupOrchestrator {
                 .cloned()
                 .collect()
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(self.my_computer_id)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::ComputerId);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(self.my_computer_id)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         };
+        if cfg.dest_hosts.is_empty() && names.len() < OFFSITE_DEST_COUNT as usize {
+            warn!(
+                kind,
+                eligible_destinations = names.len(),
+                required_destinations = OFFSITE_DEST_COUNT,
+                "backup auto fan-out is below target; refusing stale/offline fallback"
+            );
+        }
 
         let mut enqueued = Vec::new();
         let source_path = format!(
@@ -1080,7 +1149,49 @@ impl BackupOrchestrator {
             )
             .await
             {
-                Ok(_id) => enqueued.push(name),
+                Ok(copy_task_id) => {
+                    // Receipt production is a separate typed child, not shell
+                    // text appended to rsync. A receipt/DB retry therefore
+                    // never retransmits a multi-GiB artifact, and the child
+                    // cannot race the copy because the deferred claimant
+                    // enforces depends_on_task_id.
+                    let receipt_title =
+                        format!("verify {kind} backup {backup_id} receipt on {name}");
+                    let receipt_payload = serde_json::json!({
+                        "backup_id": backup_id,
+                        "expected_checksum": expected_checksum.to_ascii_lowercase(),
+                    });
+                    match pg_enqueue_deferred_dependent(
+                        &self.pg,
+                        &receipt_title,
+                        "backup_receipt",
+                        &receipt_payload,
+                        "node_online",
+                        &trigger_spec,
+                        Some(&name),
+                        &required_caps,
+                        Some(&who),
+                        Some(5),
+                        &copy_task_id,
+                    )
+                    .await
+                    {
+                        Ok(receipt_task_id) => debug!(
+                            target_node = %name,
+                            %backup_id,
+                            copy_task_id,
+                            receipt_task_id,
+                            "backup distribution copy+receipt chain enqueued"
+                        ),
+                        Err(e) => warn!(
+                            target_node = %name,
+                            %backup_id,
+                            error = %e,
+                            "backup copy enqueued but receipt child enqueue failed; reconciler will repair"
+                        ),
+                    }
+                    enqueued.push(name);
+                }
                 Err(e) => {
                     warn!(target_node = %name, error = %e, "failed to enqueue rsync task");
                 }
@@ -1098,6 +1209,22 @@ impl BackupOrchestrator {
         &self,
         cfg: &BackupKindConfig,
     ) -> Result<Vec<String>, BackupError> {
+        // The deferred rsync runs later and trusts this archive as immutable.
+        // Prove its custody invariants before even consulting destination or
+        // coalescing state: an invalid source must enqueue exactly zero work.
+        let backup_root = self.backup_dir.clone();
+        let custody =
+            tokio::task::spawn_blocking(move || validate_postgres_wal_archive_source(&backup_root))
+                .await
+                .map_err(|e| {
+                    BackupError::Cmd(format!("WAL archive custody verifier failed: {e}"))
+                })??;
+        debug!(
+            segments = custody.segments,
+            auxiliary_files = custody.auxiliary_files,
+            "Postgres WAL archive source custody verified"
+        );
+
         let row =
             sqlx::query("SELECT primary_ip, COALESCE(ssh_user, 'root') AS ssh_user FROM computers WHERE id = $1")
                 .bind(self.my_computer_id)
@@ -1115,19 +1242,21 @@ impl BackupOrchestrator {
                 .cloned()
                 .collect()
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(self.my_computer_id)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::ComputerId);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(self.my_computer_id)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         };
+        if cfg.dest_hosts.is_empty() && names.len() < OFFSITE_DEST_COUNT as usize {
+            warn!(
+                kind = "postgres_wal",
+                eligible_destinations = names.len(),
+                required_destinations = OFFSITE_DEST_COUNT,
+                "backup auto fan-out is below target; refusing stale/offline fallback"
+            );
+        }
 
         let source_path = format!(
             "{}@{}:{}/{}/",
@@ -1374,6 +1503,103 @@ impl BackupOrchestrator {
                 }
             }
         }
+        match self.reconcile_local_distribution_receipts().await {
+            Ok(verified) if verified > 0 => info!(
+                node = %self.my_node_name,
+                verified,
+                "backup distribution receipts reconciled"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                node = %self.my_node_name,
+                error = %e,
+                "backup distribution receipt reconciliation failed"
+            ),
+        }
+    }
+
+    /// Backfill receipts for exact catalog artifacts already present on this
+    /// non-source host and refresh aging proof. Runs on the existing per-node
+    /// freshness ticker, not through the PM work-item scheduler, so recovery
+    /// remains active while `work_item_execution_enabled=false`.
+    async fn reconcile_local_distribution_receipts(&self) -> Result<usize, BackupError> {
+        // Resolve the stable enrollment identity once per reconciliation pass.
+        // `my_node_name` may retain old casing or a pre-rename value, while the
+        // immutable computer UUID continues to identify this host.
+        let (computer_id, canonical_host) =
+            canonical_receipt_host_by_id(&self.pg, self.my_computer_id).await?;
+        let rows: Vec<(Uuid, String, String, String, i64, serde_json::Value)> = sqlx::query_as(
+            "SELECT id, database_kind, file_name, checksum_sha256, size_bytes,
+                    distribution_status
+               FROM backups
+              WHERE source_computer_id <> $1
+                AND database_kind IN ('postgres', 'redis', 'falkordb')
+              ORDER BY created_at DESC, id DESC
+              LIMIT $2",
+        )
+        .bind(computer_id)
+        .bind(RECEIPT_RECONCILE_SCAN_LIMIT)
+        .fetch_all(&self.pg)
+        .await?;
+
+        let now = Utc::now();
+        let mut attempted = 0usize;
+        let mut verified = 0usize;
+        for (backup_id, kind, file_name, checksum, size_bytes, distribution_status) in rows {
+            if existing_receipt_is_current(
+                &distribution_status,
+                &ExistingReceiptExpectation {
+                    backup_id,
+                    computer_id,
+                    canonical_host: &canonical_host,
+                    expected_checksum: &checksum,
+                    expected_size: size_bytes,
+                    expected_database_kind: &kind,
+                    expected_file_name: &file_name,
+                    now,
+                },
+            ) {
+                continue;
+            }
+            if !is_known_backup_kind(&kind)
+                || validate_backup_component("file_name", &file_name).is_err()
+            {
+                warn!(%backup_id, kind, "unsafe backup catalog row skipped by receipt reconciler");
+                continue;
+            }
+            let artifact = self.backup_dir.join(kind_dir(&kind)).join(&file_name);
+            match tokio::fs::symlink_metadata(&artifact).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn!(%backup_id, error = %error, "backup receipt local metadata check failed");
+                    continue;
+                }
+            }
+            if attempted >= RECEIPT_RECONCILE_BATCH_SIZE {
+                break;
+            }
+            attempted += 1;
+            match record_backup_distribution_receipt_for_host(
+                &self.pg,
+                computer_id,
+                &canonical_host,
+                backup_id,
+                &checksum,
+                Some(&self.backup_dir),
+            )
+            .await
+            {
+                Ok(_) => verified += 1,
+                Err(error) => warn!(
+                    %backup_id,
+                    kind,
+                    error = %error,
+                    "local backup copy did not earn a distribution receipt"
+                ),
+            }
+        }
+        Ok(verified)
     }
 
     async fn expected_to_hold_backup(
@@ -1397,32 +1623,18 @@ impl BackupOrchestrator {
         }
 
         let expected: Vec<String> = if let Some(source_host) = cfg.source_host.as_deref() {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.name <> $1
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $2",
-            )
-            .bind(source_host)
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::ComputerName);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(source_host)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         } else {
-            sqlx::query_scalar::<_, String>(
-                "SELECT c.name
-                   FROM computers c
-                  WHERE c.id <> (
-                        SELECT computer_id FROM fleet_leader_state LIMIT 1
-                    )
-                    AND (c.last_seen_at IS NULL OR c.last_seen_at > NOW() - INTERVAL '24 hours')
-                  ORDER BY c.last_seen_at DESC NULLS LAST, c.name
-                  LIMIT $1",
-            )
-            .bind(OFFSITE_DEST_COUNT)
-            .fetch_all(&self.pg)
-            .await?
+            let query = auto_destination_sql(AutoDestinationSource::FleetLeader);
+            sqlx::query_scalar::<_, String>(&query)
+                .bind(OFFSITE_DEST_COUNT)
+                .fetch_all(&self.pg)
+                .await?
         };
 
         debug!(
@@ -1716,6 +1928,12 @@ impl BackupOrchestrator {
 
 // ─── Free helpers ─────────────────────────────────────────────────────
 
+fn default_backup_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".forgefleet/backups")
+}
+
 pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupError> {
     let meta = tokio::fs::metadata(path).await?;
     let size_bytes = meta.len() as i64;
@@ -1735,16 +1953,89 @@ pub(crate) async fn file_metadata(path: &Path) -> Result<(i64, String), BackupEr
 
 /// `LASTSAVE` of a Redis-protocol container (redis proper or FalkorDB,
 /// which is a Redis module and answers the same command).
-async fn container_lastsave(container: &str) -> Option<u64> {
+async fn container_lastsave(container: &str) -> Result<u64, BackupError> {
     let out = Command::new("docker")
         .args(["exec", container, "redis-cli", "LASTSAVE"])
         .output()
-        .await
-        .ok()?;
+        .await?;
     if !out.status.success() {
-        return None;
+        return Err(BackupError::Cmd(format!(
+            "{container} LASTSAVE failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
     }
-    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(|e| BackupError::Cmd(format!("{container} returned invalid LASTSAVE: {e}")))
+}
+
+/// Start a fresh RDB snapshot and wait until Redis proves it completed.
+///
+/// The baseline must be captured *before* BGSAVE. Capturing it afterwards can
+/// race a fast snapshot and then either wait the full timeout or export stale /
+/// in-flight bytes. A timeout is an error: an unproven artifact must never be
+/// catalogued or distributed as a backup.
+async fn bgsave_and_wait(container: &str, kind: &str) -> Result<(), BackupError> {
+    let before_ts = container_lastsave(container).await?;
+    let bgsave = Command::new("docker")
+        .args(["exec", container, "redis-cli", "BGSAVE"])
+        .output()
+        .await?;
+    if !bgsave.status.success() {
+        return Err(BackupError::Cmd(format!(
+            "{kind} BGSAVE failed: {}",
+            String::from_utf8_lossy(&bgsave.stderr).trim()
+        )));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        if container_lastsave(container).await? > before_ts {
+            return Ok(());
+        }
+    }
+
+    Err(BackupError::Cmd(format!(
+        "{kind} BGSAVE did not advance LASTSAVE within 60s; refusing to export an unproven snapshot"
+    )))
+}
+
+/// Read one Redis CONFIG value from a container and reject malformed paths.
+async fn container_redis_config(container: &str, key: &str) -> Result<String, BackupError> {
+    let out = Command::new("docker")
+        .args([
+            "exec",
+            container,
+            "redis-cli",
+            "--raw",
+            "CONFIG",
+            "GET",
+            key,
+        ])
+        .output()
+        .await?;
+    if !out.status.success() {
+        return Err(BackupError::Cmd(format!(
+            "{container} CONFIG GET {key} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let value = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .next_back()
+        .unwrap_or_default()
+        .to_string();
+    if value.is_empty() || !Path::new(&value).is_absolute() {
+        return Err(BackupError::Cmd(format!(
+            "{container} CONFIG GET {key} returned an invalid absolute path"
+        )));
+    }
+    Ok(value)
 }
 
 /// Filename prefix the backup writer uses for a kind's artifacts
@@ -1771,12 +2062,42 @@ fn is_kind_backup_file(kind: &str, name: &str) -> bool {
     }
 }
 
-fn is_postgres_wal_archive_name(name: &str) -> bool {
-    if let Some(timeline) = name.strip_suffix(".history") {
-        return timeline.len() == 8 && timeline.chars().all(|c| c.is_ascii_hexdigit());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostgresWalArchiveEntryKind {
+    Segment,
+    History,
+    Backup,
+}
+
+fn is_postgres_archive_hex(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'A'..=b'F').contains(&byte))
+}
+
+fn postgres_wal_archive_entry_kind(name: &str) -> Option<PostgresWalArchiveEntryKind> {
+    if is_postgres_archive_hex(name, 24) {
+        return Some(PostgresWalArchiveEntryKind::Segment);
     }
-    let base = name.strip_suffix(".backup").unwrap_or(name);
-    (base.len() == 24 || base.len() == 40) && base.chars().all(|c| c.is_ascii_hexdigit())
+    if let Some(timeline) = name.strip_suffix(".history") {
+        return is_postgres_archive_hex(timeline, 8)
+            .then_some(PostgresWalArchiveEntryKind::History);
+    }
+    let backup = name.strip_suffix(".backup")?;
+    let (segment, offset) = backup.split_once('.')?;
+    if backup.matches('.').count() == 1
+        && is_postgres_archive_hex(segment, 24)
+        && is_postgres_archive_hex(offset, 8)
+    {
+        Some(PostgresWalArchiveEntryKind::Backup)
+    } else {
+        None
+    }
+}
+
+fn is_postgres_wal_archive_name(name: &str) -> bool {
+    postgres_wal_archive_entry_kind(name).is_some()
 }
 
 /// On-disk folder name for a kind under `~/.forgefleet/backups/`. The
@@ -2047,6 +2368,320 @@ pub fn verify_backup_artifact(
     }
 }
 
+fn require_unique_canonical_receipt_host(
+    rows: Vec<(Uuid, String)>,
+    identity: &str,
+) -> Result<(Uuid, String), BackupError> {
+    match rows.as_slice() {
+        [(id, name)] if !name.trim().is_empty() => Ok((*id, name.clone())),
+        [] => Err(BackupError::Cmd(format!(
+            "local worker {identity} is not an enrolled computer"
+        ))),
+        [_] => Err(BackupError::Cmd(format!(
+            "local worker {identity} has an empty canonical name"
+        ))),
+        _ => Err(BackupError::Cmd(format!(
+            "local worker identity {identity} is ambiguous"
+        ))),
+    }
+}
+
+async fn canonical_receipt_host_by_name(
+    pool: &PgPool,
+    local_worker_name: &str,
+) -> Result<(Uuid, String), BackupError> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name
+           FROM computers
+          WHERE LOWER(name) = LOWER($1)
+          ORDER BY id",
+    )
+    .bind(local_worker_name)
+    .fetch_all(pool)
+    .await?;
+    require_unique_canonical_receipt_host(rows, &format!("name {local_worker_name:?}"))
+}
+
+async fn canonical_receipt_host_by_id(
+    pool: &PgPool,
+    computer_id: Uuid,
+) -> Result<(Uuid, String), BackupError> {
+    let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name
+           FROM computers
+          WHERE id = $1
+          ORDER BY id",
+    )
+    .bind(computer_id)
+    .fetch_all(pool)
+    .await?;
+    require_unique_canonical_receipt_host(rows, &format!("id {computer_id}"))
+}
+
+async fn load_backup_identity(pool: &PgPool) -> Result<age::x25519::Identity, BackupError> {
+    let private_key = pg_get_secret(pool, BACKUP_ENC_PRIVKEY)
+        .await
+        .map_err(|e| BackupError::Cmd(format!("backup identity lookup failed: {e}")))?
+        .ok_or_else(|| BackupError::Cmd("backup encryption identity is unavailable".into()))?;
+    age::x25519::Identity::from_str(private_key.trim())
+        .map_err(|_| BackupError::Cmd("stored backup encryption identity is invalid".into()))
+}
+
+fn require_receipt_evidence(evidence: &BackupArtifactEvidence) -> Result<(), BackupError> {
+    if !evidence.checksum_match {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt checksum mismatch (expected {}, observed {})",
+            evidence.expected_sha256, evidence.observed_sha256
+        )));
+    }
+    if !evidence.age_encrypted {
+        return Err(BackupError::Cmd(
+            "backup receipt requires a valid age-encrypted artifact".into(),
+        ));
+    }
+    if evidence.decrypt_probe_ok != Some(true) {
+        return Err(BackupError::Cmd(
+            "backup receipt decrypt probe failed".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Verify and persist host-local possession of one exact catalog artifact.
+/// The task supplies only immutable UUID/SHA assertions. Host identity is
+/// derived from enrollment, path components come only from the catalog, the
+/// age identity is fetched internally, and all evidence flags/timestamps are
+/// produced here rather than trusted from task JSON.
+pub async fn record_backup_distribution_receipt(
+    pool: &PgPool,
+    local_worker_name: &str,
+    backup_id: Uuid,
+    enqueue_checksum: &str,
+    backup_root: Option<&Path>,
+) -> Result<BackupReceiptReport, BackupError> {
+    let (computer_id, canonical_host) =
+        canonical_receipt_host_by_name(pool, local_worker_name).await?;
+    record_backup_distribution_receipt_for_host(
+        pool,
+        computer_id,
+        &canonical_host,
+        backup_id,
+        enqueue_checksum,
+        backup_root,
+    )
+    .await
+}
+
+async fn record_backup_distribution_receipt_for_host(
+    pool: &PgPool,
+    computer_id: Uuid,
+    canonical_host: &str,
+    backup_id: Uuid,
+    enqueue_checksum: &str,
+    backup_root: Option<&Path>,
+) -> Result<BackupReceiptReport, BackupError> {
+    validate_expected_sha256(enqueue_checksum)?;
+    let enqueue_checksum = enqueue_checksum.to_ascii_lowercase();
+    let catalog: Option<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT database_kind, file_name, checksum_sha256, size_bytes
+           FROM backups
+          WHERE id = $1",
+    )
+    .bind(backup_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((database_kind, file_name, catalog_checksum, catalog_size)) = catalog else {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt catalog row {backup_id} does not exist"
+        )));
+    };
+    validate_expected_sha256(&catalog_checksum)?;
+    if !catalog_checksum.eq_ignore_ascii_case(&enqueue_checksum) {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt enqueue checksum no longer matches catalog row {backup_id}"
+        )));
+    }
+    if catalog_size <= 0 {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt catalog row {backup_id} has a non-positive size"
+        )));
+    }
+
+    let identity = load_backup_identity(pool).await?;
+    let root = backup_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(default_backup_dir);
+    let verify_kind = database_kind.clone();
+    let verify_file = file_name.clone();
+    let verify_checksum = enqueue_checksum.clone();
+    let evidence = tokio::task::spawn_blocking(move || {
+        verify_backup_artifact(
+            &root,
+            &verify_kind,
+            &verify_file,
+            &verify_checksum,
+            Some(&identity),
+        )
+    })
+    .await
+    .map_err(|e| BackupError::Cmd(format!("backup receipt verifier task failed: {e}")))??;
+    require_receipt_evidence(&evidence)?;
+    if evidence.size_bytes != catalog_size as u64 {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt size mismatch for catalog row {backup_id}"
+        )));
+    }
+
+    let host_key = computer_id.to_string();
+    let run_id = Uuid::new_v4();
+    let persisted = ff_db::pg_record_backup_distribution_receipt(
+        pool,
+        backup_id,
+        &enqueue_checksum,
+        &host_key,
+        computer_id,
+        canonical_host,
+        &evidence.observed_sha256,
+        catalog_size,
+        BACKUP_RECEIPT_VERSION,
+        run_id,
+        &database_kind,
+        &file_name,
+    )
+    .await
+    .map_err(|error| BackupError::Cmd(format!("persist backup receipt: {error}")))?;
+    let Some((verified_at, receipt)) = persisted else {
+        return Err(BackupError::Cmd(format!(
+            "backup receipt CAS refused catalog row {backup_id}; row changed or status map is malformed"
+        )));
+    };
+
+    Ok(BackupReceiptReport {
+        backup_id,
+        computer_id,
+        host: canonical_host.to_string(),
+        expected_checksum: enqueue_checksum,
+        observed_checksum: evidence.observed_sha256,
+        verified_at,
+        receipt,
+    })
+}
+
+/// Call-scoped expected receipt identity and freshness values. The validator
+/// borrows this context only for the duration of its synchronous boolean check.
+#[derive(Clone, Copy)]
+struct ExistingReceiptExpectation<'a> {
+    backup_id: Uuid,
+    computer_id: Uuid,
+    canonical_host: &'a str,
+    expected_checksum: &'a str,
+    expected_size: i64,
+    expected_database_kind: &'a str,
+    expected_file_name: &'a str,
+    now: chrono::DateTime<Utc>,
+}
+
+fn receipt_has_valid_run_id(receipt: &serde_json::Map<String, serde_json::Value>) -> bool {
+    receipt
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|run_id| Uuid::parse_str(run_id).is_ok())
+}
+
+fn existing_receipt_is_current(
+    distribution_status: &serde_json::Value,
+    expectation: &ExistingReceiptExpectation<'_>,
+) -> bool {
+    let ExistingReceiptExpectation {
+        backup_id,
+        computer_id,
+        canonical_host,
+        expected_checksum,
+        expected_size,
+        expected_database_kind,
+        expected_file_name,
+        now,
+    } = *expectation;
+    if validate_expected_sha256(expected_checksum).is_err()
+        || expected_size <= 0
+        || !is_known_backup_kind(expected_database_kind)
+        || validate_backup_component("file_name", expected_file_name).is_err()
+    {
+        return false;
+    }
+    let backup_id_string = backup_id.to_string();
+    let computer_id_string = computer_id.to_string();
+    let Some(receipt) = distribution_status
+        .get("hosts")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|hosts| hosts.get(&computer_id_string))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if receipt.get("version").and_then(serde_json::Value::as_i64) != Some(BACKUP_RECEIPT_VERSION)
+        || receipt.get("backup_id").and_then(serde_json::Value::as_str)
+            != Some(backup_id_string.as_str())
+        || receipt
+            .get("computer_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(computer_id_string.as_str())
+        || !receipt
+            .get("host")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|host| host.eq_ignore_ascii_case(canonical_host))
+        || receipt
+            .get("database_kind")
+            .and_then(serde_json::Value::as_str)
+            != Some(expected_database_kind)
+        || receipt.get("file_name").and_then(serde_json::Value::as_str) != Some(expected_file_name)
+        || receipt.get("checksum").and_then(serde_json::Value::as_str) != Some("ok")
+        || receipt.get("decrypt").and_then(serde_json::Value::as_str) != Some("ok")
+        || receipt
+            .get("age_format")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        || receipt
+            .get("evidence_tier")
+            .and_then(serde_json::Value::as_str)
+            != Some("checksum_decrypt")
+        || receipt
+            .get("size_bytes")
+            .and_then(serde_json::Value::as_i64)
+            != Some(expected_size)
+        || !receipt_has_valid_run_id(receipt)
+    {
+        return false;
+    }
+    for field in ["expected_checksum", "observed_checksum"] {
+        if !receipt
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|checksum| checksum.eq_ignore_ascii_case(expected_checksum))
+        {
+            return false;
+        }
+    }
+    let parse_time = |field: &str| {
+        receipt
+            .get(field)
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+    };
+    let (Some(observed_at), Some(last_ok), Some(verified_at)) = (
+        parse_time("observed_at"),
+        parse_time("last_ok"),
+        parse_time("verified_at"),
+    ) else {
+        return false;
+    };
+    observed_at <= last_ok
+        && last_ok <= verified_at
+        && verified_at <= now + chrono::Duration::seconds(BACKUP_RECEIPT_FUTURE_SKEW_SECS)
+        && now.signed_duration_since(verified_at).num_seconds() <= BACKUP_RECEIPT_MAX_AGE_SECS
+}
+
 fn validate_expected_sha256(expected: &str) -> Result<(), BackupError> {
     if expected.len() == 64 && expected.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(());
@@ -2077,30 +2712,80 @@ fn validate_backup_component(label: &str, value: &str) -> Result<(), BackupError
     )))
 }
 
+const POSTGRES_WAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+const POSTGRES_WAL_DIRECTORY_MODE: u32 = 0o2770;
+const POSTGRES_WAL_FILE_MODE: u32 = 0o640;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WalArchiveCustodyEvidence {
+    segments: usize,
+    auxiliary_files: usize,
+}
+
 #[cfg(unix)]
-fn open_backup_artifact(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct UnixCustodyState {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mode: u32,
+    nlink: u64,
+    uid: u32,
+    gid: u32,
+    mtime: i64,
+    mtime_nsec: i64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[cfg(unix)]
+fn unix_custody_state(metadata: &std::fs::Metadata) -> UnixCustodyState {
+    use std::os::unix::fs::MetadataExt;
+
+    UnixCustodyState {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        size: metadata.size(),
+        mode: metadata.mode(),
+        nlink: metadata.nlink(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mtime: metadata.mtime(),
+        mtime_nsec: metadata.mtime_nsec(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(unix)]
+fn open_directory_at(
+    parent: std::os::fd::RawFd,
+    component: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let fd = unsafe {
+        libc::openat(
+            parent,
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn open_backup_kind_directory(
     backup_root: &Path,
     kind_dir_name: &str,
-    file_name: &str,
 ) -> Result<std::fs::File, BackupError> {
     use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+    use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
-
-    fn open_dir_at(parent: RawFd, component: &CString) -> std::io::Result<std::fs::File> {
-        let fd = unsafe {
-            libc::openat(
-                parent,
-                component.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            )
-        };
-        if fd < 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(unsafe { std::fs::File::from_raw_fd(fd) })
-        }
-    }
 
     let root_c = CString::new(backup_root.as_os_str().as_bytes()).map_err(|_| {
         std::io::Error::new(
@@ -2118,11 +2803,315 @@ fn open_backup_artifact(
         return Err(std::io::Error::last_os_error().into());
     }
     let root = unsafe { std::fs::File::from_raw_fd(root_fd) };
-
     let kind_c = CString::new(kind_dir_name).map_err(|_| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "kind contains a NUL byte")
     })?;
-    let kind = open_dir_at(root.as_raw_fd(), &kind_c)?;
+    open_directory_at(root.as_raw_fd(), &kind_c).map_err(BackupError::from)
+}
+
+#[cfg(unix)]
+fn open_file_at(
+    directory: std::os::fd::RawFd,
+    name: &std::ffi::CStr,
+    nonblocking: bool,
+) -> std::io::Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+
+    let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    if nonblocking {
+        // A malicious FIFO must be rejected from metadata, not hang the
+        // blocking verifier while waiting for a writer.
+        flags |= libc::O_NONBLOCK;
+    }
+    let fd = unsafe { libc::openat(directory, name.as_ptr(), flags) };
+    if fd < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn reset_readdir_errno() {
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn reset_readdir_errno() {
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn reset_readdir_errno() {}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn readdir_errno() -> i32 {
+    unsafe { *libc::__errno_location() }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn readdir_errno() -> i32 {
+    unsafe { *libc::__error() }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn readdir_errno() -> i32 {
+    0
+}
+
+#[cfg(unix)]
+fn descriptor_directory_names(directory: &std::fs::File) -> std::io::Result<Vec<String>> {
+    use std::ffi::CStr;
+    use std::os::fd::IntoRawFd;
+
+    struct DirectoryStream(*mut libc::DIR);
+    impl Drop for DirectoryStream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+
+    let duplicate = duplicate_artifact(directory)?;
+    let duplicate_fd = duplicate.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(duplicate_fd) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate_fd) };
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = DirectoryStream(stream);
+    let mut names = Vec::new();
+    loop {
+        reset_readdir_errno();
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let errno = readdir_errno();
+            if errno != 0 {
+                return Err(std::io::Error::from_raw_os_error(errno));
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        let name = std::str::from_utf8(name).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL archive contains a non-UTF-8 entry name",
+            )
+        })?;
+        names.push(name.to_string());
+    }
+    names.sort_unstable();
+    Ok(names)
+}
+
+#[cfg(unix)]
+fn wal_custody_rejection(reason: impl Into<String>) -> BackupError {
+    BackupError::Cmd(format!(
+        "Postgres WAL archive source rejected: {}",
+        reason.into()
+    ))
+}
+
+#[cfg(unix)]
+fn validate_wal_entry_custody(
+    name: &str,
+    kind: PostgresWalArchiveEntryKind,
+    state: UnixCustodyState,
+    directory_state: UnixCustodyState,
+) -> Result<(), BackupError> {
+    // Darwin's libc exposes mode_t/S_IF* as u16 while MetadataExt::mode is
+    // u32; normalize the constants so this stays source-compatible on macOS.
+    #[cfg(target_vendor = "apple")]
+    let (file_type_mask, regular_file_type) = (u32::from(libc::S_IFMT), u32::from(libc::S_IFREG));
+    #[cfg(not(target_vendor = "apple"))]
+    let (file_type_mask, regular_file_type) = (libc::S_IFMT, libc::S_IFREG);
+    if state.mode & file_type_mask != regular_file_type {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} is not a regular file"
+        )));
+    }
+    if state.nlink != 1 {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} must have exactly one link"
+        )));
+    }
+    if state.uid != directory_state.uid || state.gid != directory_state.gid {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} ownership differs from archive directory"
+        )));
+    }
+    if state.mode & 0o7777 != POSTGRES_WAL_FILE_MODE {
+        return Err(wal_custody_rejection(format!(
+            "canonical entry {name} mode must be {POSTGRES_WAL_FILE_MODE:#05o}"
+        )));
+    }
+    match kind {
+        PostgresWalArchiveEntryKind::Segment if state.size != POSTGRES_WAL_SEGMENT_BYTES => {
+            Err(wal_custody_rejection(format!(
+                "WAL segment {name} must be exactly {POSTGRES_WAL_SEGMENT_BYTES} bytes"
+            )))
+        }
+        PostgresWalArchiveEntryKind::History | PostgresWalArchiveEntryKind::Backup
+            if state.size == 0 || state.size > POSTGRES_WAL_SEGMENT_BYTES =>
+        {
+            Err(wal_custody_rejection(format!(
+                "auxiliary WAL entry {name} must be nonempty and at most {POSTGRES_WAL_SEGMENT_BYTES} bytes"
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+fn validate_postgres_wal_archive_source_with_hook<F>(
+    backup_root: &Path,
+    before_recheck: F,
+) -> Result<WalArchiveCustodyEvidence, BackupError>
+where
+    F: FnOnce(),
+{
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    struct ValidatedEntry {
+        name: String,
+        state: UnixCustodyState,
+    }
+
+    let directory =
+        open_backup_kind_directory(backup_root, kind_dir("postgres_wal")).map_err(|e| {
+            wal_custody_rejection(format!(
+                "archive directory is not a real no-follow directory: {e}"
+            ))
+        })?;
+    let directory_metadata = directory.metadata()?;
+    if !directory_metadata.file_type().is_dir() {
+        return Err(wal_custody_rejection(
+            "archive descriptor is not a directory",
+        ));
+    }
+    let directory_state = unix_custody_state(&directory_metadata);
+    if directory_state.mode & 0o7777 != POSTGRES_WAL_DIRECTORY_MODE {
+        return Err(wal_custody_rejection(format!(
+            "archive directory mode must be {POSTGRES_WAL_DIRECTORY_MODE:#06o}"
+        )));
+    }
+
+    let names = descriptor_directory_names(&directory)
+        .map_err(|e| wal_custody_rejection(format!("cannot enumerate archive descriptor: {e}")))?;
+    if names.is_empty() {
+        return Err(wal_custody_rejection("archive directory is empty"));
+    }
+
+    let mut entries = Vec::with_capacity(names.len());
+    let mut segments = 0usize;
+    let mut auxiliary_files = 0usize;
+    for name in names {
+        let Some(kind) = postgres_wal_archive_entry_kind(&name) else {
+            // Do not echo an untrusted filename into logs or task output.
+            return Err(wal_custody_rejection(
+                "archive contains a non-canonical PostgreSQL entry name",
+            ));
+        };
+        let c_name = CString::new(name.as_bytes()).map_err(|_| {
+            wal_custody_rejection("canonical archive entry unexpectedly contains NUL")
+        })?;
+        let file = open_file_at(directory.as_raw_fd(), &c_name, true).map_err(|e| {
+            wal_custody_rejection(format!(
+                "canonical entry {name} cannot be opened safely: {e}"
+            ))
+        })?;
+        let metadata = file.metadata()?;
+        let state = unix_custody_state(&metadata);
+        validate_wal_entry_custody(&name, kind, state, directory_state)?;
+        if kind == PostgresWalArchiveEntryKind::Segment {
+            segments += 1;
+        } else {
+            auxiliary_files += 1;
+        }
+        // Do not hold one descriptor per retained WAL segment: the source
+        // normally carries thousands and may legitimately exceed RLIMIT_NOFILE.
+        // The final descriptor-relative re-open below proves identity/state
+        // again while keeping descriptor use constant.
+        entries.push(ValidatedEntry { name, state });
+    }
+    if segments == 0 {
+        return Err(wal_custody_rejection(
+            "archive contains no complete WAL segment",
+        ));
+    }
+
+    before_recheck();
+
+    for entry in &entries {
+        let c_name = CString::new(entry.name.as_bytes()).map_err(|_| {
+            wal_custody_rejection("canonical archive entry unexpectedly contains NUL")
+        })?;
+        let reopened = open_file_at(directory.as_raw_fd(), &c_name, true).map_err(|e| {
+            wal_custody_rejection(format!(
+                "canonical entry {} changed before re-open: {e}",
+                entry.name
+            ))
+        })?;
+        if unix_custody_state(&reopened.metadata()?) != entry.state {
+            return Err(wal_custody_rejection(format!(
+                "canonical entry {} was replaced or mutated during validation",
+                entry.name
+            )));
+        }
+    }
+    if unix_custody_state(&directory.metadata()?) != directory_state {
+        return Err(wal_custody_rejection(
+            "archive directory mutated during validation",
+        ));
+    }
+
+    Ok(WalArchiveCustodyEvidence {
+        segments,
+        auxiliary_files,
+    })
+}
+
+fn validate_postgres_wal_archive_source(
+    backup_root: &Path,
+) -> Result<WalArchiveCustodyEvidence, BackupError> {
+    #[cfg(unix)]
+    {
+        validate_postgres_wal_archive_source_with_hook(backup_root, || {})
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = backup_root;
+        Err(BackupError::Io(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "descriptor-safe WAL archive verification requires Unix",
+        )))
+    }
+}
+
+#[cfg(unix)]
+fn open_backup_artifact(
+    backup_root: &Path,
+    kind_dir_name: &str,
+    file_name: &str,
+) -> Result<std::fs::File, BackupError> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+
+    let kind = open_backup_kind_directory(backup_root, kind_dir_name)?;
 
     let file_c = CString::new(file_name).map_err(|_| {
         std::io::Error::new(
@@ -2130,17 +3119,7 @@ fn open_backup_artifact(
             "file_name contains a NUL byte",
         )
     })?;
-    let file_fd = unsafe {
-        libc::openat(
-            kind.as_raw_fd(),
-            file_c.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        )
-    };
-    if file_fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
+    let file = open_file_at(kind.as_raw_fd(), &file_c, false)?;
     if !file.metadata()?.file_type().is_file() {
         return Err(BackupError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -2317,14 +3296,16 @@ async fn verify_backup_decryptable(pool: &PgPool, path: &Path) -> Result<(), Bac
 
 /// Shell pipeline that streams `dump.rdb` plus the multi-part AOF dir (when
 /// present) out of the FalkorDB container as a tar, compresses with zstd, and
-/// optionally encrypts. The inner `sh -c` runs INSIDE the container; tar'ing
-/// only the two known paths means a stray file in /data is never captured.
+/// optionally encrypts. `data_dir` comes from Redis `CONFIG GET dir`; tar'ing
+/// only the two known paths means a stray file in that directory is never
+/// captured.
 /// Pure — no IO — so the command shape is unit-testable.
-fn falkordb_dump_cmd(recipients: &[String], out_path: &str) -> String {
+fn falkordb_dump_cmd(recipients: &[String], out_path: &str, data_dir: &str) -> String {
     format!(
-        "docker exec {FALKORDB_CONTAINER} sh -c \
-           'cd /data && tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
+        "docker exec --workdir {data_dir} {FALKORDB_CONTAINER} sh -c \
+           'tar cf - dump.rdb $(test -d appendonlydir && echo appendonlydir)' \
          | zstd -q{age} > {out}",
+        data_dir = shell_quote(data_dir),
         age = age_stage(recipients),
         out = shell_quote(out_path),
     )
@@ -2708,6 +3689,37 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
+    const WAL_SEGMENT_A: &str = "0000000100000000000000A1";
+    #[cfg(unix)]
+    const WAL_SEGMENT_B: &str = "0000000100000000000000A2";
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn sparse_file(path: &Path, size: u64) {
+        let file = std::fs::File::create(path).unwrap();
+        file.set_len(size).unwrap();
+        set_mode(path, POSTGRES_WAL_FILE_MODE);
+    }
+
+    #[cfg(unix)]
+    fn wal_archive_fixture(with_segment: bool) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let archive = root.path().join(kind_dir("postgres_wal"));
+        std::fs::create_dir(&archive).unwrap();
+        set_mode(&archive, POSTGRES_WAL_DIRECTORY_MODE);
+        if with_segment {
+            sparse_file(&archive.join(WAL_SEGMENT_A), POSTGRES_WAL_SEGMENT_BYTES);
+        }
+        (root, archive)
+    }
+
+    #[cfg(unix)]
     fn write_verifier_fixture(
         kind: &str,
         file_name: &str,
@@ -2719,6 +3731,387 @@ mod tests {
         std::fs::write(dir.join(file_name), bytes).unwrap();
         let expected = format!("{:x}", Sha256::digest(bytes));
         (root, expected)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_accepts_canonical_archive() {
+        let (root, archive) = wal_archive_fixture(true);
+        sparse_file(&archive.join("00000002.history"), 1);
+        sparse_file(
+            &archive.join("0000000100000000000000A1.00000020.backup"),
+            512,
+        );
+
+        let evidence = validate_postgres_wal_archive_source(root.path()).unwrap();
+        assert_eq!(evidence.segments, 1);
+        assert_eq!(evidence.auxiliary_files, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_keeps_descriptor_use_bounded() {
+        // Priya retains thousands of segments. Exceed a common 1024-FD limit
+        // so this test catches implementations that hold every entry open.
+        let (root, archive) = wal_archive_fixture(false);
+        for index in 0..1_100u32 {
+            sparse_file(
+                &archive.join(format!("{index:024X}")),
+                POSTGRES_WAL_SEGMENT_BYTES,
+            );
+        }
+        let evidence = validate_postgres_wal_archive_source(root.path()).unwrap();
+        assert_eq!(evidence.segments, 1_100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_empty_and_no_segment_archives() {
+        let (empty_root, _) = wal_archive_fixture(false);
+        assert!(validate_postgres_wal_archive_source(empty_root.path()).is_err());
+
+        let (history_root, history_archive) = wal_archive_fixture(false);
+        sparse_file(&history_archive.join("00000002.history"), 1);
+        assert!(validate_postgres_wal_archive_source(history_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_wrong_directory_or_file_modes() {
+        let (directory_root, directory_archive) = wal_archive_fixture(true);
+        set_mode(&directory_archive, 0o770);
+        assert!(validate_postgres_wal_archive_source(directory_root.path()).is_err());
+
+        let (file_root, file_archive) = wal_archive_fixture(true);
+        set_mode(&file_archive.join(WAL_SEGMENT_A), 0o600);
+        assert!(validate_postgres_wal_archive_source(file_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_unexpected_and_wrong_size_entries() {
+        let (unexpected_root, unexpected_archive) = wal_archive_fixture(true);
+        sparse_file(&unexpected_archive.join("WAL.tmp"), 1);
+        assert!(validate_postgres_wal_archive_source(unexpected_root.path()).is_err());
+
+        let (segment_root, segment_archive) = wal_archive_fixture(true);
+        sparse_file(
+            &segment_archive.join(WAL_SEGMENT_A),
+            POSTGRES_WAL_SEGMENT_BYTES - 1,
+        );
+        assert!(validate_postgres_wal_archive_source(segment_root.path()).is_err());
+
+        let (aux_root, aux_archive) = wal_archive_fixture(true);
+        sparse_file(&aux_archive.join("00000002.history"), 0);
+        assert!(validate_postgres_wal_archive_source(aux_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_non_utf8_name_without_echoing_it() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let (root, archive) = wal_archive_fixture(true);
+        let unsafe_name = std::ffi::OsString::from_vec(vec![b'W', b'A', b'L', 0xff]);
+        sparse_file(&archive.join(unsafe_name), 1);
+        let error = validate_postgres_wal_archive_source(root.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("non-UTF-8 entry name"));
+        assert!(!error.contains(char::REPLACEMENT_CHARACTER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_symlink_directory_and_entries() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let linked_root = tempfile::tempdir().unwrap();
+        symlink(
+            outside.path(),
+            linked_root.path().join(kind_dir("postgres_wal")),
+        )
+        .unwrap();
+        assert!(validate_postgres_wal_archive_source(linked_root.path()).is_err());
+
+        let (entry_root, entry_archive) = wal_archive_fixture(true);
+        symlink(WAL_SEGMENT_A, entry_archive.join(WAL_SEGMENT_B)).unwrap();
+        assert!(validate_postgres_wal_archive_source(entry_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_hardlink_and_non_regular_entries() {
+        let (link_root, link_archive) = wal_archive_fixture(true);
+        std::fs::hard_link(
+            link_archive.join(WAL_SEGMENT_A),
+            link_archive.join(WAL_SEGMENT_B),
+        )
+        .unwrap();
+        assert!(validate_postgres_wal_archive_source(link_root.path()).is_err());
+
+        let (directory_root, directory_archive) = wal_archive_fixture(true);
+        std::fs::create_dir(directory_archive.join(WAL_SEGMENT_B)).unwrap();
+        assert!(validate_postgres_wal_archive_source(directory_root.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_checks_directory_ownership_match() {
+        let (root, archive) = wal_archive_fixture(true);
+        let directory = open_backup_kind_directory(root.path(), kind_dir("postgres_wal")).unwrap();
+        let directory_state = unix_custody_state(&directory.metadata().unwrap());
+        let file = std::fs::File::open(archive.join(WAL_SEGMENT_A)).unwrap();
+        let mut file_state = unix_custody_state(&file.metadata().unwrap());
+        file_state.uid = file_state.uid.wrapping_add(1);
+        assert!(
+            validate_wal_entry_custody(
+                WAL_SEGMENT_A,
+                PostgresWalArchiveEntryKind::Segment,
+                file_state,
+                directory_state,
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn postgres_wal_source_custody_rejects_file_and_directory_mutation() {
+        let (file_root, file_archive) = wal_archive_fixture(true);
+        let segment = file_archive.join(WAL_SEGMENT_A);
+        let file_error = validate_postgres_wal_archive_source_with_hook(file_root.path(), || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&segment)
+                .unwrap()
+                .set_len(POSTGRES_WAL_SEGMENT_BYTES - 1)
+                .unwrap();
+        });
+        assert!(file_error.is_err());
+
+        let (directory_root, directory_archive) = wal_archive_fixture(true);
+        let directory_error =
+            validate_postgres_wal_archive_source_with_hook(directory_root.path(), || {
+                sparse_file(&directory_archive.join("00000002.history"), 1);
+            });
+        assert!(directory_error.is_err());
+    }
+
+    #[test]
+    fn wal_distribution_custody_gate_precedes_every_database_operation() {
+        let source = include_str!("backup.rs");
+        let method = source
+            .split_once("async fn enqueue_wal_archive_distribution(")
+            .unwrap()
+            .1;
+        let gate = method.find("validate_postgres_wal_archive_source").unwrap();
+        let first_sql = method.find("sqlx::query").unwrap();
+        let first_enqueue = method.find("pg_enqueue_deferred_delayed").unwrap();
+        assert!(gate < first_sql);
+        assert!(gate < first_enqueue);
+    }
+
+    #[test]
+    fn postgres_wal_compose_custody_invariants_are_static() {
+        let compose = include_str!("../../../../deploy/docker-compose.yml");
+        let lines: Vec<_> = compose.lines().map(str::trim).collect();
+        assert!(lines.contains(&"- ${HOME}/.forgefleet/backups/postgres-wal:/wal_archive"));
+        assert!(lines.contains(
+            &"- \"archive_command=test -f /wal_archive/%f || install -m 0640 %p /wal_archive/%f\""
+        ));
+    }
+
+    #[test]
+    fn typed_receipt_payload_rejects_every_caller_controlled_proof_field() {
+        let backup_id = Uuid::new_v4();
+        let checksum = "a".repeat(64);
+        assert_eq!(
+            parse_backup_receipt_payload(&serde_json::json!({
+                "backup_id": backup_id,
+                "expected_checksum": checksum.to_ascii_uppercase(),
+            }))
+            .unwrap(),
+            (backup_id, checksum.clone())
+        );
+
+        for forbidden in [
+            "host",
+            "computer_id",
+            "path",
+            "file_name",
+            "database_kind",
+            "identity",
+            "observed_checksum",
+            "checksum",
+            "decrypt",
+            "verified_at",
+        ] {
+            let mut payload = serde_json::json!({
+                "backup_id": backup_id,
+                "expected_checksum": checksum,
+            });
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(forbidden.to_string(), serde_json::json!("forged"));
+            assert!(
+                parse_backup_receipt_payload(&payload).is_err(),
+                "caller-controlled {forbidden} must fail closed"
+            );
+        }
+        for invalid in [
+            serde_json::json!({
+                "backup_id": "not-a-uuid",
+                "expected_checksum": "a".repeat(64),
+            }),
+            serde_json::json!({
+                "backup_id": backup_id,
+                "expected_checksum": "too-short",
+            }),
+            serde_json::json!([]),
+        ] {
+            assert!(parse_backup_receipt_payload(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn current_receipt_is_exact_identity_checksum_and_freshness_bound() {
+        let backup_id = Uuid::new_v4();
+        let computer_id = Uuid::new_v4();
+        let checksum = "b".repeat(64);
+        let now = Utc::now();
+        let receipt = |verified_at: chrono::DateTime<Utc>| {
+            serde_json::json!({
+                "hosts": {
+                    computer_id.to_string(): {
+                        "version": BACKUP_RECEIPT_VERSION,
+                        "backup_id": backup_id,
+                        "computer_id": computer_id,
+                        "host": "lily",
+                        "expected_checksum": checksum,
+                        "observed_checksum": checksum,
+                        "checksum": "ok",
+                        "decrypt": "ok",
+                        "age_format": true,
+                        "evidence_tier": "checksum_decrypt",
+                        "size_bytes": 8192,
+                        "database_kind": "postgres",
+                        "file_name": "pg-exact.tar.gz.age",
+                        "run_id": Uuid::new_v4(),
+                        "observed_at": verified_at,
+                        "last_ok": verified_at,
+                        "verified_at": verified_at,
+                    }
+                }
+            })
+        };
+        let fresh = receipt(now - chrono::Duration::minutes(5));
+        let expected = ExistingReceiptExpectation {
+            backup_id,
+            computer_id,
+            canonical_host: "lily",
+            expected_checksum: &checksum,
+            expected_size: 8192,
+            expected_database_kind: "postgres",
+            expected_file_name: "pg-exact.tar.gz.age",
+            now,
+        };
+        assert!(existing_receipt_is_current(
+            &fresh,
+            &ExistingReceiptExpectation {
+                canonical_host: "LILY",
+                ..expected
+            },
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            &ExistingReceiptExpectation {
+                expected_database_kind: "redis",
+                ..expected
+            },
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            &ExistingReceiptExpectation {
+                expected_file_name: "pg-renamed.tar.gz.age",
+                ..expected
+            },
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            &ExistingReceiptExpectation {
+                canonical_host: "rihanna",
+                ..expected
+            },
+        ));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            &ExistingReceiptExpectation {
+                backup_id: Uuid::new_v4(),
+                ..expected
+            },
+        ));
+        assert!(!existing_receipt_is_current(
+            &receipt(now - chrono::Duration::seconds(BACKUP_RECEIPT_MAX_AGE_SECS + 1)),
+            &expected,
+        ));
+        assert!(existing_receipt_is_current(
+            &receipt(now + chrono::Duration::seconds(1)),
+            &expected,
+        ));
+        assert!(!existing_receipt_is_current(
+            &receipt(now + chrono::Duration::seconds(BACKUP_RECEIPT_FUTURE_SKEW_SECS + 1),),
+            &expected,
+        ));
+        let mut incomplete = fresh.clone();
+        incomplete["hosts"][computer_id.to_string()]
+            .as_object_mut()
+            .unwrap()
+            .remove("run_id");
+        assert!(!existing_receipt_is_current(&incomplete, &expected));
+        let mut invalid_run_id = fresh.clone();
+        invalid_run_id["hosts"][computer_id.to_string()]["run_id"] =
+            serde_json::json!("not-a-uuid");
+        assert!(!existing_receipt_is_current(&invalid_run_id, &expected));
+        assert!(!existing_receipt_is_current(
+            &fresh,
+            &ExistingReceiptExpectation {
+                expected_size: 4096,
+                ..expected
+            },
+        ));
+        assert_eq!(RECEIPT_RECONCILE_BATCH_SIZE, 5);
+        assert!(RECEIPT_RECONCILE_SCAN_LIMIT >= RECEIPT_RECONCILE_BATCH_SIZE as i64);
+    }
+
+    #[test]
+    fn canonical_receipt_host_resolution_is_unique_and_fail_closed() {
+        let computer_id = Uuid::new_v4();
+        assert_eq!(
+            require_unique_canonical_receipt_host(
+                vec![(computer_id, "Vinny".into())],
+                "id under test",
+            )
+            .unwrap(),
+            (computer_id, "Vinny".into())
+        );
+        assert!(require_unique_canonical_receipt_host(Vec::new(), "missing").is_err());
+        assert!(
+            require_unique_canonical_receipt_host(
+                vec![
+                    (computer_id, "Vinny".into()),
+                    (Uuid::new_v4(), "VINNY".into()),
+                ],
+                "ambiguous name",
+            )
+            .is_err()
+        );
+        assert!(
+            require_unique_canonical_receipt_host(vec![(computer_id, "  ".into())], "blank")
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -2744,6 +4137,7 @@ mod tests {
                 .unwrap();
         assert!(!mismatch.checksum_match);
         assert_eq!(mismatch.observed_sha256, expected);
+        assert!(require_receipt_evidence(&mismatch).is_err());
 
         let uppercase = expected.to_ascii_uppercase();
         let case_insensitive =
@@ -2786,6 +4180,7 @@ mod tests {
         .unwrap();
         assert!(matching.age_encrypted);
         assert_eq!(matching.decrypt_probe_ok, Some(true));
+        assert!(require_receipt_evidence(&matching).is_ok());
 
         let wrong = verify_backup_artifact(
             root.path(),
@@ -2797,6 +4192,7 @@ mod tests {
         .unwrap();
         assert!(wrong.age_encrypted);
         assert_eq!(wrong.decrypt_probe_ok, Some(false));
+        assert!(require_receipt_evidence(&wrong).is_err());
 
         let missing = verify_backup_artifact(
             root.path(),
@@ -2992,6 +4388,53 @@ mod tests {
     }
 
     #[test]
+    fn auto_destination_queries_share_fail_closed_eligibility() {
+        for source in [
+            AutoDestinationSource::ComputerId,
+            AutoDestinationSource::ComputerName,
+            AutoDestinationSource::FleetLeader,
+        ] {
+            let query = auto_destination_sql(source);
+            assert!(query.contains("c.status = 'online'"), "query: {query}");
+            assert!(
+                query.contains("c.last_seen_at IS NOT NULL"),
+                "query: {query}"
+            );
+            assert!(
+                query.contains("c.last_seen_at >= NOW() - INTERVAL '5 minutes'"),
+                "query: {query}"
+            );
+            assert!(
+                query.contains("c.reservation_state = 'available'"),
+                "query: {query}"
+            );
+            assert!(
+                query.contains("ORDER BY c.last_seen_at DESC, c.name ASC"),
+                "query: {query}"
+            );
+            assert!(!query.contains("24 hours"), "query: {query}");
+            assert!(!query.contains("last_seen_at IS NULL OR"), "query: {query}");
+            assert!(!query.contains("connectivity_mode"), "query: {query}");
+            assert!(
+                !query.to_ascii_lowercase().contains("vinny"),
+                "query: {query}"
+            );
+        }
+
+        let by_id = auto_destination_sql(AutoDestinationSource::ComputerId);
+        assert!(by_id.contains("c.id <> $1"));
+        assert!(by_id.contains("LIMIT $2"));
+
+        let by_name = auto_destination_sql(AutoDestinationSource::ComputerName);
+        assert!(by_name.contains("LOWER(c.name) <> LOWER($1)"));
+        assert!(by_name.contains("LIMIT $2"));
+
+        let by_leader = auto_destination_sql(AutoDestinationSource::FleetLeader);
+        assert!(by_leader.contains("fleet_leader_state"));
+        assert!(by_leader.contains("LIMIT $1"));
+    }
+
+    #[test]
     fn backup_rsync_title_like_matches_real_titles() {
         // The LIKE pattern's literal prefix must align with the real title
         // format built in enqueue_distribution, or the coalesce check silently
@@ -3181,9 +4624,16 @@ mod tests {
     fn postgres_wal_archive_name_guard_is_narrow() {
         assert!(is_postgres_wal_archive_name("0000000100000000000000A1"));
         assert!(is_postgres_wal_archive_name(
-            "0000000100000000000000A1.backup"
+            "0000000100000000000000A1.00000020.backup"
         ));
         assert!(is_postgres_wal_archive_name("00000002.history"));
+        assert!(!is_postgres_wal_archive_name(
+            "0000000100000000000000A100000020"
+        ));
+        assert!(!is_postgres_wal_archive_name(
+            "0000000100000000000000A1.backup"
+        ));
+        assert!(!is_postgres_wal_archive_name("0000000100000000000000a1"));
         assert!(!is_postgres_wal_archive_name("README"));
         assert!(!is_postgres_wal_archive_name(
             "pg-20260720T000000Z.tar.gz.age"
@@ -3213,9 +4663,13 @@ mod tests {
 
     #[test]
     fn falkordb_dump_cmd_captures_rdb_and_aof() {
-        let cmd = falkordb_dump_cmd(&["age1abc".to_string()], "/tmp/falkordb-x.tar.zst.age");
+        let cmd = falkordb_dump_cmd(
+            &["age1abc".to_string()],
+            "/tmp/falkordb-x.tar.zst.age",
+            "/var/lib/falkordb/data",
+        );
         assert!(
-            cmd.contains("docker exec forgefleet-falkordb"),
+            cmd.contains("docker exec --workdir '/var/lib/falkordb/data' forgefleet-falkordb"),
             "cmd: {cmd}"
         );
         // Both the RDB snapshot and the multi-part AOF dir must be in the tar.
@@ -3229,7 +4683,8 @@ mod tests {
         );
 
         // encrypt=false policy → no age stage at all.
-        let plain = falkordb_dump_cmd(&[], "/tmp/falkordb-x.tar.zst");
+        let plain = falkordb_dump_cmd(&[], "/tmp/falkordb-x.tar.zst", "/data dir");
+        assert!(plain.contains("--workdir '/data dir'"), "cmd: {plain}");
         assert!(!plain.contains("age -r"), "cmd: {plain}");
         assert!(plain.contains("| zstd -q > "), "cmd: {plain}");
     }

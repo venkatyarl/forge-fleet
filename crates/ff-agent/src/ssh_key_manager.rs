@@ -92,6 +92,15 @@ pub struct SshKeyManager {
     pg: PgPool,
 }
 
+struct RemoveKeyRequest<'a> {
+    target: &'a str,
+    primary_ip: Option<&'a str>,
+    ssh_user: &'a str,
+    ssh_port: i32,
+    public_key: &'a str,
+    fingerprint: &'a str,
+}
+
 impl SshKeyManager {
     pub fn new(pg: PgPool) -> Self {
         Self { pg }
@@ -284,20 +293,12 @@ impl SshKeyManager {
         let gen_cmd = format!(
             "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
              rm -f ~/.ssh/id_ed25519.new ~/.ssh/id_ed25519.new.pub && \
-             ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new -C '{user}@{name}-rotated' >/dev/null && \
-             cat ~/.ssh/id_ed25519.new.pub",
-            user = target_ssh_user,
-            name = target_name
+             ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519.new -C '{target_ssh_user}@{target_name}-rotated' >/dev/null && \
+             cat ~/.ssh/id_ed25519.new.pub"
         );
 
         let gen_output = self
-            .ssh_exec(
-                &target_ssh_user,
-                &target_host,
-                target_ssh_port,
-                &gen_cmd,
-                60,
-            )
+            .ssh_exec(&target_ssh_user, target_host, target_ssh_port, &gen_cmd, 60)
             .await?;
         let new_pubkey = gen_output.trim().to_string();
 
@@ -398,7 +399,7 @@ impl SshKeyManager {
             let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
 
             let peer_host = peer_ip.as_deref().unwrap_or(&peer_name);
-            let peer_dest = ssh_dest(&peer_ssh_user, &peer_host);
+            let peer_dest = ssh_dest(&peer_ssh_user, peer_host);
             let peer_port_args = ssh_port_args(peer_ssh_port);
 
             let verify_cmd = format!(
@@ -413,7 +414,7 @@ impl SshKeyManager {
                 match self
                     .ssh_exec(
                         &target_ssh_user,
-                        &target_host,
+                        target_host,
                         target_ssh_port,
                         &verify_cmd,
                         20,
@@ -441,19 +442,13 @@ impl SshKeyManager {
                         chmod 600 ~/.ssh/id_ed25519 && \
                         chmod 644 ~/.ssh/id_ed25519.pub && \
                         echo swapped";
-        self.ssh_exec(
-            &target_ssh_user,
-            &target_host,
-            target_ssh_port,
-            swap_cmd,
-            20,
-        )
-        .await
-        .map_err(|e| {
-            SshError::RotationAborted(format!(
-                "failed to swap new key into primary slot on {target_name}: {e}"
-            ))
-        })?;
+        self.ssh_exec(&target_ssh_user, target_host, target_ssh_port, swap_cmd, 20)
+            .await
+            .map_err(|e| {
+                SshError::RotationAborted(format!(
+                    "failed to swap new key into primary slot on {target_name}: {e}"
+                ))
+            })?;
 
         // 9. Scrub the old public key from every peer.
         if let Some((old_pubkey, old_fp)) = old_key {
@@ -462,19 +457,17 @@ impl SshKeyManager {
                 let peer_ip: Option<String> = row.try_get("primary_ip").ok();
                 let peer_ssh_user: String = row.get("ssh_user");
                 let peer_ssh_port: i32 = row.try_get("ssh_port").unwrap_or(22);
-                let peer_os_family: String = row.try_get("os_family").unwrap_or_default();
 
                 if let Some(t) = report.targets.iter_mut().find(|t| t.target == peer_name) {
                     match self
-                        .remove_key_on_target(
-                            &peer_name,
-                            peer_ip.as_deref(),
-                            &peer_ssh_user,
-                            peer_ssh_port,
-                            &peer_os_family,
-                            &old_pubkey,
-                            &old_fp,
-                        )
+                        .remove_key_on_target(RemoveKeyRequest {
+                            target: &peer_name,
+                            primary_ip: peer_ip.as_deref(),
+                            ssh_user: &peer_ssh_user,
+                            ssh_port: peer_ssh_port,
+                            public_key: &old_pubkey,
+                            fingerprint: &old_fp,
+                        })
                         .await
                     {
                         Ok(msg) => {
@@ -512,7 +505,7 @@ impl SshKeyManager {
         if let Err(e) = self
             .ssh_exec(
                 &target_ssh_user,
-                &target_host,
+                target_host,
                 target_ssh_port,
                 cleanup_cmd,
                 15,
@@ -632,14 +625,16 @@ impl SshKeyManager {
     /// Remove `public_key` from `target`'s `authorized_keys`.
     async fn remove_key_on_target(
         &self,
-        target: &str,
-        primary_ip: Option<&str>,
-        ssh_user: &str,
-        ssh_port: i32,
-        _os_family: &str,
-        public_key: &str,
-        fingerprint: &str,
+        request: RemoveKeyRequest<'_>,
     ) -> Result<String, SshError> {
+        let RemoveKeyRequest {
+            target,
+            primary_ip,
+            ssh_user,
+            ssh_port,
+            public_key,
+            fingerprint,
+        } = request;
         let host = primary_ip.unwrap_or(target);
         let body = extract_key_body(public_key).unwrap_or_else(|| fingerprint.to_string());
         let remote_cmd = format!(

@@ -1278,7 +1278,10 @@ pub async fn backfill_falkordb(pool: &PgPool) -> Result<CortexBackfillReport> {
     })
 }
 
-fn symbol_keys(rows: &[SymbolRef]) -> Vec<(Uuid, String, String, Option<i32>, Option<String>)> {
+type SymbolParityKey = (Uuid, String, String, Option<i32>, Option<String>);
+type HitParityKey = (Uuid, String, String, Option<i32>, Option<String>, i64);
+
+fn symbol_keys(rows: &[SymbolRef]) -> Vec<SymbolParityKey> {
     let mut keys = rows
         .iter()
         .map(|row| {
@@ -1295,7 +1298,7 @@ fn symbol_keys(rows: &[SymbolRef]) -> Vec<(Uuid, String, String, Option<i32>, Op
     keys
 }
 
-fn hit_keys(rows: &[SymbolHit]) -> Vec<(Uuid, String, String, Option<i32>, Option<String>, i64)> {
+fn hit_keys(rows: &[SymbolHit]) -> Vec<HitParityKey> {
     let mut keys = rows
         .iter()
         .map(|row| {

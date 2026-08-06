@@ -203,6 +203,157 @@ pub enum FailoverDecision {
     AllReplicasLagging,
 }
 
+/// Complete, independently-observed evidence required before automatic
+/// promotion.  Every optional field is deliberate: missing telemetry must
+/// reject a candidate rather than silently becoming a favourable default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailoverCandidateEvidence {
+    pub stable_id: String,
+    pub name: String,
+    pub role: ReplicaRole,
+    pub status: String,
+    pub lag_bytes: Option<i64>,
+    pub last_sync_age_secs: Option<i64>,
+    pub in_recovery: Option<bool>,
+    pub read_only: Option<bool>,
+    pub streaming: Option<bool>,
+    pub replay_lsn: Option<u64>,
+    pub replay_age_secs: Option<i64>,
+    pub receiver_age_secs: Option<i64>,
+}
+
+/// Bounds for evidence accepted by automatic failover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailoverEvidenceThresholds {
+    pub max_lag_bytes: i64,
+    pub max_last_sync_age_secs: i64,
+    pub max_replay_age_secs: i64,
+    pub max_receiver_age_secs: i64,
+}
+
+/// Why a replica is not safe to promote automatically.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateRejection {
+    WrongRole,
+    NotRunning,
+    Missing(&'static str),
+    Invalid(&'static str),
+    TooStale {
+        evidence: &'static str,
+        age_secs: i64,
+        max_secs: i64,
+    },
+    TooFarBehind {
+        lag_bytes: i64,
+        max_bytes: i64,
+    },
+}
+
+/// Validate every authority, recovery and freshness signal for a candidate.
+pub fn reject_failover_candidate(
+    candidate: &FailoverCandidateEvidence,
+    thresholds: FailoverEvidenceThresholds,
+) -> Option<CandidateRejection> {
+    if candidate.role != ReplicaRole::Replica {
+        return Some(CandidateRejection::WrongRole);
+    }
+    if candidate.status != "running" {
+        return Some(CandidateRejection::NotRunning);
+    }
+    let lag_bytes = match candidate.lag_bytes {
+        Some(value) if value >= 0 => value,
+        Some(_) => return Some(CandidateRejection::Invalid("lag_bytes")),
+        None => return Some(CandidateRejection::Missing("lag_bytes")),
+    };
+    if lag_bytes > thresholds.max_lag_bytes {
+        return Some(CandidateRejection::TooFarBehind {
+            lag_bytes,
+            max_bytes: thresholds.max_lag_bytes,
+        });
+    }
+    let last_sync_age_secs = match candidate.last_sync_age_secs {
+        Some(value) if value >= 0 => value,
+        Some(_) => return Some(CandidateRejection::Invalid("last_sync_at")),
+        None => return Some(CandidateRejection::Missing("last_sync_at")),
+    };
+    if last_sync_age_secs > thresholds.max_last_sync_age_secs {
+        return Some(CandidateRejection::TooStale {
+            evidence: "last_sync_at",
+            age_secs: last_sync_age_secs,
+            max_secs: thresholds.max_last_sync_age_secs,
+        });
+    }
+    match candidate.in_recovery {
+        Some(true) => {}
+        Some(false) => return Some(CandidateRejection::Invalid("pg_is_in_recovery")),
+        None => return Some(CandidateRejection::Missing("pg_is_in_recovery")),
+    }
+    match candidate.read_only {
+        Some(true) => {}
+        Some(false) => return Some(CandidateRejection::Invalid("transaction_read_only")),
+        None => return Some(CandidateRejection::Missing("transaction_read_only")),
+    }
+    match candidate.streaming {
+        Some(true) => {}
+        Some(false) => return Some(CandidateRejection::Invalid("walreceiver_streaming")),
+        None => return Some(CandidateRejection::Missing("walreceiver_streaming")),
+    }
+    if candidate.replay_lsn.is_none() {
+        return Some(CandidateRejection::Missing("last_replay_lsn"));
+    }
+    for (evidence, age, max_secs) in [
+        (
+            "last_replay",
+            candidate.replay_age_secs,
+            thresholds.max_replay_age_secs,
+        ),
+        (
+            "walreceiver_message",
+            candidate.receiver_age_secs,
+            thresholds.max_receiver_age_secs,
+        ),
+    ] {
+        let Some(age_secs) = age else {
+            return Some(CandidateRejection::Missing(evidence));
+        };
+        if age_secs < 0 {
+            return Some(CandidateRejection::Invalid(evidence));
+        }
+        if age_secs > max_secs {
+            return Some(CandidateRejection::TooStale {
+                evidence,
+                age_secs,
+                max_secs,
+            });
+        }
+    }
+    None
+}
+
+/// Pick the safest eligible replica deterministically.
+///
+/// Ordering is highest replay LSN, then lowest measured lag, replay age,
+/// receiver age, name and stable computer id.  The last two keys guarantee
+/// every leader independently reaches the same answer on identical evidence.
+pub fn choose_evidenced_failover_target(
+    candidates: &[FailoverCandidateEvidence],
+    thresholds: FailoverEvidenceThresholds,
+) -> Option<&FailoverCandidateEvidence> {
+    candidates
+        .iter()
+        .filter(|candidate| reject_failover_candidate(candidate, thresholds).is_none())
+        .min_by(|left, right| {
+            right
+                .replay_lsn
+                .cmp(&left.replay_lsn)
+                .then_with(|| left.lag_bytes.cmp(&right.lag_bytes))
+                .then_with(|| left.replay_age_secs.cmp(&right.replay_age_secs))
+                .then_with(|| left.receiver_age_secs.cmp(&right.receiver_age_secs))
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.stable_id.cmp(&right.stable_id))
+        })
+}
+
 /// Pure decision logic: given a failed primary and a list of replicas, pick the
 /// best replica to promote.
 ///
@@ -414,5 +565,81 @@ mod tests {
 
         let target = choose_failover_target(&nodes, 256 * 1_024);
         assert_eq!(target.map(|r| r.name.as_str()), Some("charlie"));
+    }
+
+    fn complete_evidence(
+        name: &str,
+        stable_id: &str,
+        replay_lsn: u64,
+    ) -> FailoverCandidateEvidence {
+        FailoverCandidateEvidence {
+            stable_id: stable_id.into(),
+            name: name.into(),
+            role: ReplicaRole::Replica,
+            status: "running".into(),
+            lag_bytes: Some(16_384),
+            last_sync_age_secs: Some(10),
+            in_recovery: Some(true),
+            read_only: Some(true),
+            streaming: Some(true),
+            replay_lsn: Some(replay_lsn),
+            replay_age_secs: Some(4),
+            receiver_age_secs: Some(1),
+        }
+    }
+
+    fn evidence_thresholds() -> FailoverEvidenceThresholds {
+        FailoverEvidenceThresholds {
+            max_lag_bytes: 256 * 1_024,
+            max_last_sync_age_secs: 300,
+            max_replay_age_secs: 300,
+            max_receiver_age_secs: 300,
+        }
+    }
+
+    #[test]
+    fn evidenced_selector_rejects_each_incomplete_or_unsafe_signal() {
+        let base = complete_evidence("safe", "1", 100);
+        let mutations: Vec<Box<dyn Fn(&mut FailoverCandidateEvidence)>> = vec![
+            Box::new(|value| value.status = "degraded".into()),
+            Box::new(|value| value.lag_bytes = None),
+            Box::new(|value| value.lag_bytes = Some(256 * 1_024 + 1)),
+            Box::new(|value| value.last_sync_age_secs = None),
+            Box::new(|value| value.last_sync_age_secs = Some(301)),
+            Box::new(|value| value.in_recovery = Some(false)),
+            Box::new(|value| value.read_only = Some(false)),
+            Box::new(|value| value.streaming = Some(false)),
+            Box::new(|value| value.replay_lsn = None),
+            Box::new(|value| value.replay_age_secs = None),
+            Box::new(|value| value.replay_age_secs = Some(301)),
+            Box::new(|value| value.receiver_age_secs = None),
+            Box::new(|value| value.receiver_age_secs = Some(301)),
+        ];
+        for mutate in mutations {
+            let mut candidate = base.clone();
+            mutate(&mut candidate);
+            assert!(
+                reject_failover_candidate(&candidate, evidence_thresholds()).is_some(),
+                "mutation should fail closed: {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn evidenced_selector_ranks_lsn_before_lag_and_is_deterministic() {
+        let mut newest = complete_evidence("zulu", "2", 200);
+        newest.lag_bytes = Some(200_000);
+        let lower_lag_but_older = complete_evidence("alpha", "1", 199);
+        let candidates = [lower_lag_but_older.clone(), newest.clone()];
+        let selected = choose_evidenced_failover_target(&candidates, evidence_thresholds());
+        assert_eq!(selected.map(|value| value.stable_id.as_str()), Some("2"));
+
+        newest.name = "same".into();
+        newest.stable_id = "b".into();
+        let mut tied = newest.clone();
+        tied.stable_id = "a".into();
+        let candidates = [newest, tied];
+        let selected = choose_evidenced_failover_target(&candidates, evidence_thresholds());
+        assert_eq!(selected.map(|value| value.stable_id.as_str()), Some("a"));
     }
 }
