@@ -771,7 +771,7 @@ fn status_rows(home: &std::path::Path) -> Vec<Value> {
             };
             let exists = path.exists();
             let transport = has_ff.then(|| config_forgefleet_transport(&path)).flatten();
->>>>>>> 4c3c75d9 (feat: desktop apps download-to-Downloads + MCP dual-path status + canonical che            json!({
+            json!({
                 "client": name,
                 "config_path": path.display().to_string(),
                 "exists": exists,
