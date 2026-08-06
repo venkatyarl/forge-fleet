@@ -4608,6 +4608,20 @@ pub enum SecretsCommand {
     /// Delete a secret by key.
     #[command(alias = "rm")]
     Delete { key: String },
+    /// Permit one exact ready task to run while the global work-item execution
+    /// gate remains disabled. The authority always expires automatically.
+    AllowWorkItemCanary {
+        /// Exact ready task UUID to admit.
+        work_item_id: uuid::Uuid,
+        /// Lifetime of the exemption (1..=360 minutes).
+        #[arg(long)]
+        minutes: u32,
+        /// Required audit reason stored with the authority row.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Revoke the current exact-work-item canary authority immediately.
+    RevokeWorkItemCanary,
     /// Rotate a secret's value. If --value is given, uses it; otherwise
     /// generates a fresh 32-byte hex value and stores it. Also bumps
     /// rotation_count and extends expires_at by rotate_before_days.
@@ -9642,6 +9656,54 @@ mod mesh_exclusion_cli_tests {
             }
             other => panic!("expected verify-node, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod work_item_canary_cli_tests {
+    use super::{Cli, Command, SecretsCommand};
+    use clap::Parser;
+
+    #[test]
+    fn bounded_grant_and_revoke_commands_parse() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                let id = uuid::Uuid::new_v4();
+                let grant = Cli::try_parse_from([
+                    "ff",
+                    "secrets",
+                    "allow-work-item-canary",
+                    &id.to_string(),
+                    "--minutes",
+                    "90",
+                    "--reason",
+                    "isolated recovery proof",
+                ])
+                .expect("bounded canary grant should parse");
+                assert!(matches!(
+                    grant.command,
+                    Some(Command::Secrets {
+                        command: SecretsCommand::AllowWorkItemCanary {
+                            work_item_id,
+                            minutes: 90,
+                            ..
+                        }
+                    }) if work_item_id == id
+                ));
+
+                let revoke = Cli::try_parse_from(["ff", "secrets", "revoke-work-item-canary"])
+                    .expect("canary revoke should parse");
+                assert!(matches!(
+                    revoke.command,
+                    Some(Command::Secrets {
+                        command: SecretsCommand::RevokeWorkItemCanary
+                    })
+                ));
+            })
+            .expect("spawn parser test")
+            .join()
+            .expect("parser test thread");
     }
 }
 

@@ -65,7 +65,7 @@ const MAX_BUILD_ATTEMPTS: i32 = 5;
 const DISPATCH_TICK_STALE_SECS: i64 = 60;
 const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
 const MAX_FAILED_RETRIES: i32 = 3;
-pub(crate) const WORK_ITEM_EXECUTION_ENABLED_KEY: &str = "work_item_execution_enabled";
+pub(crate) const WORK_ITEM_EXECUTION_ENABLED_KEY: &str = ff_db::WORK_ITEM_EXECUTION_ENABLED_KEY;
 const WORK_ITEM_EXECUTION_DEFAULT: bool = true;
 const WORK_ITEM_EXECUTION_RESTORE_ON_EXPIRY: bool = true;
 
@@ -101,6 +101,20 @@ pub(crate) async fn work_item_execution_enabled(pg: &PgPool) -> bool {
         )
         .await,
     )
+}
+
+async fn work_item_execution_exemption(pg: &PgPool) -> Option<uuid::Uuid> {
+    match ff_db::pg_work_item_execution_exemption(pg).await {
+        Ok(exemption) => exemption,
+        Err(error) => {
+            warn!(
+                key = ff_db::WORK_ITEM_EXECUTION_EXEMPTION_KEY,
+                %error,
+                "work-item execution exemption read failed; admitting no canary"
+            );
+            None
+        }
+    }
 }
 
 const LEASE_STALE_SAMPLE_SQL: &str = r#"
@@ -505,33 +519,9 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
 
-    let routed_diagnoses = route_diagnosed_local_failures(pg).await?;
-    if routed_diagnoses > 0 {
-        info!(
-            routed_diagnoses,
-            "work_item_scheduler: routed local-failure diagnoses to improvement pipelines"
-        );
-    }
-
-    let deployed_remediations = reconcile_deploy_pending_local_failures(pg).await?;
-    if deployed_remediations > 0 {
-        info!(
-            deployed_remediations,
-            "work_item_scheduler: deployed local-failure remediations"
-        );
-    }
-
-    let local_retests = requeue_deployed_local_retests(pg).await?;
-    if local_retests > 0 {
-        info!(
-            local_retests,
-            "work_item_scheduler: queued deployed remediations for local-first verification"
-        );
-    }
-
-    // Companion sweep: `in_progress` work_items with no active lease can't be
-    // reaped by the lease sweep above (they have no lease row). Cancel the ones
-    // older than ORPHAN_MIN_AGE_SECS so they stop polluting `in_progress`.
+    // Reconciliation remains live during a recovery freeze: stale leases and
+    // orphaned lease-managed rows must not keep slots falsely busy. These are
+    // custody repairs, not new autonomous work production.
     let orphans = ff_db::pg_reap_orphaned_work_items(pg, ORPHAN_MIN_AGE_SECS).await?;
     if orphans > 0 {
         warn!(
@@ -539,64 +529,103 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             "work_item_scheduler: cancelled orphaned lease-managed work_items (no live custody)"
         );
     }
-
-    let retried = auto_requeue_failed_work_items(pg).await?;
-    if retried > 0 {
-        info!(
-            retried,
-            cooldown_minutes = FAILED_RETRY_COOLDOWN_MINUTES,
-            max_retries = MAX_FAILED_RETRIES,
-            "work_item_scheduler: requeued failed work_items at cloud attempt tier"
-        );
+    if let Err(error) = ff_db::pg_clear_terminal_work_item_execution_exemption(pg).await {
+        warn!(%error, "work_item_scheduler: could not clear terminal execution exemption");
     }
 
-    // Self-heal: terminally-`failed` items whose last_error was TRANSIENT
-    // infrastructure (backend spawn, provider/network, pool, heartbeat) are
-    // buildable once the condition clears — return a batch to the ready pool
-    // with full redispatch eligibility restored (leases released, assignment
-    // cleared). Best-effort: a sweep failure must never stall assignment.
-    match crate::self_heal::requeue_transient_failures(pg).await {
-        Ok(healed) if healed > 0 => info!(
-            healed,
-            "work_item_scheduler: self-heal requeued transiently-failed work_items"
-        ),
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "work_item_scheduler: self-heal requeue sweep failed"),
-    }
+    let execution_enabled = work_item_execution_enabled(pg).await;
+    let execution_exemption = if execution_enabled {
+        None
+    } else {
+        work_item_execution_exemption(pg).await
+    };
 
-    // SYSTEMIC-ERROR DOCTOR: before the per-item retry loop wastes the backlog on
-    // a shared infrastructure fault (a missing DB column, a migration crash, a
-    // dead router), detect clusters of DIFFERENT items failing with the IDENTICAL
-    // error, park them (halt the retry storm), and alert the operator with the
-    // signature + remediation hint. Best-effort — never stalls scheduling.
-    match crate::self_heal::detect_systemic_failures(pg).await {
-        Ok(findings) if !findings.is_empty() => {
-            for f in &findings {
-                warn!(
-                    signature = %f.signature, count = f.count, hint = %f.remediation_hint,
-                    "work_item_scheduler: SYSTEMIC failure cluster — parked + operator-alert"
-                );
-                crate::self_heal::alert_systemic_finding(pg, f).await;
-            }
+    // Every broad queue writer stays frozen in exact-canary mode. Only custody
+    // reconciliation above and the one exact assignment below may proceed.
+    if execution_enabled {
+        let routed_diagnoses = route_diagnosed_local_failures(pg).await?;
+        if routed_diagnoses > 0 {
+            info!(
+                routed_diagnoses,
+                "work_item_scheduler: routed local-failure diagnoses to improvement pipelines"
+            );
         }
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "work_item_scheduler: systemic-error doctor sweep failed"),
-    }
 
-    // Auto-complete decomposed parents (bug/feature) once all of their task
-    // children are terminal. This stops parent rows from lingering in `ready`
-    // and cluttering the board after their leaves finish.
-    let completed_parents = ff_db::pg_complete_parent_work_items(pg).await?;
-    if completed_parents > 0 {
-        info!(
-            completed_parents,
-            "work_item_scheduler: auto-completed parent work_items"
-        );
+        let deployed_remediations = reconcile_deploy_pending_local_failures(pg).await?;
+        if deployed_remediations > 0 {
+            info!(
+                deployed_remediations,
+                "work_item_scheduler: deployed local-failure remediations"
+            );
+        }
+
+        let local_retests = requeue_deployed_local_retests(pg).await?;
+        if local_retests > 0 {
+            info!(
+                local_retests,
+                "work_item_scheduler: queued deployed remediations for local-first verification"
+            );
+        }
+
+        let retried = auto_requeue_failed_work_items(pg).await?;
+        if retried > 0 {
+            info!(
+                retried,
+                cooldown_minutes = FAILED_RETRY_COOLDOWN_MINUTES,
+                max_retries = MAX_FAILED_RETRIES,
+                "work_item_scheduler: requeued failed work_items at cloud attempt tier"
+            );
+        }
+
+        // Self-heal: terminally-`failed` items whose last_error was TRANSIENT
+        // infrastructure (backend spawn, provider/network, pool, heartbeat) are
+        // buildable once the condition clears — return a batch to the ready pool
+        // with full redispatch eligibility restored (leases released, assignment
+        // cleared). Best-effort: a sweep failure must never stall assignment.
+        match crate::self_heal::requeue_transient_failures(pg).await {
+            Ok(healed) if healed > 0 => info!(
+                healed,
+                "work_item_scheduler: self-heal requeued transiently-failed work_items"
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "work_item_scheduler: self-heal requeue sweep failed"),
+        }
+
+        // SYSTEMIC-ERROR DOCTOR: before the per-item retry loop wastes the backlog on
+        // a shared infrastructure fault (a missing DB column, a migration crash, a
+        // dead router), detect clusters of DIFFERENT items failing with the IDENTICAL
+        // error, park them (halt the retry storm), and alert the operator with the
+        // signature + remediation hint. Best-effort — never stalls scheduling.
+        match crate::self_heal::detect_systemic_failures(pg).await {
+            Ok(findings) if !findings.is_empty() => {
+                for f in &findings {
+                    warn!(
+                        signature = %f.signature, count = f.count, hint = %f.remediation_hint,
+                        "work_item_scheduler: SYSTEMIC failure cluster — parked + operator-alert"
+                    );
+                    crate::self_heal::alert_systemic_finding(pg, f).await;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "work_item_scheduler: systemic-error doctor sweep failed"),
+        }
+
+        // Auto-complete decomposed parents (bug/feature) once all of their task
+        // children are terminal. This stops parent rows from lingering in `ready`
+        // and cluttering the board after their leaves finish.
+        let completed_parents = ff_db::pg_complete_parent_work_items(pg).await?;
+        if completed_parents > 0 {
+            info!(
+                completed_parents,
+                "work_item_scheduler: auto-completed parent work_items"
+            );
+        }
     }
 
     // Keep reconciliation and stale-lease cleanup alive during a recovery
-    // freeze, but stop before fetching capacity or creating any new leases.
-    if !work_item_execution_enabled(pg).await {
+    // freeze. A bounded exact-UUID exemption may admit one item without
+    // opening the global queue; every invalid authority state admits zero.
+    if !execution_enabled && execution_exemption.is_none() {
         tracing::debug!(
             key = WORK_ITEM_EXECUTION_ENABLED_KEY,
             "work_item_scheduler: new assignments paused by execution gate"
@@ -604,7 +633,14 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         return Ok(0);
     }
 
-    let ready = ff_db::pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK).await?;
+    let ready = if let Some(work_item_id) = execution_exemption {
+        ff_db::pg_ready_work_item(pg, work_item_id)
+            .await?
+            .into_iter()
+            .collect()
+    } else {
+        ff_db::pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK).await?
+    };
     if ready.is_empty() {
         return Ok(0);
     }
@@ -713,6 +749,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             &dispatch_live,
             &viable,
             &mut fallback_assigns,
+            execution_exemption,
         )
         .await
         {
@@ -731,6 +768,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             &dispatch_live,
             &viable,
             &mut fallback_assigns,
+            execution_exemption,
         )
         .await
         {
@@ -778,6 +816,7 @@ async fn try_assign_item(
     dispatch_live: &HashSet<uuid::Uuid>,
     viable: &HashSet<uuid::Uuid>,
     fallback_assigns: &mut usize,
+    execution_exemption: Option<uuid::Uuid>,
 ) -> bool {
     // Honor a host pin by re-querying that host's free slots; else take from
     // the shared pool, preferring an agent-viable computer.
@@ -797,15 +836,26 @@ async fn try_assign_item(
     };
     let Some(slot) = slot else { return false };
 
-    match ff_db::pg_assign_work_item(
-        pg,
-        item.id,
-        slot.sub_agent_id,
-        slot.computer_id,
-        LEASE_GRANT_SECS,
-    )
-    .await
-    {
+    let assignment = if execution_exemption.is_some() {
+        ff_db::pg_assign_exempted_work_item(
+            pg,
+            item.id,
+            slot.sub_agent_id,
+            slot.computer_id,
+            LEASE_GRANT_SECS,
+        )
+        .await
+    } else {
+        ff_db::pg_assign_work_item(
+            pg,
+            item.id,
+            slot.sub_agent_id,
+            slot.computer_id,
+            LEASE_GRANT_SECS,
+        )
+        .await
+    };
+    match assignment {
         Ok(true) => {
             *active_by_computer.entry(slot.computer_id).or_default() += 1;
             let lease_id = sqlx::query_scalar::<_, uuid::Uuid>(
@@ -1029,34 +1079,57 @@ mod tests {
     }
 
     #[test]
-    fn execution_gate_runs_after_housekeeping_and_before_assignment() {
+    fn execution_gate_runs_after_housekeeping_and_admits_only_exact_canary() {
         let source = include_str!("work_item_scheduler.rs");
         let body = source
             .split("pub async fn evaluate_work_items")
             .nth(1)
             .expect("scheduler evaluator exists");
-        let housekeeping = body
-            .find("pg_complete_parent_work_items")
-            .expect("final housekeeping step exists");
-        let gate = body
-            .find("if !work_item_execution_enabled(pg).await")
+        let stale_cleanup = body
+            .find("pg_reap_stale_work_item_leases")
+            .expect("stale-lease reconciliation exists");
+        let orphan_cleanup = body
+            .find("pg_reap_orphaned_work_items")
+            .expect("orphan reconciliation exists");
+        let authority = body
+            .find("let execution_enabled = work_item_execution_enabled(pg).await")
             .expect("execution gate exists");
-        let assignment = body
-            .find("pg_ready_work_items")
+        let broad_writer_guard = body[authority..]
+            .find("if execution_enabled {")
+            .map(|offset| authority + offset)
+            .expect("broad-writer guard exists");
+        let broad_writer = body
+            .find("route_diagnosed_local_failures")
+            .expect("broad queue writer exists");
+        let exact_fetch = body
+            .find("pg_ready_work_item(pg, work_item_id)")
+            .expect("exact canary fetch exists");
+        let broad_fetch = body
+            .find("pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK)")
             .expect("assignment fetch exists");
 
         assert!(
-            housekeeping < gate,
-            "gate must preserve scheduler housekeeping"
+            stale_cleanup < orphan_cleanup && orphan_cleanup < authority,
+            "custody reconciliation must remain ahead of the execution authority"
         );
         assert!(
-            gate < assignment,
+            authority < broad_writer_guard
+                && broad_writer_guard < broad_writer
+                && broad_writer < exact_fetch
+                && exact_fetch < broad_fetch,
             "gate must stop before new assignment work"
         );
         assert!(
-            body[gate..assignment].contains("return Ok(0)"),
-            "disabled gate must return without assigning"
+            body[authority..exact_fetch]
+                .contains("if !execution_enabled && execution_exemption.is_none()")
+                && body[authority..exact_fetch].contains("return Ok(0)"),
+            "disabled gate without a valid exemption must return without assigning"
         );
+        assert!(
+            body[broad_writer_guard..exact_fetch].contains("requeue_transient_failures"),
+            "self-heal queue writers must remain inside the global-enable branch"
+        );
+        assert!(body.contains("pg_assign_exempted_work_item"));
     }
 
     #[test]
