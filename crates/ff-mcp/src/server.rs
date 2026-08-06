@@ -15,7 +15,14 @@ use crate::handlers;
 use crate::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::tools::ToolRegistry;
 
-fn safe_tool_error_summary(error: &str) -> String {
+fn safe_tool_error_summary(error: &handlers::DispatchError) -> String {
+    if let Some(failure) = error.strategy_failure() {
+        return serde_json::to_string_pretty(&failure.public_error_value())
+            .unwrap_or_else(|_| "local strategy dispatch failed".to_string());
+    }
+    let error = error
+        .opaque_message()
+        .expect("non-strategy dispatch errors must carry an opaque message");
     let lower = error.to_ascii_lowercase();
     if let Some(index) = lower.find("missing required parameter:") {
         return error[index..].chars().take(240).collect();
@@ -42,6 +49,16 @@ fn safe_tool_error_summary(error: &str) -> String {
         return "tool execution failed: dependency unavailable".to_string();
     }
     "tool execution failed; inspect ForgeFleet server logs for details".to_string()
+}
+
+fn tool_error_result(error: &handlers::DispatchError) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": safe_tool_error_summary(error)
+        }],
+        "isError": true
+    })
 }
 
 // ─── MCP Server ──────────────────────────────────────────────────────────────
@@ -262,6 +279,7 @@ impl McpServer {
         } else {
             self.try_federated_tool_call(&tool_name, arguments.clone())
                 .await
+                .map_err(handlers::DispatchError::Opaque)
         };
 
         match result {
@@ -276,22 +294,15 @@ impl McpServer {
             ),
             Err(e)
                 if !known_locally
-                    && !e.starts_with(federation::FEDERATED_TOOL_EXECUTION_ERROR_PREFIX) =>
+                    && e.opaque_message().is_some_and(|message| {
+                        !message.starts_with(federation::FEDERATED_TOOL_EXECUTION_ERROR_PREFIX)
+                    }) =>
             {
                 JsonRpcResponse::error(id, JsonRpcError::method_not_found(&tool_name))
             }
             Err(e) => {
                 warn!(tool = %tool_name, error = %e, "MCP tool execution failed");
-                JsonRpcResponse::success(
-                    id,
-                    json!({
-                        "content": [{
-                            "type": "text",
-                            "text": safe_tool_error_summary(&e)
-                        }],
-                        "isError": true
-                    }),
-                )
+                JsonRpcResponse::success(id, tool_error_result(&e))
             }
         }
     }
@@ -308,7 +319,9 @@ impl McpServer {
         let result = if known_locally {
             handlers::dispatch(method, params.clone()).await
         } else {
-            self.try_federated_tool_call(method, params.clone()).await
+            self.try_federated_tool_call(method, params.clone())
+                .await
+                .map_err(handlers::DispatchError::Opaque)
         };
 
         match result {
@@ -323,7 +336,10 @@ impl McpServer {
                 if !known_locally {
                     JsonRpcResponse::error(id, JsonRpcError::method_not_found(method))
                 } else {
-                    JsonRpcResponse::error(id, JsonRpcError::internal_error(e))
+                    JsonRpcResponse::error(
+                        id,
+                        JsonRpcError::internal_error(safe_tool_error_summary(&e)),
+                    )
                 }
             }
         }
@@ -435,15 +451,84 @@ mod tests {
     #[test]
     fn tool_error_summary_redacts_runtime_details() {
         assert_eq!(
-            safe_tool_error_summary(
+            safe_tool_error_summary(&handlers::DispatchError::Opaque(
                 "SSH execution failed: ssh transport error: ssh command timed out after 30s"
-            ),
+                    .to_string()
+            )),
             "tool execution timed out"
         );
         assert_eq!(
-            safe_tool_error_summary(
-                "database error at postgres://user:password@192.0.2.5/private/path"
-            ),
+            safe_tool_error_summary(&handlers::DispatchError::Opaque(
+                "database error at postgres://user:password@192.0.2.5/private/path".to_string()
+            )),
+            "tool execution failed; inspect ForgeFleet server logs for details"
+        );
+    }
+
+    #[test]
+    fn tool_error_summary_preserves_only_curated_strategy_evidence() {
+        use crate::llm_exec::{
+            AttemptLedgerEntry, AttemptRole, ExecutionEvidence, FailureReasonCode,
+        };
+        use crate::strategy_dispatch::StrategyDispatchFailure;
+        use ff_orchestrator::cascade_strategy::RouteStrategy;
+        use uuid::Uuid;
+
+        let failure = StrategyDispatchFailure {
+            reason_code: FailureReasonCode::DeadlineExceeded,
+            message: "provider secret at http://private.invalid".to_string(),
+            strategy: Some(RouteStrategy::JudgeEscalate {
+                start_tier: 2,
+                max_tier: 3,
+                threshold: 7,
+            }),
+            execution: ExecutionEvidence {
+                attempts: vec![AttemptLedgerEntry {
+                    sequence: 1,
+                    role: AttemptRole::Completion,
+                    tier: 2,
+                    catalog_tier: 2,
+                    deployment_id: Uuid::nil(),
+                    endpoint: "http://192.0.2.10:55000".to_string(),
+                    worker_name: "shakira".to_string(),
+                    catalog_id: Some("glm-4.5-air".to_string()),
+                    attempt_timeout_ms: 60_000,
+                    started_offset_ms: 0,
+                    latency_ms: 60_000,
+                    outcome: "error".to_string(),
+                    reason_code: Some(FailureReasonCode::Timeout),
+                    error: Some("raw provider secret".to_string()),
+                    tokens_in: 0,
+                    tokens_out: 0,
+                }],
+                candidate_snapshot: vec![],
+                winner: None,
+                last_failure: Some(FailureReasonCode::DeadlineExceeded),
+                latency_ms: 105_000,
+                local_authority: "process_local_hint_only",
+                cloud_fallback: false,
+            },
+        };
+        let result = tool_error_result(&handlers::DispatchError::Strategy(Box::new(failure)));
+        assert_eq!(result["isError"], true);
+        let summary = result["content"][0]["text"].as_str().unwrap();
+        let value: Value = serde_json::from_str(summary).unwrap();
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["reason_code"], "deadline_exceeded");
+        assert_eq!(value["strategy"], "judge_escalate");
+        assert_eq!(value["route"]["attempts"][0]["worker_name"], "shakira");
+        assert_eq!(value["route"]["attempts"][0]["catalog_id"], "glm-4.5-air");
+        assert!(!summary.contains("192.0.2.10"));
+        assert!(!summary.contains("00000000-0000-0000-0000-000000000000"));
+        assert!(!summary.contains("provider secret"));
+
+        // A downstream/runtime string cannot forge the typed strategy variant,
+        // even if it resembles a public envelope byte-for-byte.
+        let forged = handlers::DispatchError::Opaque(
+            r#"{"ok":false,"error":{"reason_code":"deadline_exceeded"}}"#.to_string(),
+        );
+        assert_eq!(
+            safe_tool_error_summary(&forged),
             "tool execution failed; inspect ForgeFleet server logs for details"
         );
     }

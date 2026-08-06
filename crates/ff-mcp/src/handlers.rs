@@ -53,6 +53,57 @@ use crate::federation;
 /// Handler result type — all handlers return JSON or an error string.
 pub type HandlerResult = std::result::Result<Value, String>;
 
+/// Typed boundary between handlers and the MCP server. Only an internally
+/// constructed strategy failure can opt into the curated diagnostic response;
+/// arbitrary runtime/provider strings remain opaque.
+#[derive(Debug)]
+pub(crate) enum DispatchError {
+    Opaque(String),
+    Strategy(Box<crate::strategy_dispatch::StrategyDispatchFailure>),
+}
+
+impl DispatchError {
+    pub(crate) fn strategy_failure(
+        &self,
+    ) -> Option<&crate::strategy_dispatch::StrategyDispatchFailure> {
+        match self {
+            Self::Strategy(failure) => Some(failure),
+            Self::Opaque(_) => None,
+        }
+    }
+
+    pub(crate) fn opaque_message(&self) -> Option<&str> {
+        match self {
+            Self::Opaque(message) => Some(message),
+            Self::Strategy(_) => None,
+        }
+    }
+
+    fn into_compat_string(self) -> String {
+        match self {
+            Self::Opaque(message) => message,
+            Self::Strategy(failure) => failure.error_text(),
+        }
+    }
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opaque(message) => formatter.write_str(message),
+            Self::Strategy(failure) => formatter.write_str(&failure.error_text()),
+        }
+    }
+}
+
+impl From<String> for DispatchError {
+    fn from(message: String) -> Self {
+        Self::Opaque(message)
+    }
+}
+
+pub(crate) type DispatchResult = std::result::Result<Value, DispatchError>;
+
 const QUALITY_SNAPSHOT_KEY: &str = "ff_api.quality_snapshot";
 const PROJECT_PROFILE_KEY_PREFIX: &str = "ff_mcp.project_profile.";
 
@@ -564,6 +615,12 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
 // ─── Fleet Run ───────────────────────────────────────────────────────────────
 
 pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
+    fleet_run_typed(params)
+        .await
+        .map_err(DispatchError::into_compat_string)
+}
+
+async fn fleet_run_typed(params: Option<Value>) -> DispatchResult {
     let prompt = params
         .as_ref()
         .and_then(|p| p.get("prompt"))
@@ -580,9 +637,10 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         Some(Value::String(other)) => {
             return Err(format!(
                 "fleet_run workload must be code_oneshot or reasoning, got {other:?}"
-            ));
+            )
+            .into());
         }
-        Some(_) => return Err("fleet_run workload must be a string".to_string()),
+        Some(_) => return Err("fleet_run workload must be a string".to_string().into()),
         None => {
             warn!(
                 "fleet_run request omitted workload; applying deprecated safe default code_oneshot"
@@ -665,7 +723,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         if !ProjectPolicyEngine::model_allowed(&policy.policy.routing, model_selector) {
             return Err(format!(
                 "model selector '{model_selector}' is not allowed for project '{project_id}'"
-            ));
+            )
+            .into());
         }
 
         let (clamped_start, clamped_max) =
@@ -680,7 +739,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                     .approval_reason
                     .clone()
                     .unwrap_or_else(|| "policy threshold triggered".to_string())
-            ));
+            )
+            .into());
         }
 
         applied_policy = Some(policy);
@@ -747,9 +807,10 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             tracing::warn!(%error, "fleet_run Path-3 interaction capture failed");
         }
         return match result {
-            Ok(success) => serde_json::to_value(success)
-                .map_err(|error| format!("serialize local strategy result: {error}")),
-            Err(failure) => Err(failure.error_text()),
+            Ok(success) => serde_json::to_value(success).map_err(|error| {
+                DispatchError::Opaque(format!("serialize local strategy result: {error}"))
+            }),
+            Err(failure) => Err(DispatchError::Strategy(Box::new(failure))),
         };
     }
 
@@ -837,7 +898,9 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
 
     if chain.is_empty() {
         return Err(
-            "no healthy backends available for requested tiers/profile constraints".to_string(),
+            "no healthy backends available for requested tiers/profile constraints"
+                .to_string()
+                .into(),
         );
     }
 
@@ -1028,7 +1091,8 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         "all routed backends failed".to_string()
     } else {
         last_error
-    })
+    }
+    .into())
 }
 
 fn path3_interaction_record(
@@ -3085,13 +3149,16 @@ async fn get_pg_pool(_config: &FleetConfig) -> Result<sqlx::PgPool, String> {
 
 /// Dispatch a method call to the appropriate handler.
 ///
-/// Returns `Ok(Value)` on success or `Err(String)` if the method is unknown.
-pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
-    match method {
+/// Returns `Ok(Value)` on success or a typed internal dispatch error. Raw
+/// handler strings never become trusted/public diagnostic payloads.
+pub(crate) async fn dispatch(method: &str, params: Option<Value>) -> DispatchResult {
+    if method == "fleet_run" {
+        return fleet_run_typed(params).await;
+    }
+    let result: HandlerResult = match method {
         "fleet_status" => fleet_status(params).await,
         "fleet_config" => fleet_config(params).await,
         "fleet_ssh" => fleet_ssh(params).await,
-        "fleet_run" => fleet_run(params).await,
         "fleet_offload" => fleet_offload(params).await,
         "fleet_cascade" => fleet_cascade(params).await,
         "fleet_route" => fleet_route(params).await,
@@ -3170,7 +3237,8 @@ pub async fn dispatch(method: &str, params: Option<Value>) -> HandlerResult {
         // Computer Use (Pillar 1)
         "computer_use" => computer_use(params).await,
         _ => Err(format!("unknown method: {method}")),
-    }
+    };
+    result.map_err(DispatchError::Opaque)
 }
 
 /// Dispatcher for the `computer_use` MCP tool. Translates the action

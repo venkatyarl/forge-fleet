@@ -16,6 +16,74 @@ use crate::llm_exec::{
     AttemptRole, ExecutionEvidence, FailureReasonCode, GatewayLlmExec, WinningRoute,
 };
 
+const MAX_PUBLIC_ATTEMPTS: usize = 16;
+const MAX_PUBLIC_LABEL_LEN: usize = 128;
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicStrategyFailure {
+    reason_code: FailureReasonCode,
+    strategy: Option<String>,
+    attempts: Vec<PublicAttemptEvidence>,
+    last_failure: Option<FailureReasonCode>,
+    latency_ms: u64,
+    local_authority: String,
+    cloud_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PublicAttemptEvidence {
+    sequence: usize,
+    role: String,
+    tier: u8,
+    catalog_tier: i32,
+    worker_name: String,
+    catalog_id: Option<String>,
+    latency_ms: u64,
+    outcome: String,
+    reason_code: Option<FailureReasonCode>,
+}
+
+impl PublicStrategyFailure {
+    fn as_mcp_value(&self) -> Value {
+        json!({
+            "ok": false,
+            "error": {
+                "reason_code": self.reason_code,
+                "message": "local strategy dispatch failed before producing a usable answer",
+            },
+            "strategy": self.strategy,
+            "route": {
+                "attempts": self.attempts,
+                "last_failure": self.last_failure,
+                "latency_ms": self.latency_ms,
+                "local_authority": self.local_authority,
+                "cloud_fallback": self.cloud_fallback,
+            },
+        })
+    }
+}
+
+fn public_label(value: &str) -> String {
+    if !value.is_empty()
+        && value.len() <= MAX_PUBLIC_LABEL_LEN
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+    {
+        value.to_string()
+    } else {
+        "invalid-label".to_string()
+    }
+}
+
+fn strategy_label(strategy: &RouteStrategy) -> &'static str {
+    match strategy {
+        RouteStrategy::SingleTier { .. } => "single_tier",
+        RouteStrategy::Cascade { .. } => "cascade",
+        RouteStrategy::JudgeEscalate { .. } => "judge_escalate",
+    }
+}
+
 pub fn parse_strategy(raw: &str) -> Result<&'static str, String> {
     match raw {
         "auto" | "single" | "cascade" | "judge_escalate" => Ok(match raw {
@@ -110,18 +178,69 @@ impl StrategyDispatchFailure {
         strategy: Option<RouteStrategy>,
         message: impl Into<String>,
     ) -> Self {
+        let execution = exec.evidence();
+        // Use the terminal attempt rather than the executor's aggregate
+        // last_failure: an executor can be reused and that aggregate may refer
+        // to an earlier dispatch. A failed terminal completion before any judge
+        // accurately carries deadline/availability; a successful but
+        // semantically unparseable judge has no attempt failure and remains an
+        // invalid response.
+        let terminal_attempt = execution.attempts.last();
+        let reason_code = judge_boundary_reason(
+            terminal_attempt.map(|attempt| attempt.role),
+            terminal_attempt.and_then(|attempt| attempt.reason_code),
+            exec.last_role_failure(AttemptRole::Judge),
+        );
         Self {
-            reason_code: exec
-                .last_role_failure(AttemptRole::Judge)
-                .unwrap_or(FailureReasonCode::InvalidResponse),
+            reason_code,
             message: message.into(),
             strategy,
-            execution: exec.evidence(),
+            execution,
         }
     }
 
     pub fn error_text(&self) -> String {
         format!("{}: {}", self.reason_code.as_str(), self.message)
+    }
+
+    /// Encode a fail-closed MCP error with diagnostic route provenance. The
+    /// envelope deliberately omits endpoint URLs, deployment IDs, raw provider
+    /// errors, prompts, served-model paths, and the candidate snapshot.
+    pub fn public_error_value(&self) -> Value {
+        let public = PublicStrategyFailure {
+            reason_code: self.reason_code,
+            strategy: self
+                .strategy
+                .as_ref()
+                .map(strategy_label)
+                .map(str::to_string),
+            attempts: self
+                .execution
+                .attempts
+                .iter()
+                .take(MAX_PUBLIC_ATTEMPTS)
+                .map(|attempt| PublicAttemptEvidence {
+                    sequence: attempt.sequence,
+                    role: match attempt.role {
+                        AttemptRole::Completion => "completion",
+                        AttemptRole::Judge => "judge",
+                    }
+                    .to_string(),
+                    tier: attempt.tier,
+                    catalog_tier: attempt.catalog_tier,
+                    worker_name: public_label(&attempt.worker_name),
+                    catalog_id: attempt.catalog_id.as_deref().map(public_label),
+                    latency_ms: attempt.latency_ms,
+                    outcome: attempt.outcome.clone(),
+                    reason_code: attempt.reason_code,
+                })
+                .collect(),
+            last_failure: self.execution.last_failure,
+            latency_ms: self.execution.latency_ms,
+            local_authority: self.execution.local_authority.to_string(),
+            cloud_fallback: self.execution.cloud_fallback,
+        };
+        public.as_mcp_value()
     }
 
     pub fn route_decision(&self) -> Value {
@@ -133,6 +252,26 @@ impl StrategyDispatchFailure {
             "local_authority": self.execution.local_authority,
             "cloud_fallback": self.execution.cloud_fallback,
         })
+    }
+}
+
+fn judge_boundary_reason(
+    terminal_role: Option<AttemptRole>,
+    terminal_attempt_failure: Option<FailureReasonCode>,
+    judge_failure: Option<FailureReasonCode>,
+) -> FailureReasonCode {
+    if let Some(reason) = terminal_attempt_failure {
+        return reason;
+    }
+    // A judge response that reached the strategy but could not be parsed is a
+    // semantic invalid response, regardless of older retry failures. When the
+    // terminal successful attempt is still the completion, a judge may have
+    // failed before it could append a ledger entry (for example, no independent
+    // judge deployment); preserve that typed executor failure.
+    if terminal_role == Some(AttemptRole::Judge) {
+        FailureReasonCode::InvalidResponse
+    } else {
+        judge_failure.unwrap_or(FailureReasonCode::InvalidResponse)
     }
 }
 
@@ -315,5 +454,65 @@ mod tests {
         assert_eq!(parse_validator(Some("yaml")), ValidatorKind::Yaml);
         assert_eq!(parse_validator(Some("none")), ValidatorKind::None);
         assert_eq!(parse_validator(None), ValidatorKind::None);
+    }
+
+    #[test]
+    fn judge_boundary_uses_pre_judge_deadline_when_no_judge_ran() {
+        assert_eq!(
+            judge_boundary_reason(
+                Some(AttemptRole::Completion),
+                Some(FailureReasonCode::DeadlineExceeded),
+                None,
+            ),
+            FailureReasonCode::DeadlineExceeded
+        );
+        assert_eq!(
+            judge_boundary_reason(
+                Some(AttemptRole::Judge),
+                None,
+                Some(FailureReasonCode::Unavailable),
+            ),
+            FailureReasonCode::InvalidResponse
+        );
+        assert_eq!(
+            judge_boundary_reason(
+                Some(AttemptRole::Completion),
+                None,
+                Some(FailureReasonCode::Unavailable),
+            ),
+            FailureReasonCode::Unavailable
+        );
+        assert_eq!(
+            judge_boundary_reason(None, None, None),
+            FailureReasonCode::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn public_strategy_error_is_curated() {
+        let failure = StrategyDispatchFailure {
+            reason_code: FailureReasonCode::DeadlineExceeded,
+            message: "secret provider detail".to_string(),
+            strategy: Some(RouteStrategy::JudgeEscalate {
+                start_tier: 2,
+                max_tier: 3,
+                threshold: 7,
+            }),
+            execution: ExecutionEvidence {
+                attempts: vec![],
+                candidate_snapshot: vec![],
+                winner: None,
+                last_failure: Some(FailureReasonCode::DeadlineExceeded),
+                latency_ms: 105_000,
+                local_authority: "process_local_hint_only",
+                cloud_fallback: false,
+            },
+        };
+        let decoded = failure.public_error_value();
+        assert_eq!(decoded["error"]["reason_code"], "deadline_exceeded");
+        assert_eq!(decoded["strategy"], "judge_escalate");
+        assert_eq!(decoded["route"]["latency_ms"], 105_000);
+        assert!(!decoded.to_string().contains("secret provider detail"));
+        assert!(!decoded.to_string().contains("candidate_snapshot"));
     }
 }

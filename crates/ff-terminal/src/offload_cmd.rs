@@ -339,9 +339,39 @@ pub async fn handle_offload(
             return Err(anyhow::anyhow!(error_text));
         }
     };
-    // Defensively strip any <think>…</think> a thinking model emitted anyway
-    // (belt-and-suspenders with chat_template_kwargs.enable_thinking=false).
-    let result = strip_think(&extract_completion_text(&payload).unwrap_or_default());
+    let result = match validated_offload_result(&payload) {
+        Ok(result) => result,
+        Err(error) => {
+            // Do not turn a malformed provider response into a successful empty
+            // completion. Keep the raw body out of the operator-facing error;
+            // immutable route identity is enough to diagnose the failed turn,
+            // while the interaction row retains the canonical route decision.
+            let error_text = format!(
+                "offload completion rejected: {error}; route worker={} catalog_id={} deployment_id={} provenance={} attestation={:?}",
+                target.worker_name,
+                target.catalog_id,
+                target.deployment_id,
+                target.provenance.as_str(),
+                target.attestation,
+            );
+            record_offload_turn(
+                &pool,
+                prompt,
+                kind,
+                min_ctx,
+                max_tokens,
+                &target,
+                "",
+                0,
+                0,
+                Some(latency),
+                "error",
+                Some(&error_text),
+            )
+            .await;
+            return Err(anyhow::anyhow!(error_text));
+        }
+    };
 
     // Log the offload turn to ff_interactions (the ff-LLM training corpus). `ff
     // offload` is a core dogfood verb (route code work to a warm fleet coder) and
@@ -446,81 +476,72 @@ async fn record_offload_turn(
     }
 }
 
-/// Pull the assistant text out of an OpenAI-compatible chat completion. Mirrors
-/// the ff-mcp `extract_completion_text` helper (kept local to avoid a crate
-/// dependency just for one parser).
-fn extract_completion_text(payload: &serde_json::Value) -> Option<String> {
-    let choice = payload.get("choices")?.as_array()?.first()?;
-    if let Some(s) = choice
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|v| v.as_str())
-    {
-        return Some(s.to_string());
-    }
-    choice
-        .get("text")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-}
-
-/// Strip any `<think>…</think>` blocks a reasoning model emitted, returning the
-/// trimmed remainder.
-// NOTE: keep in sync with `strip_think_block` in ff-mcp/src/handlers.rs — both
-// the CLI and MCP offload paths must scrub reasoning identically.
-fn strip_think(s: &str) -> String {
-    let mut out = s.to_string();
-    // 1) Remove well-formed <think>…</think> pairs, left-to-right.
-    loop {
-        let Some(open) = out.find("<think>") else {
-            break;
-        };
-        match out[open..].find("</think>") {
-            Some(rel) => {
-                let close = open + rel + "</think>".len();
-                out.replace_range(open..close, "");
-            }
-            // 2) Unclosed opener — a thinking model cut off mid-reasoning under a
-            //    token cap. Everything from <think> on is reasoning; drop it.
-            None => {
-                out.truncate(open);
-                break;
-            }
-        }
-    }
-    // 3) A lone trailing </think> with no opener (the open tag was consumed by
-    //    the chat template): the answer is whatever follows the last </think>.
-    if let Some(i) = out.rfind("</think>") {
-        out = out[i + "</think>".len()..].to_string();
-    }
-    out.trim().to_string()
+/// Apply the same fail-closed response contract used by MCP and the local
+/// executor. This rejects missing/blank/truncated/reasoning-only responses and
+/// returns only sanitized public content.
+fn validated_offload_result(payload: &serde_json::Value) -> Result<String, String> {
+    ff_core::llm_completion_policy::validate_completion_response(payload)
+        .map(|completion| completion.content)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::strip_think;
+    use super::validated_offload_result;
+    use serde_json::json;
 
     #[test]
-    fn strip_think_handles_all_shapes() {
-        // well-formed pair
-        assert_eq!(strip_think("<think>reasoning</think>answer"), "answer");
-        // lone trailing </think> (open tag consumed by the chat template)
+    fn completion_contract_returns_only_non_empty_public_output() {
         assert_eq!(
-            strip_think("reasoning here</think>the answer"),
-            "the answer"
+            validated_offload_result(&json!({
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {"content": "<think>private</think>public answer"}
+                }]
+            }))
+            .unwrap(),
+            "public answer",
         );
-        // unclosed opener — model cut off mid-reasoning under a token cap
-        assert_eq!(strip_think("<think>cut off mid thought"), "");
-        // unclosed opener after real content
-        assert_eq!(
-            strip_think("partial answer<think>then cut"),
-            "partial answer"
+    }
+
+    #[test]
+    fn completion_contract_rejects_empty_and_truncated_output() {
+        let empty = json!({
+            "choices": [{"finish_reason": "stop", "message": {"content": "  "}}]
+        });
+        assert!(
+            validated_offload_result(&empty)
+                .unwrap_err()
+                .contains("empty")
         );
-        // no tags at all — passthrough
-        assert_eq!(strip_think("plain output"), "plain output");
-        // stray leading close before a real block
-        assert_eq!(strip_think("</think><think>real</think>tail"), "tail");
-        // multiple pairs
-        assert_eq!(strip_think("<think>a</think>X<think>b</think>Y"), "XY");
+
+        let truncated = json!({
+            "choices": [{"finish_reason": "length", "message": {"content": "partial"}}]
+        });
+        assert!(
+            validated_offload_result(&truncated)
+                .unwrap_err()
+                .contains("truncated")
+        );
+    }
+
+    #[test]
+    fn completion_contract_rejects_missing_and_reasoning_only_output() {
+        assert!(
+            validated_offload_result(&json!({}))
+                .unwrap_err()
+                .contains("missing choices")
+        );
+        let reasoning_only = json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "<think>private only</think>"}
+            }]
+        });
+        assert!(
+            validated_offload_result(&reasoning_only)
+                .unwrap_err()
+                .contains("empty")
+        );
     }
 }
