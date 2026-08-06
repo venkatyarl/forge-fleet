@@ -98,6 +98,49 @@ pub struct MemoryCompactResult {
     pub status: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum MemoryEdit<'a> {
+    Add(&'a str),
+    Replace { old: &'a str, new: &'a str },
+    Remove(Option<&'a str>),
+}
+
+impl MemoryEdit<'_> {
+    fn apply(self, current: &str, block: &str) -> Result<String> {
+        match self {
+            Self::Add(text) => Ok(if current.is_empty() {
+                text.to_string()
+            } else {
+                format!("{current}\n{text}")
+            }),
+            Self::Replace { old, new } => {
+                if old.is_empty() {
+                    bail!("memory_replace: 'old' must be non-empty");
+                }
+                let matches = current.matches(old).count();
+                if matches == 0 {
+                    bail!("memory_replace: 'old' not found in block '{block}'");
+                }
+                if matches > 1 {
+                    bail!(
+                        "memory_replace: 'old' matches {matches}× in block '{block}' (must be unique)"
+                    );
+                }
+                Ok(current.replacen(old, new, 1))
+            }
+            Self::Remove(None) => Ok(String::new()),
+            Self::Remove(Some(text)) => match current.find(text) {
+                Some(index) => {
+                    let mut next = current.to_string();
+                    next.replace_range(index..index + text.len(), "");
+                    Ok(next.replace("\n\n", "\n").trim().to_string())
+                }
+                None => bail!("memory_remove: text not found in block '{block}'"),
+            },
+        }
+    }
+}
+
 fn valid_scope_type(scope_type: &str) -> bool {
     matches!(scope_type, "session" | "agent" | "project")
 }
@@ -147,13 +190,7 @@ pub async fn memory_add(
     text: &str,
 ) -> Result<WriteResult> {
     validate(scope_type, block)?;
-    let cur = ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block).await?;
-    let next = if cur.is_empty() {
-        text.to_string()
-    } else {
-        format!("{cur}\n{text}")
-    };
-    write_block(pool, scope_type, scope_key, block, &cur, &next).await
+    write_block(pool, scope_type, scope_key, block, MemoryEdit::Add(text)).await
 }
 
 /// Replace the single occurrence of `old` with `new` in a block.
@@ -167,19 +204,14 @@ pub async fn memory_replace(
     new: &str,
 ) -> Result<WriteResult> {
     validate(scope_type, block)?;
-    if old.is_empty() {
-        bail!("memory_replace: 'old' must be non-empty");
-    }
-    let cur = ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block).await?;
-    let matches = cur.matches(old).count();
-    if matches == 0 {
-        bail!("memory_replace: 'old' not found in block '{block}'");
-    }
-    if matches > 1 {
-        bail!("memory_replace: 'old' matches {matches}× in block '{block}' (must be unique)");
-    }
-    let next = cur.replacen(old, new, 1);
-    write_block(pool, scope_type, scope_key, block, &cur, &next).await
+    write_block(
+        pool,
+        scope_type,
+        scope_key,
+        block,
+        MemoryEdit::Replace { old, new },
+    )
+    .await
 }
 
 /// Remove one occurrence of `text` from a block, or clear the block entirely
@@ -192,22 +224,7 @@ pub async fn memory_remove(
     text: Option<&str>,
 ) -> Result<WriteResult> {
     validate(scope_type, block)?;
-    let cur = ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block).await?;
-    let next = match text {
-        None => String::new(),
-        Some(t) => {
-            match cur.find(t) {
-                Some(idx) => {
-                    let mut s = cur.clone();
-                    s.replace_range(idx..idx + t.len(), "");
-                    // collapse a doubled newline left behind by the removal
-                    s.replace("\n\n", "\n").trim().to_string()
-                }
-                None => bail!("memory_remove: text not found in block '{block}'"),
-            }
-        }
-    };
-    write_block(pool, scope_type, scope_key, block, &cur, &next).await
+    write_block(pool, scope_type, scope_key, block, MemoryEdit::Remove(text)).await
 }
 
 /// Set the per-scope byte cap (`scope_key == ""` sets the scope_type default).
@@ -283,6 +300,7 @@ pub async fn memory_compact(
         scope_key,
         cap_bytes,
         Some(before.scope.scope_hash),
+        i64::from(cap_bytes),
     )
     .await?;
     let after = ff_db::queries::pg_memory_compact_snapshot(pool, scope_type, scope_key)
@@ -348,25 +366,44 @@ pub async fn memory_compact(
     })
 }
 
-/// Compare-and-set a block's full new content without ever growing the scope
-/// above its cap. Background consolidation repairs legacy over-cap scopes;
-/// foreground callers fail closed instead of committing an oversized write.
+/// Compare-and-set a block's edited content without ever growing the scope
+/// above its cap. An over-cap proposal gets one bounded compaction attempt,
+/// followed by one fresh read/recompute/CAS; every other failure is surfaced
+/// with the requested edit unapplied.
 async fn write_block(
     pool: &PgPool,
     scope_type: &str,
     scope_key: &str,
     block: &str,
-    expected_content: &str,
-    content: &str,
+    edit: MemoryEdit<'_>,
 ) -> Result<WriteResult> {
+    write_block_with_retry_hook(pool, scope_type, scope_key, block, edit, || async {}).await
+}
+
+async fn write_block_with_retry_hook<Hook, HookFuture>(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    block: &str,
+    edit: MemoryEdit<'_>,
+    before_retry: Hook,
+) -> Result<WriteResult>
+where
+    Hook: FnOnce() -> HookFuture + Send,
+    HookFuture: std::future::Future<Output = ()> + Send,
+{
+    let expected_content = ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block)
+        .await
+        .context("read bounded memory block before write")?;
+    let content = edit.apply(&expected_content, block)?;
     let write = ff_db::queries::pg_memory_try_set_block(
         pool,
         MemoryTrySetBlockRequest {
             scope_type,
             scope_key,
             block,
-            expected_content,
-            new_content: content,
+            expected_content: &expected_content,
+            new_content: &content,
             allow_over_cap_repair: false,
             eviction_archive: None,
         },
@@ -374,36 +411,115 @@ async fn write_block(
     .await
     .context("write bounded memory block")?;
     match write.status {
-        MemoryBlockWriteStatus::Applied => {}
+        MemoryBlockWriteStatus::Applied => {
+            return Ok(WriteResult {
+                scope_type: scope_type.to_string(),
+                scope_key: scope_key.to_string(),
+                block: block.to_string(),
+                bytes_used: write.bytes_used,
+                cap_bytes: write.cap_bytes,
+                consolidated: false,
+                over_cap: write.over_cap,
+                data_loss: false,
+                status: write_status(write.over_cap, false, false),
+            });
+        }
         MemoryBlockWriteStatus::Busy => {
-            bail!("Scratchpad scope is being updated concurrently; retry the write")
+            bail!(
+                "Scratchpad scope is being updated concurrently; requested write was not applied; retry"
+            )
         }
         MemoryBlockWriteStatus::Stale => {
-            bail!("Scratchpad block changed concurrently; read it again before retrying")
+            bail!(
+                "Scratchpad block changed concurrently; requested write was not applied; read it again before retrying"
+            )
         }
-        MemoryBlockWriteStatus::OverCap => bail!(
-            "Scratchpad write rejected: resulting scope would use {}/{} bytes; remove or replace existing content first",
-            write.bytes_used,
-            write.cap_bytes
-        ),
+        MemoryBlockWriteStatus::OverCap => {}
     }
 
-    Ok(WriteResult {
-        scope_type: scope_type.to_string(),
-        scope_key: scope_key.to_string(),
-        block: block.to_string(),
-        bytes_used: write.bytes_used,
-        cap_bytes: write.cap_bytes,
-        consolidated: false,
-        over_cap: write.over_cap,
-        data_loss: false,
-        status: write_status(write.over_cap, false, false),
-    })
+    let expected_scope_hash = write
+        .scope_hash
+        .as_deref()
+        .context("over-cap Scratchpad result omitted its scope revision")?;
+    let requested_delta = i64::try_from(content.len())
+        .and_then(|new_bytes| i64::try_from(expected_content.len()).map(|old| new_bytes - old))
+        .context("Scratchpad edit is too large")?;
+    let target_bytes = i64::from(write.cap_bytes)
+        .saturating_sub(requested_delta)
+        .max(0);
+    let consolidation = consolidate_and_forget_from(
+        pool,
+        scope_type,
+        scope_key,
+        write.cap_bytes,
+        Some(expected_scope_hash.to_string()),
+        target_bytes,
+    )
+    .await
+    .context("Scratchpad auto-compaction failed; requested write was not applied")?;
+
+    // Compaction may summarize the target block itself. Re-read it and apply
+    // the original semantic edit to the current value rather than replaying a
+    // stale full-content replacement.
+    let retry_expected = ff_db::queries::pg_memory_get_block(pool, scope_type, scope_key, block)
+        .await
+        .context("read Scratchpad block after auto-compaction")?;
+    let retry_content = edit.apply(&retry_expected, block).with_context(
+        || "Scratchpad target changed during auto-compaction; requested write was not applied",
+    )?;
+
+    // The test hook deliberately sits after the fresh read/recompute and
+    // before the retry CAS, making the stale-writer interleaving deterministic
+    // without sleeps or process-global mutable state.
+    before_retry().await;
+
+    let retry = ff_db::queries::pg_memory_try_set_block(
+        pool,
+        MemoryTrySetBlockRequest {
+            scope_type,
+            scope_key,
+            block,
+            expected_content: &retry_expected,
+            new_content: &retry_content,
+            allow_over_cap_repair: false,
+            eviction_archive: None,
+        },
+    )
+    .await
+    .context("retry bounded memory block after auto-compaction")?;
+    match retry.status {
+        MemoryBlockWriteStatus::Applied => Ok(WriteResult {
+            scope_type: scope_type.to_string(),
+            scope_key: scope_key.to_string(),
+            block: block.to_string(),
+            bytes_used: retry.bytes_used,
+            cap_bytes: retry.cap_bytes,
+            consolidated: consolidation.changed,
+            over_cap: retry.over_cap,
+            data_loss: consolidation.data_loss,
+            status: write_status(
+                retry.over_cap,
+                consolidation.changed,
+                consolidation.data_loss,
+            ),
+        }),
+        MemoryBlockWriteStatus::Busy => bail!(
+            "Scratchpad scope became busy after auto-compaction; requested write was not applied; retry"
+        ),
+        MemoryBlockWriteStatus::Stale => bail!(
+            "Scratchpad block changed after auto-compaction; requested write was not applied; read it again before retrying"
+        ),
+        MemoryBlockWriteStatus::OverCap => bail!(
+            "Scratchpad auto-compaction could not make enough space: requested write would use {}/{} bytes and was not applied; remove or replace existing content first",
+            retry.bytes_used,
+            retry.cap_bytes
+        ),
+    }
 }
 
-/// Consolidate-and-forget: while the scope is over `cap`, pick the
-/// lowest-priority non-empty block, summarize it (preserving decisions /
-/// paths / commands / IDs / failures), push the full pre-summary content into
+/// Consolidate-and-forget: until the scope reaches the requested byte target,
+/// pick the lowest-priority non-empty block, summarize it (preserving decisions
+/// / paths / commands / IDs / failures), push the full pre-summary content into
 /// Brain, record an eviction row, and replace the block with the summary.
 /// Falls back to a hard trim if the summarizer is unavailable.
 /// `pub(crate)` for the dreamer's cap re-enforcement sweep.
@@ -413,7 +529,7 @@ pub(crate) async fn consolidate_and_forget(
     scope_key: &str,
     cap: i32,
 ) -> Result<ConsolidationResult> {
-    consolidate_and_forget_from(pool, scope_type, scope_key, cap, None).await
+    consolidate_and_forget_from(pool, scope_type, scope_key, cap, None, i64::from(cap)).await
 }
 
 async fn consolidate_and_forget_from(
@@ -422,6 +538,7 @@ async fn consolidate_and_forget_from(
     scope_key: &str,
     cap: i32,
     mut expected_scope_hash: Option<String>,
+    target_bytes: i64,
 ) -> Result<ConsolidationResult> {
     let mut result = ConsolidationResult::default();
     let mut skipped_blocks: Vec<String> = Vec::new();
@@ -441,7 +558,8 @@ async fn consolidate_and_forget_from(
         expected_scope_hash = Some(snapshot.scope_hash.clone());
         let blocks = snapshot.blocks;
         let total: i64 = blocks.iter().map(|b| b.bytes as i64).sum();
-        if total <= cap as i64 {
+        if total <= target_bytes {
+            result.over_cap = total > i64::from(cap);
             result.final_scope_hash = expected_scope_hash;
             return Ok(result);
         }
@@ -602,7 +720,8 @@ async fn consolidate_and_forget_from(
         expected_scope_hash = Some(snapshot.scope_hash.clone());
         let blocks = snapshot.blocks;
         let total: i64 = blocks.iter().map(|b| i64::from(b.bytes)).sum();
-        if total <= i64::from(cap) {
+        if total <= target_bytes {
+            result.over_cap = total > i64::from(cap);
             result.final_scope_hash = expected_scope_hash;
             return Ok(result);
         }
@@ -878,6 +997,87 @@ fn write_status(over_cap: bool, consolidated: bool, data_loss: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::{Row, postgres::PgPoolOptions};
+    use std::sync::Arc;
+    use tokio::sync::Barrier;
+
+    fn temp_db_urls() -> Option<(String, String, String)> {
+        let base_url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        let (prefix, _) = base_url.rsplit_once('/')?;
+        let db_name = format!("ff_scratchpad_write_{}", uuid::Uuid::new_v4().simple());
+        Some((
+            format!("{prefix}/postgres"),
+            format!("{prefix}/{db_name}"),
+            db_name,
+        ))
+    }
+
+    async fn scratchpad_test_pool() -> Option<(PgPool, PgPool, String)> {
+        let (admin_url, db_url, db_name) = temp_db_urls()?;
+        let admin = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("connect scratchpad test admin db");
+        sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("create scratchpad test db");
+        let pool = PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&db_url)
+            .await
+            .expect("connect scratchpad test db");
+        sqlx::query("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            .execute(&pool)
+            .await
+            .expect("install pgcrypto in scratchpad test db");
+        sqlx::raw_sql(ff_db::schema::SCHEMA_V139_AGENT_SCRATCHPAD)
+            .execute(&pool)
+            .await
+            .expect("install canonical Scratchpad tables");
+        Some((admin, pool, db_name))
+    }
+
+    async fn drop_temp_db(admin: PgPool, pool: PgPool, db_name: &str) {
+        pool.close().await;
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid)
+               FROM pg_stat_activity
+              WHERE datname = $1 AND pid <> pg_backend_pid()",
+        )
+        .bind(db_name)
+        .execute(&admin)
+        .await
+        .expect("terminate scratchpad test db sessions");
+        sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
+            .execute(&admin)
+            .await
+            .expect("drop scratchpad test db");
+    }
+
+    async fn seed_overflow_fixture(pool: &PgPool, scope_key: &str) -> (&'static str, &'static str) {
+        const ORIGINAL_SCRATCH: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
+        const APPEND: &str = "12345678901234";
+        memory_set_cap(pool, "project", scope_key, 48)
+            .await
+            .expect("set test cap");
+        ff_db::queries::pg_memory_set_block(
+            pool,
+            "project",
+            scope_key,
+            "scratch",
+            ORIGINAL_SCRATCH,
+        )
+        .await
+        .expect("seed scratch block");
+        ff_db::queries::pg_memory_set_block(pool, "project", scope_key, "task", "seed")
+            .await
+            .expect("seed target block");
+        (ORIGINAL_SCRATCH, APPEND)
+    }
 
     fn block(name: &str, content: &str) -> MemoryBlock {
         MemoryBlock {
@@ -1002,6 +1202,162 @@ mod tests {
             "over_cap_after_consolidation".to_string()
         );
         assert_eq!(write_status(false, false, false), "ok".to_string());
+    }
+
+    #[tokio::test]
+    async fn append_over_cap_compacts_applies_and_archives_exact_previous_bytes() {
+        let Some((admin, pool, db_name)) = scratchpad_test_pool().await else {
+            return;
+        };
+        let scope_key = format!("append-{}", uuid::Uuid::new_v4().simple());
+        let (original_scratch, append) = seed_overflow_fixture(&pool, &scope_key).await;
+
+        let result = memory_add(&pool, "project", &scope_key, "task", append)
+            .await
+            .expect("append should compact once and apply");
+
+        assert!(result.consolidated);
+        assert!(result.data_loss, "missing test summarizer must hard-trim");
+        assert!(!result.over_cap);
+        assert_eq!(result.status, "ok_data_loss");
+        assert!(result.bytes_used <= i64::from(result.cap_bytes));
+        assert_eq!(
+            ff_db::queries::pg_memory_get_block(&pool, "project", &scope_key, "task")
+                .await
+                .unwrap(),
+            format!("seed\n{append}")
+        );
+
+        let archive = sqlx::query(
+            "SELECT summary, prev_hash, prev_bytes
+               FROM agent_memory_evictions
+              WHERE scope_type = 'project' AND scope_key = $1 AND block = 'scratch'
+              ORDER BY created_at, id
+              LIMIT 1",
+        )
+        .bind(&scope_key)
+        .fetch_one(&pool)
+        .await
+        .expect("read exact eviction evidence");
+        let summary: String = archive.get("summary");
+        assert!(summary.contains(&format!("FULL PRE-MUTATION:\n{original_scratch}")));
+        assert_eq!(
+            archive.get::<String, _>("prev_hash"),
+            hex_sha256(original_scratch)
+        );
+        assert_eq!(
+            archive.get::<i32, _>("prev_bytes"),
+            original_scratch.len() as i32
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn replacement_after_compaction_makes_retry_stale_without_overwrite() {
+        let Some((admin, pool, db_name)) = scratchpad_test_pool().await else {
+            return;
+        };
+        let scope_key = format!("stale-{}", uuid::Uuid::new_v4().simple());
+        let (_, append) = seed_overflow_fixture(&pool, &scope_key).await;
+        let reached_retry = Arc::new(Barrier::new(2));
+        let release_retry = Arc::new(Barrier::new(2));
+
+        let writer_pool = pool.clone();
+        let writer_scope = scope_key.clone();
+        let writer_reached = reached_retry.clone();
+        let writer_release = release_retry.clone();
+        let writer = tokio::spawn(async move {
+            write_block_with_retry_hook(
+                &writer_pool,
+                "project",
+                &writer_scope,
+                "task",
+                MemoryEdit::Add(append),
+                move || async move {
+                    writer_reached.wait().await;
+                    writer_release.wait().await;
+                },
+            )
+            .await
+        });
+
+        reached_retry.wait().await;
+        let compacted_target =
+            ff_db::queries::pg_memory_get_block(&pool, "project", &scope_key, "task")
+                .await
+                .expect("read compacted target");
+        let replacement = ff_db::queries::pg_memory_try_set_block(
+            &pool,
+            MemoryTrySetBlockRequest {
+                scope_type: "project",
+                scope_key: &scope_key,
+                block: "task",
+                expected_content: &compacted_target,
+                new_content: "replacement-authority",
+                allow_over_cap_repair: false,
+                eviction_archive: None,
+            },
+        )
+        .await
+        .expect("write concurrent replacement");
+        assert_eq!(replacement.status, MemoryBlockWriteStatus::Applied);
+        release_retry.wait().await;
+
+        let error = writer
+            .await
+            .expect("join append writer")
+            .expect_err("stale retry must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("requested write was not applied")
+        );
+        assert_eq!(
+            ff_db::queries::pg_memory_get_block(&pool, "project", &scope_key, "task")
+                .await
+                .unwrap(),
+            "replacement-authority"
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn no_eligible_space_leaves_append_unapplied() {
+        let Some((admin, pool, db_name)) = scratchpad_test_pool().await else {
+            return;
+        };
+        let scope_key = format!("decisions-{}", uuid::Uuid::new_v4().simple());
+        let protected = "decision-bytes-must-stay-full";
+        memory_set_cap(&pool, "project", &scope_key, 32)
+            .await
+            .expect("set protected-block cap");
+        ff_db::queries::pg_memory_set_block(&pool, "project", &scope_key, "decisions", protected)
+            .await
+            .expect("seed protected decisions");
+
+        let error = memory_add(&pool, "project", &scope_key, "decisions", "cannot-fit")
+            .await
+            .expect_err("decisions must never be hard-trimmed for an append");
+        assert!(error.to_string().contains("requested write"));
+        assert_eq!(
+            ff_db::queries::pg_memory_get_block(&pool, "project", &scope_key, "decisions")
+                .await
+                .unwrap(),
+            protected
+        );
+        let evictions: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM agent_memory_evictions
+              WHERE scope_type = 'project' AND scope_key = $1",
+        )
+        .bind(&scope_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(evictions, 0);
+
+        drop_temp_db(admin, pool, &db_name).await;
     }
 }
 
