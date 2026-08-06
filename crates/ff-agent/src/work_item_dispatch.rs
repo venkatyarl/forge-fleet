@@ -2597,6 +2597,14 @@ fn same_model_family(builder: &str, reviewer: &str) -> bool {
         || builder.starts_with(&format!("{reviewer}:"))
 }
 
+/// A fleet-local builder must be reviewed by a pinned, provably distinct
+/// fleet-local deployment.  Trying authenticated cloud CLIs first makes a
+/// healthy local build depend on unrelated shared OAuth state and can requeue
+/// finished work before the local reviewer is ever reached.
+fn should_try_cloud_reviewers(builder: &str) -> bool {
+    normalized_cloud_backend(builder).is_some()
+}
+
 fn reviewer_family(identity: &str) -> String {
     let identity = identity.trim().to_ascii_lowercase();
     for family in [
@@ -2989,12 +2997,11 @@ fn order_cloud_reviewers(
 }
 
 /// Run the in-place review in the warm build workspace. Reviewer selection:
-///   1. NEVER the model that built the change (builder recorded alongside).
-///   2. Cloud trio (claude/codex/kimi) in latency-weighted round-robin order,
-///      falling through to the next on a backend failure.
-///   3. The 480B ring participates only when [`GATE_480B`] has a free permit
-///      RIGHT NOW (`try_acquire`) — builds have priority on the ring, and a
-///      busy ring means cloud review without waiting.
+///   1. NEVER the model/deployment/endpoint that built the change.
+///   2. A local builder goes directly to a pinned, provably distinct local
+///      reviewer; it does not depend on cloud CLI authentication.
+///   3. A cloud builder tries the 480B ring when immediately available, then
+///      authenticated non-Claude cloud reviewers, then fleet-local fallback.
 /// `Err` means no independent reviewer produced a verdict. The caller requeues
 /// the item and never hands it to merge custody (fail closed).
 async fn run_in_place_review(
@@ -3007,6 +3014,8 @@ async fn run_in_place_review(
     let prompt = build_review_prompt(item, worktree).await;
     let mut first_rejection: Option<(String, String)> = None;
     let mut last_confirmation_issue: Option<String> = None;
+    let try_cloud_reviewers = should_try_cloud_reviewers(builder);
+    let local_builder = !try_cloud_reviewers;
 
     if !builder_excludes_480b(builder) {
         if let Ok(permit) = GATE_480B.try_acquire() {
@@ -3057,97 +3066,102 @@ async fn run_in_place_review(
         }
     }
 
-    let stats = cloud_reviewer_stats(pg).await.unwrap_or_default();
-    // The fleet inventory is the routing source of truth. This deliberately
-    // avoids a compiled-in provider list/model hint and follows newly enrolled
-    // authenticated cloud CLIs without a daemon rebuild.
-    //
-    // Operator directive (2026-07-22): the in-place REVIEWER must never be claude
-    // — review runs on the local 480B ring (tried first, above) or the codex/kimi
-    // cloud CLIs. The shared claude OAuth account is scarce (rotating refresh
-    // tokens churn under concurrency) and is reserved for BUILDING, a separate
-    // dispatch path. Excluding it here (not via computer_backends.authenticated)
-    // keeps claude available as a builder while removing it from review.
-    let backends: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT backend FROM computer_backends \
-          WHERE installed AND authenticated AND backend <> 'claude' ORDER BY backend",
-    )
-    .fetch_all(pg)
-    .await
-    .context("load authenticated review backends")?;
     let mut last_err: Option<anyhow::Error> = None;
-    for backend in order_cloud_reviewers(builder, &stats, &backends) {
-        let started_at = chrono::Utc::now();
-        match crate::cli_executor::execute_cli_in_dir(
-            &backend,
-            &prompt,
-            &[],
-            Some(&worktree.worktree_path),
-            Some(REVIEW_CLOUD_TIMEOUT),
+    if try_cloud_reviewers {
+        let stats = cloud_reviewer_stats(pg).await.unwrap_or_default();
+        // The fleet inventory is the routing source of truth. This deliberately
+        // avoids a compiled-in provider list/model hint and follows newly enrolled
+        // authenticated cloud CLIs without a daemon rebuild.
+        //
+        // Operator directive (2026-07-22): the in-place REVIEWER must never be
+        // claude. The shared claude OAuth account is scarce and reserved for
+        // building, a separate dispatch path.
+        let backends: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT backend FROM computer_backends \
+              WHERE installed AND authenticated AND backend <> 'claude' ORDER BY backend",
         )
+        .fetch_all(pg)
         .await
-        {
-            Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
-                record_review_interaction(
-                    pg,
-                    item.work_item_id,
-                    &backend,
-                    &prompt,
-                    &res.stdout,
-                    i32::try_from(res.duration_ms).ok(),
-                    None,
-                )
-                .await;
-                let (approved, reason) =
-                    crate::work_item_merge_drain::parse_review_response(&res.stdout);
-                let mut outcome = ReviewOutcome {
-                    reviewer: backend,
-                    reviewer_computer: Some(item.computer_name.clone()),
-                    reviewer_port: None,
-                    approved,
-                    reason,
-                    started_at,
-                    completed_at: chrono::Utc::now(),
-                };
-                match adjudicate_review_candidate(
-                    first_rejection
-                        .as_ref()
-                        .map(|(reviewer, reason)| (reviewer.as_str(), reason.as_str())),
-                    &outcome.reviewer,
-                    outcome.approved,
-                    &outcome.reason,
-                ) {
-                    ReviewAdjudication::Approve(reason) => {
-                        outcome.approved = true;
-                        outcome.reason = reason;
-                        return Ok(outcome);
-                    }
-                    ReviewAdjudication::Reject(reason) => {
-                        outcome.approved = false;
-                        outcome.reason = reason;
-                        return Ok(outcome);
-                    }
-                    ReviewAdjudication::AwaitConfirmation(reason) => {
-                        first_rejection.get_or_insert((outcome.reviewer, outcome.reason));
-                        last_confirmation_issue = Some(reason);
-                        continue;
+        .context("load authenticated review backends")?;
+        for backend in order_cloud_reviewers(builder, &stats, &backends) {
+            let started_at = chrono::Utc::now();
+            match crate::cli_executor::execute_cli_in_dir(
+                &backend,
+                &prompt,
+                &[],
+                Some(&worktree.worktree_path),
+                Some(REVIEW_CLOUD_TIMEOUT),
+            )
+            .await
+            {
+                Ok(res) if res.exit_code == 0 && !res.stdout.trim().is_empty() => {
+                    record_review_interaction(
+                        pg,
+                        item.work_item_id,
+                        &backend,
+                        &prompt,
+                        &res.stdout,
+                        i32::try_from(res.duration_ms).ok(),
+                        None,
+                    )
+                    .await;
+                    let (approved, reason) =
+                        crate::work_item_merge_drain::parse_review_response(&res.stdout);
+                    let mut outcome = ReviewOutcome {
+                        reviewer: backend,
+                        reviewer_computer: Some(item.computer_name.clone()),
+                        reviewer_port: None,
+                        approved,
+                        reason,
+                        started_at,
+                        completed_at: chrono::Utc::now(),
+                    };
+                    match adjudicate_review_candidate(
+                        first_rejection
+                            .as_ref()
+                            .map(|(reviewer, reason)| (reviewer.as_str(), reason.as_str())),
+                        &outcome.reviewer,
+                        outcome.approved,
+                        &outcome.reason,
+                    ) {
+                        ReviewAdjudication::Approve(reason) => {
+                            outcome.approved = true;
+                            outcome.reason = reason;
+                            return Ok(outcome);
+                        }
+                        ReviewAdjudication::Reject(reason) => {
+                            outcome.approved = false;
+                            outcome.reason = reason;
+                            return Ok(outcome);
+                        }
+                        ReviewAdjudication::AwaitConfirmation(reason) => {
+                            first_rejection.get_or_insert((outcome.reviewer, outcome.reason));
+                            last_confirmation_issue = Some(reason);
+                            continue;
+                        }
                     }
                 }
-            }
-            Ok(res) => {
-                let e = anyhow!(
-                    "{backend} exited {}: {}",
-                    res.exit_code,
-                    err_tail(&res.stderr)
-                );
-                warn!(backend = %backend, error = %e, "work_item_dispatch: in-place review backend failed — trying next");
-                last_err = Some(e);
-            }
-            Err(e) => {
-                warn!(backend = %backend, error = format!("{e:#}"), "work_item_dispatch: in-place review backend unavailable — trying next");
-                last_err = Some(e);
+                Ok(res) => {
+                    let e = anyhow!(
+                        "{backend} exited {}: {}",
+                        res.exit_code,
+                        err_tail(&res.stderr)
+                    );
+                    warn!(backend = %backend, error = %e, "work_item_dispatch: in-place review backend failed — trying next");
+                    last_err = Some(e);
+                }
+                Err(e) => {
+                    warn!(backend = %backend, error = format!("{e:#}"), "work_item_dispatch: in-place review backend unavailable — trying next");
+                    last_err = Some(e);
+                }
             }
         }
+    } else {
+        info!(
+            work_item_id = %item.work_item_id,
+            builder,
+            "work_item_dispatch: local builder requires a distinct fleet-local reviewer; skipping cloud CLIs"
+        );
     }
 
     // FLEET-LOCAL REVIEW FALLBACK (operator 2026-07-25): a dead 480B ring +
@@ -3155,8 +3169,8 @@ async fn run_in_place_review(
     // backend available" (4 of the last 12 failures). Route the review through
     // ANY healthy fleet LLM — fleet_oneshot picks the next available deployment
     // across ALL nodes, the same fleet-wide local routing the build lane uses.
-    // A local-Devstral review beats failing the item outright.
-    let local_builder = normalized_cloud_backend(builder).is_none();
+    // For a local builder this is not a fallback: it is the required first
+    // review lane, pinned to a deployment proven distinct from the builder.
     let explicit_target = if local_builder {
         Some(
             resolve_distinct_local_review_target(
@@ -8395,9 +8409,10 @@ mod tests {
         quick_empty_success_is_provider_failure, record_cloud_rescue_local_failure_diagnosis,
         repo_cache_path, repo_slug, resolve_dispatch_repo_binding, retry_error_is_actionable,
         reviewer_family, rewrite_github_host_alias, route_endpoint_port, same_model_family,
-        should_attempt_lane15, status_output_is_clean, synthetic_output, task_failed_alert_text,
-        task_prefers_cloud_lane, try_acquire_lane15_480b_permit, use_local_lane,
-        validate_local_routed_attribution, validate_manifest_fields,
+        should_attempt_lane15, should_try_cloud_reviewers, status_output_is_clean,
+        synthetic_output, task_failed_alert_text, task_prefers_cloud_lane,
+        try_acquire_lane15_480b_permit, use_local_lane, validate_local_routed_attribution,
+        validate_manifest_fields,
     };
     use sqlx::Row;
     use std::path::{Path, PathBuf};
@@ -9089,6 +9104,14 @@ mod tests {
         assert!(!builder_excludes_480b("codex"));
         assert!(!builder_excludes_480b("claude"));
         assert!(!builder_excludes_480b("kimi"));
+    }
+
+    #[test]
+    fn local_builders_skip_cloud_reviewers() {
+        assert!(!should_try_cloud_reviewers("local"));
+        assert!(!should_try_cloud_reviewers("local:glm-4.5-air"));
+        assert!(should_try_cloud_reviewers("codex"));
+        assert!(should_try_cloud_reviewers("cloud:kimi:latest"));
     }
 
     #[test]
