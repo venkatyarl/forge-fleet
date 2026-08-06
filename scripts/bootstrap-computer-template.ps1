@@ -216,6 +216,42 @@ for ($i = 0; $i -lt $SUB_AGENTS; $i++) {
 }
 Report "sub_agents" "ok" "count=$SUB_AGENTS"
 
+# ─── 8b. Desktop apps (operator installs by hand) ────────────────────────
+
+# Mirrors the bash template's desktop step: stage the Claude / Kimi /
+# ChatGPT installers in Downloads\fleet-desktop-apps so the OPERATOR
+# installs them by hand (operator preference 2026-08-06 — no silent GUI
+# installs). The vendor URLs resolve the current installer, so Downloads
+# always gets the latest without hardcoding versioned links. All three
+# apps auto-update once installed:
+#   claude  — Anthropic's Claude desktop (https://claude.ai/download)
+#   kimi    — Moonshot's Kimi desktop (https://kimi.com)
+#   chatgpt — OpenAI's desktop app; Codex's desktop mode lives here now
+#             (https://chatgpt.com/download)
+# Best-effort only: a failed download warns and onboarding continues.
+Report "desktop_apps" "running"
+$DESKTOP_DL = Join-Path $env:USERPROFILE "Downloads\fleet-desktop-apps"
+New-Item -ItemType Directory -Force -Path $DESKTOP_DL | Out-Null
+$desktopApps = @(
+    @{ Name = "Claude";  Url = "https://claude.ai/download" },
+    @{ Name = "Kimi";    Url = "https://kimi.com" },
+    @{ Name = "ChatGPT"; Url = "https://chatgpt.com/download" }
+)
+$desktopStaged = 0
+foreach ($app in $desktopApps) {
+    $installed = (Test-Path (Join-Path $env:ProgramFiles $app.Name)) -or
+                 (Test-Path (Join-Path $env:LOCALAPPDATA "Programs\$($app.Name)"))
+    if ($installed) { continue }
+    try {
+        Invoke-WebRequest -Uri $app.Url -OutFile (Join-Path $DESKTOP_DL "$($app.Name)-download") -TimeoutSec 60
+        $desktopStaged++
+    } catch {
+        Say "Desktop app download warning ($($app.Name)): $_ — fetch from $($app.Url) by hand"
+        Report "desktop_apps" "warn" "$($app.Name) installer download failed"
+    }
+}
+Report "desktop_apps" "ok" "$desktopStaged installer(s) in Downloads\fleet-desktop-apps (operator installs)"
+
 # ─── 9. Self-enroll ──────────────────────────────────────────────────────
 
 Report "enroll" "running"

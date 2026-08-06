@@ -114,7 +114,9 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
 
     // Build scan targets from whichever source we're using
     let scan_targets = if let Some(ref db_nodes) = pg_nodes {
-        let default_port = config.fleet.api_port;
+        // Health probes target the public gateway (api_port + 2); api_port
+        // itself (:51000) is loopback-only on managed nodes.
+        let default_port = config.fleet.api_port.saturating_add(2);
         let node_tuples: Vec<(String, String, Option<u16>, u32)> = db_nodes
             .iter()
             .map(|n| {
@@ -3516,7 +3518,8 @@ fn load_config_auto() -> Result<(FleetConfig, PathBuf), String> {
 }
 
 fn build_known_scan_targets(config: &FleetConfig) -> Vec<ff_discovery::scanner::ScanTarget> {
-    let default_port = config.fleet.api_port;
+    // Health probes target the public gateway (api_port + 2); api_port itself is loopback-only.
+    let default_port = config.fleet.api_port.saturating_add(2);
     let nodes: Vec<(String, String, Option<u16>, u32)> = config
         .nodes
         .iter()

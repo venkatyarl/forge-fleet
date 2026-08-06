@@ -1,0 +1,186 @@
+{
+  "$schema": "onboarding-checklist/v1",
+  "description": "Canonical software inventory for fleet computer onboarding. Source of truth for what every node should have, where it lives per-OS, how to verify it, and how it updates. Keep this current when vendors rename/move things (they do).",
+  "updated_at": "2026-08-06",
+  "items": [
+    {
+      "name": "claude-code",
+      "title": "Claude Code CLI",
+      "category": "cloud-cli",
+      "check": "command -v claude",
+      "install": {
+        "macos": "curl -fsSL https://claude.ai/install.sh | bash",
+        "linux": "curl -fsSL https://claude.ai/install.sh | bash",
+        "windows": "irm https://claude.ai/install.ps1 | iex"
+      },
+      "locations": {
+        "macos": ["~/.local/bin/claude", "~/.local/share/claude/versions/"],
+        "linux": ["~/.local/bin/claude", "~/.local/share/claude/versions/"],
+        "windows": ["%LOCALAPPDATA%\\Programs\\claude"],
+        "legacy_npm_global": ["/usr/lib/node_modules/@anthropic-ai", "/usr/local/lib/node_modules/@anthropic-ai"]
+      },
+      "update": "self-updates (native installer); `claude update` forces",
+      "notes": "npm package @anthropic-ai/claude-code is DEPRECATED. npm-global installs cannot self-update when node_modules is root-owned — migrate via the bootstrap migrate_native step."
+    },
+    {
+      "name": "codex",
+      "title": "OpenAI Codex CLI",
+      "category": "cloud-cli",
+      "check": "command -v codex",
+      "install": {
+        "macos": "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        "linux": "curl -fsSL https://chatgpt.com/codex/install.sh | sh",
+        "windows": "npm i -g @openai/codex (Windows support experimental)"
+      },
+      "locations": {
+        "macos": ["~/.local/bin/codex"],
+        "linux": ["~/.local/bin/codex"],
+        "legacy_npm_global": ["/usr/lib/node_modules/@openai", "/usr/local/lib/node_modules/@openai"],
+        "brew": ["/opt/homebrew/bin/codex"]
+      },
+      "update": "self-updates (native installer); npm/brew paths update via their managers",
+      "notes": "Native script verified to redirect to releases.openai.com. brew cask 'codex' is this same terminal CLI, not a desktop app."
+    },
+    {
+      "name": "kimi-code",
+      "title": "Kimi Code CLI",
+      "category": "cloud-cli",
+      "check": "command -v kimi",
+      "install": {
+        "macos": "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        "linux": "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
+        "windows": "irm https://code.kimi.com/kimi-code/install.ps1 | iex"
+      },
+      "locations": {
+        "macos": ["~/.local/bin/kimi"],
+        "linux": ["~/.local/bin/kimi"],
+        "npm": ["node_modules/@moonshot-ai/kimi-code"],
+        "uv_tool_legacy": ["~/.local/share/uv/tools/kimi-cli"]
+      },
+      "update": "`kimi upgrade` (self) or reinstall via source",
+      "notes": "uv/pipx 'kimi-cli' on PyPI is NOT the same tool. Config: ~/.kimi-code/ (some builds read ~/.kimi/mcp.json — ff writes both)."
+    },
+    {
+      "name": "claude-desktop",
+      "title": "Claude Desktop",
+      "category": "desktop-app",
+      "check": "test -d /Applications/Claude.app",
+      "install": {
+        "macos": "download dmg from https://claude.ai/download to ~/Downloads (operator installs)",
+        "windows": "download exe from https://claude.ai/download to Downloads (operator installs)",
+        "linux": "no official build"
+      },
+      "locations": {
+        "macos": ["/Applications/Claude.app", "~/Library/Application Support/Claude/claude_desktop_config.json"],
+        "windows": ["%LOCALAPPDATA%\\Programs\\Claude", "%APPDATA%\\Claude\\claude_desktop_config.json"],
+        "linux": []
+      },
+      "update": "auto-updates",
+      "notes": "Operator installs the downloaded dmg/exe by hand (operator preference 2026-08-06)."
+    },
+    {
+      "name": "kimi-desktop",
+      "title": "Kimi Desktop",
+      "category": "desktop-app",
+      "check": "test -d /Applications/Kimi.app",
+      "install": {
+        "macos": "download dmg from https://kimi.com to ~/Downloads (operator installs)",
+        "windows": "download exe from https://kimi.com to Downloads (operator installs)",
+        "linux": "no official build"
+      },
+      "locations": {
+        "macos": ["/Applications/Kimi.app", "~/Library/Application Support/kimi-desktop/"],
+        "windows": ["%LOCALAPPDATA%\\Programs\\Kimi"]
+      },
+      "update": "auto-updates",
+      "notes": "MCP config for the bundled runtime lives under Library/Application Support/kimi-desktop/daimon-share/..."
+    },
+    {
+      "name": "chatgpt-desktop",
+      "title": "ChatGPT Desktop (Codex desktop mode)",
+      "category": "desktop-app",
+      "check": "test -d /Applications/ChatGPT.app",
+      "install": {
+        "macos": "download dmg from https://chatgpt.com/download to ~/Downloads (operator installs)",
+        "windows": "download exe from https://chatgpt.com/download to Downloads (operator installs)",
+        "linux": "no official build"
+      },
+      "locations": {
+        "macos": ["/Applications/ChatGPT.app"],
+        "windows": ["%LOCALAPPDATA%\\Programs\\ChatGPT"]
+      },
+      "update": "auto-updates",
+      "notes": "The standalone Codex desktop app was merged into ChatGPT desktop (Codex Code Mode), July 2026. This IS the Codex desktop client."
+    },
+    {
+      "name": "rust",
+      "title": "Rust toolchain (rustup)",
+      "category": "toolchain",
+      "check": "command -v cargo",
+      "install": { "all": "curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y" },
+      "locations": { "all": ["~/.cargo/bin", "~/.rustup"] },
+      "update": "rustup update"
+    },
+    {
+      "name": "node22",
+      "title": "Node.js 22",
+      "category": "toolchain",
+      "check": "node --version >= 20",
+      "install": {
+        "macos": "brew install node@22 && brew link --overwrite --force node@22",
+        "linux": "NodeSource setup_22.x + apt-get install nodejs",
+        "windows": "nodejs.org LTS installer"
+      },
+      "locations": {
+        "macos": ["/opt/homebrew/opt/node@22/bin/node"],
+        "linux": ["/usr/bin/node"]
+      },
+      "update": "brew upgrade / apt upgrade (NodeSource)"
+    },
+    {
+      "name": "gh",
+      "title": "GitHub CLI",
+      "category": "toolchain",
+      "check": "command -v gh",
+      "install": { "macos": "brew install gh", "linux": "apt-get install gh" },
+      "locations": { "macos": ["/opt/homebrew/bin/gh"], "linux": ["/usr/bin/gh"] },
+      "update": "brew/apt"
+    },
+    {
+      "name": "op",
+      "title": "1Password CLI",
+      "category": "toolchain",
+      "check": "command -v op",
+      "install": { "macos": "brew install --cask 1password-cli", "linux": "official apt repo" },
+      "locations": { "macos": ["/usr/local/bin/op", "/opt/homebrew/bin/op"], "linux": ["/usr/bin/op"] },
+      "update": "brew/apt"
+    },
+    {
+      "name": "uv",
+      "title": "uv (Python tooling)",
+      "category": "toolchain",
+      "check": "command -v uv",
+      "install": { "all": "curl -LsSf https://astral.sh/uv/install.sh | sh" },
+      "locations": { "all": ["~/.local/bin/uv"] },
+      "update": "self-updates (uv self update)"
+    },
+    {
+      "name": "forgefleet",
+      "title": "ForgeFleet (ff + forgefleetd)",
+      "category": "fleet",
+      "check": "command -v ff && forgefleetd --version",
+      "install": { "all": "git clone + cargo build --release (bootstrap script)" },
+      "locations": { "all": ["~/.local/bin/ff", "~/.local/bin/forgefleetd", "~/.forgefleet/"] },
+      "update": "ff fleet deploy (rolling, from origin/main)"
+    },
+    {
+      "name": "web-forge-fleet",
+      "title": "Web console build (out/)",
+      "category": "fleet",
+      "check": "test -f web-forge-fleet/out/index.html",
+      "install": { "all": "npm ci && npm run build in web-forge-fleet/" },
+      "locations": { "all": ["<repo>/web-forge-fleet/out/"] },
+      "update": "rebuilt on every fleet deploy (deploy playbook web-build step)"
+    }
+  ]
+}

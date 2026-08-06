@@ -181,6 +181,14 @@ fn install_claude_code(
     let settings_path = home.join(".claude").join("settings.json");
     upsert_resilient_mcp_server_json(&settings_path, "forgefleet", server_url, dry_run)?;
     println!("  ✓ claude-code: {}", settings_path.display());
+    // Claude Code versions differ on where user-scope mcpServers are honored:
+    // newer builds read ~/.claude.json, older ones ~/.claude/settings.json —
+    // and a write to the wrong one is SILENTLY ignored (found live on vinny
+    // 2026-08-06: ff reported "installed" while the session saw no tools).
+    // Write both; the upsert is idempotent.
+    let user_scope = home.join(".claude.json");
+    upsert_mcp_server_json(&user_scope, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ claude-code: {} (user scope)", user_scope.display());
     if write_instructions {
         let claude_md = home.join(".claude").join("CLAUDE.md");
         append_instructions_md(&claude_md, dry_run)?;
@@ -277,6 +285,12 @@ fn install_kimi(
     let config = home.join(".kimi-code").join("mcp.json");
     upsert_resilient_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ kimi: {}", config.display());
+    // Some kimi builds/versions read ~/.kimi/mcp.json instead — a write to
+    // the wrong one is silently ignored (found live on vinny 2026-08-06).
+    // Upsert the fallback too; idempotent.
+    let legacy = home.join(".kimi").join("mcp.json");
+    upsert_mcp_server_json(&legacy, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ kimi: {} (fallback path)", legacy.display());
     if write_instructions {
         // Kimi reads agent instructions from ~/.kimi/AGENTS.md (the cross-tool
         // AGENTS.md convention).
@@ -400,11 +414,51 @@ fn upsert_mcp_server_stdio_bridge(
     server_url: &str,
     dry_run: bool,
 ) -> Result<()> {
+    // GUI apps launch with a stripped PATH (no /opt/homebrew/bin on macOS),
+    // so a bare `npx` fails to resolve AND npx's own `#!/usr/bin/env node`
+    // shebang can't find node — the server shows "disconnected" either way
+    // (vinny, Claude Desktop, 2026-08-06). Resolve the absolute npx path AND
+    // pin an explicit env.PATH covering the Node bin dir.
+    let npx = resolve_gui_binary("npx");
     let entry = json!({
-        "command": "npx",
+        "command": npx,
         "args": ["-y", "mcp-remote", server_url, "--transport", "http-only"],
+        "env": { "PATH": gui_path() },
     });
     upsert_mcp_entry(path, server_name, entry, dry_run)
+}
+
+/// PATH string for GUI-launched processes: the well-known binary dirs GUI
+/// apps miss (homebrew, local) plus the system defaults.
+fn gui_path() -> String {
+    "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string()
+}
+
+/// Resolve a binary for GUI-launched contexts (desktop apps get a minimal
+/// PATH): prefer the well-known absolute locations, fall back to PATH lookup,
+/// and only then to the bare name.
+fn resolve_gui_binary(name: &str) -> String {
+    let well_known = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/opt/bin",
+    ];
+    for dir in well_known {
+        let candidate = format!("{dir}/{name}");
+        if std::path::Path::new(&candidate).exists() {
+            return candidate;
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in path_var.split(':') {
+            let candidate = format!("{dir}/{name}");
+            if std::path::Path::new(&candidate).exists() {
+                return candidate;
+            }
+        }
+    }
+    name.to_string()
 }
 
 /// Insert/replace `mcpServers.<server_name>` with `entry` in a JSON config,
@@ -638,30 +692,48 @@ fn text_mark(state: &str) -> &'static str {
     }
 }
 
-fn status_candidates(home: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
-    let mut candidates = vec![
-        ("claude-code", home.join(".claude").join("settings.json")),
-        ("claude-desktop", claude_desktop_config_path(home)),
-        ("codex", home.join(".codex").join("config.toml")),
-        ("gemini", home.join(".gemini").join("settings.json")),
-        ("kimi", home.join(".kimi-code").join("mcp.json")),
-        ("kimi-desktop", kimi_desktop_config_path(home)),
-        ("cursor", home.join(".cursor").join("mcp.json")),
+fn status_candidates(home: &std::path::Path) -> Vec<(&'static str, Vec<PathBuf>)> {
+    // Each client maps to its candidate config paths in preference order.
+    // Install writes ALL candidates (a write to a path the client ignores is
+    // silently dropped — vinny 2026-08-06), so status must accept a match on
+    // ANY candidate and report the path that matched.
+    let mut candidates: Vec<(&'static str, Vec<PathBuf>)> = vec![
+        (
+            "claude-code",
+            vec![
+                home.join(".claude").join("settings.json"),
+                home.join(".claude.json"),
+            ],
+        ),
+        ("claude-desktop", vec![claude_desktop_config_path(home)]),
+        ("codex", vec![home.join(".codex").join("config.toml")]),
+        ("gemini", vec![home.join(".gemini").join("settings.json")]),
+        (
+            "kimi",
+            vec![
+                home.join(".kimi-code").join("mcp.json"),
+                home.join(".kimi").join("mcp.json"),
+            ],
+        ),
+        ("kimi-desktop", vec![kimi_desktop_config_path(home)]),
+        ("cursor", vec![home.join(".cursor").join("mcp.json")]),
         (
             "windsurf",
-            home.join(".codeium")
-                .join("windsurf")
-                .join("mcp_config.json"),
+            vec![
+                home.join(".codeium")
+                    .join("windsurf")
+                    .join("mcp_config.json"),
+            ],
         ),
         (
             "goose",
-            home.join(".config").join("goose").join("config.yaml"),
+            vec![home.join(".config").join("goose").join("config.yaml")],
         ),
-        ("grok", home.join(".grok").join("mcp-config.json")),
+        ("grok", vec![home.join(".grok").join("mcp-config.json")]),
     ];
     let legacy_kimi = home.join(".kimi").join("config.json");
     if legacy_kimi.exists() {
-        candidates.insert(5, ("kimi-legacy", legacy_kimi));
+        candidates.insert(5, ("kimi-legacy", vec![legacy_kimi]));
     }
     candidates
 }
@@ -687,12 +759,75 @@ fn config_has_forgefleet(path: &std::path::Path) -> bool {
     contents.contains("forgefleet")
 }
 
+fn config_forgefleet_transport(path: &std::path::Path) -> Option<&'static str> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        let doc: Value = serde_json::from_str(&contents).ok()?;
+        let server = doc.get("mcpServers")?.as_object()?.get("forgefleet")?;
+        if server.get("type").and_then(Value::as_str) == Some("http")
+            || server.get("url").and_then(Value::as_str).is_some()
+            || server.get("httpUrl").and_then(Value::as_str).is_some()
+        {
+            return Some("http");
+        }
+        if server.get("command").and_then(Value::as_str) == Some("npx")
+            && server
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("mcp-remote")))
+        {
+            return Some("http_bridge");
+        }
+        if server.get("command").and_then(Value::as_str).is_some() {
+            return Some("stdio");
+        }
+        return Some("unknown");
+    }
+
+    let section = if let Some((_, tail)) = contents.split_once("[mcp_servers.forgefleet]") {
+        tail.split_once("\n[")
+            .map(|(current, _)| current)
+            .unwrap_or(tail)
+    } else {
+        // Goose uses YAML.  Its installer writes only native HTTP entries.
+        if contents.contains("  forgefleet:") && contents.contains("    type: http") {
+            return Some("http");
+        }
+        return None;
+    };
+    if section
+        .lines()
+        .any(|line| line.trim_start().starts_with("url ="))
+    {
+        Some("http")
+    } else if section
+        .lines()
+        .any(|line| line.trim_start().starts_with("command ="))
+    {
+        Some("stdio")
+    } else {
+        Some("unknown")
+    }
+}
+
 fn status_rows(home: &std::path::Path) -> Vec<Value> {
     status_candidates(home)
         .into_iter()
-        .map(|(name, path)| {
+        .map(|(name, paths)| {
+            // A client counts as installed if ANY candidate path carries the
+            // forgefleet entry; report the path that matched (else primary).
+            let matched = paths
+                .iter()
+                .find(|p| p.exists() && config_has_forgefleet(p));
+            let (path, has_ff) = match matched {
+                Some(p) => (p.clone(), true),
+                None => (paths[0].clone(), false),
+            };
             let exists = path.exists();
-            let has_ff = exists && config_has_forgefleet(&path);
+            let transport = has_ff.then(|| config_forgefleet_transport(&path)).flatten();
             json!({
                 "client": name,
                 "config_path": path.display().to_string(),

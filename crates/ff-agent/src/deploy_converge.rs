@@ -293,7 +293,16 @@ async fn run_once(pg: &PgPool) -> Result<()> {
                 .iter()
                 .filter(|n| online.contains(*n))
                 .collect();
-            if real_failures.is_empty() {
+            // FALSE-SUCCESS GUARD (vinny onboarding, 2026-08-04): an early
+            // abort (e.g. "ForgeFleet checkout is not configured") exits
+            // non-zero with ZERO per-node result lines — no ✓ and no ✗ —
+            // and the old condition recorded the SHA anyway, silently
+            // skipping the entire fleet deploy. Only accept the
+            // offline-skip path when the child actually produced per-node
+            // results (at least one ✓ or ✗ line).
+            let succeeded_nodes = combined.lines().filter(|l| l.contains('✓')).count();
+            let produced_node_results = succeeded_nodes > 0 || !failed_nodes.is_empty();
+            if real_failures.is_empty() && produced_node_results {
                 info!(
                     head = %head,
                     offline_skipped = ?failed_nodes,
@@ -307,6 +316,12 @@ async fn run_once(pg: &PgPool) -> Result<()> {
                     Some("deploy-converge"),
                 )
                 .await;
+            } else if !produced_node_results {
+                warn!(
+                    head = %head, code = ?o.status.code(),
+                    stderr = %String::from_utf8_lossy(&o.stderr).chars().take(400).collect::<String>(),
+                    "deploy-converge: deploy aborted before any per-node results (no ✓/✗ lines) — NOT recording SHA; will retry next tick"
+                );
             } else {
                 warn!(
                     head = %head, code = ?o.status.code(),

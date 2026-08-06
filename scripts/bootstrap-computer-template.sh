@@ -503,22 +503,27 @@ esac
 # Install every supported cloud CLI as the target user, then materialize the
 # allowlisted centralized OAuth tokens at each CLI's canonical credential path.
 report "cloud_clis" running
+# Vendor-preferred installers ONLY — each self-updates; installing from the
+# wrong source (npm/brew when the vendor prefers a native script) breaks the
+# update path and strands the box on stale versions (operator directive
+# 2026-08-06):
+#   claude — native installer (npm package deprecated by Anthropic)
+#   codex  — native installer (npm/brew are alternates, script is preferred)
+#   kimi   — official install script (uv/pipx kimi-cli is NOT the same tool)
 if ! run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' \
     || die "Claude Code install failed"
 fi
 if ! run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
-  run_as_user bash -lc 'npm install -g @openai/codex' || die "Codex install failed"
-fi
-CODEX_BIN="$(run_as_user bash -lc 'npm prefix -g')/bin/codex"
-if [ -x "$CODEX_BIN" ]; then
-  run_as_user ln -sf "$CODEX_BIN" "$USER_HOME/.local/bin/codex"
+  run_as_user bash -lc 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' \
+    || die "Codex install failed"
 fi
 if ! run_as_user bash -lc 'command -v uv >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh' || die "uv install failed"
 fi
 if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
-  run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
+  run_as_user bash -lc 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash' \
+    || die "Kimi Code install failed"
 fi
 
 CLAUDE_CREDENTIALS="$(peek_secret anthropic.oauth_token.credentials)"
@@ -548,16 +553,55 @@ fi
 # missing so a fresh machine is fully usable, not just CLI-wired. The Codex
 # brew cask is the terminal CLI (already handled above) — OpenAI ships no
 # separate desktop app cask.
+
+# Migrate npm-global cloud CLIs to their native installers. npm-global
+# installs can't self-update when the global node_modules is root-owned
+# (adele, 2026-08) and the npm claude package is deprecated. The native
+# installers live in ~/.local and self-update; section 0 already puts
+# ~/.local/bin first in PATH so the native binary wins immediately.
+migrate_native() {
+  local tool="$1" url="$2"
+  local active
+  active="$(run_as_user bash -lc "command -v $tool" 2>/dev/null || true)"
+  [ -n "$active" ] || return 0
+  case "$active" in
+    "$USER_HOME/.local/bin/"*) return 0 ;;
+  esac
+  if run_as_user bash -lc "npm ls -g --depth=0 2>/dev/null | grep -qi $tool"; then
+    if run_as_user bash -lc "curl -fsSL $url | bash"; then
+      report "cli_migrate" ok "$tool migrated to native installer"
+    else
+      report "cli_migrate" warn "$tool native migration failed"
+    fi
+  fi
+}
+migrate_native claude https://claude.ai/install.sh
+migrate_native codex https://chatgpt.com/codex/install.sh
+
+# Desktop clients (macOS): download the installers to ~/Downloads so the
+# OPERATOR installs the dmg/zip by hand (operator preference 2026-08-06 —
+# no silent brew cask installs of GUI apps). brew fetch resolves the current
+# vendor URL, so Downloads always gets the latest without hardcoding
+# versioned links. All three apps auto-update once installed:
+#   claude  — Anthropic's Claude desktop
+#   kimi    — Moonshot's Kimi desktop
+#   chatgpt — OpenAI's desktop app; Codex's desktop mode lives here now (the
+#             standalone Codex desktop app was merged into it, July 2026)
+# These three have no official Linux builds; the Windows template downloads
+# the exe installers to Downloads the same way.
 if [ "$OS_ID" = "macos" ]; then
-  if [ ! -d "/Applications/Claude.app" ]; then
-    run_as_user bash -lc 'brew install --cask claude' \
-      || report "desktop_apps" warn "Claude desktop cask install failed — install manually"
-  fi
-  if [ ! -d "/Applications/Kimi.app" ]; then
-    run_as_user bash -lc 'brew install --cask kimi' \
-      || report "desktop_apps" warn "Kimi desktop cask install failed — install manually"
-  fi
-  report "desktop_apps" ok "claude + kimi desktop present"
+  DESKTOP_DL="$USER_HOME/Downloads/fleet-desktop-apps"
+  run_as_user mkdir -p "$DESKTOP_DL"
+  desktop_fetch() {
+    local app_dir="$1" cask="$2"
+    [ -d "$app_dir" ] && return 0
+    run_as_user bash -lc "brew fetch --cask $cask >/dev/null 2>&1 && cp \"\$(brew --cache --cask $cask)\" '$DESKTOP_DL/'" \
+      || report "desktop_apps" warn "$cask installer download failed — fetch from the vendor site by hand"
+  }
+  desktop_fetch "/Applications/Claude.app" claude
+  desktop_fetch "/Applications/Kimi.app" kimi
+  desktop_fetch "/Applications/ChatGPT.app" chatgpt
+  report "desktop_apps" ok "installers in ~/Downloads/fleet-desktop-apps (operator installs)"
 fi
 
 report "cloud_clis" ok "claude, codex, kimi"
@@ -691,10 +735,20 @@ ENROLL_PAYLOAD="$(cat <<EOF
 EOF
 )"
 
-ENROLL_RESP="$(curl -fsS -m 30 -X POST \
+# Capture the HTTP status + body so a rejection tells us WHY (invalid token
+# vs transport vs server error) — with -f the body was silently discarded
+# and every failure looked identical (vinny onboarding, 2026-08-04).
+ENROLL_RESP="$(curl -sS -m 30 -X POST \
   -H "Content-Type: application/json" \
   --data "$ENROLL_PAYLOAD" \
-  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP request failed"
+  -w '\n%{http_code}' \
+  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP transport failed"
+ENROLL_STATUS="$(printf '%s' "$ENROLL_RESP" | tail -1)"
+ENROLL_RESP="$(printf '%s' "$ENROLL_RESP" | sed '$d')"
+case "$ENROLL_STATUS" in
+  2*) ;;
+  *) die "self-enroll rejected (HTTP $ENROLL_STATUS): $ENROLL_RESP" ;;
+esac
 
 say "Enrolled: $ENROLL_RESP"
 report "enroll" ok
@@ -1024,6 +1078,15 @@ if [ "$VERIFY_OK" = "1" ]; then
   report "verify" ok "gateway healthy on 127.0.0.1:51002"
 else
   report "verify" failed "gateway not healthy after 30s — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleetd; linux: systemctl --user status forgefleetd"
+fi
+
+# The MCP listener is a SEPARATE supervised service (launchd/systemd) — the
+# gateway can be healthy while MCP is down, which silently breaks every
+# desktop-CLI integration (vinny 2026-08-06: Claude Desktop 'disconnected').
+if curl -fsS -m 4 "http://127.0.0.1:50001/mcp/health" 2>/dev/null | grep -q '^ok'; then
+  report "verify_mcp" ok "mcp listener healthy on 127.0.0.1:50001"
+else
+  report "verify_mcp" failed "mcp listener not answering on 127.0.0.1:50001 — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleet-mcp; linux: systemctl --user status forgefleet-mcp"
 fi
 
 # A mid-run network flip (subnet/VLAN change — e.g. Wi-Fi re-enabled on a

@@ -1110,6 +1110,30 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 18b'') Infra canary — leader-gated, every 60s: TCP-probe the fleet's
+    // shared Redis + NATS and alert when one dies. The 2026-08-03 incident:
+    // NATS was dead ~35h with zero alerts while surfaces went quietly stale.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        subsystem_tasks.push(ff_agent::infra_canary::spawn_infra_canary_tick(
+            pg_pool,
+            ff_agent::infra_canary::resolve_redis_url(&config),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
+    // 18b''') Mesh key sync — leader-gated, hourly: propagate the canonical
+    // fleet user-key set (fleet_workers_ssh_keys) into every online node's
+    // authorized_keys via the defer queue whenever the set changes. Closes
+    // the one-directional gap in enroll-time mesh import (vinny 2026-08-04).
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        subsystem_tasks.push(ff_agent::mesh_sync::spawn_mesh_sync_tick(
+            pg_pool,
+            3600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 18c) Fleet-integrity verify tick — every 15min, leader-gated, gate
     // `fleet_secrets.fleet_integrity_mode` (off|report, DEFAULT off).
     // `revive_scan` already repairs DEAD nodes; this covers the blind spot of an
@@ -3005,9 +3029,40 @@ fn start_self_heal_subsystem(
 
         let mut ticker = tokio::time::interval(Duration::from_secs(loop_cfg.interval_secs.max(5)));
 
+        // Convergent onboarding cadence: re-apply the local checklist
+        // (mcp wiring, skills sync, cloud CLIs, desktop installers) once a
+        // day. Seeded 25h in the past so the first pass runs on the first
+        // tick (~one interval after daemon start) — heals nodes whose
+        // bootstrap died mid-way (2026-08 macOS enroll left MCP/skills/
+        // desktop undone) without waiting a full day.
+        let mut last_converge = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(25 * 3600))
+            .unwrap_or_else(std::time::Instant::now);
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Daily onboarding convergence. Spawned as its own task so
+                    // even a panic inside converge can't kill the self-heal
+                    // loop; per-item failures are collected, not fatal.
+                    if last_converge.elapsed() >= Duration::from_secs(86_400) {
+                        last_converge = std::time::Instant::now();
+                        match tokio::spawn(ff_agent::converge::run_converge()).await {
+                            Ok(results) => {
+                                use ff_agent::converge::ConvergeStatus as S;
+                                let count = |s: S| results.iter().filter(|r| r.status == s).count();
+                                info!(
+                                    ok = count(S::Ok),
+                                    installed = count(S::Installed),
+                                    skipped = count(S::Skipped),
+                                    failed = count(S::Failed),
+                                    "onboarding converge pass complete"
+                                );
+                            }
+                            Err(e) => warn!(error = %e, "onboarding converge task failed"),
+                        }
+                    }
+
                     if expected_ports.is_empty() {
                         continue;
                     }
