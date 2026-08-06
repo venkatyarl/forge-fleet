@@ -326,24 +326,29 @@ mod tests {
 
     #[tokio::test]
     async fn record_emits_a_structured_tracing_line() {
+        use tracing::instrument::WithSubscriber;
+
         let buf = SharedBuf::default();
         let subscriber = tracing_subscriber::fmt()
             .json()
             .with_writer(buf.clone())
             .finish();
 
-        let store = Arc::new(RecordingStore::default());
-        let (auditor, writer) = ReconciliationAuditor::start(store);
-        let trace_id = tracing::subscriber::with_default(subscriber, || {
-            auditor.record(
+        let trace_id = async {
+            let store = Arc::new(RecordingStore::default());
+            let (auditor, writer) = ReconciliationAuditor::start(store);
+            let trace_id = auditor.record(
                 ReconciliationAction::ConflictResolved,
                 "wi-42",
                 "PR conflicted with advanced main — item reset for rebuild",
                 serde_json::json!({"queue_id": "q-1"}),
-            )
-        });
-        drop(auditor);
-        writer.await.unwrap();
+            );
+            drop(auditor);
+            writer.await.unwrap();
+            trace_id
+        }
+        .with_subscriber(subscriber)
+        .await;
 
         let logged = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
         let line = logged

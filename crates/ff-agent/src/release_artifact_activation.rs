@@ -5156,6 +5156,41 @@ mod tests {
         (id, identity, platform, ports)
     }
 
+    fn resume_explicit_rollback_after_transient_inherited_lock(
+        id: Uuid,
+        identity: LocalComputerIdentity,
+        platform: ServicePlatform,
+        ports: ServicePorts,
+        home: PathBuf,
+        runner: &dyn CommandRunner,
+    ) -> Result<PreparedExplicitRollback> {
+        const ATTEMPTS: usize = 50;
+        for attempt in 1..=ATTEMPTS {
+            match prepare_explicit_rollback(
+                id,
+                identity.clone(),
+                platform,
+                ports,
+                home.clone(),
+                runner,
+                None,
+            ) {
+                Err(ReleaseActivationError::Refused(reason))
+                    if reason.starts_with(
+                        "another release activation or rollback owns the local operation lock:",
+                    ) && attempt < ATTEMPTS =>
+                {
+                    // libtest runs process-spawning tests in parallel. A child
+                    // forked while this test held the flock can briefly retain
+                    // the open-file description until exec applies O_CLOEXEC.
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                result => return result,
+            }
+        }
+        unreachable!("the final retry always returns")
+    }
+
     fn rolled_back_activation_fixture(
         home: &Path,
     ) -> (Uuid, LocalComputerIdentity, ServicePlatform) {
@@ -5475,26 +5510,24 @@ mod tests {
                 },
             );
             let runner = FakeRunner::new(home.clone()).with_prior_source("5c1b63fb");
-            assert!(
-                prepare_explicit_rollback(
-                    id,
-                    identity.clone(),
-                    platform,
-                    ports,
-                    home.clone(),
-                    &runner,
-                    Some(transition),
-                )
-                .is_err()
+            let injected = prepare_explicit_rollback(
+                id,
+                identity.clone(),
+                platform,
+                ports,
+                home.clone(),
+                &runner,
+                Some(transition),
             );
-            let prepared = prepare_explicit_rollback(
+            assert!(matches!(&injected, Err(_)));
+            drop(injected);
+            let prepared = resume_explicit_rollback_after_transient_inherited_lock(
                 id,
                 identity,
                 platform,
                 ports,
                 home.clone(),
                 &runner,
-                None,
             )
             .unwrap();
             commit_explicit_rollback(prepared, &runner).unwrap();

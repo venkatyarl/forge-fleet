@@ -1177,7 +1177,7 @@ fn list_directory_names(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
     use uuid::Uuid;
 
     fn identity(name: &str) -> LocalComputerIdentity {
@@ -1210,9 +1210,15 @@ mod tests {
     }
 
     fn loader_dependency() -> RuntimeLoaderDependency {
-        let path = std::fs::canonicalize("/usr/bin/env").unwrap();
+        // `/bin/sh` is the portable, root-owned loader fixture on supported
+        // Ubuntu releases. Unlike Ubuntu 26.04's coreutils `env`, its target is
+        // not installed as one member of a hard-link farm.
+        let path = std::fs::canonicalize("/bin/sh").unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let metadata = std::fs::metadata(&path).unwrap();
+        assert!(metadata.is_file(), "test loader must be a regular file");
+        assert_eq!(metadata.uid(), 0, "test loader must be root-owned");
+        assert_eq!(metadata.nlink(), 1, "test loader must not be hard-linked");
         RuntimeLoaderDependency {
             path,
             sha256: hex_sha256(&bytes),
