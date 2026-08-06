@@ -758,6 +758,61 @@ fn config_has_forgefleet(path: &std::path::Path) -> bool {
     contents.contains("forgefleet")
 }
 
+fn config_forgefleet_transport(path: &std::path::Path) -> Option<&'static str> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "json")
+    {
+        let doc: Value = serde_json::from_str(&contents).ok()?;
+        let server = doc.get("mcpServers")?.as_object()?.get("forgefleet")?;
+        if server.get("type").and_then(Value::as_str) == Some("http")
+            || server.get("url").and_then(Value::as_str).is_some()
+            || server.get("httpUrl").and_then(Value::as_str).is_some()
+        {
+            return Some("http");
+        }
+        if server.get("command").and_then(Value::as_str) == Some("npx")
+            && server
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|args| args.iter().any(|arg| arg.as_str() == Some("mcp-remote")))
+        {
+            return Some("http_bridge");
+        }
+        if server.get("command").and_then(Value::as_str).is_some() {
+            return Some("stdio");
+        }
+        return Some("unknown");
+    }
+
+    let section = if let Some((_, tail)) = contents.split_once("[mcp_servers.forgefleet]") {
+        tail.split_once("\n[")
+            .map(|(current, _)| current)
+            .unwrap_or(tail)
+    } else {
+        // Goose uses YAML.  Its installer writes only native HTTP entries.
+        if contents.contains("  forgefleet:") && contents.contains("    type: http") {
+            return Some("http");
+        }
+        return None;
+    };
+    if section
+        .lines()
+        .any(|line| line.trim_start().starts_with("url ="))
+    {
+        Some("http")
+    } else if section
+        .lines()
+        .any(|line| line.trim_start().starts_with("command ="))
+    {
+        Some("stdio")
+    } else {
+        Some("unknown")
+    }
+}
+
+
 fn status_rows(home: &std::path::Path) -> Vec<Value> {
     status_candidates(home)
         .into_iter()

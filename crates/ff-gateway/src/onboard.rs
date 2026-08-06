@@ -773,7 +773,7 @@ pub struct EnrollmentProgress {
 }
 
 pub async fn enrollment_progress(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Json(payload): Json<EnrollmentProgress>,
 ) -> impl IntoResponse {
     // Lightweight pass-through: publish to Redis so the dashboard's WS can
@@ -786,7 +786,7 @@ pub async fn enrollment_progress(
         "at": chrono::Utc::now().to_rfc3339(),
     })
     .to_string();
-    let _ = publish_redis(&channel, &message).await;
+    let _ = publish_redis_at(&channel, &message, redis_url_from_state(&state).await.as_deref()).await;
     // Also log so operators can tail daemon logs. Include the detail payload
     // for failures — a fatal without its reason is undebuggable (vinny
     // 2026-08-04: mesh_import fatal with no visible cause).
@@ -1137,15 +1137,48 @@ fn compute_default_sub_agents(cores: i32, ram_gb: i32, has_nvidia: bool) -> i32 
     n
 }
 
+/// Redis URL from the gateway's fleet config, when loaded.
+pub(crate) async fn redis_url_from_state(state: &GatewayState) -> Option<String> {
+    match state.fleet_config.as_ref() {
+        Some(lock) => {
+            let url = lock.read().await.redis.url.clone();
+            if url.trim().is_empty() { None } else { Some(url) }
+        }
+        None => None,
+    }
+}
+
 /// Lightweight Redis publish; no dedicated crate import — we shell out to a
 /// tiny helper to avoid adding another dep on ff-gateway (ff-pulse has the
 /// redis crate). Best-effort: failures are logged, not raised.
+<<<<<<< HEAD
 async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
     // Read redis URL from env; default localhost:56379.
     let url = std::env::var("FORGEFLEET_REDIS_URL")
         .unwrap_or_else(|_| "redis://192.168.5.100:56379".into());
+=======
+///
+/// URL resolution: explicit `url` argument → FORGEFLEET_REDIS_URL → localhost.
+/// The previous fallback hardcoded vinny's IP (192.168.5.100) from its leader
+/// era — stale after the wipe + leader rotation (2026-08-06).
+pub(crate) async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
+    publish_redis_at(channel, payload, None).await
+}
+
+/// As [`publish_redis`], with an explicit URL override (callers with gateway
+/// state pass the fleet config's redis.url).
+pub(crate) async fn publish_redis_at(
+    channel: &str,
+    payload: &str,
+    url: Option<&str>,
+) -> Result<(), String> {
+    let url = url
+        .map(str::to_string)
+        .or_else(|| std::env::var("FORGEFLEET_REDIS_URL").ok())
+        .unwrap_or_else(|| "redis://127.0.0.1:56379".into());
+>>>>>>> 0802d394 (fix: drop stale vinny-IP redis fallback in enrollment publish path)
     // Parse host:port from URL (redis://host:port or redis://host:port/db).
-    let (host, port) = parse_redis_hostport(&url).unwrap_or(("192.168.5.100".into(), 56379));
+    let (host, port) = parse_redis_hostport(&url).unwrap_or(("127.0.0.1".into(), 56379));
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     let mut sock = TcpStream::connect((host.as_str(), port))
