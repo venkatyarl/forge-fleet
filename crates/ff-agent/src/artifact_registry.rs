@@ -7,6 +7,7 @@
 //! userspace cannot make the filesystem pass and database commit one atomic
 //! snapshot.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,6 +21,8 @@ use ff_db::{
 };
 
 use crate::fleet_info::LocalComputerIdentity;
+
+pub(crate) const RELEASE_ARTIFACT_NAMES: [&str; 2] = ["ff", "forgefleetd"];
 
 #[derive(Debug, Clone)]
 pub struct LocalReleaseArtifactSpec {
@@ -48,6 +51,10 @@ pub enum ArtifactRegistryError {
     DigestMismatch,
     #[error("verified relative path is not valid UTF-8")]
     NonUtf8Path,
+    #[error("release artifact name must be exactly ff or forgefleetd")]
+    InvalidArtifactName,
+    #[error("release artifact relative-path basename must exactly match its artifact name")]
+    ArtifactBasenameMismatch,
     #[error(transparent)]
     Filesystem(#[from] ModelIntegrityError),
     #[error(transparent)]
@@ -129,7 +136,12 @@ pub async fn register_local_release_artifact(
 ) -> Result<ReleaseArtifactRegistration, ArtifactRegistryError> {
     let release_root = local_release_build_root()?;
     let assertion = verify_release_evidence(identity, &release_root, spec)?;
-    Ok(pg_register_release_artifact(pool, &assertion).await?)
+    let registration = pg_register_release_artifact(pool, &assertion).await?;
+    validate_release_artifact_basename(
+        &registration.artifact.artifact_name,
+        Path::new(&registration.custody.relative_path),
+    )?;
+    Ok(registration)
 }
 
 fn verify_release_evidence(
@@ -178,6 +190,7 @@ fn verify_release_evidence(
     if !constant_time_sha256_eq(&digest.sha256, &spec.expected_sha256) {
         return Err(ArtifactRegistryError::DigestMismatch);
     }
+    validate_release_artifact_basename(&spec.artifact_name, &spec.relative_path)?;
 
     let relative_path = spec
         .relative_path
@@ -195,6 +208,19 @@ fn verify_release_evidence(
         holder_name: identity.name.clone(),
         relative_path,
     })
+}
+
+pub(crate) fn validate_release_artifact_basename(
+    artifact_name: &str,
+    relative_path: &Path,
+) -> Result<(), ArtifactRegistryError> {
+    if !RELEASE_ARTIFACT_NAMES.contains(&artifact_name) {
+        return Err(ArtifactRegistryError::InvalidArtifactName);
+    }
+    if relative_path.file_name() != Some(OsStr::new(artifact_name)) {
+        return Err(ArtifactRegistryError::ArtifactBasenameMismatch);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -239,17 +265,56 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn requires_exact_logical_name_and_matching_relative_path_basename() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("build")).unwrap();
+        std::fs::write(root.path().join("build/ff"), b"abc").unwrap();
+        std::fs::write(root.path().join("build/forgefleetd"), b"abc").unwrap();
+
+        let mut daemon = spec(PathBuf::from("build/forgefleetd"));
+        daemon.artifact_name = "forgefleetd".to_string();
+        assert!(verify_release_evidence(&identity(), root.path(), &daemon).is_ok());
+
+        for (artifact_name, relative_path, expected_error) in [
+            (
+                "agent",
+                "build/ff",
+                ArtifactRegistryError::InvalidArtifactName,
+            ),
+            (
+                "ff",
+                "build/forgefleetd",
+                ArtifactRegistryError::ArtifactBasenameMismatch,
+            ),
+            (
+                "forgefleetd",
+                "build/ff",
+                ArtifactRegistryError::ArtifactBasenameMismatch,
+            ),
+        ] {
+            let mut invalid = spec(PathBuf::from(relative_path));
+            invalid.artifact_name = artifact_name.to_string();
+            let error = verify_release_evidence(&identity(), root.path(), &invalid).unwrap_err();
+            assert_eq!(
+                std::mem::discriminant(&error),
+                std::mem::discriminant(&expected_error)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn rejects_absolute_parent_and_symlink_paths() {
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("real"), b"abc").unwrap();
-        symlink(root.path().join("real"), root.path().join("link")).unwrap();
+        symlink(root.path().join("real"), root.path().join("ff")).unwrap();
 
         for rejected in [
-            PathBuf::from("../real"),
-            root.path().join("real"),
-            PathBuf::from("link"),
+            PathBuf::from("../ff"),
+            root.path().join("ff"),
+            PathBuf::from("ff"),
         ] {
             assert!(
                 verify_release_evidence(&identity(), root.path(), &spec(rejected)).is_err(),

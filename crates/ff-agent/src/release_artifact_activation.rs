@@ -29,12 +29,11 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::artifact_registry::{
-    LocalReleaseArtifactSpec, authority_home_dir, local_release_build_root,
-    register_local_release_artifact,
+    LocalReleaseArtifactSpec, RELEASE_ARTIFACT_NAMES, authority_home_dir, local_release_build_root,
+    register_local_release_artifact, validate_release_artifact_basename,
 };
 use crate::fleet_info::{LocalComputerIdentity, resolve_this_computer_identity_strict};
 
-const ARTIFACT_NAMES: [&str; 2] = ["ff", "forgefleetd"];
 const MCP_UNIT: &str = "forgefleet-mcp.service";
 const DAEMON_UNIT: &str = "forgefleetd.service";
 const MCP_LABEL: &str = "com.forgefleet.forgefleet-mcp";
@@ -331,7 +330,7 @@ pub async fn activate_local_release_pair(
     }
 
     let mut pair = Vec::with_capacity(2);
-    for artifact_name in ARTIFACT_NAMES {
+    for artifact_name in RELEASE_ARTIFACT_NAMES {
         let row = pg_get_release_artifact(
             pool,
             artifact_name,
@@ -812,7 +811,7 @@ fn validate_registry_row(
     request: &CanonicalReleaseIdentity,
     target: &str,
 ) -> Result<()> {
-    if !ARTIFACT_NAMES.contains(&row.artifact_name.as_str())
+    if !RELEASE_ARTIFACT_NAMES.contains(&row.artifact_name.as_str())
         || row.artifact_name != expected_name
         || row.artifact_version != request.artifact_version
         || row.source_commit != request.source_commit
@@ -854,7 +853,7 @@ fn validate_pair(
             "ff and forgefleetd do not share one canonical origin custodian".into(),
         ));
     }
-    for (artifact, expected_name) in pair.iter().zip(ARTIFACT_NAMES) {
+    for (artifact, expected_name) in pair.iter().zip(RELEASE_ARTIFACT_NAMES) {
         validate_registry_row(&artifact.row, expected_name, request, target)?;
         if artifact.custody.artifact_id != artifact.row.id
             || artifact.custody.computer_id != identity.id
@@ -864,7 +863,10 @@ fn validate_pair(
                 "{expected_name} is not in exact local canonical custody"
             )));
         }
-        validate_safe_relative_path(Path::new(&artifact.custody.relative_path))?;
+        validate_registered_custody_path(
+            expected_name,
+            Path::new(&artifact.custody.relative_path),
+        )?;
     }
     Ok(())
 }
@@ -875,6 +877,9 @@ async fn ensure_local_custody(
     row: &ReleaseArtifactRow,
 ) -> Result<LocalCustodyResolution> {
     let custody = pg_list_release_artifact_custody(pool, row.id).await?;
+    for entry in &custody {
+        validate_registered_custody_path(&row.artifact_name, Path::new(&entry.relative_path))?;
+    }
     let origin = select_canonical_origin(&custody, &row.artifact_name)?;
     if origin
         .holder_name_at_registration
@@ -983,6 +988,12 @@ async fn ensure_local_custody(
 
 fn canonical_live_status(status: &str) -> bool {
     matches!(status, "active" | "online")
+}
+
+fn validate_registered_custody_path(artifact_name: &str, relative_path: &Path) -> Result<()> {
+    validate_safe_relative_path(relative_path)?;
+    validate_release_artifact_basename(artifact_name, relative_path)?;
+    Ok(())
 }
 
 /// The first immutable verifier is the origin. Later recipient custody rows do
@@ -2466,7 +2477,7 @@ fn build_rollback_receipt(
     entries: &[InstallEntry],
     receipt_path: &Path,
 ) -> ReleaseRollbackReceipt {
-    let artifacts = ARTIFACT_NAMES
+    let artifacts = RELEASE_ARTIFACT_NAMES
         .iter()
         .filter_map(|name| {
             let matching: Vec<_> = entries
@@ -2555,7 +2566,7 @@ fn validate_rollback_receipt(
 }
 
 fn build_artifact_receipts(entries: &[InstallEntry]) -> Vec<ActivatedArtifactReceipt> {
-    ARTIFACT_NAMES
+    RELEASE_ARTIFACT_NAMES
         .iter()
         .filter_map(|name| {
             let matching: Vec<_> = entries
@@ -3256,7 +3267,7 @@ fn smoke_staged_pair(
     source_commit: &str,
     runner: &dyn CommandRunner,
 ) -> Result<()> {
-    for artifact_name in ARTIFACT_NAMES {
+    for artifact_name in RELEASE_ARTIFACT_NAMES {
         let entry = entries
             .iter()
             .find(|entry| entry.artifact_name == artifact_name)
@@ -3277,7 +3288,7 @@ fn smoke_installed_pair(
     source_commit: &str,
     runner: &dyn CommandRunner,
 ) -> Result<()> {
-    for artifact_name in ARTIFACT_NAMES {
+    for artifact_name in RELEASE_ARTIFACT_NAMES {
         let entry = entries
             .iter()
             .find(|entry| entry.artifact_name == artifact_name)
@@ -3372,7 +3383,7 @@ fn probe_installed_pair_identity(
     runner: &dyn CommandRunner,
 ) -> Result<PriorReleaseIdentity> {
     let mut reported = Vec::with_capacity(2);
-    for name in ARTIFACT_NAMES {
+    for name in RELEASE_ARTIFACT_NAMES {
         let path = home.join(".local/bin").join(name);
         let output = runner.run(&path.display().to_string(), &["--version".into()])?;
         if !output.success {
@@ -4463,20 +4474,71 @@ mod tests {
         assert!(validate_full_source_commit(&SOURCE.to_ascii_uppercase()).is_err());
         assert!(validate_full_source_commit(&SOURCE[..10]).is_err());
 
-        let lily = derive_platform_identity(SOURCE, "linux", "x86_64", "gnu", "24").unwrap();
-        let logan = derive_platform_identity(SOURCE, "linux", "x86_64", "gnu", "26").unwrap();
-        assert_eq!(lily.target_triple, logan.target_triple);
-        assert_eq!(
-            lily.artifact_version,
-            format!("recovery.{SOURCE}.ubuntu24-x86_64")
-        );
-        assert_eq!(
-            logan.artifact_version,
-            format!("recovery.{SOURCE}.ubuntu26-x86_64")
-        );
-        assert_ne!(lily.artifact_version, logan.artifact_version);
+        let supported = [
+            (
+                "linux",
+                "x86_64",
+                "gnu",
+                "24",
+                "ubuntu24-x86_64",
+                "x86_64-unknown-linux-gnu",
+                ServicePlatform::Linux,
+            ),
+            (
+                "linux",
+                "aarch64",
+                "gnu",
+                "24",
+                "ubuntu24-aarch64",
+                "aarch64-unknown-linux-gnu",
+                ServicePlatform::Linux,
+            ),
+            (
+                "linux",
+                "x86_64",
+                "gnu",
+                "26",
+                "ubuntu26-x86_64",
+                "x86_64-unknown-linux-gnu",
+                ServicePlatform::Linux,
+            ),
+            (
+                "macos",
+                "aarch64",
+                "",
+                "26",
+                "macos26-arm64",
+                "aarch64-apple-darwin",
+                ServicePlatform::Macos,
+            ),
+        ];
+        for (os, arch, env, release, qualifier, target, platform) in supported {
+            let identity = derive_platform_identity(SOURCE, os, arch, env, release).unwrap();
+            assert_eq!(identity.target_triple, target);
+            assert_eq!(
+                identity.artifact_version,
+                format!("recovery.{SOURCE}.{qualifier}")
+            );
+            assert_eq!(identity.service_platform, platform);
+        }
+
         assert!(derive_platform_identity(SOURCE, "linux", "x86_64", "gnu", "25").is_err());
         assert!(derive_platform_identity(SOURCE, "linux", "x86_64", "musl", "24").is_err());
+        assert!(derive_platform_identity(SOURCE, "linux", "aarch64", "gnu", "26").is_err());
+        assert!(derive_platform_identity(SOURCE, "linux", "arm64", "gnu", "24").is_err());
+
+        let arm64 = derive_platform_identity(SOURCE, "linux", "aarch64", "gnu", "24").unwrap();
+        let request = CanonicalReleaseIdentity {
+            artifact_version: arm64.artifact_version,
+            source_commit: SOURCE.into(),
+        };
+        let legacy = row(
+            "ff",
+            &format!("recovery.{SOURCE}.ubuntu24-arm64"),
+            &arm64.target_triple,
+            b"abc",
+        );
+        assert!(validate_registry_row(&legacy, "ff", &request, &arm64.target_triple).is_err());
     }
 
     #[test]
@@ -4617,6 +4679,9 @@ mod tests {
             source_commit: SOURCE.into(),
         };
         assert!(validate_pair(&pair, &identity, &request, target).is_ok());
+        pair[0].custody.relative_path = "x/forgefleetd".into();
+        assert!(validate_pair(&pair, &identity, &request, target).is_err());
+        pair[0].custody.relative_path = "x/ff".into();
         pair[1].origin_computer_id = Uuid::new_v4();
         assert!(validate_pair(&pair, &identity, &request, target).is_err());
         pair[1].origin_computer_id = origin;
