@@ -1122,6 +1122,18 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 18b''') Mesh key sync — leader-gated, hourly: propagate the canonical
+    // fleet user-key set (fleet_workers_ssh_keys) into every online node's
+    // authorized_keys via the defer queue whenever the set changes. Closes
+    // the one-directional gap in enroll-time mesh import (vinny 2026-08-04).
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        subsystem_tasks.push(ff_agent::mesh_sync::spawn_mesh_sync_tick(
+            pg_pool,
+            3600,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 18c) Fleet-integrity verify tick — every 15min, leader-gated, gate
     // `fleet_secrets.fleet_integrity_mode` (off|report, DEFAULT off).
     // `revive_scan` already repairs DEAD nodes; this covers the blind spot of an
