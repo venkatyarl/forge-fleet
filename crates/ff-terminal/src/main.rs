@@ -2311,10 +2311,12 @@ enum FleetCommand {
         #[arg(default_value = "status")]
         mode: String,
     },
-    /// Staged upgrade rollout + auto-halt (PROD_READINESS item 26). Drives a
-    /// gated canary→rest progression that halts on a bad build instead of
-    /// rolling every host. The leader-gated `staged_rollout_mode` tick advances
-    /// stages; this command starts a rollout and lists existing ones.
+    /// Legacy staged software-updater rollout + auto-halt.
+    ///
+    /// This namespace drives software-registry upgrade playbooks through a
+    /// gated canary→rest progression. It does not release `ff` or
+    /// `forgefleetd` artifacts; use `ff artifact rollout` for exact release
+    /// binaries and their artifact authority.
     Rollout {
         #[command(subcommand)]
         command: RolloutCommand,
@@ -2323,12 +2325,12 @@ enum FleetCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum RolloutCommand {
-    /// Start a staged rollout: create the `upgrade_rollouts` row and compose
-    /// ONLY stage 0 (the canary). The leader-gated tick advances the rest as
-    /// each stage passes, and halts (+ alerts) if a stage's failure rate
-    /// crosses its threshold. Requires `--staged` (the unstaged path is the
-    /// existing `ff fleet upgrade`). The tick must be enabled
-    /// (`fleet_secrets.staged_rollout_mode` = active) to progress past stage 0.
+    /// Start a legacy staged software-updater rollout.
+    ///
+    /// Creates an `upgrade_rollouts` row and composes ONLY stage 0 (the
+    /// canary). The leader-gated tick advances later stages and halts on a bad
+    /// stage. Requires `--staged`; the unstaged updater is `ff fleet upgrade`.
+    /// Release binaries belong to the exact `ff artifact rollout` namespace.
     Start {
         /// software_id from `software_registry` (e.g. `forgefleetd_git`).
         software: String,
@@ -6860,6 +6862,40 @@ mod oauth_cli_guard_tests {
             "cleanup-mesh-repair-backlog",
             "--apply",
         ]));
+    }
+}
+
+#[cfg(test)]
+mod legacy_rollout_cli_tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn legacy_rollout_help_distinguishes_exact_artifact_rollouts() {
+        let (rollout_help, start_help) = std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let mut root = Cli::command();
+                let rollout = root
+                    .find_subcommand_mut("fleet")
+                    .expect("fleet command")
+                    .find_subcommand_mut("rollout")
+                    .expect("fleet rollout command");
+                let rollout_help = rollout.render_long_help().to_string();
+                let start_help = rollout
+                    .find_subcommand_mut("start")
+                    .expect("fleet rollout start command")
+                    .render_long_help()
+                    .to_string();
+                (rollout_help, start_help)
+            })
+            .expect("spawn rollout help thread")
+            .join()
+            .expect("rollout help thread panicked");
+        assert!(rollout_help.contains("Legacy staged software-updater rollout"));
+        assert!(rollout_help.contains("ff artifact rollout"));
+        assert!(start_help.contains("legacy staged software-updater rollout"));
+        assert!(start_help.contains("ff artifact rollout"));
     }
 }
 

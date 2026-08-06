@@ -5040,7 +5040,7 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
     Ok(())
 }
 
-/// `ff fleet rollout <start|status>` — staged upgrade rollouts (item 26).
+/// `ff fleet rollout <start|status>` — legacy staged software-updater rollouts.
 async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -> Result<()> {
     use crate::RolloutCommand;
     match cmd {
@@ -5065,19 +5065,30 @@ async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -
             )
             .await?;
             let leader_lower = me.to_ascii_lowercase();
-            let targets: Vec<String> = plans
+            let requested_targets: Vec<String> = plans
                 .into_iter()
                 .map(|p| p.computer_name)
                 .filter(|n| !n.eq_ignore_ascii_case(&leader_lower))
                 .collect();
+            let targets =
+                ff_agent::upgrade_rollout::resolve_legacy_rollout_targets(pool, &requested_targets)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resolve legacy rollout targets: {e}"))?;
 
             if targets.is_empty() {
                 anyhow::bail!(
-                    "no resolvable non-leader targets for software_id='{software}' \
+                    "no resolvable unprotected non-leader targets for software_id='{software}' \
                      ({} skipped)",
                     skipped.len()
                 );
             }
+            ff_agent::upgrade_rollout::ensure_no_active_release_rollout_overlap(pool, &targets)
+                .await
+                .map_err(|e| anyhow::anyhow!("refusing legacy rollout start: {e}"))?;
+            let target_names = targets
+                .iter()
+                .map(|target| target.computer_name.clone())
+                .collect::<Vec<_>>();
 
             // Phase 2: optional cumulative percentage stages (e.g. --stages 10,50,100).
             // Empty/absent → canary + the rest (Phase 1 behaviour).
@@ -5089,10 +5100,13 @@ async fn handle_fleet_rollout(pool: &sqlx::PgPool, cmd: crate::RolloutCommand) -
                         .collect()
                 })
                 .unwrap_or_default();
-            let stages = ff_agent::upgrade_rollout::plan_stages_pct(&targets, canary, &pcts);
+            let stages = ff_agent::upgrade_rollout::plan_stages_pct(&target_names, canary, &pcts);
             println!("{CYAN}▶ ff fleet rollout start {software} --staged{RESET}");
+            println!(
+                "  namespace:         legacy software updater (release binaries use `ff artifact rollout`)"
+            );
             println!("  software:          {software}");
-            println!("  targets (non-leader): {}", targets.len());
+            println!("  targets (unprotected non-leader): {}", targets.len());
             println!("  failure threshold:  {failure_threshold_pct}% (canary halts on first fail)");
             for s in &stages {
                 let label = if s.stage_idx == 0 { "canary" } else { "stage" };
