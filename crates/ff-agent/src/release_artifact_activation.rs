@@ -5419,8 +5419,10 @@ mod tests {
             Some("rollback_committed")
         );
 
-        let retried =
-            prepare_explicit_rollback(id, identity, platform, ports, home, &runner, None).unwrap();
+        let retried = resume_explicit_rollback_after_transient_inherited_lock(
+            id, identity, platform, ports, home, &runner,
+        )
+        .unwrap();
         assert!(retried.receipt_already_committed);
         assert_eq!(retried.receipt, committed);
     }
