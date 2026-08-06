@@ -38,6 +38,16 @@ const MAX_OPERATIONAL_EVIDENCE_AGE_SECS: i64 = 300;
 const UNHEALTHY_SAMPLES_TO_DEGRADE: u8 = 3;
 const HEALTHY_SAMPLES_TO_RECOVER: u8 = 3;
 
+/// Telegram accepts at most 4096 Unicode scalar values. Keep the body well
+/// below that boundary so dispatch can add `[severity] ` and the largest
+/// repeat-summary suffix without making a valid alert unsendable.
+const ALERT_MESSAGE_MAX_CHARS: usize = 3_500;
+const ALERT_LEADER_MAX_CHARS: usize = 96;
+const ALERT_NAME_MAX_CHARS: usize = 96;
+const ALERT_IP_MAX_CHARS: usize = 96;
+const ALERT_REASON_MAX_CHARS: usize = 192;
+const ALERT_DETAIL_MAX_CHARS: usize = 448;
+
 /// A registered Postgres replica as read from the DB.
 #[derive(Debug, Clone)]
 pub struct ReplicaRow {
@@ -45,6 +55,7 @@ pub struct ReplicaRow {
     pub name: String,
     pub primary_ip: String,
     pub ssh_user: String,
+    pub status: String,
 }
 
 /// A replica that failed the TCP probe.
@@ -59,6 +70,7 @@ pub struct DeadReplica {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReplicaUnhealthyReason {
+    PersistedDegraded,
     ProbeFailed,
     NotInRecovery,
     NotReadOnly,
@@ -78,6 +90,7 @@ pub enum ReplicaUnhealthyReason {
 impl fmt::Display for ReplicaUnhealthyReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::PersistedDegraded => write!(f, "persisted degraded state"),
             Self::ProbeFailed => write!(f, "probe failed"),
             Self::NotInRecovery => write!(f, "pg_is_in_recovery=false"),
             Self::NotReadOnly => write!(f, "transaction_read_only=false"),
@@ -93,6 +106,14 @@ impl fmt::Display for ReplicaUnhealthyReason {
             Self::InvalidLag(lag) => write!(f, "lag is negative ({lag} bytes)"),
             Self::ExcessiveLag(lag) => write!(f, "lag exceeds operational limit ({lag} bytes)"),
         }
+    }
+}
+
+impl ReplicaUnhealthyReason {
+    /// Unexpected promotion or writeability can indicate split-brain, so it
+    /// must not wait for the ordinary transient-failure debounce window.
+    fn requires_immediate_degrade(&self) -> bool {
+        matches!(self, Self::NotInRecovery | Self::NotReadOnly)
     }
 }
 
@@ -113,14 +134,6 @@ fn operational_replica_health(
     if probe.replay_lsn.is_none() {
         return Err(ReplicaUnhealthyReason::MissingReplayLsn);
     }
-    match probe.replay_age_seconds {
-        None => return Err(ReplicaUnhealthyReason::MissingReplayAge),
-        Some(age) if age < 0 => return Err(ReplicaUnhealthyReason::InvalidReplayAge(age)),
-        Some(age) if age > MAX_OPERATIONAL_EVIDENCE_AGE_SECS => {
-            return Err(ReplicaUnhealthyReason::StaleReplay(age));
-        }
-        Some(_) => {}
-    }
     match probe.receiver_age_seconds {
         None => return Err(ReplicaUnhealthyReason::MissingReceiverAge),
         Some(age) if age < 0 => return Err(ReplicaUnhealthyReason::InvalidReceiverAge(age)),
@@ -129,11 +142,26 @@ fn operational_replica_health(
         }
         Some(_) => {}
     }
-    match lag_bytes {
-        None => Err(ReplicaUnhealthyReason::MissingLag),
-        Some(lag) if lag < 0 => Err(ReplicaUnhealthyReason::InvalidLag(lag)),
+    let lag = match lag_bytes {
+        None => return Err(ReplicaUnhealthyReason::MissingLag),
+        Some(lag) if lag < 0 => return Err(ReplicaUnhealthyReason::InvalidLag(lag)),
         Some(lag) if lag > MAX_OPERATIONAL_LAG_BYTES => {
-            Err(ReplicaUnhealthyReason::ExcessiveLag(lag))
+            return Err(ReplicaUnhealthyReason::ExcessiveLag(lag));
+        }
+        Some(lag) => lag,
+    };
+
+    match probe.replay_age_seconds {
+        Some(age) if age < 0 => Err(ReplicaUnhealthyReason::InvalidReplayAge(age)),
+        // pg_last_xact_replay_timestamp tracks the last replayed transaction,
+        // not WAL-receiver liveness. On an idle primary it legitimately ages
+        // (or can be NULL after restart). Exact zero byte lag plus a fresh
+        // streaming receiver is stronger operational evidence of catch-up.
+        None if lag == 0 => Ok(()),
+        Some(age) if age > MAX_OPERATIONAL_EVIDENCE_AGE_SECS && lag == 0 => Ok(()),
+        None => Err(ReplicaUnhealthyReason::MissingReplayAge),
+        Some(age) if age > MAX_OPERATIONAL_EVIDENCE_AGE_SECS => {
+            Err(ReplicaUnhealthyReason::StaleReplay(age))
         }
         Some(_) => Ok(()),
     }
@@ -148,6 +176,18 @@ struct ReplicaHealthState {
 }
 
 impl ReplicaHealthState {
+    fn from_persisted_status(status: &str) -> Self {
+        if status == "degraded" {
+            Self {
+                degraded: true,
+                last_failure: Some(ReplicaUnhealthyReason::PersistedDegraded),
+                ..Self::default()
+            }
+        } else {
+            Self::default()
+        }
+    }
+
     fn record_sample(&mut self, result: Result<(), ReplicaUnhealthyReason>) {
         match result {
             Ok(()) => {
@@ -161,8 +201,11 @@ impl ReplicaHealthState {
             Err(reason) => {
                 self.consecutive_healthy = 0;
                 self.consecutive_unhealthy = self.consecutive_unhealthy.saturating_add(1);
+                let immediate = reason.requires_immediate_degrade();
                 self.last_failure = Some(reason);
-                if !self.degraded && self.consecutive_unhealthy >= UNHEALTHY_SAMPLES_TO_DEGRADE {
+                if !self.degraded
+                    && (immediate || self.consecutive_unhealthy >= UNHEALTHY_SAMPLES_TO_DEGRADE)
+                {
                     self.degraded = true;
                 }
             }
@@ -227,6 +270,99 @@ fn dead_from_results(results: &[ReplicaResult]) -> Vec<DeadReplica> {
         .collect()
 }
 
+fn truncate_scalars(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    let mut bounded: String = value.chars().take(max_chars - 1).collect();
+    bounded.push('…');
+    bounded
+}
+
+fn render_replica_detail(name: &str, primary_ip: &str, reason: &str, lag: Option<i64>) -> String {
+    let name = truncate_scalars(name, ALERT_NAME_MAX_CHARS);
+    let primary_ip = truncate_scalars(primary_ip, ALERT_IP_MAX_CHARS);
+    let reason = truncate_scalars(reason, ALERT_REASON_MAX_CHARS);
+    let lag = lag
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let detail = format!("{name} ({primary_ip}, reason={reason}, lag_bytes={lag})");
+    // The component limits above keep all fixed reason/lag evidence inside
+    // this bound. This final per-detail cap is defense-in-depth if formatting
+    // changes later.
+    truncate_scalars(&detail, ALERT_DETAIL_MAX_CHARS)
+}
+
+fn omitted_replicas_suffix(omitted: usize) -> String {
+    format!("… (+{omitted} more replicas)")
+}
+
+/// Build a deterministic, Telegram-safe body and return how many sorted rows
+/// were omitted. Keeping the count alongside construction makes truncation
+/// tests exact rather than inferring it from the rendered string.
+fn bounded_alert_message(leader_name: &str, dead: &[DeadReplica]) -> (String, usize) {
+    let leader_name = truncate_scalars(leader_name, ALERT_LEADER_MAX_CHARS);
+    let mut message = format!(
+        "Postgres replica unhealthy: {} replica(s) failed recovery/streaming/freshness/lag evidence (detected by leader '{}'): {}",
+        dead.len(),
+        leader_name,
+        if dead.is_empty() { "none" } else { "" }
+    );
+
+    let mut ordered: Vec<&DeadReplica> = dead.iter().collect();
+    ordered.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.primary_ip.cmp(&right.primary_ip))
+            .then_with(|| left.computer_id.cmp(&right.computer_id))
+    });
+
+    let mut retained = 0usize;
+    for replica in ordered {
+        let detail = render_replica_detail(
+            &replica.name,
+            &replica.primary_ip,
+            &replica.reason.to_string(),
+            replica.lag_bytes,
+        );
+        let separator = if retained == 0 { "" } else { ", " };
+        let omitted_after = dead.len() - retained - 1;
+        let reserved_suffix = if omitted_after == 0 {
+            String::new()
+        } else {
+            format!("; {}", omitted_replicas_suffix(omitted_after))
+        };
+        let candidate_chars = message.chars().count()
+            + separator.chars().count()
+            + detail.chars().count()
+            + reserved_suffix.chars().count();
+        if candidate_chars > ALERT_MESSAGE_MAX_CHARS {
+            break;
+        }
+        message.push_str(separator);
+        message.push_str(&detail);
+        retained += 1;
+    }
+
+    let omitted = dead.len() - retained;
+    if omitted > 0 {
+        message.push_str("; ");
+        message.push_str(&omitted_replicas_suffix(omitted));
+    }
+
+    // This must be a no-op under the budgeting above, but keeps this call site
+    // safe if a future edit changes a constant or fixed prefix. Scalar-based
+    // truncation cannot split UTF-8.
+    (truncate_scalars(&message, ALERT_MESSAGE_MAX_CHARS), omitted)
+}
+
+fn alert_message(leader_name: &str, dead: &[DeadReplica]) -> String {
+    bounded_alert_message(leader_name, dead).0
+}
+
 /// The replica health monitor tick. Spawned on every daemon; no-ops on
 /// followers via the per-fire leader gate.
 pub struct ReplicaMonitorTick {
@@ -253,6 +389,7 @@ impl ReplicaMonitorTick {
     async fn list_postgres_replicas(&self) -> Result<Vec<ReplicaRow>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT dr.computer_id,
+                    dr.status,
                     c.name,
                     c.primary_ip,
                     c.ssh_user
@@ -272,6 +409,7 @@ impl ReplicaMonitorTick {
                 name: r.get("name"),
                 primary_ip: r.get("primary_ip"),
                 ssh_user: r.get("ssh_user"),
+                status: r.get("status"),
             })
             .collect())
     }
@@ -324,7 +462,9 @@ impl ReplicaMonitorTick {
                 .is_some_and(|value| replica_probe_healthy(value, lag_bytes));
             let (healthy, reason) = {
                 let mut states = self.health_state.lock().await;
-                let state = states.entry(r.computer_id).or_default();
+                let state = states
+                    .entry(r.computer_id)
+                    .or_insert_with(|| ReplicaHealthState::from_persisted_status(&r.status));
                 state.record_sample(operational_health);
                 (!state.degraded, state.last_failure.clone())
             };
@@ -483,26 +623,7 @@ impl ReplicaMonitorTick {
         channel: &str,
         dead: &[DeadReplica],
     ) {
-        let detail: Vec<String> = dead
-            .iter()
-            .map(|d| {
-                format!(
-                    "{} ({}, reason={}, lag_bytes={})",
-                    d.name,
-                    d.primary_ip,
-                    d.reason,
-                    d.lag_bytes
-                        .map(|lag| lag.to_string())
-                        .unwrap_or_else(|| "unknown".into())
-                )
-            })
-            .collect();
-        let message = format!(
-            "Postgres replica unhealthy: {} replica(s) failed recovery/streaming/freshness/lag evidence (detected by leader '{}'): {}",
-            dead.len(),
-            self.my_name,
-            detail.join(", ")
-        );
+        let message = alert_message(&self.my_name, dead);
 
         // Dispatch FIRST so the recorded channel_result reflects reality.
         let channel_result =
@@ -614,6 +735,7 @@ mod tests {
             name: name.into(),
             primary_ip: "10.0.0.2".into(),
             ssh_user: name.into(),
+            status: "running".into(),
         }
     }
 
@@ -634,6 +756,50 @@ mod tests {
             operational_replica_health(Some(&healthy_probe()), Some(300 * 1024)),
             Ok(())
         );
+    }
+
+    #[test]
+    fn operational_health_accepts_idle_zero_lag_with_old_or_missing_replay_timestamp() {
+        let mut probe = healthy_probe();
+        probe.replay_age_seconds = Some(MAX_OPERATIONAL_EVIDENCE_AGE_SECS + 1);
+        assert_eq!(operational_replica_health(Some(&probe), Some(0)), Ok(()));
+
+        probe.replay_age_seconds = None;
+        assert_eq!(operational_replica_health(Some(&probe), Some(0)), Ok(()));
+
+        probe.replay_age_seconds = Some(-1);
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(0)),
+            Err(ReplicaUnhealthyReason::InvalidReplayAge(-1))
+        );
+    }
+
+    #[test]
+    fn operational_health_requires_fresh_replay_timestamp_when_lagging() {
+        let mut probe = healthy_probe();
+        probe.replay_age_seconds = Some(MAX_OPERATIONAL_EVIDENCE_AGE_SECS + 1);
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(1)),
+            Err(ReplicaUnhealthyReason::StaleReplay(
+                MAX_OPERATIONAL_EVIDENCE_AGE_SECS + 1
+            ))
+        );
+
+        probe.replay_age_seconds = None;
+        assert_eq!(
+            operational_replica_health(Some(&probe), Some(1)),
+            Err(ReplicaUnhealthyReason::MissingReplayAge)
+        );
+    }
+
+    #[test]
+    fn strict_promotion_gate_remains_tighter_and_replay_strict() {
+        let mut probe = healthy_probe();
+        assert!(replica_probe_healthy(&probe, Some(256 * 1024)));
+        assert!(!replica_probe_healthy(&probe, Some(256 * 1024 + 1)));
+
+        probe.replay_age_seconds = Some(MAX_OPERATIONAL_EVIDENCE_AGE_SECS + 1);
+        assert!(!replica_probe_healthy(&probe, Some(0)));
     }
 
     #[test]
@@ -670,7 +836,7 @@ mod tests {
         let mut probe = healthy_probe();
         probe.replay_age_seconds = None;
         assert_eq!(
-            operational_replica_health(Some(&probe), Some(0)),
+            operational_replica_health(Some(&probe), Some(1)),
             Err(ReplicaUnhealthyReason::MissingReplayAge)
         );
         let mut probe = healthy_probe();
@@ -682,7 +848,7 @@ mod tests {
         let mut probe = healthy_probe();
         probe.replay_age_seconds = Some(301);
         assert_eq!(
-            operational_replica_health(Some(&probe), Some(0)),
+            operational_replica_health(Some(&probe), Some(1)),
             Err(ReplicaUnhealthyReason::StaleReplay(301))
         );
         let mut probe = healthy_probe();
@@ -750,6 +916,63 @@ mod tests {
     }
 
     #[test]
+    fn transient_large_lag_does_not_page_but_sustained_large_lag_does() {
+        let reason = ReplicaUnhealthyReason::ExcessiveLag(540 * 1024 * 1024);
+        let mut state = ReplicaHealthState::default();
+        state.record_sample(Err(reason.clone()));
+        assert!(!state.degraded);
+        state.record_sample(Ok(()));
+        assert!(!state.degraded);
+        assert_eq!(state.consecutive_unhealthy, 0);
+
+        for _ in 0..UNHEALTHY_SAMPLES_TO_DEGRADE {
+            state.record_sample(Err(reason.clone()));
+        }
+        assert!(state.degraded);
+        assert_eq!(state.last_failure, Some(reason));
+    }
+
+    #[test]
+    fn structural_promotion_or_writeability_degrades_immediately() {
+        for reason in [
+            ReplicaUnhealthyReason::NotInRecovery,
+            ReplicaUnhealthyReason::NotReadOnly,
+        ] {
+            let mut state = ReplicaHealthState::default();
+            state.record_sample(Err(reason.clone()));
+            assert!(state.degraded, "{reason} must page without debounce");
+            assert_eq!(state.last_failure, Some(reason));
+        }
+
+        let mut state = ReplicaHealthState::default();
+        state.record_sample(Err(ReplicaUnhealthyReason::NotStreaming));
+        assert!(
+            !state.degraded,
+            "stream reconnects retain the debounce window"
+        );
+    }
+
+    #[test]
+    fn persisted_degraded_state_survives_restart_until_sustained_recovery() {
+        let mut state = ReplicaHealthState::from_persisted_status("degraded");
+        assert!(state.degraded);
+        assert_eq!(
+            decide_alert_action(1, true, false),
+            AlertAction::NoOp,
+            "an open alert remains open after leader restart"
+        );
+
+        for _ in 0..HEALTHY_SAMPLES_TO_RECOVER - 1 {
+            state.record_sample(Ok(()));
+            assert!(state.degraded);
+            assert_eq!(decide_alert_action(1, true, false), AlertAction::NoOp);
+        }
+        state.record_sample(Ok(()));
+        assert!(!state.degraded);
+        assert_eq!(decide_alert_action(0, true, false), AlertAction::Resolve);
+    }
+
+    #[test]
     fn dead_result_preserves_reason_and_lag() {
         let id = Uuid::new_v4();
         let results = vec![ReplicaResult {
@@ -766,6 +989,106 @@ mod tests {
             ReplicaUnhealthyReason::ExcessiveLag(70_000_000)
         );
         assert_eq!(dead[0].lag_bytes, Some(70_000_000));
+    }
+
+    #[test]
+    fn alert_message_names_exact_reason_lag_replica_and_leader() {
+        let dead = vec![DeadReplica {
+            computer_id: Uuid::new_v4(),
+            name: "duncan".into(),
+            primary_ip: "192.168.5.114".into(),
+            reason: ReplicaUnhealthyReason::ExcessiveLag(540 * 1024 * 1024),
+            lag_bytes: Some(540 * 1024 * 1024),
+        }];
+        let message = alert_message("beyonce", &dead);
+        assert!(message.contains("duncan (192.168.5.114"));
+        assert!(message.contains("reason=lag exceeds operational limit (566231040 bytes)"));
+        assert!(message.contains("lag_bytes=566231040"));
+        assert!(message.contains("detected by leader 'beyonce'"));
+    }
+
+    #[test]
+    fn unicode_components_and_detail_are_scalar_bounded_without_losing_lag() {
+        let detail = render_replica_detail(
+            &"名".repeat(4_000),
+            &"址".repeat(4_000),
+            &"原".repeat(4_000),
+            Some(i64::MIN),
+        );
+        assert!(detail.chars().count() <= ALERT_DETAIL_MAX_CHARS);
+        assert!(detail.contains('…'));
+        assert!(detail.ends_with("lag_bytes=-9223372036854775808)"));
+
+        let dead = vec![DeadReplica {
+            computer_id: Uuid::from_u128(1),
+            name: "名".repeat(4_000),
+            primary_ip: "址".repeat(4_000),
+            reason: ReplicaUnhealthyReason::ProbeFailed,
+            lag_bytes: None,
+        }];
+        let (message, omitted) = bounded_alert_message(&"领".repeat(4_000), &dead);
+        assert_eq!(omitted, 0);
+        assert!(message.chars().count() <= ALERT_MESSAGE_MAX_CHARS);
+        assert!(message.contains(&"领".repeat(ALERT_LEADER_MAX_CHARS - 1)));
+        assert!(!message.contains(&"领".repeat(ALERT_LEADER_MAX_CHARS)));
+        assert!(message.contains("reason=probe failed"));
+        assert!(message.contains("lag_bytes=unknown"));
+    }
+
+    #[test]
+    fn many_replicas_are_sorted_and_report_exact_omitted_count() {
+        let replicas: Vec<DeadReplica> = (0..40)
+            .rev()
+            .map(|index| DeadReplica {
+                computer_id: Uuid::from_u128(index + 1),
+                name: format!("replica-{index:03}-{}", "名".repeat(400)),
+                primary_ip: format!("10.0.0.{index}-{}", "址".repeat(400)),
+                reason: ReplicaUnhealthyReason::ExcessiveLag(540 * 1024 * 1024),
+                lag_bytes: Some(540 * 1024 * 1024),
+            })
+            .collect();
+        let (message, omitted) = bounded_alert_message("beyonce", &replicas);
+        let retained = replicas.len() - omitted;
+
+        assert!(omitted > 0);
+        assert!(retained > 0);
+        assert!(message.chars().count() <= ALERT_MESSAGE_MAX_CHARS);
+        assert_eq!(message.matches("lag_bytes=").count(), retained);
+        assert!(message.ends_with(&omitted_replicas_suffix(omitted)));
+        assert!(message.contains("reason=lag exceeds operational limit"));
+
+        let first = message.find("replica-000-").expect("sorted first replica");
+        let second = message.find("replica-001-").expect("sorted second replica");
+        assert!(first < second);
+    }
+
+    #[test]
+    fn replica_message_order_is_stable_across_input_order() {
+        let make = |id, name: &str| DeadReplica {
+            computer_id: Uuid::from_u128(id),
+            name: name.into(),
+            primary_ip: format!("10.0.0.{id}"),
+            reason: ReplicaUnhealthyReason::NotStreaming,
+            lag_bytes: Some(id as i64),
+        };
+        let forward = vec![make(1, "alpha"), make(2, "beta"), make(3, "gamma")];
+        let reverse = vec![make(3, "gamma"), make(2, "beta"), make(1, "alpha")];
+        assert_eq!(
+            bounded_alert_message("beyonce", &forward),
+            bounded_alert_message("beyonce", &reverse)
+        );
+    }
+
+    #[test]
+    fn telegram_dispatch_prefix_and_largest_repeat_suffix_fit_reserved_headroom() {
+        let dispatch_prefix = "[critical] ";
+        let repeat_suffix = format!("\n(repeated {} times since the previous alert)", i64::MAX);
+        assert!(
+            ALERT_MESSAGE_MAX_CHARS
+                + dispatch_prefix.chars().count()
+                + repeat_suffix.chars().count()
+                <= 4_096
+        );
     }
 
     #[test]
