@@ -786,7 +786,12 @@ pub async fn enrollment_progress(
         "at": chrono::Utc::now().to_rfc3339(),
     })
     .to_string();
-    let _ = publish_redis_at(&channel, &message, redis_url_from_state(&state).await.as_deref()).await;
+    let _ = publish_redis_at(
+        &channel,
+        &message,
+        redis_url_from_state(&state).await.as_deref(),
+    )
+    .await;
     // Also log so operators can tail daemon logs. Include the detail payload
     // for failures — a fatal without its reason is undebuggable (vinny
     // 2026-08-04: mesh_import fatal with no visible cause).
@@ -1142,7 +1147,11 @@ pub(crate) async fn redis_url_from_state(state: &GatewayState) -> Option<String>
     match state.fleet_config.as_ref() {
         Some(lock) => {
             let url = lock.read().await.redis.url.clone();
-            if url.trim().is_empty() { None } else { Some(url) }
+            if url.trim().is_empty() {
+                None
+            } else {
+                Some(url)
+            }
         }
         None => None,
     }

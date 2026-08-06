@@ -113,7 +113,11 @@ async fn converge_mcp_wiring() -> ConvergeResult {
             ConvergeStatus::Ok,
             format!("ff mcp install --for all ({})", ff.display()),
         ),
-        Ok(false) => ConvergeResult::new(item, ConvergeStatus::Failed, "ff mcp install exited non-zero"),
+        Ok(false) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            "ff mcp install exited non-zero",
+        ),
         Err(e) => ConvergeResult::new(item, ConvergeStatus::Failed, e),
     }
 }
@@ -161,7 +165,7 @@ async fn converge_skills_sync() -> ConvergeResult {
                 item,
                 ConvergeStatus::Skipped,
                 format!("Postgres unavailable: {e}"),
-            )
+            );
         }
     };
     match crate::skills_db::materialize_all(&pool).await {
@@ -218,9 +222,11 @@ async fn converge_cloud_cli(bin: &str, url: &str, shell: &str) -> ConvergeResult
     let home = home_dir();
     let action = classify_cli_source(resolve_on_path(bin).as_deref(), &home);
     match action {
-        CliAction::SkipLocal => {
-            ConvergeResult::new(item, ConvergeStatus::Ok, "native install under ~/.local/bin")
-        }
+        CliAction::SkipLocal => ConvergeResult::new(
+            item,
+            ConvergeStatus::Ok,
+            "native install under ~/.local/bin",
+        ),
         CliAction::SkipOther => ConvergeResult::new(
             item,
             ConvergeStatus::Ok,
@@ -275,7 +281,11 @@ async fn converge_desktop_apps() -> Vec<ConvergeResult> {
     for (app_dir, cask) in DESKTOP_APPS {
         let item = format!("desktop app: {cask}");
         if Path::new(app_dir).exists() {
-            out.push(ConvergeResult::new(item, ConvergeStatus::Ok, format!("{app_dir} present")));
+            out.push(ConvergeResult::new(
+                item,
+                ConvergeStatus::Ok,
+                format!("{app_dir} present"),
+            ));
             continue;
         }
         // brew fetch resolves the current vendor URL (no hardcoded versioned
@@ -366,7 +376,10 @@ mod tests {
 
     #[test]
     fn classify_missing_installs() {
-        assert_eq!(classify_cli_source(None, &home()), CliAction::InstallMissing);
+        assert_eq!(
+            classify_cli_source(None, &home()),
+            CliAction::InstallMissing
+        );
     }
 
     #[test]

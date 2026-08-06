@@ -37,7 +37,10 @@ impl ServiceProbe {
             if self.alerted {
                 self.alerted = false;
                 self.consecutive_failures = 0;
-                let msg = format!("infra canary: {} recovered ({}:{})", self.name, self.host, self.port);
+                let msg = format!(
+                    "infra canary: {} recovered ({}:{})",
+                    self.name, self.host, self.port
+                );
                 info!("{msg}");
                 let _ = crate::alert_evaluator::dispatch_alert(pg, "log", "info", &msg).await;
                 let _ = crate::alert_evaluator::dispatch_alert(pg, "telegram", "info", &msg).await;
@@ -151,13 +154,25 @@ mod tests {
 
     #[test]
     fn parses_redis_urls() {
-        assert_eq!(host_port("redis://192.168.5.104:56379", 1), ("192.168.5.104".into(), 56379));
-        assert_eq!(host_port("redis://10.0.0.2:6380/0", 1), ("10.0.0.2".into(), 6380));
-        assert_eq!(host_port("redis://localhost", 56379), ("localhost".into(), 56379));
+        assert_eq!(
+            host_port("redis://192.168.5.104:56379", 1),
+            ("192.168.5.104".into(), 56379)
+        );
+        assert_eq!(
+            host_port("redis://10.0.0.2:6380/0", 1),
+            ("10.0.0.2".into(), 6380)
+        );
+        assert_eq!(
+            host_port("redis://localhost", 56379),
+            ("localhost".into(), 56379)
+        );
     }
 
     #[test]
     fn parses_nats_urls() {
-        assert_eq!(host_port("nats://192.168.5.104:54222", 1), ("192.168.5.104".into(), 54222));
+        assert_eq!(
+            host_port("nats://192.168.5.104:54222", 1),
+            ("192.168.5.104".into(), 54222)
+        );
     }
 }

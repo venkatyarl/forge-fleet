@@ -719,10 +719,11 @@ fn status_candidates(home: &std::path::Path) -> Vec<(&'static str, Vec<PathBuf>)
         ("cursor", vec![home.join(".cursor").join("mcp.json")]),
         (
             "windsurf",
-            vec![home
-                .join(".codeium")
-                .join("windsurf")
-                .join("mcp_config.json")],
+            vec![
+                home.join(".codeium")
+                    .join("windsurf")
+                    .join("mcp_config.json"),
+            ],
         ),
         (
             "goose",
@@ -812,14 +813,15 @@ fn config_forgefleet_transport(path: &std::path::Path) -> Option<&'static str> {
     }
 }
 
-
 fn status_rows(home: &std::path::Path) -> Vec<Value> {
     status_candidates(home)
         .into_iter()
         .map(|(name, paths)| {
             // A client counts as installed if ANY candidate path carries the
             // forgefleet entry; report the path that matched (else primary).
-            let matched = paths.iter().find(|p| p.exists() && config_has_forgefleet(p));
+            let matched = paths
+                .iter()
+                .find(|p| p.exists() && config_has_forgefleet(p));
             let (path, has_ff) = match matched {
                 Some(p) => (p.clone(), true),
                 None => (paths[0].clone(), false),

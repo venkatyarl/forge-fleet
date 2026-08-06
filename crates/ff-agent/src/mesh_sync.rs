@@ -24,7 +24,13 @@ fn merge_command(keys: &[String]) -> String {
         "mkdir -p ~/.ssh && chmod 700 ~/.ssh && touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys".to_string(),
     ];
     for key in keys {
-        let body: String = key.split_whitespace().nth(1).unwrap_or("").chars().take(48).collect();
+        let body: String = key
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("")
+            .chars()
+            .take(48)
+            .collect();
         if body.len() < 20 {
             continue;
         }
@@ -109,7 +115,11 @@ async fn run_once(pg: &sqlx::PgPool) -> Result<(), String> {
             Some("mesh-sync-tick"),
         )
         .await;
-        info!(nodes = enqueued, keys = keys.len(), "mesh sync: propagated changed key set");
+        info!(
+            nodes = enqueued,
+            keys = keys.len(),
+            "mesh sync: propagated changed key set"
+        );
     }
     Ok(())
 }
