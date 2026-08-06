@@ -2479,8 +2479,13 @@ pub async fn postgres_migration_status(pool: &PgPool) -> Result<PostgresMigratio
         .filter(|migration| !applied_versions.contains(&migration.version))
         .map(|migration| migration_descriptor(migration, true))
         .collect();
-    let rollout_schema_valid = if applied_versions.contains(&295) {
+    let rollout_schema_valid = if applied_versions.contains(&297) {
         Some(crate::rollout_authority::release_rollout_schema_is_exact(pool).await?)
+    } else if applied_versions.contains(&295) {
+        // V295 is explicit and is the prerequisite for automatic V296/V297.
+        // Its own postcondition must remain observable before V297 exists;
+        // runtime rollout APIs separately require the full V297 predicate.
+        Some(crate::rollout_authority::release_rollout_authority_schema_is_exact(pool).await?)
     } else {
         None
     };
@@ -2928,7 +2933,9 @@ mod tests {
             RolloutAuthorityRegistrationOutcome, RolloutTargetAuthority,
             RolloutTransactionBeginOutcome, pg_begin_release_rollout,
             pg_cas_release_rollout_target_state, pg_cas_release_rollout_transaction_state,
-            pg_claim_succeeded_release_rollout_rollback, pg_register_release_rollout_authority,
+            pg_claim_succeeded_release_rollout_rollback,
+            pg_get_release_rollout_transaction_by_request_id,
+            pg_register_release_rollout_authority, release_rollout_schema_is_exact,
         };
 
         const SOURCE: &str = "39b017341b7536df64b61f42672ab33fb62343f8";
@@ -3030,6 +3037,10 @@ mod tests {
         assert_eq!(applied.rollout_schema_valid, Some(true));
         assert_eq!(applied.reconciliation_schema_valid, Some(true));
         assert!(applied.drift.is_empty());
+        assert!(
+            !release_rollout_schema_is_exact(&pool).await.unwrap(),
+            "runtime rollout APIs must fail closed until V297 is durably recorded"
+        );
 
         let replay =
             apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
@@ -3041,6 +3052,46 @@ mod tests {
             .await
             .expect("automatic V296/V297 must follow recorded explicit V295");
         assert_eq!(advanced, 297);
+        assert!(release_rollout_schema_is_exact(&pool).await.unwrap());
+        sqlx::query("UPDATE _migrations SET name = 'drifted_v297' WHERE version = 297")
+            .execute(&pool)
+            .await
+            .expect("drift V297 ledger fixture");
+        assert!(
+            !release_rollout_schema_is_exact(&pool).await.unwrap(),
+            "V297 ledger name drift must make runtime authority fail closed"
+        );
+        sqlx::query(
+            "UPDATE _migrations
+                SET name = 'release_rollout_post_success_rollback'
+              WHERE version = 297",
+        )
+        .execute(&pool)
+        .await
+        .expect("restore exact V297 ledger fixture");
+        assert!(release_rollout_schema_is_exact(&pool).await.unwrap());
+        let drifted_v297 = schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK.replace(
+            "AND NEW.completed_at IS NULL",
+            "AND NEW.completed_at IS NOT NULL",
+        );
+        assert_ne!(
+            drifted_v297,
+            schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK,
+            "test must mutate a required V297 rollback clause"
+        );
+        sqlx::raw_sql(&drifted_v297)
+            .execute(&pool)
+            .await
+            .expect("install drifted V297 guard fixture");
+        assert!(
+            !release_rollout_schema_is_exact(&pool).await.unwrap(),
+            "V297 semantic drift must make runtime authority fail closed"
+        );
+        sqlx::raw_sql(schema::SCHEMA_V297_RELEASE_ROLLOUT_POST_SUCCESS_ROLLBACK)
+            .execute(&pool)
+            .await
+            .expect("restore exact V297 guard");
+        assert!(release_rollout_schema_is_exact(&pool).await.unwrap());
         let replay_after_v296 =
             apply_explicit_postgres_migrations(&pool, 295, SOURCE, SOURCE, "unpushed", "test@v295")
                 .await
@@ -3119,6 +3170,18 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query("UPDATE computers SET status = 'online' WHERE id = $1")
+            .bind(TARGET_ID)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO fleet_workers (name, ip, ssh_user, status)
+             VALUES ('beyonce', '192.0.2.10', 'test', 'online')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let artifact_version = format!("recovery.{SOURCE}.ubuntu24-arm64");
         let ff_id: Uuid = sqlx::query_scalar(
             "INSERT INTO release_artifacts
@@ -3188,11 +3251,49 @@ mod tests {
         );
 
         let request_id = Uuid::new_v4();
+        let legacy_rollout_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO upgrade_rollouts (software_id, started_by, stages, status)
+             VALUES ('ff', 'legacy@test', $1, 'in_progress') RETURNING id",
+        )
+        .bind(serde_json::json!([{"stage_idx": 0, "target_names": ["beyonce"]}]))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let overlap_error =
+            pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30)
+                .await
+                .expect_err("active legacy UUID overlap must refuse artifact begin");
+        assert!(overlap_error.to_string().contains("overlaps"));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM release_rollout_transactions WHERE request_id = $1",
+            )
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "overlap refusal must happen before transaction creation"
+        );
+        sqlx::query("UPDATE upgrade_rollouts SET status = 'halted' WHERE id = $1")
+            .bind(legacy_rollout_id)
+            .execute(&pool)
+            .await
+            .unwrap();
         let begun =
             pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30)
                 .await
                 .expect("begin complete leased transaction");
         assert_eq!(begun.outcome, RolloutTransactionBeginOutcome::Inserted);
+        assert_eq!(
+            pg_get_release_rollout_transaction_by_request_id(&pool, request_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            begun.transaction.id,
+            "request identity must recover the durable transaction read-only"
+        );
         assert_eq!(
             pg_begin_release_rollout(&pool, request_id, authority.authority.id, "test@v295", 30,)
                 .await

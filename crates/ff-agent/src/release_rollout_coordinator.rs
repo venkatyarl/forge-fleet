@@ -12,6 +12,7 @@ use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::str::FromStr;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,8 +23,9 @@ use ff_db::{
     ReleaseRolloutTransactionRow, RolloutArtifactAuthority, RolloutAuthorityRegistration,
     RolloutTargetAuthority, RolloutTransactionBegin, RolloutTransactionBeginOutcome,
     pg_begin_release_rollout, pg_cas_release_rollout_target_state,
-    pg_cas_release_rollout_transaction_state, pg_register_release_rollout_authority,
-    pg_renew_release_rollout_lease, pg_take_over_release_rollout_lease,
+    pg_cas_release_rollout_transaction_state, pg_get_release_rollout_transaction_by_request_id,
+    pg_register_release_rollout_authority, pg_renew_release_rollout_lease,
+    pg_take_over_release_rollout_lease,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -72,6 +74,14 @@ pub enum ReleaseRolloutError {
     Io(#[from] std::io::Error),
     #[error("release rollout worker failed: {0}")]
     Join(#[from] tokio::task::JoinError),
+    #[error(
+        "release rollout began as transaction {transaction_id} for request {request_id}, then failed: {source}"
+    )]
+    AfterBegin {
+        transaction_id: Uuid,
+        request_id: Uuid,
+        source: Box<ReleaseRolloutError>,
+    },
 }
 
 type Result<T> = std::result::Result<T, ReleaseRolloutError>;
@@ -86,6 +96,39 @@ pub struct RolloutEndpoint {
     pub ssh_port: u16,
     pub computer_status: String,
     pub worker_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RolloutRosterEntry {
+    pub computer_name: String,
+    pub computer_id: Uuid,
+}
+
+impl FromStr for RolloutRosterEntry {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let (computer_name, computer_id) = value
+            .split_once('=')
+            .filter(|(_, id)| !id.contains('='))
+            .ok_or_else(|| "target must be exactly NAME=UUID".to_string())?;
+        if !canonical_name(computer_name) || computer_name == "vinny" {
+            return Err("target name must be canonical lowercase and cannot be vinny".to_string());
+        }
+        let parsed = Uuid::parse_str(computer_id)
+            .map_err(|_| "target UUID must be canonical lowercase hyphenated form".to_string())?;
+        if parsed.is_nil() || parsed.hyphenated().to_string() != computer_id {
+            return Err("target UUID must be canonical lowercase hyphenated form".to_string());
+        }
+        if parsed == FORBIDDEN_VINNY_ID {
+            return Err("Vinny is forbidden by exact UUID".to_string());
+        }
+        Ok(Self {
+            computer_name: computer_name.to_string(),
+            computer_id: parsed,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -128,6 +171,7 @@ pub struct RolloutPlanReceipt {
     pub source_commit: String,
     pub outcome: String,
     pub targets: Vec<RolloutTarget>,
+    pub excluded_active_extras: Vec<RolloutRosterEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -216,6 +260,10 @@ pub trait ReleaseRolloutDatabase: Send + Sync {
         authority_id: Uuid,
         lease_seconds: i32,
     ) -> Result<RolloutTransactionBegin>;
+    async fn transaction_by_request_id(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<ReleaseRolloutTransactionRow>>;
     async fn status(&self, transaction_id: Uuid) -> Result<Option<RolloutStatus>>;
     async fn renew(
         &self,
@@ -441,6 +489,13 @@ impl ReleaseRolloutDatabase for PgReleaseRolloutDatabase<'_> {
         load_pg_status(self.pool, transaction_id).await
     }
 
+    async fn transaction_by_request_id(
+        &self,
+        request_id: Uuid,
+    ) -> Result<Option<ReleaseRolloutTransactionRow>> {
+        Ok(pg_get_release_rollout_transaction_by_request_id(self.pool, request_id).await?)
+    }
+
     async fn renew(
         &self,
         transaction: &ReleaseRolloutTransactionRow,
@@ -523,7 +578,7 @@ impl ReleaseRolloutDatabase for PgReleaseRolloutDatabase<'_> {
 async fn load_pg_status(pool: &PgPool, transaction_id: Uuid) -> Result<Option<RolloutStatus>> {
     if !ff_db::release_rollout_schema_is_exact(pool).await? {
         return Err(ReleaseRolloutError::Refused(
-            "V295 rollout schema or sealed authority data drifted".into(),
+            "V295/V297 rollout schema or sealed authority data drifted".into(),
         ));
     }
     let Some(parent) = sqlx::query(
@@ -723,7 +778,8 @@ fn validate_endpoint(target: &RolloutEndpoint) -> Result<()> {
 }
 
 fn validate_endpoint_shape(target: &RolloutEndpoint) -> Result<()> {
-    if !canonical_name(&target.computer_name)
+    if target.computer_id.is_nil()
+        || !canonical_name(&target.computer_name)
         || target.ssh_user.is_empty()
         || target.ssh_user.len() > 64
         || !target
@@ -820,53 +876,144 @@ fn validate_target_material(target: &RolloutTarget, source_commit: &str) -> Resu
     Ok(())
 }
 
-fn deterministic_target_order(mut targets: Vec<RolloutEndpoint>) -> Result<Vec<RolloutEndpoint>> {
-    if targets.is_empty() || targets.len() > MAX_ROLLOUT_TARGETS + 1 {
+fn validate_requested_roster_order(requested: &[RolloutRosterEntry]) -> Result<()> {
+    if requested.len() < ROLLOUT_CANARIES.len() || requested.len() > MAX_ROLLOUT_TARGETS {
         return Err(ReleaseRolloutError::Refused(
-            "fleet rollout requires a bounded non-empty roster".into(),
+            "fleet rollout requires the complete bounded canary roster".into(),
         ));
     }
     let mut ids = BTreeSet::new();
     let mut names = BTreeSet::new();
-    targets.retain(|target| !forbidden_target(target));
-    for target in &targets {
-        validate_endpoint(target)?;
-        if !ids.insert(target.computer_id) || !names.insert(target.computer_name.clone()) {
+    for target in requested {
+        if !canonical_name(&target.computer_name)
+            || target.computer_id.is_nil()
+            || target.computer_id == FORBIDDEN_VINNY_ID
+            || target.computer_name == "vinny"
+            || !ids.insert(target.computer_id)
+            || !names.insert(target.computer_name.as_str())
+        {
             return Err(ReleaseRolloutError::Refused(
-                "fleet roster contains duplicate target identity".into(),
+                "operator roster contains non-canonical, duplicate, or forbidden identity".into(),
             ));
         }
-        if !matches!(target.computer_status.as_str(), "active" | "online")
-            || !matches!(target.worker_status.as_str(), "active" | "online")
+    }
+    if requested
+        .iter()
+        .take(ROLLOUT_CANARIES.len())
+        .map(|target| target.computer_name.as_str())
+        .ne(ROLLOUT_CANARIES)
+    {
+        return Err(ReleaseRolloutError::Refused(
+            "operator roster must begin Beyoncé -> Lily -> Ace -> Logan".into(),
+        ));
+    }
+    if requested[ROLLOUT_CANARIES.len()..]
+        .windows(2)
+        .any(|pair| pair[0].computer_name >= pair[1].computer_name)
+    {
+        return Err(ReleaseRolloutError::Refused(
+            "operator roster after the canaries must be in strict lexical order".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_requested_roster(
+    requested: &[RolloutRosterEntry],
+    registry: Vec<RolloutEndpoint>,
+) -> Result<(Vec<RolloutEndpoint>, Vec<RolloutRosterEntry>)> {
+    validate_requested_roster_order(requested)?;
+    let mut by_id = BTreeMap::new();
+    let mut by_name = BTreeMap::new();
+    for target in registry {
+        if forbidden_target(&target) {
+            continue;
+        }
+        if by_id.insert(target.computer_id, target.clone()).is_some()
+            || by_name
+                .insert(target.computer_name.clone(), target)
+                .is_some()
+        {
+            return Err(ReleaseRolloutError::Refused(
+                "live fleet registry contains duplicate target identity".into(),
+            ));
+        }
+    }
+
+    let mut selected = Vec::with_capacity(requested.len());
+    for exact in requested {
+        let by_exact_id = by_id.get(&exact.computer_id);
+        let by_exact_name = by_name.get(&exact.computer_name);
+        let endpoint = match (by_exact_id, by_exact_name) {
+            (None, None) => {
+                return Err(ReleaseRolloutError::Refused(format!(
+                    "operator target {}={} is missing from the live registry",
+                    exact.computer_name, exact.computer_id
+                )));
+            }
+            (Some(by_id), Some(by_name))
+                if by_id.computer_id == by_name.computer_id
+                    && by_id.computer_name == exact.computer_name
+                    && by_id.computer_id == exact.computer_id =>
+            {
+                by_id.clone()
+            }
+            _ => {
+                return Err(ReleaseRolloutError::Refused(format!(
+                    "operator target {}={} drifted from the live name+UUID registry",
+                    exact.computer_name, exact.computer_id
+                )));
+            }
+        };
+        validate_endpoint(&endpoint)?;
+        if !matches!(endpoint.computer_status.as_str(), "active" | "online")
+            || !matches!(endpoint.worker_status.as_str(), "active" | "online")
         {
             return Err(ReleaseRolloutError::Refused(format!(
                 "target {} is not active in both registries",
-                target.computer_name
+                endpoint.computer_name
             )));
         }
+        selected.push(endpoint);
     }
-    if targets.len() > MAX_ROLLOUT_TARGETS {
-        return Err(ReleaseRolloutError::Refused(
-            "non-Vinny fleet exceeds the 64-target authority bound".into(),
-        ));
+
+    let selected_ids = selected
+        .iter()
+        .map(|target| target.computer_id)
+        .collect::<BTreeSet<_>>();
+    let mut extras = Vec::new();
+    for target in by_id.into_values().filter(|target| {
+        !selected_ids.contains(&target.computer_id)
+            && matches!(target.computer_status.as_str(), "active" | "online")
+            && matches!(target.worker_status.as_str(), "active" | "online")
+    }) {
+        validate_endpoint(&target)?;
+        extras.push(RolloutRosterEntry {
+            computer_name: target.computer_name,
+            computer_id: target.computer_id,
+        });
     }
-    let mut ordered = Vec::with_capacity(targets.len());
-    for canary in ROLLOUT_CANARIES {
-        let index = targets
-            .iter()
-            .position(|target| target.computer_name == canary)
-            .ok_or_else(|| {
-                ReleaseRolloutError::Refused(format!("required rollout canary {canary} is missing"))
-            })?;
-        ordered.push(targets.remove(index));
-    }
-    targets.sort_by(|a, b| {
+    extras.sort_by(|a, b| {
         a.computer_name
             .cmp(&b.computer_name)
             .then(a.computer_id.cmp(&b.computer_id))
     });
-    ordered.extend(targets);
-    Ok(ordered)
+    Ok((selected, extras))
+}
+
+fn validate_live_target_readiness(status: &RolloutStatus) -> Result<()> {
+    for target in &status.targets {
+        let endpoint = &target.target.endpoint;
+        if !matches!(endpoint.computer_status.as_str(), "active" | "online")
+            || !matches!(endpoint.worker_status.as_str(), "active" | "online")
+        {
+            return Err(ReleaseRolloutError::Refused(format!(
+                "sealed target {} is not active in both live registries",
+                endpoint.computer_name
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_status_invariants(targets: &[RolloutTargetState]) -> Result<()> {
@@ -1024,9 +1171,14 @@ where
         }
     }
 
-    pub async fn plan(&self, source_commit: &str) -> Result<RolloutPlanReceipt> {
+    pub async fn plan(
+        &self,
+        source_commit: &str,
+        requested_roster: &[RolloutRosterEntry],
+    ) -> Result<RolloutPlanReceipt> {
         validate_source_commit(source_commit)?;
-        let ordered = deterministic_target_order(self.database.planning_targets().await?)?;
+        let (ordered, excluded_active_extras) =
+            resolve_requested_roster(requested_roster, self.database.planning_targets().await?)?;
         let materials = self.database.artifact_materials(source_commit).await?;
         let mut targets = Vec::with_capacity(ordered.len());
         for (ordinal, endpoint) in ordered.into_iter().enumerate() {
@@ -1085,6 +1237,7 @@ where
             }
             .to_string(),
             targets,
+            excluded_active_extras,
         })
     }
 
@@ -1095,7 +1248,56 @@ where
             .await?;
         let owned_lease = matches!(begun.outcome, RolloutTransactionBeginOutcome::Inserted)
             .then_some(begun.transaction.lease_token);
-        self.drive(begun.transaction.id, false, owned_lease).await
+        self.drive(begun.transaction.id, false, owned_lease)
+            .await
+            .map_err(|source| ReleaseRolloutError::AfterBegin {
+                transaction_id: begun.transaction.id,
+                request_id: begun.transaction.request_id,
+                source: Box::new(source),
+            })
+    }
+
+    async fn resolve_transaction_identity(
+        &self,
+        transaction_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+    ) -> Result<Uuid> {
+        match (transaction_id, request_id) {
+            (Some(transaction_id), None) => Ok(transaction_id),
+            (None, Some(request_id)) => self
+                .database
+                .transaction_by_request_id(request_id)
+                .await?
+                .map(|transaction| transaction.id)
+                .ok_or_else(|| {
+                    ReleaseRolloutError::Refused(format!("unknown rollout request {request_id}"))
+                }),
+            _ => Err(ReleaseRolloutError::Refused(
+                "provide exactly one rollout transaction id or request id".into(),
+            )),
+        }
+    }
+
+    pub async fn status_for_identity(
+        &self,
+        transaction_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+    ) -> Result<RolloutStatus> {
+        let transaction_id = self
+            .resolve_transaction_identity(transaction_id, request_id)
+            .await?;
+        self.status(transaction_id).await
+    }
+
+    pub async fn resume_for_identity(
+        &self,
+        transaction_id: Option<Uuid>,
+        request_id: Option<Uuid>,
+    ) -> Result<RolloutStatus> {
+        let transaction_id = self
+            .resolve_transaction_identity(transaction_id, request_id)
+            .await?;
+        self.resume(transaction_id).await
     }
 
     pub async fn status(&self, transaction_id: Uuid) -> Result<RolloutStatus> {
@@ -1116,6 +1318,7 @@ where
                 // Completed target evidence is immutable until this exact
                 // claim wins. Validate the entire rollback authority before
                 // the single succeeded -> rolling_back database write.
+                validate_live_target_readiness(&initial)?;
                 validate_post_success_rollback_preconditions(&initial, &self.config)?;
                 let Some(claimed) = self
                     .database
@@ -1196,6 +1399,7 @@ where
         ) {
             return Ok(status);
         }
+        validate_live_target_readiness(&status)?;
         if owned_lease.is_some_and(|token| token == status.transaction.lease_token) {
             return Ok(status);
         }
@@ -1262,6 +1466,7 @@ where
         if status.transaction.state != expected_state {
             return Ok(status);
         }
+        validate_live_target_readiness(&status)?;
         let lease_token = status.transaction.lease_token;
         let Some(renewed) = self.database.renew(&status.transaction).await? else {
             // A same-token parent transition may have won the revision CAS.
@@ -2283,43 +2488,106 @@ mod tests {
         }
     }
 
-    #[test]
-    fn deterministic_order_is_exact_canaries_then_lexical_and_excludes_vinny() {
-        let mut roster = vec![
-            endpoint("zeta", 8),
-            endpoint("logan", 3),
-            endpoint("ace", 2),
-            endpoint("beyonce", 0),
-            endpoint("lily", 1),
-            endpoint("alpha", 7),
-        ];
-        let mut vinny = endpoint("vinny", 50);
-        vinny.computer_id = FORBIDDEN_VINNY_ID;
-        roster.push(vinny);
-        let names = deterministic_target_order(roster)
-            .unwrap()
-            .into_iter()
-            .map(|target| target.computer_name)
-            .collect::<Vec<_>>();
-        assert_eq!(names, ["beyonce", "lily", "ace", "logan", "alpha", "zeta"]);
+    fn roster_entry(endpoint: &RolloutEndpoint) -> RolloutRosterEntry {
+        RolloutRosterEntry {
+            computer_name: endpoint.computer_name.clone(),
+            computer_id: endpoint.computer_id,
+        }
     }
 
     #[test]
-    fn vinny_alias_by_name_or_uuid_never_survives_roster_selection() {
-        for (name, id) in [
-            ("vinny", Uuid::new_v4()),
-            ("renamed-vinny", FORBIDDEN_VINNY_ID),
-        ] {
-            let mut roster = vec![
-                endpoint("beyonce", 0),
-                endpoint("lily", 1),
-                endpoint("ace", 2),
-                endpoint("logan", 3),
-                endpoint(name, 9),
-            ];
-            roster.last_mut().unwrap().computer_id = id;
-            assert_eq!(deterministic_target_order(roster).unwrap().len(), 4);
-        }
+    fn known_seventeen_operator_roster_resolves_in_exact_order_and_reports_extras() {
+        let names = [
+            "beyonce", "lily", "ace", "logan", "adele", "aura", "duncan", "james", "marcus",
+            "priya", "rihanna", "sarah", "shakira", "sia", "sophie", "thalia", "veronica",
+        ];
+        let ordered = names
+            .iter()
+            .enumerate()
+            .map(|(ordinal, name)| endpoint(name, ordinal as u128))
+            .collect::<Vec<_>>();
+        let requested = ordered.iter().map(roster_entry).collect::<Vec<_>>();
+        let mut registry = ordered.clone();
+        registry.reverse();
+        registry.push(endpoint("zeta", 30));
+        let mut vinny = endpoint("vinny", 50);
+        vinny.computer_id = FORBIDDEN_VINNY_ID;
+        registry.push(vinny);
+
+        let (selected, extras) = resolve_requested_roster(&requested, registry).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|target| target.computer_name.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+        assert_eq!(extras, vec![roster_entry(&endpoint("zeta", 30))]);
+    }
+
+    #[test]
+    fn operator_roster_refuses_missing_drift_duplicates_canary_and_order_failures() {
+        let registry = ["beyonce", "lily", "ace", "logan", "zeta"]
+            .iter()
+            .enumerate()
+            .map(|(ordinal, name)| endpoint(name, ordinal as u128))
+            .collect::<Vec<_>>();
+        let exact = registry[..4].iter().map(roster_entry).collect::<Vec<_>>();
+
+        let mut missing = exact.clone();
+        missing[3].computer_id = Uuid::new_v4();
+        assert!(resolve_requested_roster(&missing, registry.clone()).is_err());
+
+        let mut drift = exact.clone();
+        drift[3].computer_id = registry[4].computer_id;
+        assert!(resolve_requested_roster(&drift, registry.clone()).is_err());
+
+        let mut duplicate = exact.clone();
+        duplicate.push(exact[3].clone());
+        assert!(resolve_requested_roster(&duplicate, registry.clone()).is_err());
+
+        let mut missing_canary = exact.clone();
+        missing_canary.swap(0, 1);
+        assert!(resolve_requested_roster(&missing_canary, registry.clone()).is_err());
+
+        let mut inactive_registry = registry.clone();
+        inactive_registry[3].worker_status = "offline".into();
+        assert!(resolve_requested_roster(&exact, inactive_registry).is_err());
+
+        let mut wrong_tail = exact;
+        wrong_tail.extend([
+            roster_entry(&endpoint("zeta", 4)),
+            roster_entry(&endpoint("alpha", 5)),
+        ]);
+        let mut expanded_registry = registry;
+        expanded_registry.push(endpoint("alpha", 5));
+        assert!(resolve_requested_roster(&wrong_tail, expanded_registry).is_err());
+    }
+
+    #[test]
+    fn roster_parser_requires_canonical_name_uuid_pair_and_forbids_vinny() {
+        let id = Uuid::new_v4();
+        assert_eq!(
+            format!("beyonce={id}")
+                .parse::<RolloutRosterEntry>()
+                .unwrap(),
+            RolloutRosterEntry {
+                computer_name: "beyonce".into(),
+                computer_id: id,
+            }
+        );
+        assert!("beyonce=NOT-A-UUID".parse::<RolloutRosterEntry>().is_err());
+        assert!(
+            format!("Beyonce={id}")
+                .parse::<RolloutRosterEntry>()
+                .is_err()
+        );
+        assert!(format!("vinny={id}").parse::<RolloutRosterEntry>().is_err());
+        assert!(
+            format!("renamed-vinny={FORBIDDEN_VINNY_ID}")
+                .parse::<RolloutRosterEntry>()
+                .is_err()
+        );
     }
 
     #[test]
@@ -2518,6 +2786,7 @@ mod tests {
                 endpoint("lily", 1),
                 endpoint("beyonce", 0),
                 endpoint("zeta", 4),
+                endpoint("omega", 5),
             ])
         }
 
@@ -2563,6 +2832,12 @@ mod tests {
             unreachable!()
         }
         async fn status(&self, _transaction_id: Uuid) -> Result<Option<RolloutStatus>> {
+            unreachable!()
+        }
+        async fn transaction_by_request_id(
+            &self,
+            _request_id: Uuid,
+        ) -> Result<Option<ReleaseRolloutTransactionRow>> {
             unreachable!()
         }
         async fn renew(
@@ -2625,16 +2900,37 @@ mod tests {
 
         async fn begin(
             &self,
-            _request_id: Uuid,
-            _authority_id: Uuid,
-            _lease_seconds: i32,
+            request_id: Uuid,
+            authority_id: Uuid,
+            lease_seconds: i32,
         ) -> Result<RolloutTransactionBegin> {
-            unreachable!("not used by execution tests")
+            let state = self.inner.lock().unwrap();
+            if state.status.transaction.request_id != request_id
+                || state.status.transaction.authority_id != authority_id
+                || state.status.transaction.lease_seconds != lease_seconds
+            {
+                return Err(ReleaseRolloutError::Refused(
+                    "fake begin identity drifted".into(),
+                ));
+            }
+            Ok(RolloutTransactionBegin {
+                transaction: state.status.transaction.clone(),
+                outcome: RolloutTransactionBeginOutcome::ExactExisting,
+            })
         }
 
         async fn status(&self, transaction_id: Uuid) -> Result<Option<RolloutStatus>> {
             let state = self.inner.lock().unwrap();
             Ok((state.status.transaction.id == transaction_id).then(|| state.status.clone()))
+        }
+
+        async fn transaction_by_request_id(
+            &self,
+            request_id: Uuid,
+        ) -> Result<Option<ReleaseRolloutTransactionRow>> {
+            let state = self.inner.lock().unwrap();
+            Ok((state.status.transaction.request_id == request_id)
+                .then(|| state.status.transaction.clone()))
         }
 
         async fn renew(
@@ -2757,8 +3053,24 @@ mod tests {
         };
         let transport = FakeTransport::default();
         let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
-        let receipt = coordinator.plan(SOURCE).await.unwrap();
+        let registry = db.planning_targets().await.unwrap();
+        let requested = ["beyonce", "lily", "ace", "logan", "zeta"]
+            .iter()
+            .map(|name| {
+                roster_entry(
+                    registry
+                        .iter()
+                        .find(|target| target.computer_name == *name)
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let receipt = coordinator.plan(SOURCE, &requested).await.unwrap();
         assert_eq!(receipt.authority_id, authority_id);
+        assert_eq!(
+            receipt.excluded_active_extras,
+            vec![roster_entry(&endpoint("omega", 5))]
+        );
         let spec = captured.lock().unwrap().clone().unwrap();
         assert_eq!(spec.created_by, LEASE_OWNER);
         assert_eq!(
@@ -2777,6 +3089,10 @@ mod tests {
                     .collect::<BTreeSet<_>>()
                     == BTreeSet::from(["ff", "forgefleetd"])
         }));
+        assert!(
+            transport.calls().iter().all(|call| call != "probe:omega"),
+            "excluded registry extras must never be probed"
+        );
     }
 
     #[derive(Default)]
@@ -2822,9 +3138,14 @@ mod tests {
     impl ReleaseRolloutTransport for FakeTransport {
         async fn probe_platform(
             &self,
-            _target: &RolloutEndpoint,
+            target: &RolloutEndpoint,
             _source_commit: &str,
         ) -> Result<PlatformProbe> {
+            self.inner
+                .lock()
+                .unwrap()
+                .calls
+                .push(format!("probe:{}", target.computer_name));
             Ok(PlatformProbe {
                 target_triple: "x86_64-unknown-linux-gnu".into(),
                 release_qualifier: "ubuntu24-x86_64".into(),
@@ -3419,6 +3740,96 @@ mod tests {
             Err(ReleaseRolloutError::LeaseLost(message))
                 if message.contains("another foreground coordinator")
         ));
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_id_recovers_the_exact_transaction_for_status_and_resume() {
+        let state = succeeded_status();
+        let transaction_id = state.transaction.id;
+        let request_id = state.transaction.request_id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert_eq!(
+            coordinator
+                .status_for_identity(None, Some(request_id))
+                .await
+                .unwrap()
+                .transaction
+                .id,
+            transaction_id
+        );
+        assert_eq!(
+            coordinator
+                .resume_for_identity(None, Some(request_id))
+                .await
+                .unwrap()
+                .transaction
+                .id,
+            transaction_id
+        );
+        assert!(
+            coordinator
+                .status_for_identity(Some(transaction_id), Some(request_id))
+                .await
+                .is_err()
+        );
+        assert!(coordinator.status_for_identity(None, None).await.is_err());
+        assert!(
+            coordinator
+                .status_for_identity(None, Some(Uuid::new_v4()))
+                .await
+                .is_err()
+        );
+        assert!(transport.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_failure_after_begin_always_reports_both_recovery_ids() {
+        let state = status(&["pending"]);
+        let transaction_id = state.transaction.id;
+        let request_id = state.transaction.request_id;
+        let authority_id = state.transaction.authority_id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        let error = coordinator
+            .start(authority_id, request_id)
+            .await
+            .expect_err("an exact replay cannot borrow its still-expired initial lease");
+        assert!(matches!(
+            &error,
+            ReleaseRolloutError::AfterBegin {
+                transaction_id: actual_transaction_id,
+                request_id: actual_request_id,
+                ..
+            } if *actual_transaction_id == transaction_id && *actual_request_id == request_id
+        ));
+        let rendered = error.to_string();
+        assert!(rendered.contains(&transaction_id.to_string()));
+        assert!(rendered.contains(&request_id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn registry_readiness_drift_refuses_before_takeover_renewal_or_transport() {
+        let mut state = status(&["pending"]);
+        state.targets[0].target.endpoint.worker_status = "offline".into();
+        let before = state.transaction.clone();
+        let id = before.id;
+        let db = FakeDb::new(state);
+        let transport = FakeTransport::default();
+        let coordinator = ReleaseRolloutCoordinator::new(&db, &transport, fast_config());
+
+        assert!(matches!(
+            coordinator.resume(id).await,
+            Err(ReleaseRolloutError::Refused(message))
+                if message.contains("not active in both live registries")
+        ));
+        assert_eq!(db.state().transaction, before);
+        assert_eq!(db.renew_count(), 0);
         assert!(transport.calls().is_empty());
     }
 

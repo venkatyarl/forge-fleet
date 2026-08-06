@@ -13,7 +13,7 @@ use ff_agent::release_artifact_activation::{
 };
 use ff_agent::release_rollout_coordinator::{
     PgReleaseRolloutDatabase, ReleaseRolloutCoordinator, RolloutCoordinatorConfig,
-    SystemReleaseRolloutTransport,
+    RolloutRosterEntry, SystemReleaseRolloutTransport,
 };
 use ff_db::ReleaseArtifactRegistrationOutcome;
 
@@ -90,10 +90,13 @@ pub enum ArtifactCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum ArtifactRolloutCommand {
-    /// Probe the fixed fleet roster and seal exact V291 artifacts into V295.
+    /// Probe an explicit operator roster and seal exact V291 artifacts into V295.
     Plan {
         #[arg(long)]
         source_commit: String,
+        /// Repeatable canonical target identity in exact rollout order.
+        #[arg(long = "target", value_name = "NAME=UUID", required = true)]
+        targets: Vec<RolloutRosterEntry>,
         #[arg(long)]
         json: bool,
     },
@@ -109,15 +112,35 @@ pub enum ArtifactRolloutCommand {
     },
     /// Read the durable rollout and per-target receipts without mutation.
     Status {
-        #[arg(long)]
-        transaction_id: Uuid,
+        #[arg(
+            long,
+            required_unless_present = "request_id",
+            conflicts_with = "request_id"
+        )]
+        transaction_id: Option<Uuid>,
+        #[arg(
+            long,
+            required_unless_present = "transaction_id",
+            conflicts_with = "transaction_id"
+        )]
+        request_id: Option<Uuid>,
         #[arg(long)]
         json: bool,
     },
     /// Resume one crash-interrupted transaction, taking over only an expired lease.
     Resume {
-        #[arg(long)]
-        transaction_id: Uuid,
+        #[arg(
+            long,
+            required_unless_present = "request_id",
+            conflicts_with = "request_id"
+        )]
+        transaction_id: Option<Uuid>,
+        #[arg(
+            long,
+            required_unless_present = "transaction_id",
+            conflicts_with = "transaction_id"
+        )]
+        request_id: Option<Uuid>,
         #[arg(long)]
         json: bool,
     },
@@ -302,9 +325,10 @@ async fn handle_rollout(command: ArtifactRolloutCommand) -> Result<()> {
     let (value, json, label) = match command {
         ArtifactRolloutCommand::Plan {
             source_commit,
+            targets,
             json,
         } => (
-            serde_json::to_value(coordinator.plan(&source_commit).await?)?,
+            serde_json::to_value(coordinator.plan(&source_commit, &targets).await?)?,
             json,
             "exact rollout authority sealed",
         ),
@@ -319,17 +343,27 @@ async fn handle_rollout(command: ArtifactRolloutCommand) -> Result<()> {
         ),
         ArtifactRolloutCommand::Status {
             transaction_id,
+            request_id,
             json,
         } => (
-            serde_json::to_value(coordinator.status(transaction_id).await?)?,
+            serde_json::to_value(
+                coordinator
+                    .status_for_identity(transaction_id, request_id)
+                    .await?,
+            )?,
             json,
             "rollout status loaded",
         ),
         ArtifactRolloutCommand::Resume {
             transaction_id,
+            request_id,
             json,
         } => (
-            serde_json::to_value(coordinator.resume(transaction_id).await?)?,
+            serde_json::to_value(
+                coordinator
+                    .resume_for_identity(transaction_id, request_id)
+                    .await?,
+            )?,
             json,
             "rollout resume command finished",
         ),
@@ -362,6 +396,90 @@ async fn handle_rollout(command: ArtifactRolloutCommand) -> Result<()> {
         if let Some(targets) = value.get("targets").and_then(|targets| targets.as_array()) {
             println!("  targets: {}", targets.len());
         }
+        if let Some(extras) = value
+            .get("excluded_active_extras")
+            .and_then(|extras| extras.as_array())
+        {
+            println!("  excluded active extras: {}", extras.len());
+            for extra in extras {
+                if let (Some(name), Some(id)) = (
+                    extra.get("computer_name").and_then(|name| name.as_str()),
+                    extra.get("computer_id").and_then(|id| id.as_str()),
+                ) {
+                    println!("    {name}={id}");
+                }
+            }
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[derive(Debug, Parser)]
+    struct RolloutCli {
+        #[command(subcommand)]
+        command: ArtifactRolloutCommand,
+    }
+
+    #[test]
+    fn status_and_resume_require_exactly_one_transaction_or_request_identity() {
+        let transaction_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+        assert!(RolloutCli::try_parse_from(["rollout", "status"]).is_err());
+        assert!(
+            RolloutCli::try_parse_from([
+                "rollout",
+                "status",
+                "--transaction-id",
+                &transaction_id.to_string(),
+                "--request-id",
+                &request_id.to_string(),
+            ])
+            .is_err()
+        );
+        let parsed = RolloutCli::try_parse_from([
+            "rollout",
+            "resume",
+            "--request-id",
+            &request_id.to_string(),
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            ArtifactRolloutCommand::Resume {
+                transaction_id: None,
+                request_id: Some(id),
+                ..
+            } if id == request_id
+        ));
+    }
+
+    #[test]
+    fn plan_requires_repeatable_canonical_name_uuid_targets() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        assert!(
+            RolloutCli::try_parse_from(["rollout", "plan", "--source-commit", &"a".repeat(40),])
+                .is_err()
+        );
+        let parsed = RolloutCli::try_parse_from([
+            "rollout",
+            "plan",
+            "--source-commit",
+            &"a".repeat(40),
+            "--target",
+            &format!("beyonce={first}"),
+            "--target",
+            &format!("lily={second}"),
+        ])
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            ArtifactRolloutCommand::Plan { targets, .. } if targets.len() == 2
+        ));
+    }
 }

@@ -324,14 +324,14 @@ pub use queries::{
     seed_from_fleet_toml,
 };
 pub use rollout_authority::{
-    FORBIDDEN_VINNY_ID, FORBIDDEN_VINNY_NAME, ReleaseRolloutAuthorityRow,
-    ReleaseRolloutAuthoritySpec, ReleaseRolloutTargetStateRow, ReleaseRolloutTransactionRow,
-    RolloutArtifactAuthority, RolloutAuthorityRegistration, RolloutAuthorityRegistrationOutcome,
-    RolloutTargetAuthority, RolloutTransactionBegin, RolloutTransactionBeginOutcome,
-    pg_begin_release_rollout, pg_cas_release_rollout_target_state,
-    pg_cas_release_rollout_transaction_state, pg_register_release_rollout_authority,
-    pg_renew_release_rollout_lease, pg_take_over_release_rollout_lease,
-    release_rollout_schema_is_exact,
+    FORBIDDEN_VINNY_ID, FORBIDDEN_VINNY_NAME, RELEASE_ROLLOUT_ADVISORY_XACT_LOCK_KEY,
+    ReleaseRolloutAuthorityRow, ReleaseRolloutAuthoritySpec, ReleaseRolloutTargetStateRow,
+    ReleaseRolloutTransactionRow, RolloutArtifactAuthority, RolloutAuthorityRegistration,
+    RolloutAuthorityRegistrationOutcome, RolloutTargetAuthority, RolloutTransactionBegin,
+    RolloutTransactionBeginOutcome, pg_begin_release_rollout, pg_cas_release_rollout_target_state,
+    pg_cas_release_rollout_transaction_state, pg_get_release_rollout_transaction_by_request_id,
+    pg_register_release_rollout_authority, pg_renew_release_rollout_lease,
+    pg_take_over_release_rollout_lease, release_rollout_schema_is_exact,
 };
 pub use runtime_registry::RuntimeRegistryStore;
 pub use sqlx::PgPool;
