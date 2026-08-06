@@ -313,25 +313,6 @@ if [ -f /etc/gdm3/custom.conf ]; then
   report "gdm_autologin" ok "$SUDO_INVOKER"
 fi
 
-# ─── 1d. macOS Remote Login (SSH server) ──────────────────────────────────
-# Fresh macOS ships with Remote Login OFF, leaving the node unreachable for
-# fleet ops (deploy/ssh/mesh) until someone toggles it by hand — vinny
-# 2026-08-04/05: the whole enrollment had to be driven manually over Telegram
-# because of exactly this. Linux fleet images have sshd on by default, so this
-# step is macOS-only. Never blocks enrollment: if we can't enable it
-# automatically (no TTY for the sudo prompt, or macOS demands Full Disk
-# Access), report failed with the manual instruction instead of dying.
-if [ "$OS_ID" = "macos" ]; then
-  report "remote_login" running
-  if lsof -nP -iTCP:22 -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
-    report "remote_login" ok "already on"
-  elif [ -t 0 ] && sudo systemsetup -setremotelogin on 2>/dev/null; then
-    report "remote_login" ok "enabled"
-  else
-    report "remote_login" failed "could not enable automatically — operator: System Settings → General → Sharing → Remote Login → On"
-  fi
-fi
-
 # ─── 2. Prerequisites ─────────────────────────────────────────────────────
 
 report "prereqs" running
