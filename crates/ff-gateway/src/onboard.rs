@@ -232,7 +232,11 @@ pub async fn bootstrap_script(
                 .url
                 .strip_prefix("redis://")
                 .unwrap_or(&cfg.redis.url);
-            if let Some((h, p)) = redis_rest.split('/').next().and_then(|s| s.rsplit_once(':')) {
+            if let Some((h, p)) = redis_rest
+                .split('/')
+                .next()
+                .and_then(|s| s.rsplit_once(':'))
+            {
                 if !h.is_empty() {
                     rd_h = h.to_string();
                 }
