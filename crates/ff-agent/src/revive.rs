@@ -6,10 +6,10 @@
 //!
 //! ## Attempt order
 //! 1. **SSH probe** — `ssh -o ConnectTimeout=5 -o BatchMode=yes user@host "echo ok"`.
-//!    - If the probe succeeds and `forgefleetd` is alive, we log and bail
-//!      (ODOWN with a healthy daemon usually means Redis/network split — not
-//!      something SSH can fix).
-//!    - If the probe succeeds and the daemon is dead, we `launchctl kickstart`
+//!    - Process existence is not health: a bounded localhost HTTP probe must
+//!      show progress before an active daemon is spared.
+//!    - If the daemon is dead or its local health endpoint is proven unhealthy,
+//!      we `launchctl kickstart`
 //!      (macOS) or `systemctl --user restart` (Linux) the services.
 //! 2. **Wake-on-LAN** — if SSH is unreachable and we have MAC addresses on
 //!    record, fire a magic packet to the local broadcast on UDP/9.
@@ -36,6 +36,18 @@ use tracing::{debug, info, warn};
 const SSH_TIMEOUT: Duration = Duration::from_secs(12);
 /// Magic-packet destination port (WoL canonical).
 const WOL_PORT: u16 = 9;
+const STALE_AFTER: Duration = Duration::from_secs(90);
+const RECENTLY_HEALTHY_WINDOW: Duration = Duration::from_secs(15 * 60);
+const RESTART_BACKOFF_WINDOW: Duration = Duration::from_secs(30 * 60);
+const CONFIRM_INTERVAL: Duration = Duration::from_secs(3);
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(45);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonProbe {
+    Healthy,
+    Unhealthy,
+    NotRunning,
+}
 
 /// Orchestrates one revive attempt against a target computer.
 pub struct ReviveManager {
@@ -95,9 +107,6 @@ impl ReviveManager {
     /// Try to revive a target. Non-blocking on pulse return — the caller
     /// observes pulse independently.
     pub async fn attempt(&self, target: &ReviveTarget) -> Result<ReviveOutcome, ReviveError> {
-        // Record that we're trying, so the backoff check can see it.
-        self.record_revive_attempt(target.computer_id).await?;
-
         info!(
             node = %target.name,
             ip = %target.primary_ip,
@@ -110,28 +119,55 @@ impl ReviveManager {
             .await;
 
         if probe_ok {
-            // 2. Daemon liveness via pgrep over SSH.
+            // Fresh database presence is authoritative and also makes manual
+            // `ff fleet revive` safe to run against a healthy member.
+            if !self.target_is_stale(target.computer_id).await? {
+                return Ok(ReviveOutcome::Skipped("pulse is fresh".into()));
+            }
+            if self.fleet_ingest_outage().await? {
+                return Ok(ReviveOutcome::Skipped(
+                    "fleet-wide pulse ingest outage suspected; restart suppressed".into(),
+                ));
+            }
+
+            // 2. Bounded node-local health/progress probe. An SSH transport
+            // failure is deliberately not evidence that the daemon failed.
             match self
-                .ssh_daemon_running(&target.ssh_user, &target.primary_ip, target.ssh_port)
+                .ssh_daemon_probe(&target.ssh_user, &target.primary_ip, target.ssh_port)
                 .await
             {
-                Ok(true) => {
+                Ok(DaemonProbe::Healthy) => {
                     info!(
                         node = %target.name,
-                        "ssh ok + daemon alive — nothing to restart (likely Redis split)"
+                        "daemon localhost health probe is progressing — nothing to restart"
                     );
                     Ok(ReviveOutcome::Skipped(
-                        "SSH works, daemon running — Redis connectivity issue likely".into(),
+                        "daemon is locally healthy; pulse transport/ingest issue likely".into(),
                     ))
                 }
-                Ok(false) => {
+                Ok(DaemonProbe::Unhealthy | DaemonProbe::NotRunning) => {
+                    if !self.claim_restart(target.computer_id).await? {
+                        return Ok(ReviveOutcome::Skipped(
+                            "targeted restart already attempted in backoff window".into(),
+                        ));
+                    }
                     info!(
                         node = %target.name,
                         os = %target.os_family,
                         "ssh ok + daemon dead — attempting restart"
                     );
+                    let restart_started = chrono::Utc::now();
                     match self.ssh_restart_daemon(target).await {
-                        Ok(()) => Ok(ReviveOutcome::DaemonRestarted),
+                        Ok(()) => {
+                            if self.confirm_recovered(target, restart_started).await? {
+                                Ok(ReviveOutcome::DaemonRestarted)
+                            } else {
+                                Ok(ReviveOutcome::Failed(
+                                    "restart issued, but service and fresh pulse were not confirmed"
+                                        .into(),
+                                ))
+                            }
+                        }
                         Err(e) => {
                             warn!(
                                 node = %target.name,
@@ -145,8 +181,10 @@ impl ReviveManager {
                     }
                 }
                 Err(e) => {
-                    warn!(node = %target.name, error = %e, "ssh pgrep failed");
-                    self.try_wol_or_fail(target).await
+                    warn!(node = %target.name, error = %e, "daemon probe transport failed");
+                    Ok(ReviveOutcome::Skipped(
+                        "ambiguous daemon probe transport failure; failing closed".into(),
+                    ))
                 }
             }
         } else {
@@ -196,17 +234,57 @@ impl ReviveManager {
         Ok(target)
     }
 
-    /// Append a `revive_attempt` row to `computer_downtime_events` for
-    /// backoff accounting. Never opens a new downtime window — just a marker.
-    async fn record_revive_attempt(&self, computer_id: uuid::Uuid) -> Result<(), ReviveError> {
-        sqlx::query(
-            "INSERT INTO computer_downtime_events (computer_id, offline_at, cause)
-             VALUES ($1, NOW(), 'revive_attempt')",
+    async fn target_is_stale(&self, computer_id: uuid::Uuid) -> Result<bool, ReviveError> {
+        Ok(sqlx::query_scalar::<_, bool>(
+            "SELECT COALESCE(c.last_seen_at < NOW() - make_interval(secs => $2), TRUE)
+                    AND (c.status IN ('odown', 'offline', 'sdown') OR EXISTS (
+                        SELECT 1 FROM computer_downtime_events d
+                         WHERE d.computer_id = c.id AND d.online_at IS NULL
+                           AND d.cause IS DISTINCT FROM 'revive_attempt'))
+               FROM computers c WHERE c.id = $1",
         )
         .bind(computer_id)
-        .execute(&self.pg)
+        .bind(STALE_AFTER.as_secs() as i32)
+        .fetch_one(&self.pg)
+        .await?)
+    }
+
+    /// Suppress restart storms when a majority of at least three nodes that
+    /// were recently healthy have simultaneously stopped materializing.
+    async fn fleet_ingest_outage(&self) -> Result<bool, ReviveError> {
+        let (recent, stale): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*)::BIGINT,
+                    COUNT(*) FILTER (WHERE last_seen_at < NOW() - make_interval(secs => $1))::BIGINT
+               FROM computers
+              WHERE last_seen_at > NOW() - make_interval(secs => $2)",
+        )
+        .bind(STALE_AFTER.as_secs() as i32)
+        .bind(RECENTLY_HEALTHY_WINDOW.as_secs() as i32)
+        .fetch_one(&self.pg)
         .await?;
-        Ok(())
+        Ok(is_ingest_outage(recent, stale))
+    }
+
+    /// Atomically claim the one allowed targeted restart for this node/window.
+    async fn claim_restart(&self, computer_id: uuid::Uuid) -> Result<bool, ReviveError> {
+        let inserted = sqlx::query_scalar::<_, i32>(
+            "WITH locked AS (
+                 SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))
+             ), inserted AS (
+                 INSERT INTO computer_downtime_events (computer_id, offline_at, cause)
+                 SELECT $1, NOW(), 'revive_attempt' FROM locked
+                  WHERE NOT EXISTS (
+                    SELECT 1 FROM computer_downtime_events
+                     WHERE computer_id = $1 AND cause = 'revive_attempt'
+                       AND offline_at > NOW() - make_interval(secs => $2))
+                 RETURNING 1
+             ) SELECT 1 FROM inserted",
+        )
+        .bind(computer_id)
+        .bind(RESTART_BACKOFF_WINDOW.as_secs() as i32)
+        .fetch_optional(&self.pg)
+        .await?;
+        Ok(inserted.is_some())
     }
 
     /// Count revive attempts for a computer in the last `minutes` minutes.
@@ -241,13 +319,14 @@ impl ReviveManager {
         run_ssh(cmd).await.unwrap_or(false)
     }
 
-    /// Check whether `forgefleetd` is alive on the target via pgrep.
-    async fn ssh_daemon_running(
+    /// Prove daemon health locally. The HTTP response carries a current
+    /// timestamp, so a successful request demonstrates event-loop progress.
+    async fn ssh_daemon_probe(
         &self,
         user: &str,
         host: &str,
         port: i32,
-    ) -> Result<bool, ReviveError> {
+    ) -> Result<DaemonProbe, ReviveError> {
         // Note on the pgrep pattern: SSH invokes us via `bash -c <cmd>`,
         // and `pgrep -f` scans full command lines — including our own
         // bash shell's, which contains the literal string "forgefleetd".
@@ -261,13 +340,47 @@ impl ReviveManager {
                 // older deploys (e.g. systemd-launched, no argv suffix) get
                 // missed by `forgefleetd.*start` and a revive cycle then
                 // tries to spawn a second daemon. Use a broader pattern.
-                "if pgrep -f '/forgefleetd($| )' | grep -v \"^$$\\$\" >/dev/null; \
-                 then echo yes; else echo no; fi",
+                "if ! pgrep -f '/forgefleetd($| )' | grep -v \"^$$\\$\" >/dev/null; then \
+                    echo not_running; \
+                 elif curl -fsS --max-time 4 http://127.0.0.1:${FF_AGENT_HTTP_PORT:-51820}/health \
+                    | grep -q '\"ok\":true'; then echo healthy; \
+                 else echo unhealthy; fi",
             );
 
         match run_ssh_output(cmd).await {
-            Ok(stdout) => Ok(stdout.trim().ends_with("yes")),
+            Ok(stdout) => parse_daemon_probe(&stdout).ok_or_else(|| {
+                ReviveError::Io(std::io::Error::other("unrecognized daemon probe response"))
+            }),
             Err(e) => Err(e),
+        }
+    }
+
+    async fn confirm_recovered(
+        &self,
+        target: &ReviveTarget,
+        restart_started: chrono::DateTime<chrono::Utc>,
+    ) -> Result<bool, ReviveError> {
+        let deadline = tokio::time::Instant::now() + CONFIRM_TIMEOUT;
+        loop {
+            let service_healthy = matches!(
+                self.ssh_daemon_probe(&target.ssh_user, &target.primary_ip, target.ssh_port)
+                    .await,
+                Ok(DaemonProbe::Healthy)
+            );
+            let pulse_fresh = sqlx::query_scalar::<_, bool>(
+                "SELECT COALESCE(last_seen_at >= $2, FALSE) FROM computers WHERE id = $1",
+            )
+            .bind(target.computer_id)
+            .bind(restart_started)
+            .fetch_one(&self.pg)
+            .await?;
+            if recovery_confirmed(service_healthy, pulse_fresh) {
+                return Ok(true);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(CONFIRM_INTERVAL).await;
         }
     }
 
@@ -467,6 +580,23 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(out)
 }
 
+fn is_ingest_outage(recently_healthy: i64, stale: i64) -> bool {
+    recently_healthy >= 3 && stale * 2 > recently_healthy
+}
+
+fn recovery_confirmed(service_healthy: bool, pulse_fresh: bool) -> bool {
+    service_healthy && pulse_fresh
+}
+
+fn parse_daemon_probe(stdout: &str) -> Option<DaemonProbe> {
+    match stdout.trim() {
+        "healthy" => Some(DaemonProbe::Healthy),
+        "unhealthy" => Some(DaemonProbe::Unhealthy),
+        "not_running" => Some(DaemonProbe::NotRunning),
+        _ => None,
+    }
+}
+
 /// If `fleet_info::resolve_best_ip` knows a better IP (LAN preferred over
 /// tailscale), overwrite the target's `primary_ip` so SSH/probe calls hit
 /// the right interface. Silently leaves the target unchanged on any error —
@@ -545,5 +675,43 @@ mod tests {
         assert!(args.iter().any(|a| a == "BatchMode=yes"));
         // Wedged-agent bypass must be present (HA.2).
         assert!(args.iter().any(|a| a == "IdentityAgent=none"));
+    }
+
+    #[test]
+    fn majority_ingest_outage_requires_three_recent_nodes() {
+        assert!(!is_ingest_outage(2, 2));
+        assert!(is_ingest_outage(3, 2));
+        assert!(is_ingest_outage(10, 6));
+        assert!(!is_ingest_outage(10, 5));
+    }
+
+    #[test]
+    fn restart_is_not_recovered_until_service_and_new_pulse_agree() {
+        assert!(!recovery_confirmed(false, false));
+        assert!(!recovery_confirmed(true, false));
+        assert!(!recovery_confirmed(false, true));
+        assert!(recovery_confirmed(true, true));
+    }
+
+    #[test]
+    fn sophie_shape_active_process_without_local_progress_is_unhealthy() {
+        assert_eq!(
+            parse_daemon_probe("unhealthy\n"),
+            Some(DaemonProbe::Unhealthy)
+        );
+        assert_ne!(
+            parse_daemon_probe("unhealthy\n"),
+            Some(DaemonProbe::Healthy)
+        );
+    }
+
+    #[test]
+    fn healthy_local_progress_skips_restart_signal() {
+        assert_eq!(parse_daemon_probe("healthy\n"), Some(DaemonProbe::Healthy));
+    }
+
+    #[test]
+    fn ambiguous_probe_output_fails_closed() {
+        assert_eq!(parse_daemon_probe("ssh: connection reset"), None);
     }
 }
