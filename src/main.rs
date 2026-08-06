@@ -4343,7 +4343,7 @@ mod tests {
         while std::path::Path::new(&format!("/proc/{pid}")).exists()
             && std::time::Instant::now() < deadline
         {
-            std::thread::sleep(Duration::from_millis(10));
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
             !std::path::Path::new(&format!("/proc/{pid}")).exists(),
