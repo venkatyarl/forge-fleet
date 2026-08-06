@@ -704,10 +704,7 @@ async fn handle_doctor(args: DoctorArgs) -> Result<()> {
     let rows = fleet_install_rows(&payload, args.verbose);
 
     println!("{GREEN}✓ Fleet Install Status{RESET}");
-    println!(
-        "  {CYAN}{:<20} {:<10} {}{RESET}",
-        "NODE", "INSTALLED", "MISSING"
-    );
+    println!("  {CYAN}{:<20} {:<10} MISSING{RESET}", "NODE", "INSTALLED");
     if rows.is_empty() {
         println!("  {YELLOW}No recent install status reported{RESET}");
     } else {
