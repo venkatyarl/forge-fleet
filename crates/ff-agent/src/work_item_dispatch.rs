@@ -6,6 +6,7 @@
 //! lease, push a branch, open a PR, enqueue merge, then free the slot.
 
 use anyhow::{Context, Result, anyhow, bail};
+use regex::Regex;
 use sqlx::{PgPool, Row};
 use std::{
     collections::HashSet,
@@ -13,7 +14,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -5620,42 +5621,33 @@ fn mirror_repo_url(mirror_prefix: &str, github_url: &str) -> Option<String> {
 /// is pointed at the canonical GitHub URL.
 /// Mirror fetches are retried with exponential backoff + jitter; if they all
 /// fail we transparently fall back to a direct GitHub fetch.
-/// Build an HTTPS-with-PAT fetch URL (`https://x-access-token:<pat>@github.com/
-/// owner/repo.git`) from any GitHub remote form — the SSH host-alias
-/// (`git@github.com-venkat:owner/repo.git`), plain SSH (`git@github.com:...`), or
-/// HTTPS. Returns None if we can't parse owner/repo. This lets a node fetch via
-/// the fleet PAT (portable — works from ANY node) when its SSH key/host-alias
-/// isn't set up (the priya failure: SSH remote needs a per-node key priya lacked,
-/// but the PAT works everywhere over HTTPS).
-fn https_pat_url(remote: &str, pat: &str) -> Option<String> {
-    let r = remote.trim().trim_end_matches(".git");
-    // Extract "owner/repo" from the various forms.
-    let owner_repo = if let Some(rest) = r.split_once(':').map(|(_, b)| b).filter(|_| {
-        r.starts_with("git@") // git@github.com[-alias]:owner/repo
-    }) {
-        rest.to_string()
-    } else if let Some(idx) = r.find("github.com") {
-        // https://github.com/owner/repo  OR  ssh://git@github.com/owner/repo
-        r[idx + "github.com".len()..]
-            .trim_start_matches('/')
-            .to_string()
-    } else {
-        return None;
-    };
-    let owner_repo = owner_repo.trim_matches('/');
-    if owner_repo.is_empty() || !owner_repo.contains('/') {
+/// Return a credential-free equivalent for a GitHub remote that contains URL
+/// userinfo. Existing managed caches may predate the no-credential-remote
+/// invariant, so checkout scrubs those remotes before any fetch or log field can
+/// reuse them. Non-GitHub or unparsable credential-bearing URLs fail closed.
+fn credential_free_github_remote(remote: &str) -> Option<String> {
+    if !contains_url_userinfo(remote) {
+        return Some(remote.trim().to_string());
+    }
+    static STRIP_USERINFO: OnceLock<Regex> = OnceLock::new();
+    let without_userinfo = STRIP_USERINFO
+        .get_or_init(|| {
+            Regex::new(r"(?i)^(https?://)[^/@\s]+@").expect("valid URL-userinfo strip regex")
+        })
+        .replace(remote, "${1}");
+    let (owner, repo) = crate::project_github_sync::parse_owner_repo(&without_userinfo)?;
+    let repo = repo.trim_end_matches(".git");
+    if owner.is_empty() || repo.is_empty() {
         return None;
     }
-    Some(format!(
-        "https://x-access-token:{pat}@github.com/{owner_repo}.git"
-    ))
+    Some(format!("https://github.com/{owner}/{repo}.git"))
 }
 
 fn checkout_clone_for_build(
     repo_path: &Path,
     base_branch: &str,
     task_branch: &str,
-    gh_token: Option<&str>,
+    _gh_token: Option<&str>,
 ) -> Result<()> {
     let base_ref = format!("origin/{base_branch}");
 
@@ -5665,7 +5657,7 @@ fn checkout_clone_for_build(
     // the mirror, and git falls back to the fetch URL when no push URL is
     // set), so this recovers the canonical URL even when a prior run died
     // with origin's fetch URL still pointing at the mirror.
-    let github_url = run_git(
+    let raw_github_url = run_git(
         repo_path,
         ["remote", "get-url", "--push", "origin"],
         Duration::from_secs(30),
@@ -5675,6 +5667,33 @@ fn checkout_clone_for_build(
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
         if s.is_empty() { None } else { Some(s) }
     });
+    let github_url = match raw_github_url.as_deref() {
+        Some(remote) => Some(
+            credential_free_github_remote(remote)
+                .context("reject credential-bearing or unsupported GitHub origin")?,
+        ),
+        None => None,
+    };
+    if raw_github_url.as_deref() != github_url.as_deref()
+        && let Some(github) = &github_url
+    {
+        run_git(
+            repo_path,
+            ["remote", "set-url", "origin", github],
+            Duration::from_secs(30),
+        )
+        .context("scrub credential-bearing origin fetch URL")?;
+        run_git(
+            repo_path,
+            ["remote", "set-url", "--push", "origin", github],
+            Duration::from_secs(30),
+        )
+        .context("scrub credential-bearing origin push URL")?;
+        info!(
+            github_url = %truncate_for_log(github),
+            "checkout_clone_for_build: removed credentials from managed origin"
+        );
+    }
 
     // Optionally configure the LAN mirror: fetch from mirror, push to GitHub.
     // The env value is a URL PREFIX shared by every repo the mirror serves;
@@ -5687,8 +5706,8 @@ fn checkout_clone_for_build(
                 let url = mirror_repo_url(&prefix, github);
                 if url.is_none() {
                     warn!(
-                        mirror_prefix = %prefix,
-                        github_url = %github,
+                        mirror_prefix = %truncate_for_log(&prefix),
+                        github_url = %truncate_for_log(github),
                         "checkout_clone_for_build: cannot derive owner/repo for LAN mirror; fetching directly from GitHub"
                     );
                 }
@@ -5703,16 +5722,23 @@ fn checkout_clone_for_build(
                 ["remote", "set-url", "origin", mirror],
                 Duration::from_secs(30),
             )
-            .with_context(|| format!("set origin fetch URL to LAN mirror {mirror}"))?;
+            .with_context(|| {
+                format!(
+                    "set origin fetch URL to LAN mirror {}",
+                    truncate_for_log(mirror)
+                )
+            })?;
             run_git(
                 repo_path,
                 ["remote", "set-url", "--push", "origin", github],
                 Duration::from_secs(30),
             )
-            .with_context(|| format!("set origin push URL to GitHub {github}"))?;
+            .with_context(|| {
+                format!("set origin push URL to GitHub {}", truncate_for_log(github))
+            })?;
             info!(
-                mirror_url = mirror,
-                push_url = github,
+                mirror_url = %truncate_for_log(mirror),
+                push_url = %truncate_for_log(github),
                 "checkout_clone_for_build: configured LAN mirror fetch with GitHub push"
             );
             true
@@ -5760,7 +5786,9 @@ fn checkout_clone_for_build(
                     ["remote", "set-url", "origin", github],
                     Duration::from_secs(30),
                 )
-                .with_context(|| format!("restore origin URL to GitHub {github}"))?;
+                .with_context(|| {
+                    format!("restore origin URL to GitHub {}", truncate_for_log(github))
+                })?;
                 // Push should also use GitHub now that we're not mirroring.
                 let _ = run_git(
                     repo_path,
@@ -5796,51 +5824,6 @@ fn checkout_clone_for_build(
                         "checkout_clone_for_build: direct fetch failed; retrying"
                     )
                 }
-            }
-        }
-    }
-
-    // Phase 2.5: HTTPS-with-PAT fetch (portable across ALL nodes). The SSH remote
-    // (git@github.com-venkat:...) needs a per-node SSH key/host-alias; a node that
-    // lacks it (priya) fails both prior phases even though it has network to
-    // GitHub. The fleet PAT works over HTTPS from any node — so fetch a temporary
-    // HTTPS URL WITHOUT persisting it to the remote (a one-shot `git fetch <url>`),
-    // keeping the canonical SSH origin for push. This is the durable fix for the
-    // "could not fetch origin/main — refusing to build" terminal failures.
-    if !fetched
-        && let (Some(token), Some(github)) = (gh_token, &github_url)
-        && let Some(https) = https_pat_url(github, token)
-    {
-        for attempt in 0..FETCH_ATTEMPTS {
-            if attempt > 0 {
-                let backoff =
-                    Duration::from_millis(FETCH_BACKOFF_BASE_MS * (1u64 << (attempt - 1)));
-                std::thread::sleep(backoff + fetch_jitter(200));
-            }
-            // Fetch the base into a local ref we can check out from. `git fetch
-            // <url> <branch>` writes FETCH_HEAD; also update the tracking ref so
-            // `origin/<base>` resolves for the checkout below.
-            match run_git(
-                repo_path,
-                [
-                    "fetch",
-                    &https,
-                    &format!("{base_branch}:refs/remotes/origin/{base_branch}"),
-                ],
-                Duration::from_secs(120),
-            ) {
-                Ok(_) => {
-                    info!(
-                        base_branch,
-                        "checkout_clone_for_build: fetched via HTTPS PAT fallback (SSH remote unusable on this node)"
-                    );
-                    fetched = true;
-                    break;
-                }
-                Err(e) => warn!(
-                    base_branch, attempt, error = %e,
-                    "checkout_clone_for_build: HTTPS PAT fetch failed; retrying"
-                ),
             }
         }
     }
@@ -6976,6 +6959,50 @@ fn command_display(cmd: &Command) -> String {
     truncate_for_log(&s)
 }
 
+/// Whether an HTTP(S) URL contains userinfo before the host. Git accepts such
+/// URLs, but ForgeFleet never persists or logs them because userinfo is a common
+/// credential carrier. This intentionally treats even username-only userinfo as
+/// sensitive.
+fn contains_url_userinfo(value: &str) -> bool {
+    static USERINFO: OnceLock<Regex> = OnceLock::new();
+    USERINFO
+        .get_or_init(|| Regex::new(r"(?i)https?://[^/@\s]+@").expect("valid userinfo regex"))
+        .is_match(value)
+}
+
+/// Defense-in-depth sanitizer for command renderings and captured stdout/stderr.
+/// Prevention remains primary (no credential-bearing argv/remotes); this keeps
+/// legacy remotes and malicious Git diagnostics from copying common token forms
+/// into daemon logs, work-item errors, or the shared database.
+fn redact_sensitive(value: &str) -> String {
+    static URL_USERINFO: OnceLock<Regex> = OnceLock::new();
+    static TOKEN: OnceLock<Regex> = OnceLock::new();
+    static AUTH_HEADER: OnceLock<Regex> = OnceLock::new();
+    static PASSWORD_FIELD: OnceLock<Regex> = OnceLock::new();
+
+    let value = URL_USERINFO
+        .get_or_init(|| Regex::new(r"(?i)(https?://)[^/@\s]+@").expect("valid URL-userinfo regex"))
+        .replace_all(value, "${1}[REDACTED]@");
+    let value = AUTH_HEADER
+        .get_or_init(|| {
+            Regex::new(r"(?i)(authorization\s*[:=]\s*(?:bearer|basic)\s+)[^\s]+")
+                .expect("valid authorization regex")
+        })
+        .replace_all(&value, "${1}[REDACTED]");
+    let value = PASSWORD_FIELD
+        .get_or_init(|| {
+            Regex::new(r"(?i)(password\s*[:=]\s*)[^\s]+").expect("valid password-field regex")
+        })
+        .replace_all(&value, "${1}[REDACTED]");
+    TOKEN
+        .get_or_init(|| {
+            Regex::new(r"(?i)\b(?:github_pat_|gh[pousr]_|glpat-)[A-Za-z0-9_-]{8,}")
+                .expect("valid token regex")
+        })
+        .replace_all(&value, "[REDACTED_TOKEN]")
+        .into_owned()
+}
+
 /// Like [`run_command_timeout`] but returns the `Output` for ANY exit code —
 /// it only errors on spawn failure or timeout. Used for the backend CLI, whose
 /// non-zero exits must be INSPECTED by the caller, not collapsed into a generic
@@ -7125,7 +7152,8 @@ fn truncate_for_db(s: &str) -> String {
 
 fn truncate_for_log(s: &str) -> String {
     const MAX: usize = 2000;
-    let trimmed = s.trim();
+    let redacted = redact_sensitive(s);
+    let trimmed = redacted.trim();
     if trimmed.len() <= MAX {
         return trimmed.to_string();
     }
@@ -9032,6 +9060,58 @@ mod tests {
             "command_display leaked an env secret: {shown}"
         );
         assert!(!shown.contains("GH_TOKEN"), "env var name leaked: {shown}");
+    }
+
+    #[test]
+    fn log_sanitizer_redacts_git_credentials_and_tokens() {
+        let raw = concat!(
+            "fatal: https://x-access-token:github_pat_example123456789@github.com/o/r.git\n",
+            "Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz\n",
+            "password=glpat-example123456789"
+        );
+        let shown = super::truncate_for_log(raw);
+        assert!(!shown.contains("github_pat_example123456789"));
+        assert!(!shown.contains("ghp_abcdefghijklmnopqrstuvwxyz"));
+        assert!(!shown.contains("glpat-example123456789"));
+        assert!(shown.contains("https://[REDACTED]@github.com/o/r.git"));
+        assert!(shown.contains("Authorization: Bearer [REDACTED]"));
+        assert!(shown.contains("password=[REDACTED]"));
+    }
+
+    #[test]
+    fn legacy_credential_remote_is_canonicalized_without_secret() {
+        let clean = super::credential_free_github_remote(
+            "https://x-access-token:github_pat_example123456789@github.com/owner/repo.git",
+        )
+        .expect("GitHub remote");
+        assert_eq!(clean, "https://github.com/owner/repo.git");
+        assert!(!clean.contains("github_pat_"));
+        assert_eq!(
+            super::credential_free_github_remote("git@github.com:owner/repo.git").as_deref(),
+            Some("git@github.com:owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn credential_remote_rejects_unsupported_host_and_preserves_ssh() {
+        assert!(
+            super::credential_free_github_remote(
+                "https://user:github_pat_example123456789@example.com/owner/repo.git"
+            )
+            .is_none(),
+            "credential-bearing non-GitHub remotes must fail closed"
+        );
+        let ssh = "git@github.com:owner/repo.git";
+        assert_eq!(super::redact_sensitive(ssh), ssh);
+    }
+
+    #[test]
+    fn log_truncation_is_unicode_safe_after_redaction() {
+        let input = format!("{}😊github_pat_example123456789", "a".repeat(1999));
+        let shown = super::truncate_for_log(&input);
+        assert!(shown.is_char_boundary(shown.len()));
+        assert!(!shown.contains("github_pat_example123456789"));
+        assert!(shown.ends_with("..."));
     }
 
     fn ok_output() -> anyhow::Result<Output> {

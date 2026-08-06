@@ -174,10 +174,15 @@ pub fn decide_stage(
     }
 }
 
+async fn read_mode_durable(pg: &PgPool) -> anyhow::Result<RolloutMode> {
+    let value = ff_db::pg_read_gate_value(pg, ROLLOUT_MODE_KEY, "manual", "manual").await?;
+    Ok(RolloutMode::parse(Some(value.as_str())))
+}
+
 /// Read the gate. Unreadable secret → `Manual` (fail-safe), logged once.
 async fn read_mode(pg: &PgPool) -> RolloutMode {
-    match ff_db::pg_read_gate_value(pg, ROLLOUT_MODE_KEY, "manual", "manual").await {
-        Ok(v) => RolloutMode::parse(Some(v.as_str())),
+    match read_mode_durable(pg).await {
+        Ok(mode) => mode,
         Err(e) => {
             warn!(error = %e, "continuous-rollout: gate read failed; treating as manual");
             RolloutMode::Manual
@@ -187,6 +192,13 @@ async fn read_mode(pg: &PgPool) -> RolloutMode {
 
 pub async fn continuous_mode_is_auto(pg: &PgPool) -> bool {
     read_mode(pg).await == RolloutMode::Auto
+}
+
+/// Operator/run-once variant: callers that promise durable, fail-closed
+/// behavior must be able to distinguish an explicit `manual` gate from a
+/// database read failure.
+pub async fn continuous_mode_is_auto_durable(pg: &PgPool) -> anyhow::Result<bool> {
+    Ok(read_mode_durable(pg).await? == RolloutMode::Auto)
 }
 
 /// A live rollout row (only the columns the tick needs).

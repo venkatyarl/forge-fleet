@@ -389,7 +389,7 @@ pub async fn handle_fleet_upgrade(
     // Dirty-build gate for `ff_git` / `forgefleetd_git` — refuses propagation
     // of a leader with an uncommitted working tree unless `--force-dirty`.
     use ff_agent::auto_upgrade::GitStateGate;
-    let gate = ff_agent::auto_upgrade::gate_git_state(pool, software_id, force_dirty).await;
+    let gate = ff_agent::auto_upgrade::gate_git_state(pool, software_id, force_dirty).await?;
     let leader_sha = plans
         .first()
         .and_then(|p| p.installed_version.clone())
@@ -2183,11 +2183,10 @@ pub async fn handle_fleet_disband(
     )
     .fetch_all(pool)
     .await?;
-    let computer_names: Vec<String> = sqlx::query_scalar(
-        "SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name",
-    )
-    .fetch_all(pool)
-    .await?;
+    let computer_names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM computers WHERE LOWER(name) <> 'vinny' ORDER BY name")
+            .fetch_all(pool)
+            .await?;
 
     let mut targets: Vec<String> = fleet_names.clone();
     for n in &computer_names {
@@ -4176,8 +4175,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             concurrency,
             json,
             graceful,
+            via_defer,
         } => {
-            handle_fleet_deploy(&pool, all, node, concurrency, json, graceful).await?;
+            handle_fleet_deploy(&pool, all, node, concurrency, json, graceful, via_defer).await?;
         }
         FleetCommand::Autoscaler { mode } => {
             handle_fleet_autoscaler(&pool, &mode).await?;
@@ -4873,6 +4873,26 @@ const DEPLOY_LEADER_HANDOFF_POLL_SECS: u64 = 2;
 // verification, while remaining bounded for automatic fail-back.
 const DEPLOY_LEADER_YIELD_MINUTES: i64 = 120;
 
+async fn cleanup_owned_deploy_handoff(
+    pool: &sqlx::PgPool,
+    yield_value: &str,
+    maintenance_value: &str,
+) {
+    // Compare-and-delete both values installed by this deploy. A replacement
+    // request written by an operator or a newer deploy is never removed.
+    for (key, value) in [
+        ("leader_yield_request", yield_value),
+        ("leader_maintenance_lease", maintenance_value),
+    ] {
+        sqlx::query("DELETE FROM fleet_secrets WHERE key = $1 AND value = $2")
+            .bind(key)
+            .bind(value)
+            .execute(pool)
+            .await
+            .ok();
+    }
+}
+
 /// If a deploy target is the current leader, explicitly hand leadership to the
 /// next-priority healthy node and wait for its fresh heartbeat before allowing
 /// the deploy to proceed. The yield lease remains active across the restart so
@@ -4914,6 +4934,7 @@ async fn handoff_deploy_leader(
 
     let until = chrono::Utc::now() + chrono::Duration::minutes(DEPLOY_LEADER_YIELD_MINUTES);
     let yield_value = format!("{}|{}", current.member_name, until.to_rfc3339());
+    let maintenance_value = format!("{}|{}", successor, until.to_rfc3339());
     if let Some(active) = ff_db::pg_get_secret(pool, "leader_yield_request").await?
         && active != yield_value
         && active
@@ -4923,6 +4944,20 @@ async fn handoff_deploy_leader(
     {
         anyhow::bail!("refusing to overwrite an active leader handoff request");
     }
+    if let Some(active) = ff_db::pg_get_secret(pool, "leader_maintenance_lease").await?
+        && active != maintenance_value
+        && active
+            .split_once('|')
+            .and_then(|(_, expires)| chrono::DateTime::parse_from_rfc3339(expires.trim()).ok())
+            .is_some_and(|expires| expires.with_timezone(&chrono::Utc) > chrono::Utc::now())
+    {
+        anyhow::bail!("refusing to overwrite an active leader maintenance lease");
+    }
+    // Publish the designated successor before asking the old leader to yield.
+    // The lease survives the target restart for bounded automatic fail-back.
+    ff_db::pg_set_maintenance_lease(pool, &successor, until)
+        .await
+        .map_err(|e| anyhow::anyhow!("set deploy maintenance lease: {e}"))?;
     if let Err(error) = ff_db::pg_set_secret(
         pool,
         "leader_yield_request",
@@ -4932,6 +4967,7 @@ async fn handoff_deploy_leader(
     )
     .await
     {
+        cleanup_owned_deploy_handoff(pool, &yield_value, &maintenance_value).await;
         return Err(error.into());
     }
 
@@ -4955,13 +4991,7 @@ async fn handoff_deploy_leader(
         if tokio::time::Instant::now() >= deadline {
             // Undo only the request values installed by this deploy. A newer
             // operator handoff must not be cleared by our timeout cleanup.
-            sqlx::query(
-                "DELETE FROM fleet_secrets WHERE key = 'leader_yield_request' AND value = $1",
-            )
-            .bind(&yield_value)
-            .execute(pool)
-            .await
-            .ok();
+            cleanup_owned_deploy_handoff(pool, &yield_value, &maintenance_value).await;
             anyhow::bail!(
                 "refusing to restart leader '{}': '{}' did not take over within {}s",
                 current.member_name,
@@ -6063,12 +6093,16 @@ async fn handle_fleet_deploy(
     concurrency: usize,
     json: bool,
     graceful: bool,
+    via_defer: bool,
 ) -> Result<()> {
     if !all && node.is_none() {
         anyhow::bail!("pass --all or --node <name> to pick targets");
     }
     if all && node.is_some() {
         anyhow::bail!("--all and --node are mutually exclusive");
+    }
+    if via_defer && json {
+        anyhow::bail!("--via-defer --json is not supported");
     }
     let concurrency = concurrency.max(1);
 
@@ -6148,6 +6182,14 @@ async fn handle_fleet_deploy(
             report_skipped_hosts(&skipped);
         }
         return Ok(());
+    }
+
+    // --via-defer: skip the SSH preflight + drain entirely — the whole point is
+    // nodes whose SSH is closed but whose forgefleetd is online. Queue one
+    // self-build deferred task per node; each node's own defer-worker executes
+    // the canonical deploy playbook when it sees the node online.
+    if via_defer {
+        return deploy_via_defer(pool, &targets, &skipped).await;
     }
 
     // Prove every DB-online target is actually reachable before taking a
@@ -6431,6 +6473,83 @@ async fn handle_fleet_deploy(
     // counts TARGETED hosts, so "N/N converged" can otherwise read as full-fleet
     // coverage while offline/reserved hosts were silently left behind.
     report_skipped_hosts(&skipped);
+    Ok(())
+}
+
+/// `ff fleet deploy --via-defer`: queue the canonical self-build playbook as
+/// one deferred shell task per target node instead of driving it over SSH. For
+/// nodes whose SSH is closed but whose forgefleetd is online (vinny, macOS,
+/// 2026-08-06): each node's defer-worker claims its own task (trigger
+/// node_online + preferred_node) and self-upgrades. No drain, no SSH, no
+/// leader self-refresh — the deploy itself happens asynchronously per node.
+async fn deploy_via_defer(
+    pool: &sqlx::PgPool,
+    targets: &[DeployTarget],
+    skipped: &[(String, String, String)],
+) -> Result<()> {
+    // Pin the rollout to the same immutable live branch tip the SSH path uses.
+    let target = live_remote_main_target().await?;
+    let who = whoami_tag();
+    let mut enqueued: Vec<(String, String)> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for t in targets {
+        // Same playbook the SSH path runs — fetch/reset → web build → cargo
+        // build → install → restart — resolved with this node's own os_family
+        // + source_tree_path, exactly as plans resolve them.
+        let playbook = deploy_playbook(
+            &t.os_family,
+            &t.source_tree_path,
+            &target.remote_url,
+            &target.sha,
+        );
+        let title = format!("deploy {} to {} (via-defer)", short10(&target.sha), t.name);
+        let payload = serde_json::json!({
+            "command": playbook,
+            // Self-builds on memory-tight boxes can run long; 90min matches the
+            // SSH path's worst-case build timeout budget.
+            "max_duration_secs": 5400,
+        });
+        match ff_db::pg_enqueue_deferred(
+            pool,
+            &title,
+            "shell",
+            &payload,
+            "node_online",
+            &serde_json::json!({"node": t.name}),
+            Some(&t.name),
+            &serde_json::json!([]),
+            Some(&who),
+            None,
+        )
+        .await
+        {
+            Ok(id) => enqueued.push((t.name.clone(), id)),
+            Err(e) => failures.push((t.name.clone(), e.to_string())),
+        }
+    }
+
+    println!(
+        "{CYAN}▶ ff fleet deploy --via-defer{RESET}: {} deferred task(s) queued targeting {}",
+        enqueued.len(),
+        short10(&target.sha)
+    );
+    for (name, id) in &enqueued {
+        println!("  {name:<12} task {id}");
+    }
+    for (name, err) in &failures {
+        eprintln!("{YELLOW}⚠ {name:<12} enqueue failed: {err}{RESET}");
+    }
+    report_skipped_hosts(skipped);
+    println!();
+    println!("Each node self-executes its playbook when its defer-worker sees the node online;");
+    println!("watch with `ff defer list` (or `ff defer get <id>`).");
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} of {} enqueue(s) failed",
+            failures.len(),
+            enqueued.len() + failures.len()
+        );
+    }
     Ok(())
 }
 
@@ -7111,6 +7230,39 @@ mod route_tests {
             .find("leader_refresh_playbook")
             .expect("leader refresh must restart");
         assert!(handoff < drain && drain < restart);
+    }
+
+    #[test]
+    fn deploy_handoff_sets_successor_lease_before_yield_request() {
+        let source = include_str!("fleet_cmd.rs");
+        let handoff = source
+            .split("async fn handoff_deploy_leader")
+            .nth(1)
+            .expect("deploy handoff helper");
+        let lease = handoff
+            .find("pg_set_maintenance_lease(pool, &successor, until)")
+            .expect("deploy must publish the successor lease");
+        let yielding = handoff
+            .find("pg_set_secret(\n        pool,\n        \"leader_yield_request\"")
+            .expect("deploy must publish the yield request");
+        assert!(
+            lease < yielding,
+            "successor lease must precede leader yield"
+        );
+    }
+
+    #[test]
+    fn timeout_cleanup_is_compare_and_delete_for_both_owned_values() {
+        let source = include_str!("fleet_cmd.rs");
+        let cleanup = source
+            .split("async fn cleanup_owned_deploy_handoff")
+            .nth(1)
+            .and_then(|s| s.split("async fn handoff_deploy_leader").next())
+            .expect("owned handoff cleanup helper");
+        assert!(cleanup.contains("WHERE key = $1 AND value = $2"));
+        assert!(cleanup.contains("leader_yield_request"));
+        assert!(cleanup.contains("leader_maintenance_lease"));
+        assert!(!cleanup.contains("pg_clear_maintenance_lease"));
     }
 
     #[test]

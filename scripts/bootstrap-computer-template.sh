@@ -38,14 +38,18 @@ IS_VINNY="{{IS_VINNY}}"
 # ─── Helpers ──────────────────────────────────────────────────────────────
 
 say() { printf '▶ %s\n' "$*"; }
+# JSON-escape a detail string WITHOUT python3 (the bootstrap's report/die/trap
+# paths must never depend on a binary that can hang: vinny 2026-08-04).
+json_escape() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr '\n' ' '
+}
 report() {
   # POST progress event to the leader so the dashboard can show live status.
   local step="$1" status="${2:-running}" detail="${3:-}"
   curl -fsS -m 5 -X POST \
     -H "Content-Type: application/json" \
-    --data "$(printf '{"name":"%s","step":"%s","status":"%s","detail":%s}' \
-      "$NAME" "$step" "$status" \
-      "$(printf '%s' "$detail" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '""')")" \
+    --data "$(printf '{"name":"%s","step":"%s","status":"%s","detail":"%s"}' \
+      "$NAME" "$step" "$status" "$(json_escape "$detail")")" \
     "$LEADER/api/fleet/enrollment-progress" >/dev/null 2>&1 || true
 }
 
@@ -274,6 +278,25 @@ if [ -f /etc/gdm3/custom.conf ]; then
   report "gdm_autologin" ok "$SUDO_INVOKER"
 fi
 
+# ─── 1d. macOS Remote Login (SSH server) ──────────────────────────────────
+# Fresh macOS ships with Remote Login OFF, leaving the node unreachable for
+# fleet ops (deploy/ssh/mesh) until someone toggles it by hand — vinny
+# 2026-08-04/05: the whole enrollment had to be driven manually over Telegram
+# because of exactly this. Linux fleet images have sshd on by default, so this
+# step is macOS-only. Never blocks enrollment: if we can't enable it
+# automatically (no TTY for the sudo prompt, or macOS demands Full Disk
+# Access), report failed with the manual instruction instead of dying.
+if [ "$OS_ID" = "macos" ]; then
+  report "remote_login" running
+  if lsof -nP -iTCP:22 -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+    report "remote_login" ok "already on"
+  elif [ -t 0 ] && sudo systemsetup -setremotelogin on 2>/dev/null; then
+    report "remote_login" ok "enabled"
+  else
+    report "remote_login" failed "could not enable automatically — operator: System Settings → General → Sharing → Remote Login → On"
+  fi
+fi
+
 # ─── 2. Prerequisites ─────────────────────────────────────────────────────
 
 report "prereqs" running
@@ -480,22 +503,27 @@ esac
 # Install every supported cloud CLI as the target user, then materialize the
 # allowlisted centralized OAuth tokens at each CLI's canonical credential path.
 report "cloud_clis" running
+# Vendor-preferred installers ONLY — each self-updates; installing from the
+# wrong source (npm/brew when the vendor prefers a native script) breaks the
+# update path and strands the box on stale versions (operator directive
+# 2026-08-06):
+#   claude — native installer (npm package deprecated by Anthropic)
+#   codex  — native installer (npm/brew are alternates, script is preferred)
+#   kimi   — official install script (uv/pipx kimi-cli is NOT the same tool)
 if ! run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -fsSL https://claude.ai/install.sh | bash' \
     || die "Claude Code install failed"
 fi
 if ! run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
-  run_as_user bash -lc 'npm install -g @openai/codex' || die "Codex install failed"
-fi
-CODEX_BIN="$(run_as_user bash -lc 'npm prefix -g')/bin/codex"
-if [ -x "$CODEX_BIN" ]; then
-  run_as_user ln -sf "$CODEX_BIN" "$USER_HOME/.local/bin/codex"
+  run_as_user bash -lc 'curl -fsSL https://chatgpt.com/codex/install.sh | sh' \
+    || die "Codex install failed"
 fi
 if ! run_as_user bash -lc 'command -v uv >/dev/null 2>&1'; then
   run_as_user bash -lc 'curl -LsSf https://astral.sh/uv/install.sh | sh' || die "uv install failed"
 fi
 if ! run_as_user bash -lc 'command -v kimi >/dev/null 2>&1'; then
-  run_as_user bash -lc 'uv tool install kimi-cli' || die "Kimi CLI install failed"
+  run_as_user bash -lc 'curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash' \
+    || die "Kimi Code install failed"
 fi
 
 CLAUDE_CREDENTIALS="$(peek_secret anthropic.oauth_token.credentials)"
@@ -520,6 +548,62 @@ if [ -n "$KIMI_CREDENTIALS" ]; then
     || die "invalid Kimi credentials from fleet_secrets"
   run_as_user chmod 600 "$USER_HOME/.kimi/credentials/kimi-code.json"
 fi
+
+# Desktop clients (macOS): install the Claude + Kimi desktop apps when
+# missing so a fresh machine is fully usable, not just CLI-wired. The Codex
+# brew cask is the terminal CLI (already handled above) — OpenAI ships no
+# separate desktop app cask.
+
+# Migrate npm-global cloud CLIs to their native installers. npm-global
+# installs can't self-update when the global node_modules is root-owned
+# (adele, 2026-08) and the npm claude package is deprecated. The native
+# installers live in ~/.local and self-update; section 0 already puts
+# ~/.local/bin first in PATH so the native binary wins immediately.
+migrate_native() {
+  local tool="$1" url="$2"
+  local active
+  active="$(run_as_user bash -lc "command -v $tool" 2>/dev/null || true)"
+  [ -n "$active" ] || return 0
+  case "$active" in
+    "$USER_HOME/.local/bin/"*) return 0 ;;
+  esac
+  if run_as_user bash -lc "npm ls -g --depth=0 2>/dev/null | grep -qi $tool"; then
+    if run_as_user bash -lc "curl -fsSL $url | bash"; then
+      report "cli_migrate" ok "$tool migrated to native installer"
+    else
+      report "cli_migrate" warn "$tool native migration failed"
+    fi
+  fi
+}
+migrate_native claude https://claude.ai/install.sh
+migrate_native codex https://chatgpt.com/codex/install.sh
+
+# Desktop clients (macOS): download the installers to ~/Downloads so the
+# OPERATOR installs the dmg/zip by hand (operator preference 2026-08-06 —
+# no silent brew cask installs of GUI apps). brew fetch resolves the current
+# vendor URL, so Downloads always gets the latest without hardcoding
+# versioned links. All three apps auto-update once installed:
+#   claude  — Anthropic's Claude desktop
+#   kimi    — Moonshot's Kimi desktop
+#   chatgpt — OpenAI's desktop app; Codex's desktop mode lives here now (the
+#             standalone Codex desktop app was merged into it, July 2026)
+# These three have no official Linux builds; the Windows template downloads
+# the exe installers to Downloads the same way.
+if [ "$OS_ID" = "macos" ]; then
+  DESKTOP_DL="$USER_HOME/Downloads/fleet-desktop-apps"
+  run_as_user mkdir -p "$DESKTOP_DL"
+  desktop_fetch() {
+    local app_dir="$1" cask="$2"
+    [ -d "$app_dir" ] && return 0
+    run_as_user bash -lc "brew fetch --cask $cask >/dev/null 2>&1 && cp \"\$(brew --cache --cask $cask)\" '$DESKTOP_DL/'" \
+      || report "desktop_apps" warn "$cask installer download failed — fetch from the vendor site by hand"
+  }
+  desktop_fetch "/Applications/Claude.app" claude
+  desktop_fetch "/Applications/Kimi.app" kimi
+  desktop_fetch "/Applications/ChatGPT.app" chatgpt
+  report "desktop_apps" ok "installers in ~/Downloads/fleet-desktop-apps (operator installs)"
+fi
+
 report "cloud_clis" ok "claude, codex, kimi"
 
 report "web_build" running
@@ -651,10 +735,20 @@ ENROLL_PAYLOAD="$(cat <<EOF
 EOF
 )"
 
-ENROLL_RESP="$(curl -fsS -m 30 -X POST \
+# Capture the HTTP status + body so a rejection tells us WHY (invalid token
+# vs transport vs server error) — with -f the body was silently discarded
+# and every failure looked identical (vinny onboarding, 2026-08-04).
+ENROLL_RESP="$(curl -sS -m 30 -X POST \
   -H "Content-Type: application/json" \
   --data "$ENROLL_PAYLOAD" \
-  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP request failed"
+  -w '\n%{http_code}' \
+  "$LEADER/api/fleet/self-enroll")" || die "self-enroll HTTP transport failed"
+ENROLL_STATUS="$(printf '%s' "$ENROLL_RESP" | tail -1)"
+ENROLL_RESP="$(printf '%s' "$ENROLL_RESP" | sed '$d')"
+case "$ENROLL_STATUS" in
+  2*) ;;
+  *) die "self-enroll rejected (HTTP $ENROLL_STATUS): $ENROLL_RESP" ;;
+esac
 
 say "Enrolled: $ENROLL_RESP"
 report "enroll" ok
@@ -663,8 +757,15 @@ report "enroll" ok
 
 report "mesh_import" running
 # Parse peer_ssh_identities from the enrollment response and merge into
-# ~/.ssh/authorized_keys and ~/.ssh/known_hosts.
-python3 <<PY || die "failed to import peer SSH identities"
+# ~/.ssh/authorized_keys and ~/.ssh/known_hosts. Runs from a temp file (not a
+# heredoc) under a 90s watchdog with captured output: the 2026-08-03 vinny
+# onboard hung silently INSIDE this step with zero diagnostics — a hang the
+# EXIT trap cannot see — so now it logs visibly and times out loudly.
+# Suffix-free mktemp templates — GNU mktemp accepts `XXXXXX.py` suffixes but
+# stock macOS (BSD) mktemp rejects them, killing the step instantly.
+MESH_PY="$(mktemp /tmp/forgefleet-mesh-import-py.XXXXXX)"
+MESH_LOG="$(mktemp /tmp/forgefleet-mesh-import-log.XXXXXX)"
+cat > "$MESH_PY" <<PY
 import json, os, sys, pathlib
 data = json.loads('''$ENROLL_RESP''')
 peers = data.get("peer_ssh_identities", [])
@@ -708,18 +809,38 @@ authz.chmod(0o600)
 known.write_text(existing_known)
 known.chmod(0o644)
 import pwd
-uid = pwd.getpwnam("$SUDO_INVOKER").pw_uid
-gid = pwd.getpwnam("$SUDO_INVOKER").pw_gid
-os.chown(str(authz), uid, gid)
-os.chown(str(known), uid, gid)
+try:
+    uid = pwd.getpwnam("$SUDO_INVOKER").pw_uid
+    gid = pwd.getpwnam("$SUDO_INVOKER").pw_gid
+    os.chown(str(authz), uid, gid)
+    os.chown(str(known), uid, gid)
+except PermissionError:
+    # Sudo-less runs already own these files; chown is only needed when the
+    # script runs as root (legacy sudo flow).
+    pass
 print(f"imported: +{added_user} authorized_keys, +{added_host} known_hosts")
 PY
-report "mesh_import" ok
+# Hard, un-hangable cap: perl's alarm survives exec and always fires — no
+# polling loop, no zombie semantics, no ps portability roulette (the 2026-08-04
+# vinny runs proved every shell-watchdog variant can itself wedge). Peer keys
+# are best-effort: a failure here must NEVER block enrollment.
+perl -e 'alarm 60; exec @ARGV' python3 "$MESH_PY" > "$MESH_LOG" 2>&1
+mesh_rc=$?
+cat "$MESH_LOG"
+if [ "$mesh_rc" -ne 0 ]; then
+  report "mesh_import" failed "peer key import failed/timeout (rc=$mesh_rc) — continuing without it"
+else
+  report "mesh_import" ok
+fi
+rm -f "$MESH_PY" "$MESH_LOG"
 
-# ─── 10b. fleet.toml — Postgres + Redis URL pointing at the leader ──────
+# ─── 10b. fleet.toml — Postgres + Redis URL pointing at the DB host ──────
 # The daemon refuses to start without this file. Self-heal gap surfaced on
 # Sia's first enrollment (Apr 21 2026): daemon crashed-looped with
 # `connect Postgres: read fleet.toml: No such file or directory`.
+# DB host is rendered separately from the leader host: Postgres/Redis do NOT
+# necessarily live on the serving gateway (vinny 2026-08-04 — a fleet.toml
+# pointing at the leader's IP would crash-loop the fresh daemon).
 report "fleet_toml" running
 FLEET_TOML="$USER_HOME/.forgefleet/fleet.toml"
 run_as_user mkdir -p "$USER_HOME/.forgefleet"
@@ -728,15 +849,15 @@ if [ ! -f "$FLEET_TOML" ]; then
 [database]
 mode = \"postgres_full\"
 cutover_evidence = \"phase38-cutover-validated-2026-04-05\"
-host = \"{{LEADER_HOST}}\"
-port = 55432
+host = \"{{DB_HOST}}\"
+port = {{DB_PORT}}
 name = \"forgefleet\"
 user = \"forgefleet\"
 password = \"forgefleet\"
-url = \"postgresql://forgefleet:forgefleet@{{LEADER_HOST}}:55432/forgefleet\"
+url = \"postgresql://forgefleet:forgefleet@{{DB_HOST}}:{{DB_PORT}}/forgefleet\"
 
 [redis]
-url = \"redis://{{LEADER_HOST}}:56379\"
+url = \"redis://{{REDIS_HOST}}:{{REDIS_PORT}}\"
 prefix = \"pulse\"
 
 [loops.self_heal]
@@ -752,7 +873,53 @@ else
   report "fleet_toml" ok "already exists"
 fi
 
-# ─── 11. systemd unit ────────────────────────────────────────────────────
+# ─── 11. CLI MCP auto-config ─────────────────────────────────────────────
+#
+# Delegate every client-specific config shape and transport choice to ff's
+# typed, idempotent installer. This is the single authority for current Claude
+# Code/Desktop, Codex, Gemini, Kimi Code/Desktop, and the other supported
+# clients. In particular, do not call `claude mcp add <name> <url>` here: that
+# CLI form can interpret the URL as a stdio command instead of a native HTTP
+# endpoint. --no-instructions limits bootstrap to MCP config; the shared
+# project/user instructions are managed separately.
+report "mcp-config" running
+
+if MCP_CONFIG_OUTPUT="$(run_as_user "$USER_HOME/.local/bin/ff" mcp install --for all --no-instructions 2>&1)"; then
+  printf '%s\n' "$MCP_CONFIG_OUTPUT"
+  # `ff mcp install` continues across per-client errors and reports each one
+  # with a cross marker. Surface partial failure in the bootstrap workstream
+  # even though the aggregate CLI invocation intentionally exits successfully.
+  if grep -Fq '✗' <<<"$MCP_CONFIG_OUTPUT"; then
+    MCP_CONFIG_FAILURES="$(grep -Fc '✗' <<<"$MCP_CONFIG_OUTPUT")"
+    report "mcp-config" failed "canonical installer reported $MCP_CONFIG_FAILURES client failure(s); inspect bootstrap output"
+    die "ff mcp install reported one or more client configuration failures"
+  else
+    report "mcp-config" ok "canonical ff mcp install --for all completed"
+  fi
+else
+  MCP_CONFIG_RC=$?
+  printf '%s\n' "$MCP_CONFIG_OUTPUT" >&2
+  report "mcp-config" failed "ff mcp install exited $MCP_CONFIG_RC; inspect bootstrap output"
+  die "ff mcp install failed"
+fi
+
+# ─── Skills catalog sync (V105) ──────────────────────────────────────────
+# Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/
+# so the runtime skill_catalog.rs reader has a populated catalog from this
+# node's very first session, instead of the operator having to remember to
+# run `ff skills sync` by hand after every new-node bootstrap.
+report "skills-sync" running
+if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
+  if run_as_user bash -lc 'ff skills sync 2>&1'; then
+    report "skills-sync" ok "materialized skills catalog from DB"
+  else
+    report "skills-sync" warn "ff skills sync failed — run manually after bootstrap"
+  fi
+else
+  report "skills-sync" warn "ff not on PATH — skipping skills sync"
+fi
+
+# ─── 12. systemd unit ────────────────────────────────────────────────────
 
 if [ "$OS_ID" != "macos" ]; then
   # Sweep legacy user-scope units that ship the `forgefleetd --node-name <h>
@@ -844,6 +1011,10 @@ else
     TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
     run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
     # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
+    # bootout FIRST: kickstart/bootstrap reuse launchd's cached job definition
+    # when the service was ever loaded, so plist edits (env changes like
+    # FF_GATEWAY_TRUSTED_LAN) silently don't apply (ace + vinny 2026-08-04).
+    run_as_user launchctl bootout "$GUI_DOMAIN" 2>/dev/null || true
     run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
     run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true
     run_as_user launchctl kickstart -k "$GUI_DOMAIN" 2>/dev/null || true
@@ -857,67 +1028,6 @@ else
     report "service" failed "missing $PLIST_TEMPLATE"
   fi
 fi
-
-# ─── 12. CLI MCP auto-config ─────────────────────────────────────────────
-#
-# Wire each vendor CLI (Claude Code, Codex, Gemini) to the local ff-mcp
-# server at port 50001 so the agent loops in those CLIs see ff's brain
-# tools (brain_search, brain_write_to_inbox, etc.) and the standard 36
-# fleet MCP tools. Per the multi-LLM roadmap (PR-A4), this closes the
-# manual `claude mcp add ...` gap.
-#
-# Each CLI has its own config-file convention; we write only when the
-# CLI binary itself is installed (gated by `command -v <cli>`). Idempotent
-# via merge-or-create logic.
-report "mcp-config" running
-
-MCP_URL="http://127.0.0.1:50001/mcp"
-
-# Claude Code: ~/.claude/.mcp-servers.json (JSON array of server objs)
-if run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
-  CLAUDE_MCP_DIR="$USER_HOME/.claude"
-  CLAUDE_MCP_FILE="$CLAUDE_MCP_DIR/.mcp-servers.json"
-  run_as_user mkdir -p "$CLAUDE_MCP_DIR"
-  if [ ! -f "$CLAUDE_MCP_FILE" ]; then
-    run_as_user bash -c "cat > '$CLAUDE_MCP_FILE' <<EOF
-{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
-EOF"
-    report "mcp-config" ok "wrote claude mcp config"
-  else
-    # File exists — try `claude mcp add` if available, else leave alone.
-    run_as_user bash -lc "claude mcp add forgefleet $MCP_URL 2>/dev/null" || true
-  fi
-fi
-
-# Codex: ~/.codex/config.toml (TOML; append [mcp_servers.forgefleet] block)
-if run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
-  CODEX_CONFIG_DIR="$USER_HOME/.codex"
-  CODEX_CONFIG_FILE="$CODEX_CONFIG_DIR/config.toml"
-  run_as_user mkdir -p "$CODEX_CONFIG_DIR"
-  if ! run_as_user bash -lc "grep -q 'mcp_servers.forgefleet' '$CODEX_CONFIG_FILE' 2>/dev/null"; then
-    run_as_user bash -c "cat >> '$CODEX_CONFIG_FILE' <<EOF
-
-[mcp_servers.forgefleet]
-url = \"$MCP_URL\"
-EOF"
-    report "mcp-config" ok "appended codex mcp config"
-  fi
-fi
-
-# Gemini CLI: ~/.gemini/settings.json (JSON; mcpServers map, similar shape)
-if run_as_user bash -lc 'command -v gemini >/dev/null 2>&1'; then
-  GEMINI_DIR="$USER_HOME/.gemini"
-  GEMINI_FILE="$GEMINI_DIR/settings.json"
-  run_as_user mkdir -p "$GEMINI_DIR"
-  if [ ! -f "$GEMINI_FILE" ]; then
-    run_as_user bash -c "cat > '$GEMINI_FILE' <<EOF
-{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
-EOF"
-    report "mcp-config" ok "wrote gemini mcp config"
-  fi
-fi
-
-report "mcp-config" ok
 
 # ─── GitHub SSH identity (V89) ───────────────────────────────────────────
 # Pull the canonical github.com SSH aliases + keypairs from Postgres so
@@ -951,21 +1061,44 @@ else
   report "github-identity" warn "ff not on PATH — skipping github sync"
 fi
 
-# ─── Skills catalog sync (V105) ──────────────────────────────────────────
-# Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/
-# so the runtime skill_catalog.rs reader has a populated catalog from this
-# node's very first session, instead of the operator having to remember to
-# run `ff skills sync` by hand after every new-node bootstrap.
-report "skills-sync" running
-if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
-  if run_as_user bash -lc 'ff skills sync 2>&1'; then
-    report "skills-sync" ok "materialized skills catalog from DB"
-  else
-    report "skills-sync" warn "ff skills sync failed — run manually after bootstrap"
+# ─── Final verification ─────────────────────────────────────────────────
+# Prove the daemon actually came up healthy instead of reporting "done" into
+# the void (vinny 2026-08-04: a "successful" bootstrap whose daemon never
+# started cost hours of remote debugging).
+report "verify" running
+VERIFY_OK=0
+for _ in 1 2 3 4 5 6; do
+  sleep 5
+  if curl -fsS -m 8 "http://127.0.0.1:51002/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    VERIFY_OK=1
+    break
   fi
+done
+if [ "$VERIFY_OK" = "1" ]; then
+  report "verify" ok "gateway healthy on 127.0.0.1:51002"
 else
-  report "skills-sync" warn "ff not on PATH — skipping skills sync"
+  report "verify" failed "gateway not healthy after 30s — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleetd; linux: systemctl --user status forgefleetd"
 fi
+
+# The MCP listener is a SEPARATE supervised service (launchd/systemd) — the
+# gateway can be healthy while MCP is down, which silently breaks every
+# desktop-CLI integration (vinny 2026-08-06: Claude Desktop 'disconnected').
+if curl -fsS -m 4 "http://127.0.0.1:50001/mcp/health" 2>/dev/null | grep -q '^ok'; then
+  report "verify_mcp" ok "mcp listener healthy on 127.0.0.1:50001"
+else
+  report "verify_mcp" failed "mcp listener not answering on 127.0.0.1:50001 — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleet-mcp; linux: systemctl --user status forgefleet-mcp"
+fi
+
+# A mid-run network flip (subnet/VLAN change — e.g. Wi-Fi re-enabled on a
+# laptop) silently kills report POSTs from here on. Detect and say it OUT
+# LOUD locally, because the report itself may not reach the leader.
+if ! curl -fsS -m 5 "$LEADER/health" >/dev/null 2>&1; then
+  say "WARNING: leader at $LEADER is unreachable from this machine right now."
+  say "  → check the network (fleet LAN vs wrong subnet; on a Mac: Wi-Fi off)."
+  say "  → enrollment IS recorded; remaining steps will complete locally but report nothing."
+fi
+
+[ "$VERIFY_OK" = "1" ] || die "post-install verification failed"
 
 # ─── Done ────────────────────────────────────────────────────────────────
 

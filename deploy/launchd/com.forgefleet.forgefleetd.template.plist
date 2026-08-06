@@ -30,6 +30,12 @@
         <string>__USER_HOME__</string>
         <key>PATH</key>
         <string>__USER_HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/usr/sbin:/bin:/sbin</string>
+        <!-- LAN bind + anonymous GETs on the private fleet LAN (same posture
+             as the systemd gateway-lan.conf drop-in on Linux nodes). Without
+             this the gateway binds 127.0.0.1 and the fleet cannot reach the
+             node's web console (vinny 2026-08-04). -->
+        <key>FF_GATEWAY_TRUSTED_LAN</key>
+        <string>1</string>
         <!-- Telegram bot token can be injected here for non-Postgres setups.
              RECOMMENDED: use fleet_secrets instead (see docs/TELEGRAM_SETUP.md).
              Leave empty or remove this key if using fleet_secrets. -->
