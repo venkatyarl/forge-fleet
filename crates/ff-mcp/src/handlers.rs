@@ -92,27 +92,9 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
             let deployments = ff_db::pg_list_deployments(&pool, None)
                 .await
                 .unwrap_or_default();
-<<<<<<< HEAD
             if nodes.is_empty() {
                 info!("fleet_status: Postgres fleet_workers empty, falling back to fleet.toml");
                 (None, None)
-=======
-            // `fleet.api_port` is the loopback-only agent API (:51000) on
-            // managed nodes. Cross-node health must probe the public gateway
-            // port, whose live authority is `fleet_secrets.port.gateway`.
-            let gateway_port = sqlx::query_scalar::<_, String>(
-                "SELECT value FROM fleet_secrets WHERE key = 'port.gateway'",
-            )
-            .fetch_optional(&pool)
-            .await
-            .ok()
-            .flatten()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(config.fleet.api_port.saturating_add(2));
-            if nodes.is_empty() {
-                info!("fleet_status: Postgres fleet_workers empty, falling back to fleet.toml");
-                (None, None, config.fleet.api_port.saturating_add(2))
->>>>>>> 13e0289a (fix: ff-mcp fleet_status probes the gateway port (api_port+2), not loopback api_port)
             } else {
                 info!(
                     nodes = nodes.len(),
@@ -124,11 +106,7 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
         }
         Err(e) => {
             warn!("fleet_status: Postgres unavailable ({e}), falling back to fleet.toml");
-<<<<<<< HEAD
             (None, None)
-=======
-            (None, None, config.fleet.api_port.saturating_add(2))
->>>>>>> 13e0289a (fix: ff-mcp fleet_status probes the gateway port (api_port+2), not loopback api_port)
         }
     };
 
@@ -136,7 +114,9 @@ pub async fn fleet_status(params: Option<Value>) -> HandlerResult {
 
     // Build scan targets from whichever source we're using
     let scan_targets = if let Some(ref db_nodes) = pg_nodes {
-        let default_port = config.fleet.api_port;
+        // Health probes target the public gateway (api_port + 2); api_port
+        // itself (:51000) is loopback-only on managed nodes.
+        let default_port = config.fleet.api_port.saturating_add(2);
         let node_tuples: Vec<(String, String, Option<u16>, u32)> = db_nodes
             .iter()
             .map(|n| {
