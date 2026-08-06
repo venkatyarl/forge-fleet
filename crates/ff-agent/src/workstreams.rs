@@ -405,9 +405,10 @@ pub async fn attach(
 }
 
 /// Report working state from an attached session into its workstream: update
-/// the shared `working_summary` / `focus` (what's happening now) and append a
-/// timestamped note to `open_threads` (the running activity log). Any of the
-/// three may be omitted. Bumps the client's `last_report_at` heartbeat.
+/// `focus` (what the session is doing now) and append a timestamped note to
+/// `open_threads` (the running activity log). The leader exclusively derives
+/// `working_summary`; supplying one is rejected. Bumps the client's
+/// `last_report_at` heartbeat.
 pub async fn report(
     pg: &PgPool,
     session_id: &str,
@@ -452,17 +453,28 @@ pub async fn report(
     Ok(ws)
 }
 
-/// Auto-derive each project's workstream `working_summary` from live work_item
-/// activity — so a project's session-of-record reflects reality WITHOUT any
-/// session manually calling `ff workstream report`. Runs on the leader tick.
-///
-/// Precedence: a LIVE session owns the narrative. If any attached client
-/// reported within the last 15 min, we leave that workstream's summary alone
-/// (the session's semantic report beats a mechanical one). Only for UNATTENDED
-/// projects (no fresh client report) do we overwrite with the derived status.
-/// Returns how many workstreams were auto-updated.
+type WorkItemSummaryCounts = (i64, i64, i64, Option<String>);
+
+const WORK_ITEM_SUMMARY_UNAVAILABLE: &str = "work-item state unavailable (auto)";
+
+fn mechanical_working_summary(counts: Option<WorkItemSummaryCounts>) -> String {
+    let Some((building, merged_1h, failed, latest)) = counts else {
+        return WORK_ITEM_SUMMARY_UNAVAILABLE.to_string();
+    };
+
+    let mut summary = format!("{building} building · {merged_1h} merged/1h · {failed} failed");
+    if let Some(title) = latest.filter(|title| !title.trim().is_empty()) {
+        summary.push_str(&format!(" · latest: {title}"));
+    }
+    summary.push_str(" (auto)");
+    summary
+}
+
+/// Auto-derive each project's workstream `working_summary` from live work-item
+/// activity. The leader is the sole summary writer; attached sessions publish
+/// semantic narrative through `focus` and `open_threads` instead. Runs on the
+/// leader tick and returns how many summaries actually changed.
 pub async fn derive_working_summaries(pg: &PgPool) -> Result<u64> {
-    ensure_client_schema(pg).await?;
     let projects = sqlx::query_scalar::<_, String>(
         "SELECT project_key FROM ff_workstreams WHERE status = 'active'",
     )
@@ -471,52 +483,35 @@ pub async fn derive_working_summaries(pg: &PgPool) -> Result<u64> {
 
     let mut updated = 0u64;
     for project in projects {
-        // Skip if a live session reported recently — it owns the summary.
-        let has_live: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM workstream_clients c \
-                JOIN ff_workstreams w ON w.id = c.workstream_id \
-               WHERE w.project_key = $1 AND c.last_report_at > now() - interval '15 minutes')",
-        )
-        .bind(&project)
-        .fetch_one(pg)
-        .await
-        .unwrap_or(false);
-        if has_live {
-            continue;
-        }
-
-        // Mechanical status from work_items + provenance (fail-open on any miss).
-        let row: Option<(i64, i64, i64, Option<String>)> = sqlx::query_as(
+        let counts = sqlx::query_as::<_, WorkItemSummaryCounts>(
             "SELECT \
                (SELECT count(*) FROM work_items WHERE project_id = $1 AND status = 'building'), \
                (SELECT count(*) FROM work_item_provenance p JOIN work_items w ON w.id = p.work_item_id \
                  WHERE w.project_id = $1 AND p.merged_at > now() - interval '1 hour'), \
                (SELECT count(*) FROM work_items WHERE project_id = $1 AND status = 'failed'), \
-               (SELECT left(title, 48) FROM work_items WHERE project_id = $1 AND status = 'building' \
-                 ORDER BY updated_at DESC NULLS LAST LIMIT 1)",
+               (SELECT left(w.title, 48) FROM work_items w \
+                 WHERE w.project_id = $1 AND w.status = 'building' \
+                 ORDER BY COALESCE(w.completed_at, w.started_at, w.created_at) DESC NULLS LAST \
+                 LIMIT 1)",
         )
         .bind(&project)
-        .fetch_optional(pg)
-        .await
-        .ok()
-        .flatten();
-
-        let Some((building, merged_1h, failed, latest)) = row else {
-            continue;
+        .fetch_one(pg)
+        .await;
+        let summary = match counts {
+            Ok(counts) => mechanical_working_summary(Some(counts)),
+            Err(error) => {
+                tracing::warn!(
+                    project = %project,
+                    %error,
+                    "workstreams: work-item summary source unavailable"
+                );
+                mechanical_working_summary(None)
+            }
         };
-        // Nothing happening + nothing to report → leave a prior summary intact.
-        if building == 0 && merged_1h == 0 && failed == 0 {
-            continue;
-        }
-        let mut summary = format!("{building} building · {merged_1h} merged/1h · {failed} failed");
-        if let Some(t) = latest.filter(|t| !t.trim().is_empty()) {
-            summary.push_str(&format!(" · latest: {t}"));
-        }
-        summary.push_str(" (auto)");
 
         let n = sqlx::query(
             "UPDATE ff_workstreams SET working_summary = $2, updated_at = now() \
-              WHERE project_key = $1",
+              WHERE project_key = $1 AND working_summary IS DISTINCT FROM $2",
         )
         .bind(&project)
         .bind(&summary)
@@ -736,5 +731,197 @@ mod tests {
         for secret in ["abc.def-123", "top-secret", "eyJabc.def.ghi"] {
             assert!(!redacted.contains(secret), "secret leaked: {secret}");
         }
+    }
+
+    #[test]
+    fn mechanical_summary_is_deterministic_for_zero_and_unavailable_counts() {
+        assert_eq!(
+            mechanical_working_summary(Some((0, 0, 0, None))),
+            "0 building · 0 merged/1h · 0 failed (auto)"
+        );
+        assert_eq!(
+            mechanical_working_summary(None),
+            "work-item state unavailable (auto)"
+        );
+    }
+
+    #[test]
+    fn mechanical_summary_includes_only_a_nonempty_latest_title() {
+        assert_eq!(
+            mechanical_working_summary(Some((2, 3, 4, Some("truth repair".to_string())))),
+            "2 building · 3 merged/1h · 4 failed · latest: truth repair (auto)"
+        );
+        assert_eq!(
+            mechanical_working_summary(Some((2, 3, 4, Some("   ".to_string())))),
+            "2 building · 3 merged/1h · 4 failed (auto)"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_summary_is_rejected_before_any_database_access() {
+        let pg = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://invalid.invalid/forgefleet")
+            .expect("lazy pool");
+        let error = report(&pg, "session", Some("rolling-deploy ON"), None, None)
+            .await
+            .expect_err("clients must not write leader-owned summaries");
+        assert!(
+            error
+                .to_string()
+                .contains("working_summary is leader-owned")
+        );
+    }
+
+    #[sqlx::test]
+    #[ignore = "requires PostgreSQL; self-verify runs this explicitly when configured"]
+    async fn leader_summary_truth_is_fail_closed_and_client_narrative_stays_separate(pg: PgPool) {
+        const WORKSTREAM_ID: &str = "00000000-0000-0000-0000-000000000101";
+        const OLDER_WORK_ITEM_ID: &str = "00000000-0000-0000-0000-000000000102";
+        const LATEST_WORK_ITEM_ID: &str = "00000000-0000-0000-0000-000000000103";
+        const SESSION_ID: &str = "fresh-client";
+
+        sqlx::raw_sql(
+            "CREATE TABLE ff_workstreams (\
+                 id uuid PRIMARY KEY, project_id text NOT NULL, project_key text NOT NULL UNIQUE,\
+                 git_remote text, basename text, aliases jsonb NOT NULL DEFAULT '{}'::jsonb,\
+                 goal text, working_summary text, focus text,\
+                 open_threads jsonb NOT NULL DEFAULT '[]'::jsonb,\
+                 status text NOT NULL DEFAULT 'active', leader_generation integer NOT NULL DEFAULT 0,\
+                 owner_identity text NOT NULL DEFAULT 'operator:fleet',\
+                 updated_at timestamptz NOT NULL DEFAULT now());\
+             CREATE TABLE workstream_clients (\
+                 id bigserial PRIMARY KEY, workstream_id uuid NOT NULL,\
+                 session_id text NOT NULL UNIQUE, worker_name text NOT NULL, tool text NOT NULL,\
+                 cwd text, goal text, status text NOT NULL DEFAULT 'attached',\
+                 attached_at timestamptz NOT NULL DEFAULT now(), last_report_at timestamptz);\
+             CREATE TABLE work_items (\
+                 id uuid PRIMARY KEY, project_id text NOT NULL, title text NOT NULL,\
+                 status text NOT NULL, created_at timestamptz NOT NULL,\
+                 started_at timestamptz, completed_at timestamptz);\
+             CREATE TABLE work_item_provenance (\
+                 work_item_id uuid NOT NULL, merged_at timestamptz);",
+        )
+        .execute(&pg)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO ff_workstreams (id, project_id, project_key, basename, working_summary, focus)\
+             VALUES ($1::uuid, 'forge-fleet', 'forge-fleet', 'forge-fleet',\
+                     '11 fixes shipped + rolling-deploy ON', 'existing focus')",
+        )
+        .bind(WORKSTREAM_ID)
+        .execute(&pg)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO workstream_clients\
+                 (workstream_id, session_id, worker_name, tool, last_report_at)\
+             VALUES ($1::uuid, $2, 'adele', 'codex', now())",
+        )
+        .bind(WORKSTREAM_ID)
+        .bind(SESSION_ID)
+        .execute(&pg)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO work_items\
+                 (id, project_id, title, status, created_at, started_at, completed_at)\
+             VALUES\
+                 ($1::uuid, 'forge-fleet', 'older by lifecycle', 'building',\
+                  now() + interval '1 day', now() - interval '2 hours', NULL),\
+                 ($2::uuid, 'forge-fleet', 'truth repair', 'building',\
+                  now() - interval '1 day', now() - interval '1 hour', NULL)",
+        )
+        .bind(OLDER_WORK_ITEM_ID)
+        .bind(LATEST_WORK_ITEM_ID)
+        .execute(&pg)
+        .await
+        .unwrap();
+
+        assert_eq!(derive_working_summaries(&pg).await.unwrap(), 1);
+        let summary: String = sqlx::query_scalar(
+            "SELECT working_summary FROM ff_workstreams WHERE project_key = 'forge-fleet'",
+        )
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+        assert_eq!(
+            summary,
+            "2 building · 0 merged/1h · 0 failed · latest: truth repair (auto)"
+        );
+
+        sqlx::query(
+            "UPDATE work_items SET completed_at = now() \
+             WHERE id = $1::uuid",
+        )
+        .bind(OLDER_WORK_ITEM_ID)
+        .execute(&pg)
+        .await
+        .unwrap();
+        assert_eq!(derive_working_summaries(&pg).await.unwrap(), 1);
+        let completed_summary: String = sqlx::query_scalar(
+            "SELECT working_summary FROM ff_workstreams WHERE project_key = 'forge-fleet'",
+        )
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+        assert_eq!(
+            completed_summary,
+            "2 building · 0 merged/1h · 0 failed · latest: older by lifecycle (auto)"
+        );
+
+        sqlx::query("DELETE FROM work_items")
+            .execute(&pg)
+            .await
+            .unwrap();
+        assert_eq!(derive_working_summaries(&pg).await.unwrap(), 1);
+        let zero_summary: String = sqlx::query_scalar(
+            "SELECT working_summary FROM ff_workstreams WHERE project_key = 'forge-fleet'",
+        )
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+        assert_eq!(zero_summary, "0 building · 0 merged/1h · 0 failed (auto)");
+        assert_eq!(derive_working_summaries(&pg).await.unwrap(), 0);
+
+        sqlx::query("DROP TABLE work_item_provenance")
+            .execute(&pg)
+            .await
+            .unwrap();
+        assert_eq!(derive_working_summaries(&pg).await.unwrap(), 1);
+        let unavailable: String = sqlx::query_scalar(
+            "SELECT working_summary FROM ff_workstreams WHERE project_key = 'forge-fleet'",
+        )
+        .fetch_one(&pg)
+        .await
+        .unwrap();
+        assert_eq!(unavailable, "work-item state unavailable (auto)");
+
+        let error = report(&pg, SESSION_ID, Some("rolling-deploy ON"), None, None)
+            .await
+            .expect_err("client summary must remain leader-owned");
+        assert!(
+            error
+                .to_string()
+                .contains("working_summary is leader-owned")
+        );
+
+        let updated = report(
+            &pg,
+            SESSION_ID,
+            None,
+            Some("diagnosing truth"),
+            Some("mechanical summary repaired"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            updated.working_summary.as_deref(),
+            Some(unavailable.as_str())
+        );
+        assert_eq!(updated.focus.as_deref(), Some("diagnosing truth"));
+        let thread = updated.open_threads.as_array().unwrap().last().unwrap();
+        assert_eq!(thread["session"], SESSION_ID);
+        assert_eq!(thread["note"], "mechanical summary repaired");
     }
 }

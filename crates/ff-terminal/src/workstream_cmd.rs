@@ -2,8 +2,8 @@
 //! and report working state into it. Makes "ff owns the session" real: this
 //! Claude session on forge-fleet (or Codex/Kimi elsewhere) resolves its project
 //! from cwd, attaches to the single `ff_workstreams` row, and streams what it's
-//! doing into the shared `working_summary` / `focus` / `open_threads` so the
-//! record is visible to every other CLI + the TUI/web.
+//! doing into `focus` / `open_threads` so the record is visible to every other
+//! CLI + the TUI/web. The leader derives the shared `working_summary`.
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;
@@ -251,7 +251,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
             if let Some(g) = goal {
                 println!("   goal: {g}");
             }
-            println!("\nreport progress with:  ff workstream report --summary \"…\" --note \"…\"");
+            println!("\nreport progress with:  ff workstream report --focus \"…\" --note \"…\"");
         }
         crate::WorkstreamCommand::Detach { tool, session } => {
             let tool = resolve_tool(tool.as_deref());
@@ -279,9 +279,7 @@ pub async fn handle_workstream(cmd: crate::WorkstreamCommand, cwd: Option<PathBu
         } => {
             let tool = resolve_tool(tool.as_deref());
             if summary.is_none() && focus.is_none() && note.is_none() {
-                anyhow::bail!(
-                    "nothing to report — pass at least one of --summary / --focus / --note"
-                );
+                anyhow::bail!("nothing to report — pass at least one of --focus / --note");
             }
             let dir = effective_cwd(cwd)?;
             let ws = workstreams::workstream_for_dir(&pg, &dir)
@@ -501,7 +499,7 @@ fn install_agents_md_directive(path: &std::path::Path, tool: &str, dry_run: bool
          `ff workstream attach --tool {tool} --goal \"<what you're here to do>\"`\n\
          — this binds your session to the project's shared workstream (ff owns the\n\
          session across claude/codex/kimi). As you work, report progress with\n\
-         `ff workstream report --tool {tool} --summary \"…\" --note \"…\"` so the\n\
+         `ff workstream report --tool {tool} --focus \"…\" --note \"…\"` so the\n\
          record reflects reality. Check `ff workstream status` to resume after a\n\
          crash. Do this WITHOUT being asked — it's standing policy.\n\
          {END}"

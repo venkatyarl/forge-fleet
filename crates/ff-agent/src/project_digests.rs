@@ -224,9 +224,9 @@ async fn run_once_with_sender(pg: &PgPool, sender: &dyn DigestSender) -> Result<
     if let Err(err) = crate::workstreams::ensure_all_workstreams(pg).await {
         warn!(error = %err, "workstreams: ensure_all failed");
     }
-    // Auto-derive each UNATTENDED project's working_summary from live work_item
-    // activity, so the session-of-record reflects reality without a session
-    // manually reporting. A live session's own report (last 15 min) always wins.
+    // Auto-derive every project's working_summary from live work-item activity.
+    // Clients publish semantic narrative through focus/notes; only this
+    // leader-gated path owns the mechanical summary.
     match crate::workstreams::derive_working_summaries(pg).await {
         Ok(n) if n > 0 => info!(updated = n, "workstreams: auto-derived working summaries"),
         Ok(_) => {}
