@@ -861,6 +861,99 @@ mod work_item_execution_exemption_tests {
 /// (preserves pre-V58 behavior on a fleet with no row) and
 /// `restore_when_expired = true` (the safe "feature ON" default that the
 /// expired kill-switch should auto-restore to).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateEffectiveSource {
+    Default,
+    Set,
+    ExpiredRestore,
+}
+
+impl GateEffectiveSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Set => "set",
+            Self::ExpiredRestore => "expired_restore",
+        }
+    }
+}
+
+/// Pure projection used by status surfaces and the durable boolean reader.
+pub fn resolve_safety_gate_value(
+    raw_value: Option<&str>,
+    expires_at: Option<DateTime<Utc>>,
+    default_when_missing: bool,
+    restore_when_expired: bool,
+    now: DateTime<Utc>,
+) -> (bool, GateEffectiveSource) {
+    let Some(raw_value) = raw_value else {
+        return (default_when_missing, GateEffectiveSource::Default);
+    };
+    let parsed = matches!(
+        raw_value.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on" | "enabled"
+    );
+    if !parsed && expires_at.is_some_and(|expires_at| expires_at < now) {
+        return (restore_when_expired, GateEffectiveSource::ExpiredRestore);
+    }
+    (parsed, GateEffectiveSource::Set)
+}
+
+/// Pure projection used by status surfaces and the durable string/mode reader.
+pub fn resolve_gate_value(
+    raw_value: Option<&str>,
+    expires_at: Option<DateTime<Utc>>,
+    previous_value: Option<&str>,
+    default_when_missing: &str,
+    restore_when_expired: &str,
+    now: DateTime<Utc>,
+) -> (String, GateEffectiveSource) {
+    let Some(raw_value) = raw_value else {
+        return (
+            default_when_missing.to_string(),
+            GateEffectiveSource::Default,
+        );
+    };
+    if raw_value.trim().eq_ignore_ascii_case("false")
+        && expires_at.is_some_and(|expires_at| expires_at < now)
+    {
+        return (
+            previous_value.unwrap_or(restore_when_expired).to_string(),
+            GateEffectiveSource::ExpiredRestore,
+        );
+    }
+    (raw_value.to_string(), GateEffectiveSource::Set)
+}
+
+#[cfg(test)]
+mod gate_effective_projection_tests {
+    use super::*;
+
+    #[test]
+    fn expired_mode_without_previous_value_uses_canonical_restore_default() {
+        let now = Utc::now();
+        let (effective, source) = resolve_gate_value(
+            Some("false"),
+            Some(now - chrono::TimeDelta::seconds(1)),
+            None,
+            "off",
+            "dry_run",
+            now,
+        );
+        assert_eq!(effective, "dry_run");
+        assert_eq!(source, GateEffectiveSource::ExpiredRestore);
+    }
+
+    #[test]
+    fn expiry_boundary_is_still_an_explicit_set() {
+        let now = Utc::now();
+        let (effective, source) =
+            resolve_safety_gate_value(Some("false"), Some(now), true, true, now);
+        assert!(!effective);
+        assert_eq!(source, GateEffectiveSource::Set);
+    }
+}
+
 pub async fn pg_read_safety_gate(
     pool: &PgPool,
     key: &str,
@@ -875,34 +968,32 @@ pub async fn pg_read_safety_gate(
     .fetch_optional(pool)
     .await?;
 
-    let Some(row) = row else {
-        return Ok(default_when_missing);
-    };
-    let value: String = row.get("value");
-    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("expires_at").ok();
-
-    let parsed = matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "true" | "1" | "yes" | "on" | "enabled"
+    let raw_value = row.as_ref().map(|row| row.get::<String, _>("value"));
+    let expires_at = row
+        .as_ref()
+        .and_then(|row| row.try_get::<DateTime<Utc>, _>("expires_at").ok());
+    let (effective, source) = resolve_safety_gate_value(
+        raw_value.as_deref(),
+        expires_at,
+        default_when_missing,
+        restore_when_expired,
+        Utc::now(),
     );
 
     // Falsy + expired TTL → auto-restore to the safe "on" default. Log a
     // warning so the auto-restore is visible in journalctl.
-    if !parsed
-        && let Some(exp) = expires_at
-        && exp < chrono::Utc::now()
-    {
-        let reason: Option<String> = row.try_get("disabled_reason").ok();
+    if source == GateEffectiveSource::ExpiredRestore {
+        let reason: Option<String> = row
+            .as_ref()
+            .and_then(|row| row.try_get("disabled_reason").ok());
         tracing::warn!(
             key = %key,
-            expired_at = %exp,
+            expired_at = ?expires_at,
             reason = ?reason,
             "safety gate auto-restoring: kill-switch TTL expired"
         );
-        return Ok(restore_when_expired);
     }
-
-    Ok(parsed)
+    Ok(effective)
 }
 
 /// Set a safety gate to `false` (disabled) with a TTL and a required
@@ -968,21 +1059,22 @@ pub async fn pg_read_gate_value(
             .fetch_optional(pool)
             .await?;
 
-    let Some(row) = row else {
-        return Ok(default_when_missing.to_string());
-    };
-    let value: String = row.get("value");
-    let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("expires_at").ok();
-    let previous_value: Option<String> = row.try_get("previous_value").unwrap_or(None);
-
-    let is_disabled_sentinel = value.trim().eq_ignore_ascii_case("false");
-    if is_disabled_sentinel
-        && let Some(exp) = expires_at
-        && exp < chrono::Utc::now()
-    {
-        let restored = previous_value
-            .clone()
-            .unwrap_or_else(|| restore_when_expired.to_string());
+    let raw_value = row.as_ref().map(|row| row.get::<String, _>("value"));
+    let expires_at = row
+        .as_ref()
+        .and_then(|row| row.try_get::<DateTime<Utc>, _>("expires_at").ok());
+    let previous_value = row
+        .as_ref()
+        .and_then(|row| row.try_get::<String, _>("previous_value").ok());
+    let (effective, source) = resolve_gate_value(
+        raw_value.as_deref(),
+        expires_at,
+        previous_value.as_deref(),
+        default_when_missing,
+        restore_when_expired,
+        Utc::now(),
+    );
+    if source == GateEffectiveSource::ExpiredRestore {
         // Best-effort: write the restored value back and clear the TTL so the
         // restore is durable (and not re-applied on every read).
         let _ = sqlx::query(
@@ -991,13 +1083,12 @@ pub async fn pg_read_gate_value(
               WHERE key = $1",
         )
         .bind(key)
-        .bind(&restored)
+        .bind(&effective)
         .execute(pool)
         .await;
-        tracing::warn!(key = %key, restored = %restored, "gate TTL expired — restored prior value");
-        return Ok(restored);
+        tracing::warn!(key = %key, restored = %effective, "gate TTL expired — restored prior value");
     }
-    Ok(value)
+    Ok(effective)
 }
 
 // ─── Model Lifecycle ───────────────────────────────────────────────────────

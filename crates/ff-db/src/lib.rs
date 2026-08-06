@@ -83,6 +83,7 @@ pub use queries::{
     FleetNodeRow,
     FleetSecretRow,
     FreeSlot,
+    GateEffectiveSource,
     HostCapacity,
     // Interaction log (V121 ff_interactions)
     InteractionChannelStat,
@@ -328,6 +329,8 @@ pub use queries::{
     pg_work_item_execution_exemption,
     // Orchestrator P2 — demand sensing emission (V116)
     record_session_work_signal,
+    resolve_gate_value,
+    resolve_safety_gate_value,
     seed_from_fleet_toml,
 };
 pub use rollout_authority::{
