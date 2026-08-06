@@ -3005,9 +3005,40 @@ fn start_self_heal_subsystem(
 
         let mut ticker = tokio::time::interval(Duration::from_secs(loop_cfg.interval_secs.max(5)));
 
+        // Convergent onboarding cadence: re-apply the local checklist
+        // (mcp wiring, skills sync, cloud CLIs, desktop installers) once a
+        // day. Seeded 25h in the past so the first pass runs on the first
+        // tick (~one interval after daemon start) — heals nodes whose
+        // bootstrap died mid-way (2026-08 macOS enroll left MCP/skills/
+        // desktop undone) without waiting a full day.
+        let mut last_converge = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(25 * 3600))
+            .unwrap_or_else(std::time::Instant::now);
+
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
+                    // Daily onboarding convergence. Spawned as its own task so
+                    // even a panic inside converge can't kill the self-heal
+                    // loop; per-item failures are collected, not fatal.
+                    if last_converge.elapsed() >= Duration::from_secs(86_400) {
+                        last_converge = std::time::Instant::now();
+                        match tokio::spawn(ff_agent::converge::run_converge()).await {
+                            Ok(results) => {
+                                use ff_agent::converge::ConvergeStatus as S;
+                                let count = |s: S| results.iter().filter(|r| r.status == s).count();
+                                info!(
+                                    ok = count(S::Ok),
+                                    installed = count(S::Installed),
+                                    skipped = count(S::Skipped),
+                                    failed = count(S::Failed),
+                                    "onboarding converge pass complete"
+                                );
+                            }
+                            Err(e) => warn!(error = %e, "onboarding converge task failed"),
+                        }
+                    }
+
                     if expected_ports.is_empty() {
                         continue;
                     }

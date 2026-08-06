@@ -48,6 +48,7 @@ mod cloud_llm_cmd;
 mod codegen_cmd;
 mod config_cmd;
 mod conformance_cmd;
+mod converge_cmd;
 mod corpus_cmd;
 mod cortex_cmd;
 mod council_cmd;
@@ -292,6 +293,8 @@ enum Command {
         #[command(subcommand)]
         command: RouteCommand,
     },
+    /// Re-apply the onboarding checklist to this machine (idempotent self-heal).
+    Converge,
     /// List fleet nodes with hardware/GPU info from Postgres.
     Nodes {
         /// Filter by GPU kind substring (e.g. amd, nvidia, apple, none).
@@ -4605,6 +4608,8 @@ async fn main() -> Result<()> {
         Some(Command::Route { command }) => {
             return route_cmd::handle_route(command.clone()).await;
         }
+        // Onboarding self-heal needs no LLM router — fast path.
+        Some(Command::Converge) => return converge_cmd::handle_converge().await,
         Some(Command::Model { command }) => return model_cmd::handle_model(command.clone()).await,
         Some(Command::DeferWorker {
             as_node,
@@ -6179,6 +6184,7 @@ async fn main() -> Result<()> {
         // before reaching here). This arm exists only for exhaustiveness.
         Some(Command::Cli { .. }) => unreachable!("Command::Cli handled on fast path"),
         Some(Command::Council { .. }) => unreachable!("Command::Council handled on fast path"),
+        Some(Command::Converge) => unreachable!("Command::Converge handled on fast path"),
         None => {
             let prompt_text = cli.prompt.join(" ");
             if !prompt_text.is_empty() {
