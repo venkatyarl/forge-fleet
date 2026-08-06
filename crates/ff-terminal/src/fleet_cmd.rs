@@ -8388,29 +8388,82 @@ const DAEMON_GATES: &[GateSpec] = &[
 #[derive(serde::Serialize)]
 struct GateRow {
     key: String,
+    /// Backward-compatible alias for the effective value.
     value: String,
+    raw_value: Option<String>,
+    effective_value: String,
     default: String,
-    /// "set" when an explicit `fleet_secrets` row exists, else "default".
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    previous_value: Option<String>,
+    disabled_reason: Option<String>,
+    /// `set`, `expired_restore`, or `default`.
     source: &'static str,
     controls: String,
 }
 
-/// Resolve every canonical gate against the explicitly-set `fleet_secrets`
-/// values (key→value). Gates absent from the map run on their code default.
-/// Pure.
-fn build_gate_rows(set: &std::collections::HashMap<String, String>) -> Vec<GateRow> {
+#[derive(Clone)]
+struct GateOverride {
+    raw_value: String,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    previous_value: Option<String>,
+    disabled_reason: Option<String>,
+}
+
+fn boolean_gate_policy(key: &str) -> Option<(bool, bool)> {
+    match key {
+        // Keep these values identical to the daemon's pg_read_safety_gate calls.
+        "auto_feeder_mode" => Some((false, false)),
+        "auto_upgrade_enabled" => Some((false, true)),
+        "leader_self_upgrade" => Some((false, false)),
+        "oauth_distribution_enabled"
+        | "ssh_mesh_auto_repair_enabled"
+        | "work_item_execution_enabled" => Some((true, true)),
+        _ => None,
+    }
+}
+
+/// Resolve every canonical gate using the same pure TTL semantics as the
+/// daemon readers. This projection never mutates the live gate row.
+fn build_gate_rows(
+    set: &std::collections::HashMap<String, GateOverride>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<GateRow> {
     DAEMON_GATES
         .iter()
         .map(|g| {
-            let (value, source) = match set.get(g.key) {
-                Some(v) => (v.clone(), "set"),
-                None => (g.default.to_string(), "default"),
+            let gate_override = set.get(g.key);
+            let raw_value = gate_override.map(|value| value.raw_value.as_str());
+            let expires_at = gate_override.and_then(|value| value.expires_at);
+            let (effective_value, source) = match boolean_gate_policy(g.key) {
+                Some((default_when_missing, restore_when_expired)) => {
+                    let (effective, source) = ff_db::resolve_safety_gate_value(
+                        raw_value,
+                        expires_at,
+                        default_when_missing,
+                        restore_when_expired,
+                        now,
+                    );
+                    (effective.to_string(), source)
+                }
+                None => ff_db::resolve_gate_value(
+                    raw_value,
+                    expires_at,
+                    gate_override.and_then(|value| value.previous_value.as_deref()),
+                    g.default,
+                    g.default,
+                    now,
+                ),
             };
             GateRow {
                 key: g.key.to_string(),
-                value,
+                value: effective_value.clone(),
+                raw_value: gate_override.map(|value| value.raw_value.clone()),
+                effective_value,
                 default: g.default.to_string(),
-                source,
+                expires_at,
+                previous_value: gate_override.and_then(|value| value.previous_value.clone()),
+                disabled_reason: gate_override.and_then(|value| value.disabled_reason.clone()),
+                source: source.as_str(),
                 controls: g.controls.to_string(),
             }
         })
@@ -8418,8 +8471,6 @@ fn build_gate_rows(set: &std::collections::HashMap<String, String>) -> Vec<GateR
 }
 
 /// Render the `ff fleet gates` table. Pure (no color / I/O) for testability.
-/// A `*` in the SET column marks a gate whose live value was explicitly written
-/// to `fleet_secrets` (i.e. an operator override of the code default).
 fn render_gates(rows: &[GateRow]) -> String {
     let mut out = String::new();
     out.push_str(&format!(
@@ -8427,19 +8478,33 @@ fn render_gates(rows: &[GateRow]) -> String {
         rows.len()
     ));
     out.push_str(&format!(
-        "{:<26} {:<8} {:<8} {:<4} CONTROLS\n",
-        "GATE", "VALUE", "DEFAULT", "SET"
+        "{:<26} {:<12} {:<12} {:<8} {:<16} {:<20} {:<14} DISABLED REASON / CONTROLS\n",
+        "GATE", "EFFECTIVE", "RAW", "DEFAULT", "SOURCE", "EXPIRES", "PREVIOUS"
     ));
     for r in rows {
-        let set_mark = if r.source == "set" { "*" } else { "" };
+        let raw = r.raw_value.as_deref().unwrap_or("-");
+        let expires = r
+            .expires_at
+            .map(|value| value.format("%Y-%m-%dT%H:%MZ").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let previous = r.previous_value.as_deref().unwrap_or("-");
+        let reason = r.disabled_reason.as_deref().unwrap_or("-");
         out.push_str(&format!(
-            "{:<26} {:<8} {:<8} {:<4} {}\n",
-            r.key, r.value, r.default, set_mark, r.controls
+            "{:<26} {:<12} {:<12} {:<8} {:<16} {:<20} {:<14} {} / {}\n",
+            r.key,
+            r.effective_value,
+            raw,
+            r.default,
+            r.source,
+            expires,
+            previous,
+            reason,
+            r.controls
         ));
     }
-    let overridden = rows.iter().filter(|r| r.source == "set").count();
+    let overridden = rows.iter().filter(|r| r.raw_value.is_some()).count();
     out.push_str(&format!(
-        "\n{overridden} gate(s) explicitly set in fleet_secrets; the rest run on their code default.\n"
+        "\n{overridden} gate(s) have raw fleet_secrets rows; EFFECTIVE is the daemon-equivalent TTL projection.\n"
     ));
     out
 }
@@ -8448,14 +8513,37 @@ fn render_gates(rows: &[GateRow]) -> String {
 /// default, and what it controls.
 async fn handle_fleet_gates(pool: &sqlx::PgPool, json: bool) -> Result<()> {
     let keys: Vec<String> = DAEMON_GATES.iter().map(|g| g.key.to_string()).collect();
-    let live: Vec<(String, String)> =
-        sqlx::query_as("SELECT key, value FROM fleet_secrets WHERE key = ANY($1)")
-            .bind(&keys)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| anyhow::anyhow!("read fleet_secrets gates: {e}"))?;
-    let set: std::collections::HashMap<String, String> = live.into_iter().collect();
-    let rows = build_gate_rows(&set);
+    let live: Vec<(
+        String,
+        String,
+        Option<chrono::DateTime<chrono::Utc>>,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT key, value, expires_at, previous_value, disabled_reason \
+           FROM fleet_secrets WHERE key = ANY($1)",
+    )
+    .bind(&keys)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| anyhow::anyhow!("read fleet_secrets gates: {e}"))?;
+    let set: std::collections::HashMap<String, GateOverride> = live
+        .into_iter()
+        .map(
+            |(key, raw_value, expires_at, previous_value, disabled_reason)| {
+                (
+                    key,
+                    GateOverride {
+                        raw_value,
+                        expires_at,
+                        previous_value,
+                        disabled_reason,
+                    },
+                )
+            },
+        )
+        .collect();
+    let rows = build_gate_rows(&set, chrono::Utc::now());
     if json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
@@ -8471,7 +8559,7 @@ mod gates_tests {
 
     #[test]
     fn defaults_when_unset() {
-        let rows = build_gate_rows(&HashMap::new());
+        let rows = build_gate_rows(&HashMap::new(), chrono::Utc::now());
         assert_eq!(rows.len(), DAEMON_GATES.len());
         let unique: std::collections::HashSet<_> = rows.iter().map(|row| &row.key).collect();
         assert_eq!(unique.len(), rows.len(), "daemon gate keys must be unique");
@@ -8500,9 +8588,21 @@ mod gates_tests {
     #[test]
     fn explicit_set_overrides_and_marks_source() {
         let mut set = HashMap::new();
-        set.insert("autoscaler_mode".to_string(), "active".to_string());
-        set.insert("leader_self_upgrade".to_string(), "false".to_string());
-        let rows = build_gate_rows(&set);
+        for (key, raw_value) in [
+            ("autoscaler_mode", "active"),
+            ("leader_self_upgrade", "false"),
+        ] {
+            set.insert(
+                key.to_string(),
+                GateOverride {
+                    raw_value: raw_value.to_string(),
+                    expires_at: None,
+                    previous_value: None,
+                    disabled_reason: None,
+                },
+            );
+        }
+        let rows = build_gate_rows(&set, chrono::Utc::now());
         let asc = rows.iter().find(|r| r.key == "autoscaler_mode").unwrap();
         assert_eq!(asc.value, "active");
         assert_eq!(asc.source, "set");
@@ -8521,11 +8621,65 @@ mod gates_tests {
     #[test]
     fn render_includes_header_and_override_count() {
         let mut set = HashMap::new();
-        set.insert("autoscaler_mode".to_string(), "active".to_string());
-        let out = render_gates(&build_gate_rows(&set));
+        set.insert(
+            "autoscaler_mode".to_string(),
+            GateOverride {
+                raw_value: "active".to_string(),
+                expires_at: None,
+                previous_value: None,
+                disabled_reason: None,
+            },
+        );
+        let out = render_gates(&build_gate_rows(&set, chrono::Utc::now()));
         assert!(out.contains("forgefleetd subsystem gates"));
         assert!(out.contains("autoscaler_mode"));
         assert!(out.contains("active"));
-        assert!(out.contains("1 gate(s) explicitly set"));
+        assert!(out.contains("1 gate(s) have raw fleet_secrets rows"));
+    }
+
+    #[test]
+    fn expired_boolean_disable_projects_the_daemon_restore_value() {
+        let now = chrono::Utc::now();
+        let set = HashMap::from([(
+            "work_item_execution_enabled".to_string(),
+            GateOverride {
+                raw_value: "false".to_string(),
+                expires_at: Some(now - chrono::TimeDelta::seconds(1)),
+                previous_value: None,
+                disabled_reason: Some("recovery freeze".to_string()),
+            },
+        )]);
+        let rows = build_gate_rows(&set, now);
+        let gate = rows
+            .iter()
+            .find(|row| row.key == "work_item_execution_enabled")
+            .unwrap();
+        assert_eq!(gate.raw_value.as_deref(), Some("false"));
+        assert_eq!(gate.effective_value, "true");
+        assert_eq!(gate.source, "expired_restore");
+        assert_eq!(gate.disabled_reason.as_deref(), Some("recovery freeze"));
+    }
+
+    #[test]
+    fn expired_mode_disable_projects_the_previous_three_state_value() {
+        let now = chrono::Utc::now();
+        let set = HashMap::from([(
+            "autoscaler_mode".to_string(),
+            GateOverride {
+                raw_value: "false".to_string(),
+                expires_at: Some(now - chrono::TimeDelta::seconds(1)),
+                previous_value: Some("dry_run".to_string()),
+                disabled_reason: Some("maintenance".to_string()),
+            },
+        )]);
+        let rows = build_gate_rows(&set, now);
+        let gate = rows
+            .iter()
+            .find(|row| row.key == "autoscaler_mode")
+            .unwrap();
+        assert_eq!(gate.raw_value.as_deref(), Some("false"));
+        assert_eq!(gate.effective_value, "dry_run");
+        assert_eq!(gate.previous_value.as_deref(), Some("dry_run"));
+        assert_eq!(gate.source, "expired_restore");
     }
 }
