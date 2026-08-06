@@ -71,6 +71,9 @@ struct CompletionDispatchRequest<'a> {
 pub enum ResolvedTargetProvenance {
     ExplicitCatalog,
     ExplicitUrl,
+    /// Selected by policy from the router, then pinned to one immutable
+    /// deployment so the request cannot fail over to an ineligible peer.
+    PinnedRoute,
     Auto,
 }
 
@@ -111,11 +114,12 @@ impl ResolvedTargetProvenance {
         match self {
             Self::ExplicitCatalog => "explicit_catalog",
             Self::ExplicitUrl => "explicit_url",
+            Self::PinnedRoute => "pinned_route",
             Self::Auto => "auto",
         }
     }
 
-    pub fn is_explicit(self) -> bool {
+    pub fn is_pinned(self) -> bool {
         !matches!(self, Self::Auto)
     }
 }
@@ -929,7 +933,7 @@ pub async fn revalidate_explicit_target(
     require_tool_calling: bool,
     min_ctx: Option<i32>,
 ) -> Result<RouteCandidate> {
-    if !target.provenance.is_explicit() {
+    if !target.provenance.is_pinned() {
         return Err(anyhow!(
             "exact-target validation requires explicit provenance, got {}",
             target.provenance.as_str()
@@ -1207,7 +1211,7 @@ async fn dispatch_to_resolved_target(
 }
 
 fn enforce_dispatch_attestation(target: &ResolvedFleetTarget) -> Result<()> {
-    if target.provenance.is_explicit() && target.attestation != EndpointAttestationState::Verified {
+    if target.provenance.is_pinned() && target.attestation != EndpointAttestationState::Verified {
         return Err(anyhow!(
             "explicit target {} could not be identity-attested ({})",
             target.endpoint,
@@ -1925,6 +1929,28 @@ mod tests {
         assert_eq!(target.model_label, "Lucy 1.7B");
         assert_eq!(target.engine_label(), "local:unattested:lucy-1-7b");
         assert_eq!(target.route_decision()["provenance"], "auto");
+    }
+
+    #[test]
+    fn pinned_route_is_exact_target_eligible_and_auditable() {
+        assert!(!ResolvedTargetProvenance::Auto.is_pinned());
+        assert!(ResolvedTargetProvenance::PinnedRoute.is_pinned());
+        assert_eq!(
+            serde_json::to_string(&ResolvedTargetProvenance::PinnedRoute).unwrap(),
+            "\"pinned_route\""
+        );
+
+        let mut candidate = candidate("http://adele:55000", "adele", Some("code"), Some(1));
+        candidate.catalog_id = Some("devstral-small-2-24b".to_string());
+        candidate.catalog_name = Some("Devstral Small 2 24B".to_string());
+        let target = resolved_target_from_candidate(
+            &candidate,
+            ResolvedTargetProvenance::PinnedRoute,
+            false,
+        )
+        .unwrap();
+        assert_eq!(target.provenance, ResolvedTargetProvenance::PinnedRoute);
+        assert_eq!(target.route_decision()["provenance"], "pinned_route");
     }
 
     #[test]

@@ -2848,7 +2848,7 @@ async fn resolve_distinct_local_review_target(
         match crate::fleet_oneshot::resolve_candidate_target(
             pg,
             &candidate,
-            crate::fleet_oneshot::ResolvedTargetProvenance::Auto,
+            crate::fleet_oneshot::ResolvedTargetProvenance::PinnedRoute,
             false,
         )
         .await
