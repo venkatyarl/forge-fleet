@@ -4175,8 +4175,9 @@ pub async fn handle_fleet(cmd: FleetCommand) -> Result<()> {
             concurrency,
             json,
             graceful,
+            via_defer,
         } => {
-            handle_fleet_deploy(&pool, all, node, concurrency, json, graceful).await?;
+            handle_fleet_deploy(&pool, all, node, concurrency, json, graceful, via_defer).await?;
         }
         FleetCommand::Autoscaler { mode } => {
             handle_fleet_autoscaler(&pool, &mode).await?;
@@ -6092,12 +6093,16 @@ async fn handle_fleet_deploy(
     concurrency: usize,
     json: bool,
     graceful: bool,
+    via_defer: bool,
 ) -> Result<()> {
     if !all && node.is_none() {
         anyhow::bail!("pass --all or --node <name> to pick targets");
     }
     if all && node.is_some() {
         anyhow::bail!("--all and --node are mutually exclusive");
+    }
+    if via_defer && json {
+        anyhow::bail!("--via-defer --json is not supported");
     }
     let concurrency = concurrency.max(1);
 
@@ -6177,6 +6182,14 @@ async fn handle_fleet_deploy(
             report_skipped_hosts(&skipped);
         }
         return Ok(());
+    }
+
+    // --via-defer: skip the SSH preflight + drain entirely — the whole point is
+    // nodes whose SSH is closed but whose forgefleetd is online. Queue one
+    // self-build deferred task per node; each node's own defer-worker executes
+    // the canonical deploy playbook when it sees the node online.
+    if via_defer {
+        return deploy_via_defer(pool, &targets, &skipped).await;
     }
 
     // Prove every DB-online target is actually reachable before taking a
@@ -6460,6 +6473,83 @@ async fn handle_fleet_deploy(
     // counts TARGETED hosts, so "N/N converged" can otherwise read as full-fleet
     // coverage while offline/reserved hosts were silently left behind.
     report_skipped_hosts(&skipped);
+    Ok(())
+}
+
+/// `ff fleet deploy --via-defer`: queue the canonical self-build playbook as
+/// one deferred shell task per target node instead of driving it over SSH. For
+/// nodes whose SSH is closed but whose forgefleetd is online (vinny, macOS,
+/// 2026-08-06): each node's defer-worker claims its own task (trigger
+/// node_online + preferred_node) and self-upgrades. No drain, no SSH, no
+/// leader self-refresh — the deploy itself happens asynchronously per node.
+async fn deploy_via_defer(
+    pool: &sqlx::PgPool,
+    targets: &[DeployTarget],
+    skipped: &[(String, String, String)],
+) -> Result<()> {
+    // Pin the rollout to the same immutable live branch tip the SSH path uses.
+    let target = live_remote_main_target().await?;
+    let who = whoami_tag();
+    let mut enqueued: Vec<(String, String)> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    for t in targets {
+        // Same playbook the SSH path runs — fetch/reset → web build → cargo
+        // build → install → restart — resolved with this node's own os_family
+        // + source_tree_path, exactly as plans resolve them.
+        let playbook = deploy_playbook(
+            &t.os_family,
+            &t.source_tree_path,
+            &target.remote_url,
+            &target.sha,
+        );
+        let title = format!("deploy {} to {} (via-defer)", short10(&target.sha), t.name);
+        let payload = serde_json::json!({
+            "command": playbook,
+            // Self-builds on memory-tight boxes can run long; 90min matches the
+            // SSH path's worst-case build timeout budget.
+            "max_duration_secs": 5400,
+        });
+        match ff_db::pg_enqueue_deferred(
+            pool,
+            &title,
+            "shell",
+            &payload,
+            "node_online",
+            &serde_json::json!({"node": t.name}),
+            Some(&t.name),
+            &serde_json::json!([]),
+            Some(&who),
+            None,
+        )
+        .await
+        {
+            Ok(id) => enqueued.push((t.name.clone(), id)),
+            Err(e) => failures.push((t.name.clone(), e.to_string())),
+        }
+    }
+
+    println!(
+        "{CYAN}▶ ff fleet deploy --via-defer{RESET}: {} deferred task(s) queued targeting {}",
+        enqueued.len(),
+        short10(&target.sha)
+    );
+    for (name, id) in &enqueued {
+        println!("  {name:<12} task {id}");
+    }
+    for (name, err) in &failures {
+        eprintln!("{YELLOW}⚠ {name:<12} enqueue failed: {err}{RESET}");
+    }
+    report_skipped_hosts(skipped);
+    println!();
+    println!("Each node self-executes its playbook when its defer-worker sees the node online;");
+    println!("watch with `ff defer list` (or `ff defer get <id>`).");
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} of {} enqueue(s) failed",
+            failures.len(),
+            enqueued.len() + failures.len()
+        );
+    }
     Ok(())
 }
 
