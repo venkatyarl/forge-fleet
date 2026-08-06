@@ -285,6 +285,12 @@ fn install_kimi(
     let config = home.join(".kimi-code").join("mcp.json");
     upsert_resilient_mcp_server_json(&config, "forgefleet", server_url, dry_run)?;
     println!("  ✓ kimi: {}", config.display());
+    // Some kimi builds/versions read ~/.kimi/mcp.json instead — a write to
+    // the wrong one is silently ignored (found live on vinny 2026-08-06).
+    // Upsert the fallback too; idempotent.
+    let legacy = home.join(".kimi").join("mcp.json");
+    upsert_mcp_server_json(&legacy, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ kimi: {} (fallback path)", legacy.display());
     if write_instructions {
         // Kimi reads agent instructions from ~/.kimi/AGENTS.md (the cross-tool
         // AGENTS.md convention).
@@ -646,30 +652,47 @@ fn text_mark(state: &str) -> &'static str {
     }
 }
 
-fn status_candidates(home: &std::path::Path) -> Vec<(&'static str, PathBuf)> {
-    let mut candidates = vec![
-        ("claude-code", home.join(".claude").join("settings.json")),
-        ("claude-desktop", claude_desktop_config_path(home)),
-        ("codex", home.join(".codex").join("config.toml")),
-        ("gemini", home.join(".gemini").join("settings.json")),
-        ("kimi", home.join(".kimi-code").join("mcp.json")),
-        ("kimi-desktop", kimi_desktop_config_path(home)),
-        ("cursor", home.join(".cursor").join("mcp.json")),
+fn status_candidates(home: &std::path::Path) -> Vec<(&'static str, Vec<PathBuf>)> {
+    // Each client maps to its candidate config paths in preference order.
+    // Install writes ALL candidates (a write to a path the client ignores is
+    // silently dropped — vinny 2026-08-06), so status must accept a match on
+    // ANY candidate and report the path that matched.
+    let mut candidates: Vec<(&'static str, Vec<PathBuf>)> = vec![
+        (
+            "claude-code",
+            vec![
+                home.join(".claude").join("settings.json"),
+                home.join(".claude.json"),
+            ],
+        ),
+        ("claude-desktop", vec![claude_desktop_config_path(home)]),
+        ("codex", vec![home.join(".codex").join("config.toml")]),
+        ("gemini", vec![home.join(".gemini").join("settings.json")]),
+        (
+            "kimi",
+            vec![
+                home.join(".kimi-code").join("mcp.json"),
+                home.join(".kimi").join("mcp.json"),
+            ],
+        ),
+        ("kimi-desktop", vec![kimi_desktop_config_path(home)]),
+        ("cursor", vec![home.join(".cursor").join("mcp.json")]),
         (
             "windsurf",
-            home.join(".codeium")
+            vec![home
+                .join(".codeium")
                 .join("windsurf")
-                .join("mcp_config.json"),
+                .join("mcp_config.json")],
         ),
         (
             "goose",
-            home.join(".config").join("goose").join("config.yaml"),
+            vec![home.join(".config").join("goose").join("config.yaml")],
         ),
-        ("grok", home.join(".grok").join("mcp-config.json")),
+        ("grok", vec![home.join(".grok").join("mcp-config.json")]),
     ];
     let legacy_kimi = home.join(".kimi").join("config.json");
     if legacy_kimi.exists() {
-        candidates.insert(5, ("kimi-legacy", legacy_kimi));
+        candidates.insert(5, ("kimi-legacy", vec![legacy_kimi]));
     }
     candidates
 }
@@ -698,10 +721,17 @@ fn config_has_forgefleet(path: &std::path::Path) -> bool {
 fn status_rows(home: &std::path::Path) -> Vec<Value> {
     status_candidates(home)
         .into_iter()
-        .map(|(name, path)| {
+        .map(|(name, paths)| {
+            // A client counts as installed if ANY candidate path carries the
+            // forgefleet entry; report the path that matched (else primary).
+            let matched = paths.iter().find(|p| p.exists() && config_has_forgefleet(p));
+            let (path, has_ff) = match matched {
+                Some(p) => (p.clone(), true),
+                None => (paths[0].clone(), false),
+            };
             let exists = path.exists();
-            let has_ff = exists && config_has_forgefleet(&path);
-            json!({
+            let transport = has_ff.then(|| config_forgefleet_transport(&path)).flatten();
+>>>>>>> 4c3c75d9 (feat: desktop apps download-to-Downloads + MCP dual-path status + canonical che            json!({
                 "client": name,
                 "config_path": path.display().to_string(),
                 "exists": exists,

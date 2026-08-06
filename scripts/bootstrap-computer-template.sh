@@ -578,26 +578,30 @@ migrate_native() {
 migrate_native claude https://claude.ai/install.sh
 migrate_native codex https://chatgpt.com/codex/install.sh
 
-# Desktop clients (macOS): install the desktop apps when missing so a fresh
-# machine is fully usable, not just CLI-wired. All three casks auto-update:
+# Desktop clients (macOS): download the installers to ~/Downloads so the
+# OPERATOR installs the dmg/zip by hand (operator preference 2026-08-06 —
+# no silent brew cask installs of GUI apps). brew fetch resolves the current
+# vendor URL, so Downloads always gets the latest without hardcoding
+# versioned links. All three apps auto-update once installed:
 #   claude  — Anthropic's Claude desktop
 #   kimi    — Moonshot's Kimi desktop
 #   chatgpt — OpenAI's desktop app; Codex's desktop mode lives here now (the
 #             standalone Codex desktop app was merged into it, July 2026)
+# These three have no official Linux builds; the Windows template downloads
+# the exe installers to Downloads the same way.
 if [ "$OS_ID" = "macos" ]; then
-  if [ ! -d "/Applications/Claude.app" ]; then
-    run_as_user bash -lc 'brew install --cask claude' \
-      || report "desktop_apps" warn "Claude desktop cask install failed — install manually"
-  fi
-  if [ ! -d "/Applications/Kimi.app" ]; then
-    run_as_user bash -lc 'brew install --cask kimi' \
-      || report "desktop_apps" warn "Kimi desktop cask install failed — install manually"
-  fi
-  if [ ! -d "/Applications/ChatGPT.app" ]; then
-    run_as_user bash -lc 'brew install --cask chatgpt' \
-      || report "desktop_apps" warn "ChatGPT desktop cask install failed — install manually"
-  fi
-  report "desktop_apps" ok "claude + kimi desktop present"
+  DESKTOP_DL="$USER_HOME/Downloads/fleet-desktop-apps"
+  run_as_user mkdir -p "$DESKTOP_DL"
+  desktop_fetch() {
+    local app_dir="$1" cask="$2"
+    [ -d "$app_dir" ] && return 0
+    run_as_user bash -lc "brew fetch --cask $cask >/dev/null 2>&1 && cp \"\$(brew --cache --cask $cask)\" '$DESKTOP_DL/'" \
+      || report "desktop_apps" warn "$cask installer download failed — fetch from the vendor site by hand"
+  }
+  desktop_fetch "/Applications/Claude.app" claude
+  desktop_fetch "/Applications/Kimi.app" kimi
+  desktop_fetch "/Applications/ChatGPT.app" chatgpt
+  report "desktop_apps" ok "installers in ~/Downloads/fleet-desktop-apps (operator installs)"
 fi
 
 report "cloud_clis" ok "claude, codex, kimi"
