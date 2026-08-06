@@ -181,6 +181,14 @@ fn install_claude_code(
     let settings_path = home.join(".claude").join("settings.json");
     upsert_resilient_mcp_server_json(&settings_path, "forgefleet", server_url, dry_run)?;
     println!("  ✓ claude-code: {}", settings_path.display());
+    // Claude Code versions differ on where user-scope mcpServers are honored:
+    // newer builds read ~/.claude.json, older ones ~/.claude/settings.json —
+    // and a write to the wrong one is SILENTLY ignored (found live on vinny
+    // 2026-08-06: ff reported "installed" while the session saw no tools).
+    // Write both; the upsert is idempotent.
+    let user_scope = home.join(".claude.json");
+    upsert_mcp_server_json(&user_scope, "forgefleet", server_url, dry_run)?;
+    println!("  ✓ claude-code: {} (user scope)", user_scope.display());
     if write_instructions {
         let claude_md = home.join(".claude").join("CLAUDE.md");
         append_instructions_md(&claude_md, dry_run)?;
