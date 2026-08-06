@@ -10623,6 +10623,18 @@ pub struct MemoryEvictionArchive<'a> {
     pub brain_ref: Option<&'a str>,
 }
 
+/// Compare-and-set inputs for one bounded Scratchpad block write.
+#[derive(Debug, Clone, Copy)]
+pub struct MemoryTrySetBlockRequest<'a> {
+    pub scope_type: &'a str,
+    pub scope_key: &'a str,
+    pub block: &'a str,
+    pub expected_content: &'a str,
+    pub new_content: &'a str,
+    pub allow_over_cap_repair: bool,
+    pub eviction_archive: Option<MemoryEvictionArchive<'a>>,
+}
+
 fn memory_write_allowed(
     current_total: i64,
     current_block_bytes: i64,
@@ -10649,14 +10661,17 @@ fn memory_write_allowed(
 /// the block replacement.
 pub async fn pg_memory_try_set_block(
     pool: &PgPool,
-    scope_type: &str,
-    scope_key: &str,
-    block: &str,
-    expected_content: &str,
-    new_content: &str,
-    allow_over_cap_repair: bool,
-    eviction_archive: Option<MemoryEvictionArchive<'_>>,
+    request: MemoryTrySetBlockRequest<'_>,
 ) -> Result<MemoryBlockWriteResult> {
+    let MemoryTrySetBlockRequest {
+        scope_type,
+        scope_key,
+        block,
+        expected_content,
+        new_content,
+        allow_over_cap_repair,
+        eviction_archive,
+    } = request;
     let mut tx = pool.begin().await?;
     sqlx::query("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         .execute(&mut *tx)
@@ -12173,7 +12188,7 @@ pub async fn pg_record_route_decision(
         session_id: Some(decision.trace_id),
         channel: "router-decision".to_string(),
         request_text: "cloud backend route decision".to_string(),
-        route_decision: serde_json::to_value(&decision)?,
+        route_decision: serde_json::to_value(decision)?,
         engine: decision.chosen.clone(),
         cost_usd: decision.estimated_cost_usd,
         outcome: if decision.mode == "debug" {

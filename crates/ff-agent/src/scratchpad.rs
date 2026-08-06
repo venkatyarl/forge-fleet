@@ -14,7 +14,10 @@
 //! Design: `plans/agent-working-memory.md` (LLM council 2026-06-19).
 
 use anyhow::{Context, Result, bail};
-use ff_db::queries::{MEMORY_BLOCKS, MemoryBlock, MemoryBlockWriteStatus, MemoryEvictionArchive};
+use ff_db::queries::{
+    MEMORY_BLOCKS, MemoryBlock, MemoryBlockWriteStatus, MemoryEvictionArchive,
+    MemoryTrySetBlockRequest,
+};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tracing::{info, warn};
@@ -358,13 +361,15 @@ async fn write_block(
 ) -> Result<WriteResult> {
     let write = ff_db::queries::pg_memory_try_set_block(
         pool,
-        scope_type,
-        scope_key,
-        block,
-        expected_content,
-        content,
-        false,
-        None,
+        MemoryTrySetBlockRequest {
+            scope_type,
+            scope_key,
+            block,
+            expected_content,
+            new_content: content,
+            allow_over_cap_repair: false,
+            eviction_archive: None,
+        },
     )
     .await
     .context("write bounded memory block")?;
@@ -522,20 +527,22 @@ async fn consolidate_and_forget_from(
 
         let replacement = ff_db::queries::pg_memory_try_set_block(
             pool,
-            scope_type,
-            scope_key,
-            &target.block,
-            &target.content,
-            &summary,
-            true,
-            Some(MemoryEvictionArchive {
-                expected_scope_hash: expected_scope_hash.as_deref().expect("snapshot hash"),
-                expected_cap_bytes: cap,
-                prev_bytes: target.bytes,
-                result_summary: &summary,
-                summarizer: "fleet-summarizer",
-                brain_ref: brain_ref.as_deref(),
-            }),
+            MemoryTrySetBlockRequest {
+                scope_type,
+                scope_key,
+                block: &target.block,
+                expected_content: &target.content,
+                new_content: &summary,
+                allow_over_cap_repair: true,
+                eviction_archive: Some(MemoryEvictionArchive {
+                    expected_scope_hash: expected_scope_hash.as_deref().expect("snapshot hash"),
+                    expected_cap_bytes: cap,
+                    prev_bytes: target.bytes,
+                    result_summary: &summary,
+                    summarizer: "fleet-summarizer",
+                    brain_ref: brain_ref.as_deref(),
+                }),
+            },
         )
         .await
         .context("replace block with bounded summary")?;
@@ -723,20 +730,22 @@ async fn hard_trim(
     );
     let replacement = ff_db::queries::pg_memory_try_set_block(
         pool,
-        scope_type,
-        scope_key,
-        &block.block,
-        &block.content,
-        &trimmed,
-        true,
-        Some(MemoryEvictionArchive {
-            expected_scope_hash,
-            expected_cap_bytes,
-            prev_bytes: block.bytes,
-            result_summary: "hard-trimmed to newest half",
-            summarizer: "hard-trim",
-            brain_ref: brain_ref.as_deref(),
-        }),
+        MemoryTrySetBlockRequest {
+            scope_type,
+            scope_key,
+            block: &block.block,
+            expected_content: &block.content,
+            new_content: &trimmed,
+            allow_over_cap_repair: true,
+            eviction_archive: Some(MemoryEvictionArchive {
+                expected_scope_hash,
+                expected_cap_bytes,
+                prev_bytes: block.bytes,
+                result_summary: "hard-trimmed to newest half",
+                summarizer: "hard-trim",
+                brain_ref: brain_ref.as_deref(),
+            }),
+        },
     )
     .await
     .context("hard-trim block")?;

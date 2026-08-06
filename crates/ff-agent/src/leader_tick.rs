@@ -35,8 +35,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use ff_db::leader_state::{
-    LeaderState, pg_claim_leader_initial, pg_claim_leader_pulse_silent, pg_claim_leader_takeover,
-    pg_get_current_leader, pg_refresh_leader_heartbeat, pg_yield_leader,
+    LeaderState, LeaderTakeoverRequest, pg_claim_leader_initial, pg_claim_leader_pulse_silent,
+    pg_claim_leader_takeover, pg_get_current_leader, pg_refresh_leader_heartbeat, pg_yield_leader,
 };
 use ff_pulse::reader::{PulseError, PulseReader};
 
@@ -751,13 +751,15 @@ impl LeaderTick {
                     let displaced_name = cur.member_name.clone();
                     let took = pg_claim_leader_takeover(
                         &self.pg,
-                        self.my_computer_id,
-                        &self.my_name,
-                        new_epoch,
-                        &displaced_name,
-                        STALE_THRESHOLD_SECS,
-                        redis_url.as_deref(),
-                        nats_url.as_deref(),
+                        LeaderTakeoverRequest {
+                            my_computer_id: self.my_computer_id,
+                            my_name: &self.my_name,
+                            new_epoch,
+                            old_leader_name: &displaced_name,
+                            stale_threshold_secs: STALE_THRESHOLD_SECS,
+                            redis_url: redis_url.as_deref(),
+                            nats_url: nats_url.as_deref(),
+                        },
                     )
                     .await?;
                     if took {
