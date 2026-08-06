@@ -1110,6 +1110,18 @@ async fn run_daemon(cli: &Cli, start: &StartArgs) -> Result<()> {
         ));
     }
 
+    // 18b'') Infra canary — leader-gated, every 60s: TCP-probe the fleet's
+    // shared Redis + NATS and alert when one dies. The 2026-08-03 incident:
+    // NATS was dead ~35h with zero alerts while surfaces went quietly stale.
+    if let Some(pg_pool) = operational_store.pg_pool().cloned() {
+        subsystem_tasks.push(ff_agent::infra_canary::spawn_infra_canary_tick(
+            pg_pool,
+            ff_agent::infra_canary::resolve_redis_url(&config),
+            60,
+            shutdown_rx.clone(),
+        ));
+    }
+
     // 18c) Fleet-integrity verify tick — every 15min, leader-gated, gate
     // `fleet_secrets.fleet_integrity_mode` (off|report, DEFAULT off).
     // `revive_scan` already repairs DEAD nodes; this covers the blind spot of an

@@ -73,6 +73,7 @@ pub mod dynamic_loader;
 pub mod external_tools_installer;
 pub mod external_tools_registry;
 pub mod external_tools_upstream;
+pub mod infra_canary;
 pub mod features;
 pub mod file_history;
 pub mod fleet_events;
