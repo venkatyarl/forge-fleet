@@ -85,7 +85,10 @@ pub async fn cortex_tool(
     let mut args = serde_json::Map::new();
     for (key, value) in params {
         let coerced = if CORTEX_INT_PARAMS.contains(&key.as_str()) {
-            value.parse::<i64>().map(Value::from).unwrap_or(Value::from(value))
+            value
+                .parse::<i64>()
+                .map(Value::from)
+                .unwrap_or(Value::from(value))
         } else if CORTEX_BOOL_PARAMS.contains(&key.as_str()) {
             Value::from(matches!(value.as_str(), "true" | "1" | "yes"))
         } else {
