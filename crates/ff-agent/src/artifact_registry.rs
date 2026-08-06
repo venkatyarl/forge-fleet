@@ -8,8 +8,16 @@
 //! snapshot.
 
 use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 
 use ff_core::model_integrity::{
     ModelArtifactKind, ModelIntegrityError, ModelIntegrityLimits, constant_time_sha256_eq,
@@ -55,6 +63,18 @@ pub enum ArtifactRegistryError {
     InvalidArtifactName,
     #[error("release artifact relative-path basename must exactly match its artifact name")]
     ArtifactBasenameMismatch,
+    #[error("release artifact custody path must be a non-empty normal relative path")]
+    InvalidCustodyPath,
+    #[error("could not inspect release artifact custody parent {path}: {source}")]
+    CustodyParentInspection {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "release artifact custody parent is not a private effective-user-owned directory: {path}"
+    )]
+    UnsafeCustodyParent { path: PathBuf },
     #[error(transparent)]
     Filesystem(#[from] ModelIntegrityError),
     #[error(transparent)]
@@ -135,13 +155,30 @@ pub async fn register_local_release_artifact(
     spec: &LocalReleaseArtifactSpec,
 ) -> Result<ReleaseArtifactRegistration, ArtifactRegistryError> {
     let release_root = local_release_build_root()?;
-    let assertion = verify_release_evidence(identity, &release_root, spec)?;
-    let registration = pg_register_release_artifact(pool, &assertion).await?;
+    let registration =
+        verify_then_register(identity, &release_root, spec, |assertion| async move {
+            pg_register_release_artifact(pool, &assertion).await
+        })
+        .await?;
     validate_release_artifact_basename(
         &registration.artifact.artifact_name,
         Path::new(&registration.custody.relative_path),
     )?;
     Ok(registration)
+}
+
+async fn verify_then_register<R, F, Fut>(
+    identity: &LocalComputerIdentity,
+    release_root: &Path,
+    spec: &LocalReleaseArtifactSpec,
+    register: F,
+) -> Result<R, ArtifactRegistryError>
+where
+    F: FnOnce(ReleaseArtifactAssertion) -> Fut,
+    Fut: Future<Output = Result<R, DbError>>,
+{
+    let assertion = verify_release_evidence(identity, release_root, spec)?;
+    Ok(register(assertion).await?)
 }
 
 fn verify_release_evidence(
@@ -160,6 +197,8 @@ fn verify_release_evidence(
     if spec.expected_size_bytes <= 0 {
         return Err(ArtifactRegistryError::InvalidSize);
     }
+
+    validate_private_custody_parents(release_root, &spec.relative_path)?;
 
     let expected_bytes =
         u64::try_from(spec.expected_size_bytes).map_err(|_| ArtifactRegistryError::InvalidSize)?;
@@ -191,6 +230,10 @@ fn verify_release_evidence(
         return Err(ArtifactRegistryError::DigestMismatch);
     }
     validate_release_artifact_basename(&spec.artifact_name, &spec.relative_path)?;
+    // Re-open the fixed path immediately before producing database evidence.
+    // The first pass prevents hashing through an unsafe parent; this pass also
+    // catches an ownership or mode change made while the file was hashed.
+    validate_private_custody_parents(release_root, &spec.relative_path)?;
 
     let relative_path = spec
         .relative_path
@@ -210,6 +253,128 @@ fn verify_release_evidence(
     })
 }
 
+/// One policy predicate is shared by release registration and activation so
+/// the producer and consumer cannot drift on directory ownership or modes.
+#[cfg(unix)]
+pub(crate) fn is_private_effective_user_directory(mode: u64, uid: u64, effective_uid: u64) -> bool {
+    mode & u64::from(libc::S_IFMT) == u64::from(libc::S_IFDIR)
+        && uid == effective_uid
+        && mode & 0o022 == 0
+}
+
+#[cfg(unix)]
+fn validate_private_custody_parents(
+    release_root: &Path,
+    relative_path: &Path,
+) -> Result<(), ArtifactRegistryError> {
+    let components = relative_path
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name),
+            _ => Err(ArtifactRegistryError::InvalidCustodyPath),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if components.is_empty() {
+        return Err(ArtifactRegistryError::InvalidCustodyPath);
+    }
+
+    let effective_uid = u64::from(unsafe { libc::geteuid() });
+    let mut current_path = release_root.to_path_buf();
+    let mut directory = open_private_directory(release_root, &current_path, effective_uid)?;
+    for name in &components[..components.len() - 1] {
+        current_path.push(name);
+        directory =
+            open_private_directory_at(directory.as_raw_fd(), name, &current_path, effective_uid)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_private_custody_parents(
+    _release_root: &Path,
+    relative_path: &Path,
+) -> Result<(), ArtifactRegistryError> {
+    if relative_path.as_os_str().is_empty()
+        || relative_path.is_absolute()
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ArtifactRegistryError::InvalidCustodyPath);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_directory(
+    path: &Path,
+    display_path: &Path,
+    effective_uid: u64,
+) -> Result<OwnedFd, ArtifactRegistryError> {
+    let encoded = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| ArtifactRegistryError::InvalidCustodyPath)?;
+    let raw = unsafe {
+        libc::open(
+            encoded.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    checked_private_directory(raw, display_path, effective_uid)
+}
+
+#[cfg(unix)]
+fn open_private_directory_at(
+    parent: RawFd,
+    name: &OsStr,
+    display_path: &Path,
+    effective_uid: u64,
+) -> Result<OwnedFd, ArtifactRegistryError> {
+    let encoded =
+        CString::new(name.as_bytes()).map_err(|_| ArtifactRegistryError::InvalidCustodyPath)?;
+    let raw = unsafe {
+        libc::openat(
+            parent,
+            encoded.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    checked_private_directory(raw, display_path, effective_uid)
+}
+
+#[cfg(unix)]
+fn checked_private_directory(
+    raw: RawFd,
+    display_path: &Path,
+    effective_uid: u64,
+) -> Result<OwnedFd, ArtifactRegistryError> {
+    if raw < 0 {
+        return Err(ArtifactRegistryError::CustodyParentInspection {
+            path: display_path.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // The OwnedFd pins the opened inode for fstat and closes it on every later
+    // error path; renaming the directory cannot redirect this descriptor.
+    let directory = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(directory.as_raw_fd(), &mut stat) } != 0 {
+        return Err(ArtifactRegistryError::CustodyParentInspection {
+            path: display_path.to_path_buf(),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    if !is_private_effective_user_directory(
+        u64::from(stat.st_mode),
+        u64::from(stat.st_uid),
+        effective_uid,
+    ) {
+        return Err(ArtifactRegistryError::UnsafeCustodyParent {
+            path: display_path.to_path_buf(),
+        });
+    }
+    Ok(directory)
+}
+
 pub(crate) fn validate_release_artifact_basename(
     artifact_name: &str,
     relative_path: &Path,
@@ -226,6 +391,10 @@ pub(crate) fn validate_release_artifact_basename(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::cell::Cell;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use uuid::Uuid;
 
     const ABC_SHA256: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -250,17 +419,135 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn set_directory_mode(path: &Path, mode: u32) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(unix)]
     #[test]
     fn verifies_a_normal_relative_file_under_the_fixed_root() {
         let root = tempfile::tempdir().unwrap();
         let relative = PathBuf::from("ff-build/artifact/ff");
         std::fs::create_dir_all(root.path().join("ff-build/artifact")).unwrap();
         std::fs::write(root.path().join(&relative), b"abc").unwrap();
+        set_directory_mode(root.path(), 0o755);
+        set_directory_mode(&root.path().join("ff-build"), 0o755);
+        set_directory_mode(&root.path().join("ff-build/artifact"), 0o755);
 
         let evidence = verify_release_evidence(&identity(), root.path(), &spec(relative)).unwrap();
         assert_eq!(evidence.sha256, ABC_SHA256);
         assert_eq!(evidence.size_bytes, 3);
         assert_eq!(evidence.relative_path, "ff-build/artifact/ff");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_group_writable_root_unchanged_before_registration() {
+        let root = tempfile::tempdir().unwrap();
+        let relative = PathBuf::from("build/ff");
+        std::fs::create_dir_all(root.path().join("build")).unwrap();
+        std::fs::write(root.path().join(&relative), b"abc").unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        let registration_called = Cell::new(false);
+
+        let error = verify_then_register(&identity(), root.path(), &spec(relative), |_| {
+            registration_called.set(true);
+            std::future::ready(Ok::<(), DbError>(()))
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactRegistryError::UnsafeCustodyParent { .. }
+        ));
+        assert!(!registration_called.get());
+        assert_eq!(
+            std::fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_writable_intermediate_unchanged() {
+        let root = tempfile::tempdir().unwrap();
+        let intermediate = root.path().join("build");
+        let relative = PathBuf::from("build/artifact/ff");
+        std::fs::create_dir_all(intermediate.join("artifact")).unwrap();
+        std::fs::write(root.path().join(&relative), b"abc").unwrap();
+        set_directory_mode(root.path(), 0o755);
+        set_directory_mode(&intermediate, 0o775);
+        set_directory_mode(&intermediate.join("artifact"), 0o755);
+
+        let error = verify_release_evidence(&identity(), root.path(), &spec(relative)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            ArtifactRegistryError::UnsafeCustodyParent { .. }
+        ));
+        assert_eq!(
+            std::fs::metadata(intermediate)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_non_writable_0755_custody_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let build = root.path().join("build");
+        let artifact = build.join("artifact");
+        let relative = PathBuf::from("build/artifact/ff");
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::write(root.path().join(&relative), b"abc").unwrap();
+        for directory in [root.path(), build.as_path(), artifact.as_path()] {
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        assert!(verify_release_evidence(&identity(), root.path(), &spec(relative)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_custody_parent() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("ff"), b"abc").unwrap();
+        set_directory_mode(root.path(), 0o755);
+        set_directory_mode(&real, 0o755);
+        symlink(&real, root.path().join("linked")).unwrap();
+
+        assert!(
+            verify_release_evidence(&identity(), root.path(), &spec(PathBuf::from("linked/ff")))
+                .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlinked_custody_root() {
+        use std::os::unix::fs::symlink;
+
+        let container = tempfile::tempdir().unwrap();
+        let real_root = container.path().join("real-root");
+        let linked_root = container.path().join("linked-root");
+        std::fs::create_dir(&real_root).unwrap();
+        std::fs::write(real_root.join("ff"), b"abc").unwrap();
+        set_directory_mode(&real_root, 0o755);
+        symlink(&real_root, &linked_root).unwrap();
+
+        assert!(matches!(
+            verify_release_evidence(&identity(), &linked_root, &spec(PathBuf::from("ff"))),
+            Err(ArtifactRegistryError::CustodyParentInspection { .. })
+        ));
     }
 
     #[cfg(unix)]
@@ -270,6 +557,8 @@ mod tests {
         std::fs::create_dir_all(root.path().join("build")).unwrap();
         std::fs::write(root.path().join("build/ff"), b"abc").unwrap();
         std::fs::write(root.path().join("build/forgefleetd"), b"abc").unwrap();
+        set_directory_mode(root.path(), 0o755);
+        set_directory_mode(&root.path().join("build"), 0o755);
 
         let mut daemon = spec(PathBuf::from("build/forgefleetd"));
         daemon.artifact_name = "forgefleetd".to_string();
@@ -310,6 +599,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("real"), b"abc").unwrap();
         symlink(root.path().join("real"), root.path().join("ff")).unwrap();
+        set_directory_mode(root.path(), 0o755);
 
         for rejected in [
             PathBuf::from("../ff"),
@@ -328,6 +618,7 @@ mod tests {
     fn rejects_digest_size_and_vinny_evidence() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("ff"), b"abc").unwrap();
+        set_directory_mode(root.path(), 0o755);
 
         let mut bad_digest = spec(PathBuf::from("ff"));
         bad_digest.expected_sha256 = "0".repeat(64);

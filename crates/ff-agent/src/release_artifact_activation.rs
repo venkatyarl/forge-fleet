@@ -29,8 +29,9 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::artifact_registry::{
-    LocalReleaseArtifactSpec, RELEASE_ARTIFACT_NAMES, authority_home_dir, local_release_build_root,
-    register_local_release_artifact, validate_release_artifact_basename,
+    LocalReleaseArtifactSpec, RELEASE_ARTIFACT_NAMES, authority_home_dir,
+    is_private_effective_user_directory, local_release_build_root, register_local_release_artifact,
+    validate_release_artifact_basename,
 };
 use crate::fleet_info::{LocalComputerIdentity, resolve_this_computer_identity_strict};
 
@@ -1220,10 +1221,11 @@ fn ensure_owned_directory_tree(root: &Path, relative: &Path) -> Result<()> {
 fn validate_owned_directory(path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     use std::os::unix::fs::MetadataExt;
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o022 != 0
-    {
+    if !is_private_effective_user_directory(
+        u64::from(metadata.mode()),
+        u64::from(metadata.uid()),
+        u64::from(unsafe { libc::geteuid() }),
+    ) {
         return Err(ReleaseActivationError::Refused(format!(
             "authority directory is not a private effective-user-owned directory: {}",
             path.display()
@@ -2711,10 +2713,11 @@ fn fstat_fd(fd: RawFd) -> Result<libc::stat> {
 }
 
 fn validate_directory_stat(stat: &libc::stat) -> Result<()> {
-    if stat.st_mode & libc::S_IFMT != libc::S_IFDIR
-        || stat.st_uid != unsafe { libc::geteuid() }
-        || stat.st_mode & 0o022 != 0
-    {
+    if !is_private_effective_user_directory(
+        u64::from(stat.st_mode),
+        u64::from(stat.st_uid),
+        u64::from(unsafe { libc::geteuid() }),
+    ) {
         return Err(ReleaseActivationError::Refused(
             "path component is not a private effective-user-owned directory".into(),
         ));
