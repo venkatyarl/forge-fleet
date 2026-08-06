@@ -65,7 +65,7 @@ const MAX_BUILD_ATTEMPTS: i32 = 5;
 const DISPATCH_TICK_STALE_SECS: i64 = 60;
 const FAILED_RETRY_COOLDOWN_MINUTES: i64 = 20;
 const MAX_FAILED_RETRIES: i32 = 3;
-pub(crate) const WORK_ITEM_EXECUTION_ENABLED_KEY: &str = "work_item_execution_enabled";
+pub(crate) const WORK_ITEM_EXECUTION_ENABLED_KEY: &str = ff_db::WORK_ITEM_EXECUTION_ENABLED_KEY;
 const WORK_ITEM_EXECUTION_DEFAULT: bool = true;
 const WORK_ITEM_EXECUTION_RESTORE_ON_EXPIRY: bool = true;
 
@@ -101,6 +101,20 @@ pub(crate) async fn work_item_execution_enabled(pg: &PgPool) -> bool {
         )
         .await,
     )
+}
+
+async fn work_item_execution_exemption(pg: &PgPool) -> Option<uuid::Uuid> {
+    match ff_db::pg_work_item_execution_exemption(pg).await {
+        Ok(exemption) => exemption,
+        Err(error) => {
+            warn!(
+                key = ff_db::WORK_ITEM_EXECUTION_EXEMPTION_KEY,
+                %error,
+                "work-item execution exemption read failed; admitting no canary"
+            );
+            None
+        }
+    }
 }
 
 const LEASE_STALE_SAMPLE_SQL: &str = r#"
@@ -594,9 +608,20 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         );
     }
 
+    if let Err(error) = ff_db::pg_clear_terminal_work_item_execution_exemption(pg).await {
+        warn!(%error, "work_item_scheduler: could not clear terminal execution exemption");
+    }
+
     // Keep reconciliation and stale-lease cleanup alive during a recovery
-    // freeze, but stop before fetching capacity or creating any new leases.
-    if !work_item_execution_enabled(pg).await {
+    // freeze. A bounded exact-UUID exemption may admit one item without
+    // opening the global queue; every invalid authority state admits zero.
+    let execution_enabled = work_item_execution_enabled(pg).await;
+    let execution_exemption = if execution_enabled {
+        None
+    } else {
+        work_item_execution_exemption(pg).await
+    };
+    if !execution_enabled && execution_exemption.is_none() {
         tracing::debug!(
             key = WORK_ITEM_EXECUTION_ENABLED_KEY,
             "work_item_scheduler: new assignments paused by execution gate"
@@ -604,7 +629,14 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
         return Ok(0);
     }
 
-    let ready = ff_db::pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK).await?;
+    let ready = if let Some(work_item_id) = execution_exemption {
+        ff_db::pg_ready_work_item(pg, work_item_id)
+            .await?
+            .into_iter()
+            .collect()
+    } else {
+        ff_db::pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK).await?
+    };
     if ready.is_empty() {
         return Ok(0);
     }
@@ -713,6 +745,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             &dispatch_live,
             &viable,
             &mut fallback_assigns,
+            execution_exemption,
         )
         .await
         {
@@ -731,6 +764,7 @@ pub async fn evaluate_work_items(pg: &PgPool) -> Result<usize> {
             &dispatch_live,
             &viable,
             &mut fallback_assigns,
+            execution_exemption,
         )
         .await
         {
@@ -778,6 +812,7 @@ async fn try_assign_item(
     dispatch_live: &HashSet<uuid::Uuid>,
     viable: &HashSet<uuid::Uuid>,
     fallback_assigns: &mut usize,
+    execution_exemption: Option<uuid::Uuid>,
 ) -> bool {
     // Honor a host pin by re-querying that host's free slots; else take from
     // the shared pool, preferring an agent-viable computer.
@@ -797,15 +832,26 @@ async fn try_assign_item(
     };
     let Some(slot) = slot else { return false };
 
-    match ff_db::pg_assign_work_item(
-        pg,
-        item.id,
-        slot.sub_agent_id,
-        slot.computer_id,
-        LEASE_GRANT_SECS,
-    )
-    .await
-    {
+    let assignment = if execution_exemption.is_some() {
+        ff_db::pg_assign_exempted_work_item(
+            pg,
+            item.id,
+            slot.sub_agent_id,
+            slot.computer_id,
+            LEASE_GRANT_SECS,
+        )
+        .await
+    } else {
+        ff_db::pg_assign_work_item(
+            pg,
+            item.id,
+            slot.sub_agent_id,
+            slot.computer_id,
+            LEASE_GRANT_SECS,
+        )
+        .await
+    };
+    match assignment {
         Ok(true) => {
             *active_by_computer.entry(slot.computer_id).or_default() += 1;
             let lease_id = sqlx::query_scalar::<_, uuid::Uuid>(
@@ -1029,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn execution_gate_runs_after_housekeeping_and_before_assignment() {
+    fn execution_gate_runs_after_housekeeping_and_admits_only_exact_canary() {
         let source = include_str!("work_item_scheduler.rs");
         let body = source
             .split("pub async fn evaluate_work_items")
@@ -1039,10 +1085,13 @@ mod tests {
             .find("pg_complete_parent_work_items")
             .expect("final housekeeping step exists");
         let gate = body
-            .find("if !work_item_execution_enabled(pg).await")
+            .find("let execution_enabled = work_item_execution_enabled(pg).await")
             .expect("execution gate exists");
-        let assignment = body
-            .find("pg_ready_work_items")
+        let exact_fetch = body
+            .find("pg_ready_work_item(pg, work_item_id)")
+            .expect("exact canary fetch exists");
+        let broad_fetch = body
+            .find("pg_ready_work_items(pg, MAX_ASSIGN_PER_TICK)")
             .expect("assignment fetch exists");
 
         assert!(
@@ -1050,13 +1099,16 @@ mod tests {
             "gate must preserve scheduler housekeeping"
         );
         assert!(
-            gate < assignment,
+            gate < exact_fetch && exact_fetch < broad_fetch,
             "gate must stop before new assignment work"
         );
         assert!(
-            body[gate..assignment].contains("return Ok(0)"),
-            "disabled gate must return without assigning"
+            body[gate..exact_fetch]
+                .contains("if !execution_enabled && execution_exemption.is_none()")
+                && body[gate..exact_fetch].contains("return Ok(0)"),
+            "disabled gate without a valid exemption must return without assigning"
         );
+        assert!(body.contains("pg_assign_exempted_work_item"));
     }
 
     #[test]

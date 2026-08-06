@@ -675,6 +675,175 @@ pub async fn pg_delete_secret(pool: &PgPool, key: &str) -> Result<bool> {
     Ok(result.rows_affected() > 0)
 }
 
+/// Canonical fleet-secret key for the one-item recovery canary.  The value is
+/// a work-item UUID and the row MUST carry a future `expires_at`.
+pub const WORK_ITEM_EXECUTION_ENABLED_KEY: &str = "work_item_execution_enabled";
+pub const WORK_ITEM_EXECUTION_EXEMPTION_KEY: &str = "work_item_execution_exemption";
+
+/// Resolve the exact work item that may progress while the global execution
+/// gate is disabled.  This is deliberately stricter than `pg_get_secret`:
+/// missing, malformed, expired, disabled, unknown, or terminal rows all grant
+/// no exemption.
+pub async fn pg_work_item_execution_exemption(pool: &PgPool) -> Result<Option<uuid::Uuid>> {
+    let row = sqlx::query(
+        "SELECT fs.value, fs.expires_at, fs.disabled_reason, w.status
+           FROM fleet_secrets fs
+           LEFT JOIN work_items w ON w.id::text = BTRIM(fs.value)
+          WHERE fs.key = $1",
+    )
+    .bind(WORK_ITEM_EXECUTION_EXEMPTION_KEY)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else { return Ok(None) };
+    let value: String = row.get("value");
+    let expires_at: Option<DateTime<Utc>> = row.try_get("expires_at").ok().flatten();
+    let disabled_reason: Option<String> = row.try_get("disabled_reason").ok().flatten();
+    let status: Option<String> = row.try_get("status").ok().flatten();
+    Ok(resolve_work_item_execution_exemption(
+        &value,
+        expires_at,
+        disabled_reason.as_deref(),
+        status.as_deref(),
+        Utc::now(),
+    ))
+}
+
+fn resolve_work_item_execution_exemption(
+    value: &str,
+    expires_at: Option<DateTime<Utc>>,
+    disabled_reason: Option<&str>,
+    status: Option<&str>,
+    now: DateTime<Utc>,
+) -> Option<uuid::Uuid> {
+    if disabled_reason.is_some() || expires_at.is_none_or(|expiry| expiry <= now) {
+        return None;
+    }
+    if !matches!(status, Some("ready" | "claimed" | "building" | "in_review")) {
+        return None;
+    }
+    value.trim().parse().ok()
+}
+
+/// Grant one ready task a bounded recovery exemption.  The insert is sourced
+/// from `work_items` so an unknown, non-task, or non-ready UUID cannot become
+/// an authority row even if its text parses successfully.
+pub async fn pg_set_work_item_execution_exemption(
+    pool: &PgPool,
+    work_item_id: uuid::Uuid,
+    expires_at: DateTime<Utc>,
+    reason: &str,
+    updated_by: Option<&str>,
+) -> Result<()> {
+    if expires_at <= Utc::now() {
+        return Err(crate::error::DbError::NotFound(
+            "work-item execution exemption expiry must be in the future".into(),
+        ));
+    }
+    let inserted = sqlx::query_scalar::<_, String>(
+        "INSERT INTO fleet_secrets
+            (key, value, description, expires_at, disabled_reason,
+             previous_value, updated_at, updated_by)
+         SELECT $1, w.id::text, $4, $3, NULL, NULL, NOW(), $5
+           FROM work_items w
+          WHERE w.id = $2 AND w.kind = 'task' AND w.status = 'ready'
+         ON CONFLICT (key) DO UPDATE SET
+            value = EXCLUDED.value,
+            description = EXCLUDED.description,
+            expires_at = EXCLUDED.expires_at,
+            disabled_reason = NULL,
+            previous_value = NULL,
+            updated_at = NOW(),
+            updated_by = EXCLUDED.updated_by
+         RETURNING key",
+    )
+    .bind(WORK_ITEM_EXECUTION_EXEMPTION_KEY)
+    .bind(work_item_id)
+    .bind(expires_at)
+    .bind(reason)
+    .bind(updated_by)
+    .fetch_optional(pool)
+    .await?;
+    if inserted.is_none() {
+        return Err(crate::error::DbError::NotFound(format!(
+            "ready task work item {work_item_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Remove a stale authority row once its work item is terminal.  The UUID text
+/// is compared inside Postgres, so a concurrently replaced exemption is not
+/// accidentally deleted.
+pub async fn pg_clear_terminal_work_item_execution_exemption(pool: &PgPool) -> Result<bool> {
+    let result = sqlx::query(
+        "DELETE FROM fleet_secrets fs
+          USING work_items w
+          WHERE fs.key = $1
+            AND w.id::text = BTRIM(fs.value)
+            AND w.status IN ('done', 'merged', 'failed', 'cancelled')",
+    )
+    .bind(WORK_ITEM_EXECUTION_EXEMPTION_KEY)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod work_item_execution_exemption_tests {
+    use super::*;
+
+    fn resolve(
+        value: &str,
+        expiry_offset_secs: Option<i64>,
+        disabled_reason: Option<&str>,
+        status: Option<&str>,
+    ) -> Option<uuid::Uuid> {
+        let now = Utc::now();
+        resolve_work_item_execution_exemption(
+            value,
+            expiry_offset_secs.map(|secs| now + chrono::Duration::seconds(secs)),
+            disabled_reason,
+            status,
+            now,
+        )
+    }
+
+    #[test]
+    fn exact_future_nonterminal_uuid_is_authorized() {
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            resolve(&id.to_string(), Some(60), None, Some("ready")),
+            Some(id)
+        );
+        assert_eq!(
+            resolve(&format!("  {id}  "), Some(60), None, Some("claimed")),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn malformed_missing_expired_disabled_or_terminal_state_fails_closed() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(resolve("not-a-uuid", Some(60), None, Some("ready")), None);
+        assert_eq!(resolve(&id, None, None, Some("ready")), None);
+        assert_eq!(resolve(&id, Some(0), None, Some("ready")), None);
+        assert_eq!(resolve(&id, Some(-1), None, Some("ready")), None);
+        assert_eq!(resolve(&id, Some(60), Some("revoked"), Some("ready")), None);
+        assert_eq!(resolve(&id, Some(60), None, None), None);
+        for status in [
+            "done",
+            "merged",
+            "failed",
+            "cancelled",
+            "backlog",
+            "blocked",
+        ] {
+            assert_eq!(resolve(&id, Some(60), None, Some(status)), None);
+        }
+    }
+}
+
 /// Read a self-expiring safety gate stored in `fleet_secrets`.
 ///
 /// Returns the parsed boolean from the row, with two TTL-aware exceptions:
@@ -11735,6 +11904,41 @@ pub async fn pg_ready_work_items(pool: &PgPool, limit: i64) -> Result<Vec<ReadyW
     Ok(items)
 }
 
+/// Fetch one exact ready task using the same dependency and repository-binding
+/// policy as the normal fair-share queue.  Recovery canaries use this instead
+/// of fetching a broad queue window and filtering it in memory.
+pub async fn pg_ready_work_item(
+    pool: &PgPool,
+    work_item_id: uuid::Uuid,
+) -> Result<Option<ReadyWorkItem>> {
+    let sql = format!(
+        "SELECT w.id, w.assigned_computer, w.project_id
+           FROM work_items w
+          WHERE w.id = $1
+            AND w.status = 'ready'
+            AND w.kind = 'task'
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_leases l
+                 WHERE l.work_item_id = w.id AND l.released_at IS NULL)
+            AND NOT EXISTS (
+                SELECT 1 FROM work_item_relations r
+                  JOIN work_items dep ON dep.id = r.from_id
+                 WHERE r.to_id = w.id AND r.relation_type = 'blocks'
+                   AND dep.status <> 'merged')
+            {}",
+        schedulable_work_item_predicate("w")
+    );
+    let row = sqlx::query(&sql)
+        .bind(work_item_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| ReadyWorkItem {
+        id: r.get("id"),
+        assigned_computer: r.try_get("assigned_computer").ok().flatten(),
+        project_id: r.try_get("project_id").ok().flatten(),
+    }))
+}
+
 /// Ready parent items cannot enter the lease scheduler, which intentionally
 /// dispatches only leaf tasks. Expose their count as an operator health signal.
 pub async fn pg_unschedulable_ready_count(pool: &PgPool) -> Result<i64> {
@@ -12322,6 +12526,45 @@ pub async fn pg_assign_work_item(
     computer_id: uuid::Uuid,
     lease_secs: i64,
 ) -> Result<bool> {
+    pg_assign_work_item_inner(
+        pool,
+        work_item_id,
+        sub_agent_id,
+        computer_id,
+        lease_secs,
+        false,
+    )
+    .await
+}
+
+/// Atomically assign a work item only while the canonical, unexpired
+/// exact-UUID recovery exemption still authorizes that same item.
+pub async fn pg_assign_exempted_work_item(
+    pool: &PgPool,
+    work_item_id: uuid::Uuid,
+    sub_agent_id: uuid::Uuid,
+    computer_id: uuid::Uuid,
+    lease_secs: i64,
+) -> Result<bool> {
+    pg_assign_work_item_inner(
+        pool,
+        work_item_id,
+        sub_agent_id,
+        computer_id,
+        lease_secs,
+        true,
+    )
+    .await
+}
+
+async fn pg_assign_work_item_inner(
+    pool: &PgPool,
+    work_item_id: uuid::Uuid,
+    sub_agent_id: uuid::Uuid,
+    computer_id: uuid::Uuid,
+    lease_secs: i64,
+    require_execution_exemption: bool,
+) -> Result<bool> {
     let mut tx = pool.begin().await?;
     sqlx::query(
         "WITH RECURSIVE claim_chain AS (
@@ -12368,16 +12611,25 @@ pub async fn pg_assign_work_item(
                   JOIN work_items dep ON dep.id = r.from_id
                  WHERE r.to_id = w.id AND r.relation_type = 'blocks'
                    AND dep.status <> 'merged')
+            AND (NOT $5::boolean OR EXISTS (
+                SELECT 1
+                  FROM fleet_secrets fs
+                 WHERE fs.key = '{exemption_key}'
+                   AND BTRIM(fs.value) = w.id::text
+                   AND fs.expires_at > NOW()
+                   AND fs.disabled_reason IS NULL))
             {}
          ON CONFLICT DO NOTHING
          RETURNING id",
-        schedulable_work_item_predicate("w")
+        schedulable_work_item_predicate("w"),
+        exemption_key = WORK_ITEM_EXECUTION_EXEMPTION_KEY,
     );
     let inserted = sqlx::query(&sql)
         .bind(work_item_id)
         .bind(sub_agent_id)
         .bind(computer_id)
         .bind(lease_secs as f64)
+        .bind(require_execution_exemption)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -13046,7 +13298,17 @@ mod jira_claim_guard_tests {
              );
              CREATE UNIQUE INDEX ux_work_item_leases_active
                  ON work_item_leases(work_item_id)
-                 WHERE released_at IS NULL;",
+                 WHERE released_at IS NULL;
+             CREATE TABLE fleet_secrets (
+                 key TEXT PRIMARY KEY,
+                 value TEXT NOT NULL,
+                 description TEXT,
+                 expires_at TIMESTAMPTZ,
+                 disabled_reason TEXT,
+                 previous_value TEXT,
+                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                 updated_by TEXT
+             );",
         )
         .execute(&pool)
         .await
@@ -13280,6 +13542,50 @@ mod jira_claim_guard_tests {
         );
         assert!(
             pg_assign_work_item(&pool, child, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+
+        drop_temp_db(admin, pool, &db_name).await;
+    }
+
+    #[tokio::test]
+    async fn exempted_assignment_requires_current_exact_uuid_authority() {
+        let Some((admin, pool, db_name)) = temp_pool().await else {
+            return;
+        };
+        let (_repo_id, computer_id, sub_agent_id) = seed_project_slot(&pool).await;
+        let parent = insert_work_item(&pool, "feature", "ready", None, json!({}), None, None).await;
+        let exact =
+            insert_work_item(&pool, "task", "ready", Some(parent), json!({}), None, None).await;
+        let other =
+            insert_work_item(&pool, "task", "ready", Some(parent), json!({}), None, None).await;
+
+        assert!(
+            !pg_assign_exempted_work_item(&pool, exact, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+        pg_set_work_item_execution_exemption(
+            &pool,
+            exact,
+            Utc::now() + chrono::Duration::minutes(5),
+            "isolated test canary",
+            Some("test"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            pg_work_item_execution_exemption(&pool).await.unwrap(),
+            Some(exact)
+        );
+        assert!(
+            !pg_assign_exempted_work_item(&pool, other, sub_agent_id, computer_id, 600)
+                .await
+                .unwrap()
+        );
+        assert!(
+            pg_assign_exempted_work_item(&pool, exact, sub_agent_id, computer_id, 600)
                 .await
                 .unwrap()
         );

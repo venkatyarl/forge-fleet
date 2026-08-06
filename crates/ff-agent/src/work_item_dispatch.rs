@@ -90,6 +90,9 @@ fn dispatch_budget_for_host(free_slots: usize, recent_failures: usize) -> i64 {
 #[derive(Debug, Clone)]
 struct AssignedWorkItem {
     work_item_id: Uuid,
+    /// Selected under the exact-UUID recovery authority rather than the
+    /// globally enabled execution gate.
+    execution_exemption_required: bool,
     lease_id: Uuid,
     project_id: String,
     title: String,
@@ -240,7 +243,24 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
     // reconciliation and the host dispatch clock above must keep advancing so
     // fleet health still distinguishes an intentional pause from a wedged loop;
     // already-running dispatch tasks own their own heartbeat/finalization.
-    if !crate::work_item_scheduler::work_item_execution_enabled(pg).await {
+    let execution_enabled = crate::work_item_scheduler::work_item_execution_enabled(pg).await;
+    let execution_exemption = if execution_enabled {
+        None
+    } else {
+        match ff_db::pg_work_item_execution_exemption(pg).await {
+            Ok(exemption) => exemption,
+            Err(error) => {
+                tracing::warn!(
+                    key = ff_db::WORK_ITEM_EXECUTION_EXEMPTION_KEY,
+                    worker = worker_name,
+                    %error,
+                    "work_item_dispatch: exemption read failed; admitting no canary"
+                );
+                None
+            }
+        }
+    };
+    if !execution_enabled && execution_exemption.is_none() {
         tracing::debug!(
             key = crate::work_item_scheduler::WORK_ITEM_EXECUTION_ENABLED_KEY,
             worker = worker_name,
@@ -259,7 +279,8 @@ pub async fn evaluate_work_item_dispatch(pg: &PgPool, worker_name: &str) -> Resu
     let recent_failures = recent_host_failures(pg, worker_name).await.unwrap_or(0);
     let budget = dispatch_budget_for_host(free_slots, recent_failures).max(1);
 
-    let assigned = assigned_work_items(pg, worker_name, &repo_path, budget).await?;
+    let assigned =
+        assigned_work_items(pg, worker_name, &repo_path, budget, execution_exemption).await?;
     if assigned.is_empty() {
         return Ok(0);
     }
@@ -509,6 +530,7 @@ async fn assigned_work_items(
     worker_name: &str,
     default_repo_path: &Path,
     limit: i64,
+    execution_exemption: Option<Uuid>,
 ) -> Result<Vec<AssignedWorkItem>> {
     let default_repo_path = default_repo_path.to_string_lossy().to_string();
     let rows = sqlx::query(
@@ -587,13 +609,24 @@ async fn assigned_work_items(
            AND sa.status = 'busy'
            AND sa.current_work_item_id IS NOT NULL
            AND w.status = 'claimed'
+           AND ($4::uuid IS NULL OR (
+                w.id = $4
+                AND EXISTS (
+                    SELECT 1
+                      FROM fleet_secrets fs
+                     WHERE fs.key = $5
+                       AND BTRIM(fs.value) = w.id::text
+                       AND fs.expires_at > NOW()
+                       AND fs.disabled_reason IS NULL)))
          ORDER BY l.created_at ASC
-         LIMIT $3
+        LIMIT $3
         "#,
     )
     .bind(worker_name)
     .bind(default_repo_path)
     .bind(limit)
+    .bind(execution_exemption)
+    .bind(ff_db::WORK_ITEM_EXECUTION_EXEMPTION_KEY)
     .fetch_all(pg)
     .await?;
 
@@ -668,6 +701,7 @@ async fn assigned_work_items(
             };
             Ok(AssignedWorkItem {
                 work_item_id: r.get("work_item_id"),
+                execution_exemption_required: execution_exemption.is_some(),
                 lease_id: r.get("lease_id"),
                 project_id: r.get("project_id"),
                 title: r.get("title"),
@@ -2212,9 +2246,21 @@ async fn insert_worktree_creating(
 async fn mark_building(pg: &PgPool, item: &AssignedWorkItem) -> Result<bool> {
     let mut tx = pg.begin().await?;
     let claimed = sqlx::query(
-        "UPDATE work_items SET status = 'building' WHERE id = $1 AND status = 'claimed'",
+        "UPDATE work_items w
+            SET status = 'building'
+          WHERE w.id = $1
+            AND w.status = 'claimed'
+            AND (NOT $2::boolean OR EXISTS (
+                SELECT 1
+                  FROM fleet_secrets fs
+                 WHERE fs.key = $3
+                   AND BTRIM(fs.value) = w.id::text
+                   AND fs.expires_at > NOW()
+                   AND fs.disabled_reason IS NULL))",
     )
     .bind(item.work_item_id)
+    .bind(item.execution_exemption_required)
+    .bind(ff_db::WORK_ITEM_EXECUTION_EXEMPTION_KEY)
     .execute(&mut *tx)
     .await?
     .rows_affected();
@@ -8361,6 +8407,7 @@ mod tests {
     fn test_item(attempts: i32, last_error: Option<&str>, complexity: &str) -> AssignedWorkItem {
         AssignedWorkItem {
             work_item_id: Uuid::new_v4(),
+            execution_exemption_required: false,
             lease_id: Uuid::new_v4(),
             project_id: "forge-fleet".to_string(),
             title: "test cloud rescue".to_string(),
@@ -8425,6 +8472,25 @@ mod tests {
             body[gate..child_selection].contains("return Ok(0)"),
             "disabled gate must return without spawning a child"
         );
+    }
+
+    #[test]
+    fn recovery_dispatch_requires_live_exact_uuid_authority_in_postgres() {
+        let source = include_str!("work_item_dispatch.rs");
+        let query = source
+            .split("async fn assigned_work_items")
+            .nth(1)
+            .expect("assigned-work query exists");
+        assert!(query.contains("w.id = $4"));
+        assert!(query.contains("fs.expires_at > NOW()"));
+        assert!(query.contains("fs.disabled_reason IS NULL"));
+        assert!(query.contains("WORK_ITEM_EXECUTION_EXEMPTION_KEY"));
+        let transition = source
+            .split("async fn mark_building")
+            .nth(1)
+            .expect("claimed-to-building transition exists");
+        assert!(transition.contains("NOT $2::boolean OR EXISTS"));
+        assert!(transition.contains("fs.expires_at > NOW()"));
     }
 
     #[test]
@@ -10764,6 +10830,7 @@ mod tests {
     fn terminal_failure_alert_leads_with_human_context_and_puts_ids_last() {
         let item = AssignedWorkItem {
             work_item_id: Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap(),
+            execution_exemption_required: false,
             lease_id: Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap(),
             project_id: "forge-fleet".into(),
             title: "Make Telegram alerts readable".into(),

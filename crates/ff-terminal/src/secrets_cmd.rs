@@ -194,6 +194,54 @@ pub async fn handle_secrets(cmd: crate::SecretsCommand) -> Result<()> {
                 println!("No secret with key '{key}' to delete");
             }
         }
+        crate::SecretsCommand::AllowWorkItemCanary {
+            work_item_id,
+            minutes,
+            reason,
+        } => {
+            if reason.trim().is_empty() {
+                anyhow::bail!("--reason cannot be empty");
+            }
+            if !(1..=360).contains(&minutes) {
+                anyhow::bail!("--minutes must be between 1 and 360");
+            }
+            let execution_enabled = ff_db::pg_read_safety_gate(
+                &pool,
+                ff_db::WORK_ITEM_EXECUTION_ENABLED_KEY,
+                true,
+                true,
+            )
+            .await?;
+            if execution_enabled {
+                anyhow::bail!(
+                    "refusing canary exemption while work_item_execution_enabled is effectively true"
+                );
+            }
+            let expires_at = chrono::Utc::now() + chrono::Duration::minutes(minutes as i64);
+            let me = whoami_tag();
+            ff_db::pg_set_work_item_execution_exemption(
+                &pool,
+                work_item_id,
+                expires_at,
+                reason.trim(),
+                Some(&me),
+            )
+            .await?;
+            println!(
+                "{YELLOW}!{RESET} work-item canary {work_item_id} admitted until {} ({minutes}m)\n  reason: {}\n  by:     {me}",
+                expires_at.format("%Y-%m-%d %H:%M UTC"),
+                reason.trim(),
+            );
+        }
+        crate::SecretsCommand::RevokeWorkItemCanary => {
+            let deleted =
+                ff_db::pg_delete_secret(&pool, ff_db::WORK_ITEM_EXECUTION_EXEMPTION_KEY).await?;
+            if deleted {
+                println!("Revoked the active work-item canary authority");
+            } else {
+                println!("No work-item canary authority was active");
+            }
+        }
         crate::SecretsCommand::Rotate { key, value } => {
             let rotator = ff_agent::secrets_rotation::SecretsRotator::new(pool.clone());
             match rotator.rotate(&key, value).await {
