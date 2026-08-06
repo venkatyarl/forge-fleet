@@ -36,8 +36,7 @@ fn scope_of(p: &Value) -> (String, String) {
     // A non-default key always wins. `scope_type=project` with no real key is
     // still eligible for cwd derivation; otherwise callers that explicitly ask
     // for durable memory accidentally converge on the global `project:default`.
-    let derive_project =
-        !sk.is_some_and(|s| s != "default") && matches!(st, None | Some("project"));
+    let derive_project = sk.is_none_or(|s| s == "default") && matches!(st, None | Some("project"));
     if derive_project
         && let Some(cwd) = p
             .get("cwd")
@@ -51,37 +50,6 @@ fn scope_of(p: &Value) -> (String, String) {
         st.unwrap_or("session").to_string(),
         sk.unwrap_or("default").to_string(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::scope_of;
-    use serde_json::json;
-
-    #[test]
-    fn explicit_project_without_key_does_not_force_global_default() {
-        let cwd = env!("CARGO_MANIFEST_DIR");
-        let (scope_type, scope_key) = scope_of(&json!({
-            "scope_type": "project",
-            "scope_key": "default",
-            "cwd": cwd,
-        }));
-        assert_eq!(scope_type, "project");
-        assert_ne!(scope_key, "default");
-    }
-
-    #[test]
-    fn explicit_session_and_named_project_keys_keep_precedence() {
-        let cwd = env!("CARGO_MANIFEST_DIR");
-        assert_eq!(
-            scope_of(&json!({"scope_type": "session", "cwd": cwd})),
-            ("session".to_string(), "default".to_string())
-        );
-        assert_eq!(
-            scope_of(&json!({"scope_type": "project", "scope_key": "chosen", "cwd": cwd})),
-            ("project".to_string(), "chosen".to_string())
-        );
-    }
 }
 
 fn write_json(r: scratchpad::WriteResult) -> Value {
@@ -159,4 +127,43 @@ pub async fn memory_remove(params: Option<Value>) -> HandlerResult {
         .await
         .map(write_json)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scope_of;
+    use serde_json::json;
+
+    #[test]
+    fn implicit_scope_without_key_derives_project_from_cwd() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let (scope_type, scope_key) = scope_of(&json!({ "cwd": cwd }));
+        assert_eq!(scope_type, "project");
+        assert_ne!(scope_key, "default");
+    }
+
+    #[test]
+    fn explicit_project_without_key_does_not_force_global_default() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        let (scope_type, scope_key) = scope_of(&json!({
+            "scope_type": "project",
+            "scope_key": "default",
+            "cwd": cwd,
+        }));
+        assert_eq!(scope_type, "project");
+        assert_ne!(scope_key, "default");
+    }
+
+    #[test]
+    fn explicit_session_and_named_project_keys_keep_precedence() {
+        let cwd = env!("CARGO_MANIFEST_DIR");
+        assert_eq!(
+            scope_of(&json!({"scope_type": "session", "cwd": cwd})),
+            ("session".to_string(), "default".to_string())
+        );
+        assert_eq!(
+            scope_of(&json!({"scope_type": "project", "scope_key": "chosen", "cwd": cwd})),
+            ("project".to_string(), "chosen".to_string())
+        );
+    }
 }

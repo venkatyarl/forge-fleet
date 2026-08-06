@@ -196,8 +196,8 @@ pub(crate) async fn render_secure_bootstrap_script(
     };
 
     let script = BOOTSTRAP_TEMPLATE
-        .replace("{{LEADER_HOST}}", &leader_host)
-        .replace("{{LEADER_PORT}}", &leader_port)
+        .replace("{{LEADER_HOST}}", leader_host)
+        .replace("{{LEADER_PORT}}", leader_port)
         .replace("{{TLS_SERVER_NAME}}", claim.tls_server_name)
         .replace("{{TLS_CA_PEM_B64}}", claim.tls_ca_pem_b64)
         .replace("{{TLS_SPKI_PIN}}", claim.tls_spki_pin)
@@ -957,7 +957,10 @@ mod bootstrap_lifecycle_tests {
     fn credential_bearing_onboarding_stays_quarantined_without_server_tls_evidence() {
         assert!(!secure_onboarding_transport_available());
         assert!(ONBOARDING_TRANSPORT_QUARANTINE.contains("server-verified TLS"));
-        assert!(!ONBOARDING_TRANSPORT_QUARANTINE.is_empty());
+        assert_eq!(
+            ONBOARDING_TRANSPORT_QUARANTINE,
+            "new-node onboarding is quarantined until the gateway has server-verified TLS transport"
+        );
     }
 
     #[tokio::test]

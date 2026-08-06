@@ -1139,7 +1139,7 @@ fn map_merge_train_ci_status(gh_status: &str, conclusion: &str) -> &'static str 
 /// Prefers the explicit `project_repos` mapping, then falls back to the
 /// legacy short-repo-name convention used by `projects.id`.
 async fn resolve_project_id_for_repo(pool: &sqlx::PgPool, repo_full: &str) -> Option<String> {
-    let github_url = format!("https://github.com/{}", repo_full);
+    let github_url = format!("https://github.com/{repo_full}");
     if let Ok(Some(row)) = sqlx::query(
         "SELECT project_id FROM project_repos \
             WHERE github_url = $1 \
@@ -1172,7 +1172,7 @@ async fn find_merge_queue_by_pr(
     project_id: &str,
     pr_number: i64,
 ) -> Result<Option<(Uuid, Uuid)>, sqlx::Error> {
-    let pr_pattern = format!("%/pull/{}", pr_number);
+    let pr_pattern = format!("%/pull/{pr_number}");
     let row = sqlx::query(
         "SELECT id, work_item_id FROM work_item_merge_queue \
             WHERE project_id = $1 AND pr_url LIKE $2 LIMIT 1",
@@ -1190,7 +1190,7 @@ async fn find_work_item_by_pr(
     project_id: &str,
     pr_number: i64,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let pr_pattern = format!("%/pull/{}", pr_number);
+    let pr_pattern = format!("%/pull/{pr_number}");
     sqlx::query_scalar("SELECT id FROM work_items WHERE project_id = $1 AND pr_url LIKE $2 LIMIT 1")
         .bind(project_id)
         .bind(&pr_pattern)
@@ -1206,7 +1206,7 @@ async fn update_merge_queue_status(
     status: &str,
     conclusion: &str,
 ) -> Result<u64, sqlx::Error> {
-    let pr_pattern = format!("%/pull/{}", pr_number);
+    let pr_pattern = format!("%/pull/{pr_number}");
     let failure_reason = if status == "failed" {
         Some(conclusion)
     } else {
@@ -1253,7 +1253,7 @@ async fn handle_train_creation(pool: &sqlx::PgPool, payload: &Value) -> (StatusC
             let r = parts.next().unwrap_or("unknown").to_string();
             (o, r)
         });
-    let repo_full = format!("{}/{}", owner, repo);
+    let repo_full = format!("{owner}/{repo}");
 
     let Some(project_id) = resolve_project_id_for_repo(pool, &repo_full).await else {
         return (
@@ -1271,7 +1271,7 @@ async fn handle_train_creation(pool: &sqlx::PgPool, payload: &Value) -> (StatusC
         );
     };
 
-    let pr_url = format!("https://github.com/{}/pull/{}", repo_full, pr_number);
+    let pr_url = format!("https://github.com/{repo_full}/pull/{pr_number}");
 
     match find_merge_queue_by_pr(pool, &project_id, pr_number).await {
         Ok(Some((id, _))) => {

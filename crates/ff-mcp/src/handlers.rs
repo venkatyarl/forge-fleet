@@ -2038,9 +2038,10 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
         && crew_routing.used_template_fallback
         && !allow_unverified_test_endpoint
     {
-        return Err(format!(
+        return Err(
             "fleet_crew requires verified code-gen routing but the fleet agent catalog/router is unavailable"
-        ));
+                .to_string(),
+        );
     }
     let policy_notes = applied_policy
         .as_ref()
@@ -2064,20 +2065,20 @@ pub async fn fleet_crew(params: Option<Value>) -> HandlerResult {
         );
 
         let model_hint = preferred_model_hint(&assignment.model_preference);
-        let prompt = build_crew_step_prompt(
+        let prompt = build_crew_step_prompt(CrewStepPromptContext {
             task,
             repo_dir,
-            &subtask.title,
-            &subtask.prompt,
-            decomposed_subtask.task_type,
-            &assignment,
-            &subtask.depends_on,
-            if policy_notes.is_empty() {
+            title: &subtask.title,
+            subtask_prompt: &subtask.prompt,
+            task_type: decomposed_subtask.task_type,
+            assignment: &assignment,
+            depends_on: &subtask.depends_on,
+            policy_notes: if policy_notes.is_empty() {
                 None
             } else {
                 Some(policy_notes.as_str())
             },
-        );
+        });
 
         let timeout_secs = crew_timeout_for_complexity(decomposed_subtask.estimated_complexity);
 
@@ -3687,16 +3688,28 @@ fn preferred_model_hint(model_preference: &ModelPreference) -> Option<String> {
     }
 }
 
-fn build_crew_step_prompt(
-    task: &str,
-    repo_dir: &str,
-    title: &str,
-    subtask_prompt: &str,
+struct CrewStepPromptContext<'a> {
+    task: &'a str,
+    repo_dir: &'a str,
+    title: &'a str,
+    subtask_prompt: &'a str,
     task_type: SubTaskType,
-    assignment: &AgentAssignment,
-    depends_on: &[uuid::Uuid],
-    policy_notes: Option<&str>,
-) -> String {
+    assignment: &'a AgentAssignment,
+    depends_on: &'a [uuid::Uuid],
+    policy_notes: Option<&'a str>,
+}
+
+fn build_crew_step_prompt(context: CrewStepPromptContext<'_>) -> String {
+    let CrewStepPromptContext {
+        task,
+        repo_dir,
+        title,
+        subtask_prompt,
+        task_type,
+        assignment,
+        depends_on,
+        policy_notes,
+    } = context;
     let dependency_text = if depends_on.is_empty() {
         "None".to_string()
     } else {
@@ -4542,7 +4555,9 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
+
+    use tokio::sync::Mutex;
 
     use axum::{Json, Router, http::StatusCode, routing::post};
     use tokio::net::TcpListener;
@@ -4673,6 +4688,44 @@ mod tests {
             panic!("missing verdict must fail closed");
         };
         assert!(tail.chars().count() <= CREW_REVIEW_TAIL_CHARS);
+    }
+
+    #[test]
+    fn crew_step_prompt_preserves_exact_bytes() {
+        let mut assignment = AgentAssignment::new(AgentRole::Reviewer);
+        assignment.system_prompt_override = Some("SYSTEM".to_string());
+        let depends_on = [uuid::Uuid::nil()];
+
+        let prompt = build_crew_step_prompt(CrewStepPromptContext {
+            task: "top-level task",
+            repo_dir: "/repo",
+            title: "review step",
+            subtask_prompt: "Review the change.",
+            task_type: SubTaskType::Review,
+            assignment: &assignment,
+            depends_on: &depends_on,
+            policy_notes: Some("POLICY"),
+        });
+
+        assert_eq!(
+            prompt,
+            concat!(
+                "Role: Reviewer\n",
+                "Team: Reviewer\n",
+                "Repo: /repo\n",
+                "Top-level task: top-level task\n",
+                "Step title: review step\n",
+                "Dependencies: 00000000-0000-0000-0000-000000000000\n\n",
+                "Project policy:\nPOLICY\n\n",
+                "SYSTEM\n\n",
+                "Subtask instructions:\nReview the change.\n\n",
+                "Return concise, actionable output for the next step.\n\n",
+                "Reviewer verdict contract: your LAST non-empty line MUST be exactly one of:\n",
+                "FF_REVIEW_VERDICT: APPROVE\n",
+                "FF_REVIEW_VERDICT: REQUEST_CHANGES: <specific reason>\n",
+                "Do not claim approval anywhere else. Missing or malformed verdicts fail closed.",
+            )
+        );
     }
 
     #[tokio::test]
@@ -5002,7 +5055,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_executes_pipeline_successfully() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
         let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::Approve).await;
@@ -5040,7 +5093,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_reviewer_request_changes_makes_run_unsuccessful() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
         let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::RequestChanges).await;
         let repo_dir =
@@ -5081,7 +5134,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_missing_reviewer_verdict_fails_closed() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
         let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::InvalidReview).await;
         let repo_dir =
@@ -5117,7 +5170,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_crew_reports_failures_when_steps_fail() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let (db_path, prev_db_path, config_path, prev_config_path) = setup_isolated_crew_test();
 
         let (base_url, server_handle) = spawn_mock_llm_server(MockLlmMode::TransportFailure).await;
@@ -5176,7 +5229,7 @@ mod tests {
     #[ignore = "requires Postgres (OperationalStore is Postgres-only)"]
     #[tokio::test(flavor = "current_thread")]
     async fn project_profile_round_trip_and_policy_resolve() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = env_lock().lock().await;
         let (db_path, prev_db_path) = setup_test_db();
 
         let upsert = project_profile_upsert(Some(json!({

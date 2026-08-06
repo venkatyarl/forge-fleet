@@ -54,6 +54,21 @@ pub async fn shared_pg_pool() -> Result<sqlx::PgPool, String> {
         .cloned()
 }
 
+/// The shared MCP pulse (Redis) client, built once from the fleet config.
+/// Returns a clone sharing the same auto-reconnecting `ConnectionManager`.
+pub async fn shared_pulse() -> Result<PulseClient, String> {
+    PULSE
+        .get_or_try_init(|| async {
+            let (cfg, _) = config::load_config_auto()
+                .map_err(|e| format!("failed to load fleet config: {e}"))?;
+            PulseClient::connect(&cfg.redis.url)
+                .await
+                .map_err(|e| format!("Redis connection failed: {e}"))
+        })
+        .await
+        .cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -68,19 +83,4 @@ mod tests {
         assert_eq!(options.get_max_lifetime(), Some(MCP_POOL_MAX_LIFETIME));
         assert_eq!(options.get_acquire_timeout(), MCP_POOL_ACQUIRE_TIMEOUT);
     }
-}
-
-/// The shared MCP pulse (Redis) client, built once from the fleet config.
-/// Returns a clone sharing the same auto-reconnecting `ConnectionManager`.
-pub async fn shared_pulse() -> Result<PulseClient, String> {
-    PULSE
-        .get_or_try_init(|| async {
-            let (cfg, _) = config::load_config_auto()
-                .map_err(|e| format!("failed to load fleet config: {e}"))?;
-            PulseClient::connect(&cfg.redis.url)
-                .await
-                .map_err(|e| format!("Redis connection failed: {e}"))
-        })
-        .await
-        .cloned()
 }
