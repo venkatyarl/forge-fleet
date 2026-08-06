@@ -24,6 +24,26 @@ use crate::step::{StepId, StepKind, StepResult, StepStatus};
 
 // ─── Executor Config ─────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpClientTimeoutPolicy {
+    connect: std::time::Duration,
+    total: Option<std::time::Duration>,
+}
+
+const DEFAULT_HTTP_CLIENT_TIMEOUTS: HttpClientTimeoutPolicy = HttpClientTimeoutPolicy {
+    connect: std::time::Duration::from_secs(10),
+    // The enclosing Step timeout is the sole total request deadline.
+    total: None,
+};
+
+fn build_http_client(policy: HttpClientTimeoutPolicy) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().connect_timeout(policy.connect);
+    if let Some(total) = policy.total {
+        builder = builder.timeout(total);
+    }
+    builder.build().expect("build reqwest client")
+}
+
 /// Configuration for the pipeline executor.
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
@@ -55,10 +75,7 @@ impl Default for ExecutorConfig {
         Self {
             max_parallelism: 4,
             rust_fn_registry: None,
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .expect("build reqwest client"),
+            http_client: build_http_client(DEFAULT_HTTP_CLIENT_TIMEOUTS),
             llm_base_url: None,
             llm_api_key: None,
             llm_model: None,
@@ -534,9 +551,7 @@ async fn execute_step_kind(
                 request = request.bearer_auth(api_key);
             }
 
-            let response = request.send().await.map_err(|_| {
-                PipelineError::LlmRequest("LLM endpoint is unreachable".to_string())
-            })?;
+            let response = request.send().await.map_err(classify_llm_http_error)?;
             let status = response.status();
 
             if !status.is_success() {
@@ -546,9 +561,7 @@ async fn execute_step_kind(
                 )));
             }
 
-            let response: Value = response.json().await.map_err(|_| {
-                PipelineError::LlmResponse("LLM endpoint returned invalid JSON".to_string())
-            })?;
+            let response: Value = response.json().await.map_err(classify_llm_http_error)?;
 
             let reported_model = validate_reported_model(&response)?;
             let model_mismatch = reported_model
@@ -604,6 +617,32 @@ fn safe_completion_error(error: &CompletionValidationError) -> String {
     }
 }
 
+fn classify_llm_http_error(error: reqwest::Error) -> PipelineError {
+    // Keep provider URLs, query strings, and response bodies out of pipeline
+    // receipts. Reqwest's predicates retain the useful failure taxonomy
+    // without copying its potentially sensitive Display text.
+    if error.is_timeout() {
+        PipelineError::LlmRequest("LLM HTTP request timed out".to_string())
+    } else if error.is_connect() {
+        PipelineError::LlmRequest(
+            "LLM endpoint is unreachable: connection establishment or DNS resolution failed"
+                .to_string(),
+        )
+    } else if error.is_decode() {
+        PipelineError::LlmResponse("LLM endpoint returned invalid JSON".to_string())
+    } else if error.is_body() {
+        PipelineError::LlmResponse("LLM response body transport failed".to_string())
+    } else if error.is_redirect() {
+        PipelineError::LlmRequest("LLM endpoint redirect was rejected".to_string())
+    } else if error.is_request() {
+        PipelineError::LlmRequest(
+            "LLM request construction or HTTP protocol dispatch failed".to_string(),
+        )
+    } else {
+        PipelineError::LlmRequest("LLM HTTP transport failed".to_string())
+    }
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -635,6 +674,21 @@ mod tests {
         content_type: &str,
         response_body: String,
     ) -> (String, oneshot::Receiver<String>) {
+        spawn_delayed_single_request_server(
+            status_line,
+            content_type,
+            response_body,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    async fn spawn_delayed_single_request_server(
+        status_line: &str,
+        content_type: &str,
+        response_body: String,
+        response_delay: Duration,
+    ) -> (String, oneshot::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let (tx, rx) = oneshot::channel();
@@ -648,6 +702,7 @@ mod tests {
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let req = String::from_utf8_lossy(&buf[..n]).to_string();
                 let _ = tx.send(req);
+                tokio::time::sleep(response_delay).await;
 
                 let response = format!(
                     "HTTP/1.1 {status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
@@ -684,18 +739,30 @@ mod tests {
         max_tokens: Option<u32>,
         endpoint: Option<String>,
     ) -> PipelineGraph {
+        llm_pipeline_with_timeout(model, max_tokens, endpoint, Duration::from_secs(300))
+    }
+
+    fn llm_pipeline_with_timeout(
+        model: Option<&str>,
+        max_tokens: Option<u32>,
+        endpoint: Option<String>,
+        timeout: Duration,
+    ) -> PipelineGraph {
         let mut graph = PipelineGraph::new();
         graph
-            .add_step(Step::new(
-                "llm",
-                "LLM Prompt",
-                StepKind::LlmPrompt {
-                    prompt: "Say hello".to_string(),
-                    model: model.map(str::to_string),
-                    max_tokens,
-                    endpoint,
-                },
-            ))
+            .add_step(
+                Step::new(
+                    "llm",
+                    "LLM Prompt",
+                    StepKind::LlmPrompt {
+                        prompt: "Say hello".to_string(),
+                        model: model.map(str::to_string),
+                        max_tokens,
+                        endpoint,
+                    },
+                )
+                .with_timeout(timeout),
+            )
             .unwrap();
         graph
     }
@@ -940,6 +1007,98 @@ mod tests {
     }
 
     #[test]
+    fn default_http_client_has_bounded_connect_and_no_total_deadline() {
+        assert_eq!(
+            DEFAULT_HTTP_CLIENT_TIMEOUTS.connect,
+            Duration::from_secs(10)
+        );
+        assert_eq!(DEFAULT_HTTP_CLIENT_TIMEOUTS.total, None);
+    }
+
+    #[tokio::test]
+    async fn llm_step_timeout_outlives_scaled_legacy_client_deadline() {
+        const RESPONSE_DELAY: Duration = Duration::from_millis(60);
+        const SCALED_LEGACY_TOTAL_TIMEOUT: Duration = Duration::from_millis(20);
+        const STEP_TIMEOUT: Duration = Duration::from_millis(500);
+
+        let (legacy_url, _) = spawn_delayed_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("pipeline-model", "legacy client must time out"),
+            RESPONSE_DELAY,
+        )
+        .await;
+        let legacy_graph =
+            llm_pipeline_with_timeout(Some("pipeline-model"), None, Some(legacy_url), STEP_TIMEOUT);
+        let legacy_config = ExecutorConfig {
+            http_client: build_http_client(HttpClientTimeoutPolicy {
+                connect: Duration::from_millis(100),
+                total: Some(SCALED_LEGACY_TOTAL_TIMEOUT),
+            }),
+            ..ExecutorConfig::default()
+        };
+
+        let legacy_result = execute(&legacy_graph, legacy_config, None).await.unwrap();
+        let legacy_error = llm_failure(&legacy_result);
+        assert!(legacy_error.contains("timed out"));
+        assert!(!legacy_error.contains("unreachable"));
+
+        let (default_url, _) = spawn_delayed_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("pipeline-model", "step deadline remained authoritative"),
+            RESPONSE_DELAY,
+        )
+        .await;
+        let default_graph = llm_pipeline_with_timeout(
+            Some("pipeline-model"),
+            None,
+            Some(default_url),
+            STEP_TIMEOUT,
+        );
+
+        let default_result = execute(&default_graph, ExecutorConfig::default(), None)
+            .await
+            .unwrap();
+        assert!(default_result.success);
+        assert_eq!(
+            default_result.results[&StepId::new("llm")].output,
+            "step deadline remained authoritative"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_llm_response_is_bounded_by_step_deadline() {
+        let (base_url, _) = spawn_delayed_single_request_server(
+            "200 OK",
+            "application/json",
+            successful_llm_response("pipeline-model", "must arrive too late"),
+            Duration::from_millis(250),
+        )
+        .await;
+        let graph = llm_pipeline_with_timeout(
+            Some("pipeline-model"),
+            None,
+            Some(base_url),
+            Duration::from_millis(30),
+        );
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            execute(&graph, ExecutorConfig::default(), None),
+        )
+        .await
+        .expect("the outer test deadline must not fire")
+        .unwrap();
+
+        assert!(!result.success);
+        assert_eq!(
+            result.results[&StepId::new("llm")].status,
+            StepStatus::TimedOut
+        );
+    }
+
+    #[test]
     fn llm_endpoint_normalization_accepts_supported_shapes() {
         let full = "https://models.example:55000/v1/chat/completions";
         assert_eq!(
@@ -1054,7 +1213,7 @@ mod tests {
             successful_llm_response("pipeline-model", "must not be used"),
         )
         .await;
-        let graph = llm_pipeline(Some("pipeline-model"), None, Some(unavailable_url));
+        let graph = llm_pipeline(Some("pipeline-model"), None, Some(unavailable_url.clone()));
 
         let result = execute(
             &graph,
@@ -1064,7 +1223,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(llm_failure(&result).contains("unreachable"));
+        let error = llm_failure(&result);
+        assert!(error.contains("unreachable"));
+        assert!(error.contains("connection establishment or DNS resolution failed"));
+        assert!(!error.contains(&unavailable_url));
+        assert_ne!(error, "llm request failed: LLM endpoint is unreachable");
         assert!(
             tokio::time::timeout(Duration::from_millis(50), global_request_rx)
                 .await
