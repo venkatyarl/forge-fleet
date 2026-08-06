@@ -64,7 +64,7 @@ impl Default for RemoteExecutor {
 impl RemoteExecutor {
     pub fn new(command_timeout_secs: u64, batch_mode: bool) -> Self {
         Self {
-            command_timeout_secs,
+            command_timeout_secs: command_timeout_secs.max(1),
             batch_mode,
         }
     }
@@ -76,11 +76,7 @@ impl RemoteExecutor {
         command: impl Into<String>,
         use_sudo: bool,
     ) -> Result<NodeCommandResult, RemoteExecError> {
-        let command = command.into();
-        let exec = self.clone();
-
-        tokio::task::spawn_blocking(move || exec.run_on_node_blocking(node, command, use_sudo))
-            .await?
+        self.run_on_node_async(node, command.into(), use_sudo).await
     }
 
     /// Run a command on all nodes in parallel and collect per-node output.
@@ -133,7 +129,7 @@ impl RemoteExecutor {
         }
     }
 
-    fn run_on_node_blocking(
+    async fn run_on_node_async(
         &self,
         node: SshNodeConfig,
         command: String,
@@ -143,19 +139,20 @@ impl RemoteExecutor {
         options.batch_mode = self.batch_mode;
         options.command_timeout_secs = Some(self.command_timeout_secs);
 
-        let final_command = if use_sudo {
-            format!("sudo -n sh -c '{}'", shell_single_quote_escape(&command))
-        } else {
-            command.clone()
-        };
+        let final_command = execution_envelope(&command, use_sudo);
 
         let connection = SshConnection::new(options);
-        let output = connection.execute(&final_command)?;
+        let output = connection.execute_async(&final_command).await?;
+        let reported_command = if use_sudo {
+            format!("sudo -n -- {command}")
+        } else {
+            command
+        };
 
         Ok(NodeCommandResult {
             node: node.name,
             host: node.host,
-            command: final_command,
+            command: reported_command,
             started_at: output.started_at,
             duration_ms: output.duration_ms,
             success: output.success,
@@ -168,4 +165,127 @@ impl RemoteExecutor {
 
 fn shell_single_quote_escape(input: &str) -> String {
     input.replace('\'', "'\\''")
+}
+
+/// Wrap a remote payload in the same deterministic execution environment used
+/// by every immediate SSH caller (MCP and CLI).
+fn execution_envelope(command: &str, use_sudo: bool) -> String {
+    let command = shell_single_quote_escape(command);
+    let payload = format!("/bin/sh -c '{command}'");
+    let payload = shell_single_quote_escape(&payload);
+    let mut path_setup =
+        "ff_path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string();
+    if !use_sudo {
+        path_setup.push_str(
+            "; if [ \"$(/usr/bin/uname -s 2>/dev/null)\" = Darwin ]; then \
+             ff_path=\"$ff_path:/opt/homebrew/bin\"; fi; \
+             if [ -n \"${HOME:-}\" ]; then \
+             ff_path=\"$ff_path:$HOME/.local/bin:$HOME/.cargo/bin\"; fi",
+        );
+    }
+    let execute = format!("exec /usr/bin/env \"PATH=$ff_path\" /bin/sh -c '{payload}'");
+    let body = if use_sudo {
+        format!(
+            "{path_setup}; if [ \"$(/usr/bin/id -u)\" -eq 0 ]; then {execute}; \
+             else exec /usr/bin/sudo -n -- /usr/bin/env \"PATH=$ff_path\" /bin/sh -c '{payload}'; fi"
+        )
+    } else {
+        format!("{path_setup}; {execute}")
+    };
+    format!("/bin/sh -c '{}'", shell_single_quote_escape(&body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_has_deterministic_cross_platform_path() {
+        let envelope = execution_envelope("ff --version", false);
+        for required in [
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+            "$HOME/.local/bin",
+            "$HOME/.cargo/bin",
+            "/opt/homebrew/bin",
+        ] {
+            assert!(
+                envelope.contains(required),
+                "missing {required}: {envelope}"
+            );
+        }
+        assert!(envelope.contains("uname -s"));
+    }
+
+    #[test]
+    fn sudo_envelope_excludes_user_writable_path_entries() {
+        let envelope = execution_envelope("true", true);
+        assert!(!envelope.contains("$HOME/.local/bin"));
+        assert!(!envelope.contains("$HOME/.cargo/bin"));
+        assert!(!envelope.contains("/opt/homebrew/bin"));
+    }
+
+    #[test]
+    fn sudo_envelope_is_immune_to_homebrew_symlink_and_parent_replacement() {
+        let envelope = execution_envelope("true", true);
+        // Root never consults the optional Homebrew tree, so symlinked bins,
+        // writable/non-root ancestors, and path replacement races cannot affect
+        // executable resolution.
+        for attacker_controlled_component in ["/opt", "/opt/homebrew", "/opt/homebrew/bin"] {
+            assert!(!envelope.contains(attacker_controlled_component));
+        }
+    }
+
+    #[test]
+    fn envelope_preserves_quotes_and_shell_syntax() {
+        let envelope = execution_envelope("printf '%s\\n' \"a b\"; echo '$HOME'", false);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&envelope)
+            .output()
+            .expect("run envelope locally");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "a b\n$HOME\n");
+    }
+
+    #[test]
+    fn sudo_envelope_is_root_safe_and_non_interactive() {
+        let envelope = execution_envelope("id -u", true);
+        assert!(envelope.contains("/usr/bin/id -u"));
+        assert!(envelope.contains("/usr/bin/sudo -n --"));
+        assert!(envelope.contains("if ["));
+        assert!(
+            std::process::Command::new("sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(envelope)
+                .status()
+                .expect("parse sudo envelope")
+                .success()
+        );
+    }
+
+    #[test]
+    fn envelope_preserves_payload_exit_255() {
+        let envelope = execution_envelope("exit 255", false);
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&envelope)
+            .status()
+            .expect("run envelope locally");
+        assert_eq!(status.code(), Some(255));
+    }
+
+    #[test]
+    fn zero_timeout_is_still_bounded() {
+        assert_eq!(RemoteExecutor::new(0, true).command_timeout_secs, 1);
+    }
 }

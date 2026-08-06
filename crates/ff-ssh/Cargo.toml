@@ -15,4 +15,6 @@ thiserror.workspace = true
 tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+tempfile = "3"
+libc = "0.2"
 ff-core = { path = "../ff-core" }

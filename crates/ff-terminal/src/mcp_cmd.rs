@@ -455,7 +455,7 @@ fn upsert_codex_mcp(
         return replace_codex_section(path, &existing, server_name, &block, dry_run);
     }
     let block = format!(
-        "\n[mcp_servers.{server_name}]\nurl = \"{server_url}\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 120\n"
+        "\n[mcp_servers.{server_name}]\nurl = \"{server_url}\"\nstartup_timeout_sec = 30\ntool_timeout_sec = 180\n"
     );
 
     replace_codex_section(path, &existing, server_name, &block, dry_run)
@@ -901,6 +901,7 @@ mod tests {
         let updated = std::fs::read_to_string(config).unwrap();
         assert!(updated.contains("model = \"gpt-5\""));
         assert!(updated.contains("url = \"http://127.0.0.1:50001/mcp\""));
+        assert!(updated.contains("tool_timeout_sec = 180"));
         assert!(!updated.contains("command = \"forgefleetd\""));
         assert!(!updated.contains("--stdio"));
     }

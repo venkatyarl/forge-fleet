@@ -3,6 +3,7 @@
 //! Each handler accepts JSON params and returns a JSON result.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -563,7 +564,129 @@ pub async fn fleet_ssh(params: Option<Value>) -> HandlerResult {
 
 // ─── Fleet Run ───────────────────────────────────────────────────────────────
 
+const FLEET_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
+const FLEET_RESPONSE_BUILD_RESERVE: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy)]
+struct FleetRequestBudget {
+    handler: tokio::time::Instant,
+    persistence_finish: tokio::time::Instant,
+    execution: tokio::time::Instant,
+}
+
+impl FleetRequestBudget {
+    fn new(started_at: tokio::time::Instant) -> Self {
+        debug_assert_eq!(
+            crate::llm_exec::MCP_CLIENT_TIMEOUT_MS - crate::llm_exec::SERVER_HARD_TOTAL_TIMEOUT_MS,
+            15_000
+        );
+        let handler =
+            started_at + Duration::from_millis(crate::llm_exec::SERVER_HARD_TOTAL_TIMEOUT_MS);
+        let persistence_finish = handler - FLEET_RESPONSE_BUILD_RESERVE;
+        let execution = persistence_finish - FLEET_PERSISTENCE_BUDGET;
+        Self {
+            handler,
+            persistence_finish,
+            execution,
+        }
+    }
+
+    fn persistence_call_deadline(self) -> tokio::time::Instant {
+        (tokio::time::Instant::now() + FLEET_PERSISTENCE_BUDGET).min(self.persistence_finish)
+    }
+
+    fn admit_attempt(self, configured_timeout: Duration) -> Option<tokio::time::Instant> {
+        let now = tokio::time::Instant::now();
+        let remaining = self.execution.checked_duration_since(now)?;
+        (configured_timeout <= remaining).then_some(now + configured_timeout)
+    }
+}
+
+async fn run_before_fleet_handler_deadline<F>(
+    deadline: FleetRequestBudget,
+    tool: &'static str,
+    operation: F,
+) -> HandlerResult
+where
+    F: Future<Output = HandlerResult>,
+{
+    tokio::time::timeout_at(deadline.handler, operation)
+        .await
+        .unwrap_or_else(|_| Err(fleet_deadline_error(tool, "response")))
+}
+
+fn fleet_deadline_error(tool: &str, stage: &str) -> String {
+    format!("deadline_exceeded: {tool} server deadline elapsed during {stage}")
+}
+
+async fn await_fleet_preflight<F, T>(
+    deadline: FleetRequestBudget,
+    tool: &'static str,
+    stage: &'static str,
+    operation: F,
+) -> Result<T, String>
+where
+    F: Future<Output = Result<T, String>>,
+{
+    tokio::time::timeout_at(deadline.execution, operation)
+        .await
+        .map_err(|_| fleet_deadline_error(tool, stage))?
+}
+
+async fn load_fleet_config_before_deadline(
+    deadline: FleetRequestBudget,
+    tool: &'static str,
+) -> Result<(FleetConfig, PathBuf), String> {
+    await_fleet_preflight(deadline, tool, "config preflight", async {
+        tokio::task::spawn_blocking(load_config_auto)
+            .await
+            .map_err(|error| format!("{tool} config task failed: {error}"))?
+    })
+    .await
+}
+
+async fn await_fleet_persistence<F, T>(
+    deadline: FleetRequestBudget,
+    operation: F,
+) -> Result<T, tokio::time::error::Elapsed>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout_at(deadline.persistence_call_deadline(), operation).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FleetAttemptWaitError {
+    InsufficientBudget,
+    TimedOut,
+}
+
+async fn await_fleet_attempt<F, T>(
+    deadline: FleetRequestBudget,
+    configured_timeout: Duration,
+    operation: F,
+) -> Result<T, FleetAttemptWaitError>
+where
+    F: Future<Output = T>,
+{
+    let attempt_deadline = deadline
+        .admit_attempt(configured_timeout)
+        .ok_or(FleetAttemptWaitError::InsufficientBudget)?;
+    tokio::time::timeout_at(attempt_deadline, operation)
+        .await
+        .map_err(|_| FleetAttemptWaitError::TimedOut)
+}
+
 pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
+    let deadline = FleetRequestBudget::new(tokio::time::Instant::now());
+    run_before_fleet_handler_deadline(deadline, "fleet_run", fleet_run_bounded(params, deadline))
+        .await
+}
+
+async fn fleet_run_bounded(params: Option<Value>, deadline: FleetRequestBudget) -> HandlerResult {
+    // One absolute envelope starts at handler entry, before parsing, config,
+    // pool acquisition, route snapshot, attempts, and interaction persistence.
+    // The installed client allows 180s; this server returns by 165s.
     let prompt = params
         .as_ref()
         .and_then(|p| p.get("prompt"))
@@ -660,7 +783,13 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     let mut applied_policy: Option<AppliedProjectPolicy> = None;
 
     if let Some(project_id) = project_id {
-        let policy = resolve_project_policy(project_id, prompt).await?;
+        let policy = await_fleet_preflight(
+            deadline,
+            "fleet_run",
+            "project-policy preflight",
+            resolve_project_policy(project_id, prompt),
+        )
+        .await?;
 
         if !ProjectPolicyEngine::model_allowed(&policy.policy.routing, model_selector) {
             return Err(format!(
@@ -703,23 +832,35 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     // does not apply to this path — operators using strategy=auto/cascade
     // are explicitly trusting the cascade's auto-routing.
     if strategy_str != "tier" {
-        let (cfg, _) = load_config_auto()?;
-        let pool = get_pg_pool(&cfg).await.map_err(|error| {
-            format!(
-                "fleet_run strategy='{strategy_str}' unavailable: canonical Postgres router is required: {error}"
-            )
-        })?;
-        let stored_policy = config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await;
-        let route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
+        let (cfg, _) = load_fleet_config_before_deadline(deadline, "fleet_run").await?;
+        let pool = await_fleet_preflight(deadline, "fleet_run", "Postgres preflight", async {
+            get_pg_pool(&cfg).await.map_err(|error| {
+                format!(
+                    "fleet_run strategy='{strategy_str}' unavailable: canonical Postgres router is required: {error}"
+                )
+            })
+        })
+        .await?;
+        let stored_policy =
+            await_fleet_preflight(deadline, "fleet_run", "route-policy preflight", async {
+                Ok(config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await)
+            })
+            .await?;
+        let mut route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
             &cfg.llm.timeouts,
             stored_policy.as_deref(),
         )?;
-        let exec = crate::llm_exec::GatewayLlmExec::new(
+        route_policy
+            .cap_total_timeout_at(Instant::now(), deadline.execution.into_std())
+            .map_err(|error| format!("deadline_exceeded: {error}"))?;
+        let exec = crate::llm_exec::GatewayLlmExec::new_with_deadline(
             pool.clone(),
             workload,
             requested_max_tokens.map(|_| completion_budget),
             route_policy.clone(),
-        );
+            deadline.execution.into_std(),
+        )
+        .map_err(|error| format!("deadline_exceeded: {error}"))?;
 
         let tier_hint = params
             .as_ref()
@@ -743,8 +884,16 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         .await;
         let interaction =
             path3_interaction_record("fleet_run", prompt, strategy_str, &route_policy, &result);
-        if let Err(error) = ff_db::pg_record_interaction(&pool, &interaction).await {
-            tracing::warn!(%error, "fleet_run Path-3 interaction capture failed");
+        match await_fleet_persistence(deadline, ff_db::pg_record_interaction(&pool, &interaction))
+            .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "fleet_run Path-3 interaction capture failed");
+            }
+            Err(_) => {
+                tracing::warn!("fleet_run Path-3 interaction capture exceeded its deadline");
+            }
         }
         return match result {
             Ok(success) => serde_json::to_value(success)
@@ -753,16 +902,35 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         };
     }
 
-    let (config, _config_path) = load_config_auto()?;
+    let (config, _config_path) = load_fleet_config_before_deadline(deadline, "fleet_run").await?;
 
     // DB-first: the static `[nodes.*.models]` config is empty on a DB-driven
     // fleet, so fall back to live healthy chat deployments from
     // `fleet_model_deployments`. Without this the tier router has zero backends
     // and fleet_run / ff run fail with -32603 despite healthy LLMs serving.
-    let mut backends = healthy_backends_from_config(&config).await;
+    let mut backends = await_fleet_preflight(
+        deadline,
+        "fleet_run",
+        "configured-backend preflight",
+        async { Ok(healthy_backends_from_config(&config).await) },
+    )
+    .await?;
     if backends.is_empty() {
-        match get_pg_pool(&config).await {
-            Ok(pool) => backends = backends_from_db(&pool).await,
+        match await_fleet_preflight(deadline, "fleet_run", "Postgres preflight", async {
+            get_pg_pool(&config).await
+        })
+        .await
+        {
+            Ok(pool) => {
+                backends = await_fleet_preflight(
+                    deadline,
+                    "fleet_run",
+                    "database-backend preflight",
+                    async { Ok(backends_from_db(&pool).await) },
+                )
+                .await?
+            }
+            Err(error) if error.starts_with("deadline_exceeded:") => return Err(error),
             Err(e) => tracing::warn!("fleet_run: config has no backends and no DB pool: {e}"),
         }
     }
@@ -786,7 +954,11 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         ..Default::default()
     }));
 
-    if let Some(snapshot) = config_kv_get(QUALITY_SNAPSHOT_KEY).await
+    if let Some(snapshot) =
+        await_fleet_preflight(deadline, "fleet_run", "quality-snapshot preflight", async {
+            Ok(config_kv_get(QUALITY_SNAPSHOT_KEY).await)
+        })
+        .await?
         && let Err(err) = quality_tracker.import_json(&snapshot)
     {
         warn!(error = %err, "failed to import quality snapshot");
@@ -805,9 +977,13 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
         extra: HashMap::new(),
     }];
 
-    let (decision, mut chain) = adaptive_router
-        .route(model_selector, &messages, Some(start_tier), Some(max_tier))
-        .await;
+    let (decision, mut chain) =
+        await_fleet_preflight(deadline, "fleet_run", "adaptive-route preflight", async {
+            Ok(adaptive_router
+                .route(model_selector, &messages, Some(start_tier), Some(max_tier))
+                .await)
+        })
+        .await?;
 
     if let Some(policy) = applied_policy.as_ref()
         && !policy.policy.routing.allowed_models.is_empty()
@@ -844,7 +1020,7 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
     let client = &*SHARED_HTTP;
     let mut last_error = String::new();
 
-    for (tier, backends) in chain {
+    'routes: for (tier, backends) in chain {
         let timeout = tier_router.timeout_for_tier(tier);
 
         for backend in backends {
@@ -870,119 +1046,144 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
             let started = Instant::now();
             let endpoint = ff_core::url::normalize_chat_completions_url(&backend.base_url());
 
-            match client
-                .post(&endpoint)
-                .timeout(timeout)
-                .json(&request)
-                .send()
-                .await
+            let payload = match await_fleet_attempt(deadline, timeout, async {
+                let response = client
+                    .post(&endpoint)
+                    .timeout(timeout)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|error| format!("request failed: {error}"))?;
+                if !response.status().is_success() {
+                    // Provider bodies can echo prompts or private reasoning.
+                    // Preserve the actionable endpoint/status only.
+                    return Err(format!("returned HTTP {}", response.status()));
+                }
+                response
+                    .json::<Value>()
+                    .await
+                    .map_err(|error| format!("returned invalid completion JSON: {error}"))
+            })
+            .await
             {
-                Ok(response) => {
+                Ok(Ok(payload)) => payload,
+                Ok(Err(error)) => {
                     let latency = started.elapsed();
-
-                    if !response.status().is_success() {
-                        let status = response.status();
-
-                        tier_router.record_failure(&backend.id, latency);
-                        quality_tracker.record(
-                            &backend.model,
-                            decision.profile.task_type,
-                            &Outcome::failure(latency.as_millis() as f64),
-                        );
-
-                        // Provider bodies can echo prompts or private reasoning.
-                        // Preserve the actionable endpoint/status only.
-                        last_error = format!("backend '{}' returned HTTP {}", backend.id, status);
-                        continue;
-                    }
-
-                    let payload: Value = match response.json().await {
-                        Ok(payload) => payload,
-                        Err(error) => {
-                            tier_router.record_failure(&backend.id, latency);
-                            quality_tracker.record(
-                                &backend.model,
-                                decision.profile.task_type,
-                                &Outcome::failure(latency.as_millis() as f64),
-                            );
-                            last_error = format!(
-                                "backend '{}' returned invalid completion JSON: {error}",
-                                backend.id
-                            );
-                            continue;
-                        }
-                    };
-                    let completion = match validate_completion_response(&payload) {
-                        Ok(completion) => completion,
-                        Err(error) => {
-                            tier_router.record_failure(&backend.id, latency);
-                            quality_tracker.record(
-                                &backend.model,
-                                decision.profile.task_type,
-                                &Outcome::failure(latency.as_millis() as f64),
-                            );
-                            last_error = format!(
-                                "backend '{}' returned an unsafe completion: {error}",
-                                backend.id
-                            );
-                            continue;
-                        }
-                    };
-
-                    tier_router.record_success(&backend.id, latency);
+                    tier_router.record_failure(&backend.id, latency);
                     quality_tracker.record(
                         &backend.model,
                         decision.profile.task_type,
-                        &Outcome::success(latency.as_millis() as f64),
+                        &Outcome::failure(latency.as_millis() as f64),
                     );
+                    last_error = format!("backend '{}' {error}", backend.id);
+                    continue;
+                }
+                Err(FleetAttemptWaitError::TimedOut) => {
+                    let latency = started.elapsed();
+                    tier_router.record_failure(&backend.id, latency);
+                    quality_tracker.record(
+                        &backend.model,
+                        decision.profile.task_type,
+                        &Outcome::failure(latency.as_millis() as f64),
+                    );
+                    last_error = format!(
+                        "backend '{}' request failed: configured timeout elapsed",
+                        backend.id
+                    );
+                    continue;
+                }
+                Err(FleetAttemptWaitError::InsufficientBudget) => {
+                    last_error = fleet_deadline_error("fleet_run", "backend attempt admission");
+                    break 'routes;
+                }
+            };
 
-                    persist_quality_snapshot(&quality_tracker).await;
+            let latency = started.elapsed();
+            let completion = match validate_completion_response(&payload) {
+                Ok(completion) => completion,
+                Err(error) => {
+                    tier_router.record_failure(&backend.id, latency);
+                    quality_tracker.record(
+                        &backend.model,
+                        decision.profile.task_type,
+                        &Outcome::failure(latency.as_millis() as f64),
+                    );
+                    last_error = format!(
+                        "backend '{}' returned an unsafe completion: {error}",
+                        backend.id
+                    );
+                    continue;
+                }
+            };
 
-                    let text = completion.content;
-                    let redacted_payload = redacted_for_logging(&payload);
+            tier_router.record_success(&backend.id, latency);
+            quality_tracker.record(
+                &backend.model,
+                decision.profile.task_type,
+                &Outcome::success(latency.as_millis() as f64),
+            );
 
-                    // Fire-and-forget interaction capture (Track A). Never
-                    // blocks the response; skips silently if no pool is
-                    // available. channel="mcp".
-                    {
-                        let prompt_owned = prompt.to_string();
-                        let response_owned = text.clone();
-                        // `backend.model` is a local deployment's model name /
-                        // gguf filename — record the canonical local engine.
-                        let engine_owned = ff_agent::llm_attribution::engine_label(&backend.model);
-                        let latency_ms = latency.as_millis().min(i32::MAX as u128) as i32;
-                        let tokens_in = payload
-                            .get("usage")
-                            .and_then(|u| u.get("prompt_tokens"))
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0) as i32;
-                        let tokens_out = payload
-                            .get("usage")
-                            .and_then(|u| u.get("completion_tokens"))
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(0) as i32;
-                        let cfg_clone = config.clone();
-                        tokio::spawn(async move {
-                            if let Ok(pool) = get_pg_pool(&cfg_clone).await {
-                                let rec = ff_db::InteractionRecord {
-                                    channel: "mcp".to_string(),
-                                    request_text: prompt_owned,
-                                    engine: Some(engine_owned),
-                                    response_text: response_owned,
-                                    tokens_in,
-                                    tokens_out,
-                                    latency_ms: Some(latency_ms),
-                                    outcome: "ok".to_string(),
-                                    ..Default::default()
-                                };
-                                if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
-                                    tracing::debug!("fleet_run interaction capture failed: {e}");
-                                }
+            if await_fleet_persistence(deadline, persist_quality_snapshot(&quality_tracker))
+                .await
+                .is_err()
+            {
+                tracing::warn!("fleet_run quality snapshot exceeded its persistence deadline");
+            }
+
+            let text = completion.content;
+            let redacted_payload = redacted_for_logging(&payload);
+
+            // Fire-and-forget interaction capture (Track A). Never
+            // blocks the response; skips silently if no pool is
+            // available. channel="mcp".
+            {
+                let prompt_owned = prompt.to_string();
+                let response_owned = text.clone();
+                // `backend.model` is a local deployment's model name /
+                // gguf filename — record the canonical local engine.
+                let engine_owned = ff_agent::llm_attribution::engine_label(&backend.model);
+                let latency_ms = latency.as_millis().min(i32::MAX as u128) as i32;
+                let tokens_in = payload
+                    .get("usage")
+                    .and_then(|u| u.get("prompt_tokens"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                let tokens_out = payload
+                    .get("usage")
+                    .and_then(|u| u.get("completion_tokens"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0) as i32;
+                let cfg_clone = config.clone();
+                let persistence_finish = deadline.persistence_finish;
+                tokio::spawn(async move {
+                    let persistence = async {
+                        if let Ok(pool) = get_pg_pool(&cfg_clone).await {
+                            let rec = ff_db::InteractionRecord {
+                                channel: "mcp".to_string(),
+                                request_text: prompt_owned,
+                                engine: Some(engine_owned),
+                                response_text: response_owned,
+                                tokens_in,
+                                tokens_out,
+                                latency_ms: Some(latency_ms),
+                                outcome: "ok".to_string(),
+                                ..Default::default()
+                            };
+                            if let Err(e) = ff_db::pg_record_interaction(&pool, &rec).await {
+                                tracing::debug!("fleet_run interaction capture failed: {e}");
                             }
-                        });
+                        }
+                    };
+                    if tokio::time::timeout_at(persistence_finish, persistence)
+                        .await
+                        .is_err()
+                    {
+                        tracing::debug!("fleet_run interaction capture exceeded its deadline");
                     }
+                });
+            }
 
-                    return Ok(json!({
+            return Ok(json!({
                         "strategy": decision.strategy,
                         "task_profile": {
                             "task_type": decision.profile.task_type.as_str(),
@@ -1006,23 +1207,16 @@ pub async fn fleet_run(params: Option<Value>) -> HandlerResult {
                         "raw_response": redacted_payload,
                         "raw_response_redacted": true,
                         "project_policy": applied_policy
-                    }));
-                }
-                Err(err) => {
-                    let latency = started.elapsed();
-                    tier_router.record_failure(&backend.id, latency);
-                    quality_tracker.record(
-                        &backend.model,
-                        decision.profile.task_type,
-                        &Outcome::failure(latency.as_millis() as f64),
-                    );
-                    last_error = format!("backend '{}' request failed: {err}", backend.id);
-                }
-            }
+            }));
         }
     }
 
-    persist_quality_snapshot(&quality_tracker).await;
+    if await_fleet_persistence(deadline, persist_quality_snapshot(&quality_tracker))
+        .await
+        .is_err()
+    {
+        tracing::warn!("fleet_run quality snapshot exceeded its persistence deadline");
+    }
 
     Err(if last_error.is_empty() {
         "all routed backends failed".to_string()
@@ -1525,6 +1719,19 @@ async fn record_mcp_offload_turn(
 // See `ff_orchestrator::cascade_strategy` for the full rationale.
 
 pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
+    let deadline = FleetRequestBudget::new(tokio::time::Instant::now());
+    run_before_fleet_handler_deadline(
+        deadline,
+        "fleet_cascade",
+        fleet_cascade_bounded(params, deadline),
+    )
+    .await
+}
+
+async fn fleet_cascade_bounded(
+    params: Option<Value>,
+    deadline: FleetRequestBudget,
+) -> HandlerResult {
     let prompt = params
         .as_ref()
         .and_then(|p| p.get("prompt"))
@@ -1550,21 +1757,33 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
             .and_then(|v| v.as_str()),
     );
 
-    let (cfg, _) = config::load_config_auto().map_err(|error| format!("config: {error}"))?;
-    let pool = get_pg_pool(&cfg).await.map_err(|error| {
-        format!("fleet_cascade unavailable: canonical Postgres router is required: {error}")
-    })?;
-    let stored_policy = config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await;
-    let route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
+    let (cfg, _) = load_fleet_config_before_deadline(deadline, "fleet_cascade").await?;
+    let pool = await_fleet_preflight(deadline, "fleet_cascade", "Postgres preflight", async {
+        get_pg_pool(&cfg).await.map_err(|error| {
+            format!("fleet_cascade unavailable: canonical Postgres router is required: {error}")
+        })
+    })
+    .await?;
+    let stored_policy =
+        await_fleet_preflight(deadline, "fleet_cascade", "route-policy preflight", async {
+            Ok(config_kv_get(crate::llm_exec::LOCAL_ROUTE_POLICY_KEY).await)
+        })
+        .await?;
+    let mut route_policy = crate::llm_exec::LocalRoutePolicy::from_config(
         &cfg.llm.timeouts,
         stored_policy.as_deref(),
     )?;
-    let exec = crate::llm_exec::GatewayLlmExec::new(
+    route_policy
+        .cap_total_timeout_at(Instant::now(), deadline.execution.into_std())
+        .map_err(|error| format!("deadline_exceeded: {error}"))?;
+    let exec = crate::llm_exec::GatewayLlmExec::new_with_deadline(
         pool.clone(),
         WorkloadClass::CodeOneShot,
         None,
         route_policy.clone(),
-    );
+        deadline.execution.into_std(),
+    )
+    .map_err(|error| format!("deadline_exceeded: {error}"))?;
 
     let result = crate::strategy_dispatch::dispatch_strategy(
         &exec,
@@ -1581,8 +1800,15 @@ pub async fn fleet_cascade(params: Option<Value>) -> HandlerResult {
         &route_policy,
         &result,
     );
-    if let Err(error) = ff_db::pg_record_interaction(&pool, &interaction).await {
-        tracing::warn!(%error, "fleet_cascade Path-3 interaction capture failed");
+    match await_fleet_persistence(deadline, ff_db::pg_record_interaction(&pool, &interaction)).await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "fleet_cascade Path-3 interaction capture failed");
+        }
+        Err(_) => {
+            tracing::warn!("fleet_cascade Path-3 interaction capture exceeded its deadline");
+        }
     }
     match result {
         Ok(success) => serde_json::to_value(success)
@@ -4569,6 +4795,130 @@ mod tests {
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn fleet_deadlines_cover_handler_entry_through_persistence_with_client_margin() {
+        let started = tokio::time::Instant::now();
+        let deadline = FleetRequestBudget::new(started);
+        assert_eq!(
+            deadline.handler.duration_since(started),
+            Duration::from_millis(crate::llm_exec::SERVER_HARD_TOTAL_TIMEOUT_MS)
+        );
+        assert_eq!(
+            crate::llm_exec::MCP_CLIENT_TIMEOUT_MS - crate::llm_exec::SERVER_HARD_TOTAL_TIMEOUT_MS,
+            15_000
+        );
+        assert_eq!(
+            deadline
+                .persistence_finish
+                .duration_since(deadline.execution),
+            FLEET_PERSISTENCE_BUDGET
+        );
+        assert_eq!(
+            deadline.handler.duration_since(deadline.persistence_finish),
+            FLEET_RESPONSE_BUILD_RESERVE
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_fleet_handler_and_persistence_futures_are_bounded_by_absolute_deadlines() {
+        let deadline = FleetRequestBudget::new(tokio::time::Instant::now());
+        let handler = tokio::spawn(run_before_fleet_handler_deadline(
+            deadline,
+            "fleet_run",
+            std::future::pending(),
+        ));
+        tokio::time::advance(Duration::from_millis(
+            crate::llm_exec::SERVER_HARD_TOTAL_TIMEOUT_MS,
+        ))
+        .await;
+        let error = handler
+            .await
+            .expect("deadline task should not panic")
+            .expect_err("pending handler must hit the server deadline");
+        assert!(error.starts_with("deadline_exceeded:"));
+
+        let persistence_deadline = FleetRequestBudget::new(tokio::time::Instant::now());
+        let persistence = tokio::spawn(await_fleet_persistence(
+            persistence_deadline,
+            std::future::pending::<()>(),
+        ));
+        tokio::time::advance(FLEET_PERSISTENCE_BUDGET).await;
+        assert!(
+            persistence
+                .await
+                .expect("persistence task should not panic")
+                .is_err()
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_tier_multi_backend_exhaustion_refuses_partial_attempt_before_client_timeout() {
+        let started = tokio::time::Instant::now();
+        let deadline = FleetRequestBudget::new(started);
+
+        // Model two tier-1 backends and one tier-2 backend consuming their full
+        // configured budgets. The next tier-2 backend cannot fit wholly inside
+        // the one handler-entry execution envelope and must not start.
+        for configured_timeout in [
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+        ] {
+            let attempt = tokio::spawn(await_fleet_attempt(
+                deadline,
+                configured_timeout,
+                std::future::pending::<()>(),
+            ));
+            tokio::task::yield_now().await;
+            tokio::time::advance(configured_timeout).await;
+            assert_eq!(
+                attempt.await.expect("attempt task"),
+                Err(FleetAttemptWaitError::TimedOut)
+            );
+        }
+
+        assert_eq!(
+            await_fleet_attempt(deadline, Duration::from_secs(60), async {}).await,
+            Err(FleetAttemptWaitError::InsufficientBudget)
+        );
+        assert!(
+            tokio::time::Instant::now().duration_since(started)
+                < Duration::from_millis(crate::llm_exec::MCP_CLIENT_TIMEOUT_MS)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cascade_preflight_and_persistence_hangs_end_inside_shared_handler_budget() {
+        let started = tokio::time::Instant::now();
+        let deadline = FleetRequestBudget::new(started);
+        let preflight = tokio::spawn(await_fleet_preflight(
+            deadline,
+            "fleet_cascade",
+            "Postgres preflight",
+            std::future::pending::<Result<(), String>>(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(deadline.execution.duration_since(started)).await;
+        let error = preflight
+            .await
+            .expect("preflight task")
+            .expect_err("hanging preflight must time out");
+        assert!(error.starts_with("deadline_exceeded: fleet_cascade"));
+        assert!(
+            tokio::time::Instant::now().duration_since(started)
+                < Duration::from_millis(crate::llm_exec::MCP_CLIENT_TIMEOUT_MS)
+        );
+
+        let persistence_deadline = FleetRequestBudget::new(tokio::time::Instant::now());
+        let persistence = tokio::spawn(await_fleet_persistence(
+            persistence_deadline,
+            std::future::pending::<()>(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(FLEET_PERSISTENCE_BUDGET).await;
+        assert!(persistence.await.expect("persistence task").is_err());
     }
 
     #[test]
