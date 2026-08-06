@@ -1548,14 +1548,16 @@ impl BackupOrchestrator {
         for (backup_id, kind, file_name, checksum, size_bytes, distribution_status) in rows {
             if existing_receipt_is_current(
                 &distribution_status,
-                backup_id,
-                computer_id,
-                &canonical_host,
-                &checksum,
-                size_bytes,
-                &kind,
-                &file_name,
-                now,
+                &ExistingReceiptExpectation {
+                    backup_id,
+                    computer_id,
+                    canonical_host: &canonical_host,
+                    expected_checksum: &checksum,
+                    expected_size: size_bytes,
+                    expected_database_kind: &kind,
+                    expected_file_name: &file_name,
+                    now,
+                },
             ) {
                 continue;
             }
@@ -2565,17 +2567,41 @@ async fn record_backup_distribution_receipt_for_host(
     })
 }
 
-fn existing_receipt_is_current(
-    distribution_status: &serde_json::Value,
+/// Call-scoped expected receipt identity and freshness values. The validator
+/// borrows this context only for the duration of its synchronous boolean check.
+#[derive(Clone, Copy)]
+struct ExistingReceiptExpectation<'a> {
     backup_id: Uuid,
     computer_id: Uuid,
-    canonical_host: &str,
-    expected_checksum: &str,
+    canonical_host: &'a str,
+    expected_checksum: &'a str,
     expected_size: i64,
-    expected_database_kind: &str,
-    expected_file_name: &str,
+    expected_database_kind: &'a str,
+    expected_file_name: &'a str,
     now: chrono::DateTime<Utc>,
+}
+
+fn receipt_has_valid_run_id(receipt: &serde_json::Map<String, serde_json::Value>) -> bool {
+    receipt
+        .get("run_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|run_id| Uuid::parse_str(run_id).is_ok())
+}
+
+fn existing_receipt_is_current(
+    distribution_status: &serde_json::Value,
+    expectation: &ExistingReceiptExpectation<'_>,
 ) -> bool {
+    let ExistingReceiptExpectation {
+        backup_id,
+        computer_id,
+        canonical_host,
+        expected_checksum,
+        expected_size,
+        expected_database_kind,
+        expected_file_name,
+        now,
+    } = *expectation;
     if validate_expected_sha256(expected_checksum).is_err()
         || expected_size <= 0
         || !is_known_backup_kind(expected_database_kind)
@@ -2623,10 +2649,7 @@ fn existing_receipt_is_current(
             .get("size_bytes")
             .and_then(serde_json::Value::as_i64)
             != Some(expected_size)
-        || !receipt
-            .get("run_id")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|run_id| Uuid::parse_str(run_id).is_ok())
+        || !receipt_has_valid_run_id(receipt)
     {
         return false;
     }
@@ -2910,7 +2933,11 @@ fn validate_wal_entry_custody(
 ) -> Result<(), BackupError> {
     // Darwin's libc exposes mode_t/S_IF* as u16 while MetadataExt::mode is
     // u32; normalize the constants so this stays source-compatible on macOS.
-    if state.mode & libc::S_IFMT as u32 != libc::S_IFREG as u32 {
+    #[cfg(target_vendor = "apple")]
+    let (file_type_mask, regular_file_type) = (u32::from(libc::S_IFMT), u32::from(libc::S_IFREG));
+    #[cfg(not(target_vendor = "apple"))]
+    let (file_type_mask, regular_file_type) = (libc::S_IFMT, libc::S_IFREG);
+    if state.mode & file_type_mask != regular_file_type {
         return Err(wal_custody_rejection(format!(
             "canonical entry {name} is not a regular file"
         )));
@@ -3981,120 +4008,79 @@ mod tests {
             })
         };
         let fresh = receipt(now - chrono::Duration::minutes(5));
+        let expected = ExistingReceiptExpectation {
+            backup_id,
+            computer_id,
+            canonical_host: "lily",
+            expected_checksum: &checksum,
+            expected_size: 8192,
+            expected_database_kind: "postgres",
+            expected_file_name: "pg-exact.tar.gz.age",
+            now,
+        };
         assert!(existing_receipt_is_current(
             &fresh,
-            backup_id,
-            computer_id,
-            "LILY",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &ExistingReceiptExpectation {
+                canonical_host: "LILY",
+                ..expected
+            },
         ));
         assert!(!existing_receipt_is_current(
             &fresh,
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "redis",
-            "pg-exact.tar.gz.age",
-            now,
+            &ExistingReceiptExpectation {
+                expected_database_kind: "redis",
+                ..expected
+            },
         ));
         assert!(!existing_receipt_is_current(
             &fresh,
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-renamed.tar.gz.age",
-            now,
+            &ExistingReceiptExpectation {
+                expected_file_name: "pg-renamed.tar.gz.age",
+                ..expected
+            },
         ));
         assert!(!existing_receipt_is_current(
             &fresh,
-            backup_id,
-            computer_id,
-            "rihanna",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &ExistingReceiptExpectation {
+                canonical_host: "rihanna",
+                ..expected
+            },
         ));
         assert!(!existing_receipt_is_current(
             &fresh,
-            Uuid::new_v4(),
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &ExistingReceiptExpectation {
+                backup_id: Uuid::new_v4(),
+                ..expected
+            },
         ));
         assert!(!existing_receipt_is_current(
             &receipt(now - chrono::Duration::seconds(BACKUP_RECEIPT_MAX_AGE_SECS + 1)),
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &expected,
         ));
         assert!(existing_receipt_is_current(
             &receipt(now + chrono::Duration::seconds(1)),
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &expected,
         ));
         assert!(!existing_receipt_is_current(
             &receipt(now + chrono::Duration::seconds(BACKUP_RECEIPT_FUTURE_SKEW_SECS + 1),),
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &expected,
         ));
         let mut incomplete = fresh.clone();
         incomplete["hosts"][computer_id.to_string()]
             .as_object_mut()
             .unwrap()
             .remove("run_id");
-        assert!(!existing_receipt_is_current(
-            &incomplete,
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            8192,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
-        ));
+        assert!(!existing_receipt_is_current(&incomplete, &expected));
+        let mut invalid_run_id = fresh.clone();
+        invalid_run_id["hosts"][computer_id.to_string()]["run_id"] =
+            serde_json::json!("not-a-uuid");
+        assert!(!existing_receipt_is_current(&invalid_run_id, &expected));
         assert!(!existing_receipt_is_current(
             &fresh,
-            backup_id,
-            computer_id,
-            "lily",
-            &checksum,
-            4096,
-            "postgres",
-            "pg-exact.tar.gz.age",
-            now,
+            &ExistingReceiptExpectation {
+                expected_size: 4096,
+                ..expected
+            },
         ));
         assert_eq!(RECEIPT_RECONCILE_BATCH_SIZE, 5);
         assert!(RECEIPT_RECONCILE_SCAN_LIMIT >= RECEIPT_RECONCILE_BATCH_SIZE as i64);

@@ -340,6 +340,16 @@ fn should_alert(success: bool, days_since_success: Option<f64>, stale_days: f64)
     }
 }
 
+struct PostgresDrillContext<'a> {
+    run_id: uuid::Uuid,
+    backup_id: uuid::Uuid,
+    file_name: &'a str,
+    enc_path: &'a Path,
+    work: &'a Path,
+    policy: DrillPolicy,
+    capacity: &'a str,
+}
+
 /// The restore-drill tick. Spawn on every daemon; gated to the live leader
 /// inside the loop.
 pub struct RestoreDrillTick {
@@ -599,15 +609,15 @@ impl RestoreDrillTick {
         };
         match kind {
             RestoreKind::Postgres => {
-                self.drill_decrypt_extract(
+                self.drill_decrypt_extract(PostgresDrillContext {
                     run_id,
                     backup_id,
-                    &file_name,
-                    &path,
-                    work.path(),
+                    file_name: &file_name,
+                    enc_path: &path,
+                    work: work.path(),
                     policy,
-                    &capacity,
-                )
+                    capacity: &capacity,
+                })
                 .await
             }
             RestoreKind::FalkorDb => {
@@ -627,16 +637,16 @@ impl RestoreDrillTick {
     }
 
     /// Stages 4–6 (decrypt → extract → validate), all under `work`.
-    async fn drill_decrypt_extract(
-        &self,
-        run_id: uuid::Uuid,
-        backup_id: uuid::Uuid,
-        file_name: &str,
-        enc_path: &Path,
-        work: &Path,
-        policy: DrillPolicy,
-        capacity: &str,
-    ) -> DrillOutcome {
+    async fn drill_decrypt_extract(&self, context: PostgresDrillContext<'_>) -> DrillOutcome {
+        let PostgresDrillContext {
+            run_id,
+            backup_id,
+            file_name,
+            enc_path,
+            work,
+            policy,
+            capacity,
+        } = context;
         // 4) decrypt → `<work>/<file without .age>`.
         let plain_name = file_name.strip_suffix(".age").unwrap_or(file_name);
         let plain_path = work.join(plain_name);
@@ -1662,8 +1672,7 @@ impl PostgresProofRuntime for DockerPostgresProof {
         .to_string();
         if !valid_sha256_id(&image_id) {
             return Err(format!(
-                "PostgreSQL proof image '{}' did not resolve to an immutable sha256 ID",
-                POSTGRES_PROOF_IMAGE
+                "PostgreSQL proof image '{POSTGRES_PROOF_IMAGE}' did not resolve to an immutable sha256 ID"
             ));
         }
         let version = docker_output(
