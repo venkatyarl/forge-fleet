@@ -543,6 +543,23 @@ if [ -n "$KIMI_CREDENTIALS" ]; then
     || die "invalid Kimi credentials from fleet_secrets"
   run_as_user chmod 600 "$USER_HOME/.kimi/credentials/kimi-code.json"
 fi
+
+# Desktop clients (macOS): install the Claude + Kimi desktop apps when
+# missing so a fresh machine is fully usable, not just CLI-wired. The Codex
+# brew cask is the terminal CLI (already handled above) — OpenAI ships no
+# separate desktop app cask.
+if [ "$OS_ID" = "macos" ]; then
+  if [ ! -d "/Applications/Claude.app" ]; then
+    run_as_user bash -lc 'brew install --cask claude' \
+      || report "desktop_apps" warn "Claude desktop cask install failed — install manually"
+  fi
+  if [ ! -d "/Applications/Kimi.app" ]; then
+    run_as_user bash -lc 'brew install --cask kimi' \
+      || report "desktop_apps" warn "Kimi desktop cask install failed — install manually"
+  fi
+  report "desktop_apps" ok "claude + kimi desktop present"
+fi
+
 report "cloud_clis" ok "claude, codex, kimi"
 
 report "web_build" running
@@ -802,7 +819,53 @@ else
   report "fleet_toml" ok "already exists"
 fi
 
-# ─── 11. systemd unit ────────────────────────────────────────────────────
+# ─── 11. CLI MCP auto-config ─────────────────────────────────────────────
+#
+# Delegate every client-specific config shape and transport choice to ff's
+# typed, idempotent installer. This is the single authority for current Claude
+# Code/Desktop, Codex, Gemini, Kimi Code/Desktop, and the other supported
+# clients. In particular, do not call `claude mcp add <name> <url>` here: that
+# CLI form can interpret the URL as a stdio command instead of a native HTTP
+# endpoint. --no-instructions limits bootstrap to MCP config; the shared
+# project/user instructions are managed separately.
+report "mcp-config" running
+
+if MCP_CONFIG_OUTPUT="$(run_as_user "$USER_HOME/.local/bin/ff" mcp install --for all --no-instructions 2>&1)"; then
+  printf '%s\n' "$MCP_CONFIG_OUTPUT"
+  # `ff mcp install` continues across per-client errors and reports each one
+  # with a cross marker. Surface partial failure in the bootstrap workstream
+  # even though the aggregate CLI invocation intentionally exits successfully.
+  if grep -Fq '✗' <<<"$MCP_CONFIG_OUTPUT"; then
+    MCP_CONFIG_FAILURES="$(grep -Fc '✗' <<<"$MCP_CONFIG_OUTPUT")"
+    report "mcp-config" failed "canonical installer reported $MCP_CONFIG_FAILURES client failure(s); inspect bootstrap output"
+    die "ff mcp install reported one or more client configuration failures"
+  else
+    report "mcp-config" ok "canonical ff mcp install --for all completed"
+  fi
+else
+  MCP_CONFIG_RC=$?
+  printf '%s\n' "$MCP_CONFIG_OUTPUT" >&2
+  report "mcp-config" failed "ff mcp install exited $MCP_CONFIG_RC; inspect bootstrap output"
+  die "ff mcp install failed"
+fi
+
+# ─── Skills catalog sync (V105) ──────────────────────────────────────────
+# Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/
+# so the runtime skill_catalog.rs reader has a populated catalog from this
+# node's very first session, instead of the operator having to remember to
+# run `ff skills sync` by hand after every new-node bootstrap.
+report "skills-sync" running
+if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
+  if run_as_user bash -lc 'ff skills sync 2>&1'; then
+    report "skills-sync" ok "materialized skills catalog from DB"
+  else
+    report "skills-sync" warn "ff skills sync failed — run manually after bootstrap"
+  fi
+else
+  report "skills-sync" warn "ff not on PATH — skipping skills sync"
+fi
+
+# ─── 12. systemd unit ────────────────────────────────────────────────────
 
 if [ "$OS_ID" != "macos" ]; then
   # Sweep legacy user-scope units that ship the `forgefleetd --node-name <h>
@@ -894,6 +957,10 @@ else
     TG_TOKEN="${TELEGRAM_BOT_TOKEN:-${FORGEFLEET_TELEGRAM_BOT_TOKEN:-}}"
     run_as_user bash -c "sed -e 's|__USER_HOME__|$USER_HOME|g' -e 's|__COMPUTER_NAME__|$NAME|g' -e 's|__TELEGRAM_BOT_TOKEN__|$TG_TOKEN|g' '$PLIST_TEMPLATE' > '$PLIST_TARGET'"
     # Bootstrap into the GUI domain so live `launchctl kickstart -k` works.
+    # bootout FIRST: kickstart/bootstrap reuse launchd's cached job definition
+    # when the service was ever loaded, so plist edits (env changes like
+    # FF_GATEWAY_TRUSTED_LAN) silently don't apply (ace + vinny 2026-08-04).
+    run_as_user launchctl bootout "$GUI_DOMAIN" 2>/dev/null || true
     run_as_user launchctl bootstrap "gui/$USER_UID" "$PLIST_TARGET" 2>/dev/null || true
     run_as_user launchctl enable "$GUI_DOMAIN" 2>/dev/null || true
     run_as_user launchctl kickstart -k "$GUI_DOMAIN" 2>/dev/null || true
@@ -907,67 +974,6 @@ else
     report "service" failed "missing $PLIST_TEMPLATE"
   fi
 fi
-
-# ─── 12. CLI MCP auto-config ─────────────────────────────────────────────
-#
-# Wire each vendor CLI (Claude Code, Codex, Gemini) to the local ff-mcp
-# server at port 50001 so the agent loops in those CLIs see ff's brain
-# tools (brain_search, brain_write_to_inbox, etc.) and the standard 36
-# fleet MCP tools. Per the multi-LLM roadmap (PR-A4), this closes the
-# manual `claude mcp add ...` gap.
-#
-# Each CLI has its own config-file convention; we write only when the
-# CLI binary itself is installed (gated by `command -v <cli>`). Idempotent
-# via merge-or-create logic.
-report "mcp-config" running
-
-MCP_URL="http://127.0.0.1:50001/mcp"
-
-# Claude Code: ~/.claude/.mcp-servers.json (JSON array of server objs)
-if run_as_user bash -lc 'command -v claude >/dev/null 2>&1'; then
-  CLAUDE_MCP_DIR="$USER_HOME/.claude"
-  CLAUDE_MCP_FILE="$CLAUDE_MCP_DIR/.mcp-servers.json"
-  run_as_user mkdir -p "$CLAUDE_MCP_DIR"
-  if [ ! -f "$CLAUDE_MCP_FILE" ]; then
-    run_as_user bash -c "cat > '$CLAUDE_MCP_FILE' <<EOF
-{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
-EOF"
-    report "mcp-config" ok "wrote claude mcp config"
-  else
-    # File exists — try `claude mcp add` if available, else leave alone.
-    run_as_user bash -lc "claude mcp add forgefleet $MCP_URL 2>/dev/null" || true
-  fi
-fi
-
-# Codex: ~/.codex/config.toml (TOML; append [mcp_servers.forgefleet] block)
-if run_as_user bash -lc 'command -v codex >/dev/null 2>&1'; then
-  CODEX_CONFIG_DIR="$USER_HOME/.codex"
-  CODEX_CONFIG_FILE="$CODEX_CONFIG_DIR/config.toml"
-  run_as_user mkdir -p "$CODEX_CONFIG_DIR"
-  if ! run_as_user bash -lc "grep -q 'mcp_servers.forgefleet' '$CODEX_CONFIG_FILE' 2>/dev/null"; then
-    run_as_user bash -c "cat >> '$CODEX_CONFIG_FILE' <<EOF
-
-[mcp_servers.forgefleet]
-url = \"$MCP_URL\"
-EOF"
-    report "mcp-config" ok "appended codex mcp config"
-  fi
-fi
-
-# Gemini CLI: ~/.gemini/settings.json (JSON; mcpServers map, similar shape)
-if run_as_user bash -lc 'command -v gemini >/dev/null 2>&1'; then
-  GEMINI_DIR="$USER_HOME/.gemini"
-  GEMINI_FILE="$GEMINI_DIR/settings.json"
-  run_as_user mkdir -p "$GEMINI_DIR"
-  if [ ! -f "$GEMINI_FILE" ]; then
-    run_as_user bash -c "cat > '$GEMINI_FILE' <<EOF
-{\"mcpServers\":{\"forgefleet\":{\"url\":\"$MCP_URL\"}}}
-EOF"
-    report "mcp-config" ok "wrote gemini mcp config"
-  fi
-fi
-
-report "mcp-config" ok
 
 # ─── GitHub SSH identity (V89) ───────────────────────────────────────────
 # Pull the canonical github.com SSH aliases + keypairs from Postgres so
@@ -1001,21 +1007,35 @@ else
   report "github-identity" warn "ff not on PATH — skipping github sync"
 fi
 
-# ─── Skills catalog sync (V105) ──────────────────────────────────────────
-# Materialize the DB skills catalog onto disk under ~/.forgefleet/skills/
-# so the runtime skill_catalog.rs reader has a populated catalog from this
-# node's very first session, instead of the operator having to remember to
-# run `ff skills sync` by hand after every new-node bootstrap.
-report "skills-sync" running
-if run_as_user bash -lc 'command -v ff >/dev/null 2>&1'; then
-  if run_as_user bash -lc 'ff skills sync 2>&1'; then
-    report "skills-sync" ok "materialized skills catalog from DB"
-  else
-    report "skills-sync" warn "ff skills sync failed — run manually after bootstrap"
+# ─── Final verification ─────────────────────────────────────────────────
+# Prove the daemon actually came up healthy instead of reporting "done" into
+# the void (vinny 2026-08-04: a "successful" bootstrap whose daemon never
+# started cost hours of remote debugging).
+report "verify" running
+VERIFY_OK=0
+for _ in 1 2 3 4 5 6; do
+  sleep 5
+  if curl -fsS -m 8 "http://127.0.0.1:51002/health" 2>/dev/null | grep -q '"status":"ok"'; then
+    VERIFY_OK=1
+    break
   fi
+done
+if [ "$VERIFY_OK" = "1" ]; then
+  report "verify" ok "gateway healthy on 127.0.0.1:51002"
 else
-  report "skills-sync" warn "ff not on PATH — skipping skills sync"
+  report "verify" failed "gateway not healthy after 30s — macOS: launchctl print gui/\$(id -u)/com.forgefleet.forgefleetd; linux: systemctl --user status forgefleetd"
 fi
+
+# A mid-run network flip (subnet/VLAN change — e.g. Wi-Fi re-enabled on a
+# laptop) silently kills report POSTs from here on. Detect and say it OUT
+# LOUD locally, because the report itself may not reach the leader.
+if ! curl -fsS -m 5 "$LEADER/health" >/dev/null 2>&1; then
+  say "WARNING: leader at $LEADER is unreachable from this machine right now."
+  say "  → check the network (fleet LAN vs wrong subnet; on a Mac: Wi-Fi off)."
+  say "  → enrollment IS recorded; remaining steps will complete locally but report nothing."
+fi
+
+[ "$VERIFY_OK" = "1" ] || die "post-install verification failed"
 
 # ─── Done ────────────────────────────────────────────────────────────────
 

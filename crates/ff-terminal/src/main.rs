@@ -2252,6 +2252,11 @@ enum FleetCommand {
             default_missing_value = "true",
         )]
         graceful: bool,
+        /// Queue the deploy as per-node deferred tasks (self-build playbook)
+        /// instead of SSH — for nodes whose SSH is unreachable but whose
+        /// daemon is online.
+        #[arg(long, default_value_t = false)]
+        via_defer: bool,
     },
     /// Get or set the adaptive serving-mix autoscaler gate (Orchestrator P3).
     ///
