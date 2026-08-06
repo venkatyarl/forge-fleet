@@ -1151,12 +1151,6 @@ pub(crate) async fn redis_url_from_state(state: &GatewayState) -> Option<String>
 /// Lightweight Redis publish; no dedicated crate import — we shell out to a
 /// tiny helper to avoid adding another dep on ff-gateway (ff-pulse has the
 /// redis crate). Best-effort: failures are logged, not raised.
-<<<<<<< HEAD
-async fn publish_redis(channel: &str, payload: &str) -> Result<(), String> {
-    // Read redis URL from env; default localhost:56379.
-    let url = std::env::var("FORGEFLEET_REDIS_URL")
-        .unwrap_or_else(|_| "redis://192.168.5.100:56379".into());
-=======
 ///
 /// URL resolution: explicit `url` argument → FORGEFLEET_REDIS_URL → localhost.
 /// The previous fallback hardcoded vinny's IP (192.168.5.100) from its leader
@@ -1176,7 +1170,6 @@ pub(crate) async fn publish_redis_at(
         .map(str::to_string)
         .or_else(|| std::env::var("FORGEFLEET_REDIS_URL").ok())
         .unwrap_or_else(|| "redis://127.0.0.1:56379".into());
->>>>>>> 0802d394 (fix: drop stale vinny-IP redis fallback in enrollment publish path)
     // Parse host:port from URL (redis://host:port or redis://host:port/db).
     let (host, port) = parse_redis_hostport(&url).unwrap_or(("127.0.0.1".into(), 56379));
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
