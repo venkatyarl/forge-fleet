@@ -17,6 +17,7 @@
 //! - [`emoji_mapping`] — Custom logo emoji configuration for known projects
 //! - [`llm_router`] — Shared contract for selecting and retrying LLM endpoints
 //! - [`health_monitor`] — In-memory LLM backend health tracking
+//! - [`log_shipping`] — Coordinated log shipping and training-data service registration
 
 pub mod agent_team;
 pub mod alerts;
@@ -29,6 +30,7 @@ pub mod emoji_mapping;
 pub mod health_monitor;
 pub mod leader;
 pub mod llm_router;
+pub mod log_shipping;
 pub mod merge_train;
 pub mod node_manager;
 pub mod parallel;
@@ -64,6 +66,10 @@ pub use leader::{
     SubmissionResult, TickResult,
 };
 pub use llm_router::{LlmCandidate, LlmFailureKind, LlmRouter};
+pub use log_shipping::{
+    DataFlow, DataKind, RegistrationError, Service, ServiceManifest, ServiceRegistration,
+    log_shipping_manifest,
+};
 pub use merge_train::MergeTrainConfig;
 pub use node_manager::NodeManager;
 pub use parallel::{ExecutionResult, ParallelExecutor, SubTaskResult};
