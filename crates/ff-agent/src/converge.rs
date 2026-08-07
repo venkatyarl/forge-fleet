@@ -334,16 +334,14 @@ const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 async fn converge_boot_recovery() -> Vec<ConvergeResult> {
     let mut out = Vec::new();
     if cfg!(target_os = "macos") {
-        out.push(boot_launchd(
-            "boot: daemon auto-start",
-            "com.forgefleet.forgefleetd",
-        )
-        .await);
-        out.push(boot_launchd(
-            "boot: mcp listener auto-start",
-            "com.forgefleet.forgefleet-mcp",
-        )
-        .await);
+        out.push(boot_launchd("boot: daemon auto-start", "com.forgefleet.forgefleetd").await);
+        out.push(
+            boot_launchd(
+                "boot: mcp listener auto-start",
+                "com.forgefleet.forgefleet-mcp",
+            )
+            .await,
+        );
     } else if cfg!(target_os = "linux") {
         out.push(boot_systemd("boot: daemon auto-start", "forgefleetd.service").await);
         out.push(boot_systemd("boot: mcp listener auto-start", "forgefleet-mcp.service").await);
@@ -376,7 +374,10 @@ async fn boot_launchd(item: &str, label: &str) -> ConvergeResult {
         return ConvergeResult::new(
             item,
             ConvergeStatus::Failed,
-            format!("{} missing — rerun the bootstrap launchd step", plist.display()),
+            format!(
+                "{} missing — rerun the bootstrap launchd step",
+                plist.display()
+            ),
         );
     }
     let uid = match current_uid_string().await {
@@ -384,12 +385,9 @@ async fn boot_launchd(item: &str, label: &str) -> ConvergeResult {
         Err(e) => return ConvergeResult::new(item, ConvergeStatus::Failed, e),
     };
     let domain = format!("gui/{uid}/{label}");
-    if run_quiet(
-        Path::new("/bin/launchctl"),
-        &["print", &domain],
-    )
-    .await
-    .unwrap_or(false)
+    if run_quiet(Path::new("/bin/launchctl"), &["print", &domain])
+        .await
+        .unwrap_or(false)
     {
         return ConvergeResult::new(item, ConvergeStatus::Ok, format!("{label} loaded"));
     }
@@ -397,12 +395,24 @@ async fn boot_launchd(item: &str, label: &str) -> ConvergeResult {
     // update) — re-arm by bootstrapping into the gui domain.
     match run_quiet(
         Path::new("/bin/launchctl"),
-        &["bootstrap", &format!("gui/{uid}"), &plist.display().to_string()],
+        &[
+            "bootstrap",
+            &format!("gui/{uid}"),
+            &plist.display().to_string(),
+        ],
     )
     .await
     {
-        Ok(true) => ConvergeResult::new(item, ConvergeStatus::Installed, format!("{label} re-bootstrapped")),
-        Ok(false) => ConvergeResult::new(item, ConvergeStatus::Failed, format!("launchctl bootstrap {label} failed")),
+        Ok(true) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Installed,
+            format!("{label} re-bootstrapped"),
+        ),
+        Ok(false) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!("launchctl bootstrap {label} failed"),
+        ),
         Err(e) => ConvergeResult::new(item, ConvergeStatus::Failed, e),
     }
 }
@@ -417,12 +427,9 @@ async fn boot_systemd(item: &str, unit: &str) -> ConvergeResult {
                   export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
                   systemctl --user";
     // Unit file must exist before we can enable it.
-    let has_unit = run_shell(
-        "bash",
-        &format!("{sysctl} cat {unit} >/dev/null 2>&1"),
-    )
-    .await
-    .unwrap_or(false);
+    let has_unit = run_shell("bash", &format!("{sysctl} cat {unit} >/dev/null 2>&1"))
+        .await
+        .unwrap_or(false);
     if !has_unit {
         return ConvergeResult::new(
             item,
@@ -430,15 +437,26 @@ async fn boot_systemd(item: &str, unit: &str) -> ConvergeResult {
             format!("{unit} not installed — rerun the bootstrap service step"),
         );
     }
-    let enabled = run_shell("bash", &format!("{sysctl} is-enabled {unit} >/dev/null 2>&1"))
-        .await
-        .unwrap_or(false);
+    let enabled = run_shell(
+        "bash",
+        &format!("{sysctl} is-enabled {unit} >/dev/null 2>&1"),
+    )
+    .await
+    .unwrap_or(false);
     if enabled {
         return ConvergeResult::new(item, ConvergeStatus::Ok, format!("{unit} enabled"));
     }
     match run_shell("bash", &format!("{sysctl} enable {unit} >/dev/null 2>&1")).await {
-        Ok(true) => ConvergeResult::new(item, ConvergeStatus::Installed, format!("{unit} re-enabled")),
-        Ok(false) => ConvergeResult::new(item, ConvergeStatus::Failed, format!("systemctl --user enable {unit} failed")),
+        Ok(true) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Installed,
+            format!("{unit} re-enabled"),
+        ),
+        Ok(false) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!("systemctl --user enable {unit} failed"),
+        ),
         Err(e) => ConvergeResult::new(item, ConvergeStatus::Failed, e),
     }
 }
@@ -457,9 +475,17 @@ async fn boot_linger() -> ConvergeResult {
     )
     .await;
     match state.as_deref() {
-        Ok("yes") => ConvergeResult::new(item, ConvergeStatus::Ok, format!("linger enabled for {user}")),
+        Ok("yes") => ConvergeResult::new(
+            item,
+            ConvergeStatus::Ok,
+            format!("linger enabled for {user}"),
+        ),
         _ => match run_shell("bash", &format!("sudo -n loginctl enable-linger {user}")).await {
-            Ok(true) => ConvergeResult::new(item, ConvergeStatus::Installed, format!("linger enabled for {user}")),
+            Ok(true) => ConvergeResult::new(
+                item,
+                ConvergeStatus::Installed,
+                format!("linger enabled for {user}"),
+            ),
             _ => ConvergeResult::new(
                 item,
                 ConvergeStatus::Failed,
