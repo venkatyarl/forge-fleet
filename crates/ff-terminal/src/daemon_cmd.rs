@@ -577,12 +577,20 @@ async fn execute_shell(
     let local_is_linux = std::env::consts::OS == "linux";
 
     let mut local = true;
+    // Host attribution (issue #1611): set to the canonical target node name
+    // when the command runs remotely over SSH.
+    let mut remote_node_name: Option<String> = None;
     let (program, args): (&str, Vec<String>) = match target_node {
         None => (
             "sh",
             vec!["-c".into(), wrap_for_detachment(command, local_is_linux)],
         ),
-        Some(n) if this_hostname.starts_with(&n.to_lowercase()) => (
+        // Hard guard: match the target on the short hostname (first DNS
+        // label) only — the old unanchored `starts_with` prefix match could
+        // mis-attribute a node-targeted task to a same-prefix host and run
+        // it on the WRONG machine (issue #1611). No match → SSH path, which
+        // fails loudly when the target is dark; never a silent local run.
+        Some(n) if ff_agent::defer_worker::hostname_matches_node(&this_hostname, n) => (
             "sh",
             vec!["-c".into(), wrap_for_detachment(command, local_is_linux)],
         ),
@@ -599,6 +607,7 @@ async fn execute_shell(
                     );
                 }
             };
+            remote_node_name = Some(node.name.clone());
             let dest = format!("{}@{}", node.ssh_user, node.ip);
             // Assume remote targets are Linux (Marcus/Sophie/Priya are Ubuntu;
             // James is macOS — but gets same treatment: wrap_for_detachment
@@ -702,10 +711,20 @@ async fn execute_shell(
 
     let stdout = String::from_utf8_lossy(&stdout).to_string();
     let stderr = String::from_utf8_lossy(&stderr).to_string();
+    // Host attribution (issue #1611): `executed_on` = the host the command
+    // actually ran on (this host, or the SSH target's canonical node name);
+    // `target_node` = the requested target (null = untargeted).
+    let executed_on = match remote_node_name {
+        Some(name) => name,
+        None if this_hostname.is_empty() => "unknown".to_string(),
+        None => this_hostname,
+    };
     let result = serde_json::json!({
         "exit_code": status.code(),
         "stdout": stdout,
         "stderr": stderr,
+        "executed_on": executed_on,
+        "target_node": target_node,
     });
     if status.success() {
         (true, Some(result), None)
