@@ -539,6 +539,34 @@ impl Materializer {
             .await;
         }
 
+        // MAC addresses self-heal — the Wake-on-LAN target list revive falls
+        // back to when SSH is unreachable. The beat's per-interface probe
+        // carries the MACs; persist the distinct non-empty set. Runs BEFORE
+        // the fast-path exit (same idiom as source_tree_path above): guarded
+        // no-op once the row matches, and NEVER clobbers a good value with
+        // an empty set (a daemon that couldn't read MACs this beat must not
+        // erase previously-collected ones).
+        let mut macs: Vec<&str> = Vec::new();
+        for ip in &beat.network.all_ips {
+            if let Some(mac) = ip.mac.as_deref().filter(|m| !m.is_empty())
+                && !macs.contains(&mac)
+            {
+                macs.push(mac);
+            }
+        }
+        if !macs.is_empty()
+            && let Ok(macs_json) = serde_json::to_string(&macs)
+        {
+            let _ = sqlx::query(
+                "UPDATE computers SET mac_addresses = $1::jsonb \
+                 WHERE id = $2 AND mac_addresses <> $1::jsonb",
+            )
+            .bind(macs_json)
+            .bind(computer_id)
+            .execute(&self.pg)
+            .await;
+        }
+
         // Subsystem liveness is intentionally outside PersistedSnapshot: it
         // changes every dispatch tick and must be refreshed on the fast path.
         // A legacy beat has no value, so leave the existing timestamp alone
@@ -1991,6 +2019,7 @@ mod tests {
             paired_with: None,
             link_speed_gbps: None,
             medium: None,
+            mac: None,
         }];
         let good_ips = serde_json::to_string(&good.network.all_ips).unwrap();
         assert!(empty_persistent_beat_fields(&good, &good_ips).is_empty());

@@ -1081,9 +1081,13 @@ fn detect_all_ips() -> Vec<Ip> {
     if std::env::consts::OS == "macos" {
         // Parse `ifconfig` macOS output.
         let mut current_iface = String::new();
+        let mut current_mac: Option<String> = None;
         for line in stdout.lines() {
             if !line.starts_with('\t') && !line.starts_with(' ') && line.contains(':') {
                 current_iface = line.split(':').next().unwrap_or("").to_string();
+                current_mac = None;
+            } else if line.trim_start().starts_with("ether ") {
+                current_mac = line.split_whitespace().nth(1).map(str::to_string);
             } else if line.trim_start().starts_with("inet ")
                 && let Some(ip) = line.split_whitespace().nth(1)
                 && !ip.starts_with("127.")
@@ -1098,6 +1102,7 @@ fn detect_all_ips() -> Vec<Ip> {
                     paired_with: None,
                     link_speed_gbps,
                     medium,
+                    mac: current_mac.clone(),
                 });
             }
         }
@@ -1137,12 +1142,27 @@ fn detect_all_ips() -> Vec<Ip> {
                         paired_with: None,
                         link_speed_gbps,
                         medium,
+                        mac: read_iface_mac_linux(iface),
                     });
                 }
             }
         }
     }
     result
+}
+
+/// Linux: read the interface's MAC from `/sys/class/net/<iface>/address`.
+/// Returns None for the all-zero address (uninitialized / loopback-style
+/// interfaces) so WoL never targets a placeholder.
+fn read_iface_mac_linux(iface: &str) -> Option<String> {
+    std::fs::read_to_string(
+        std::path::Path::new("/sys/class/net")
+            .join(iface)
+            .join("address"),
+    )
+    .ok()
+    .map(|s| s.trim().to_string())
+    .filter(|mac| !mac.is_empty() && mac != "00:00:00:00:00:00")
 }
 
 /// Linux: read `/sys/class/net/<iface>/speed` (Mbps for ethernet) and
@@ -1446,6 +1466,7 @@ mod tests {
             paired_with: None,
             link_speed_gbps: None,
             medium: Some(medium.to_string()),
+            mac: None,
         }
     }
 

@@ -169,6 +169,12 @@ pub struct Ip {
     /// paths for bulk transfers and avoid wifi for tensor-parallel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub medium: Option<String>,
+    /// Link-layer (MAC) address of the interface, if collected. Feeds
+    /// `computers.mac_addresses`, the Wake-on-LAN target list. Option +
+    /// serde default so beats from older daemons (no `mac` key) still
+    /// deserialize during rolling upgrades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mac: Option<String>,
 }
 
 // -----------------------------------------------------------------------------

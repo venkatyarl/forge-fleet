@@ -927,7 +927,7 @@ CREATE TABLE IF NOT EXISTS computer_downtime_events (
     offline_at      TIMESTAMPTZ NOT NULL,
     online_at       TIMESTAMPTZ,
     duration_sec    INT,
-    cause           TEXT,       -- odown | graceful_shutdown | revive_initiated
+    cause           TEXT,       -- odown | graceful_shutdown | missed_beats | revive_initiated
     resolved_by     TEXT        -- pulse_return | revive_success | manual
 );
 CREATE INDEX IF NOT EXISTS idx_downtime_by_computer
