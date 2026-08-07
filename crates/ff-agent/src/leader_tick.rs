@@ -376,6 +376,18 @@ impl LeaderTick {
                                         | TickOutcome::BecameLeader
                                         | TickOutcome::TookOver(_)
                                 ) {
+                                    // Silent-death sweep first: flip
+                                    // online → sdown for nodes whose beats
+                                    // STOPPED, so revive_scan below can
+                                    // actually see them.
+                                    if let Err(err) = self.stale_beat_sdown_sweep().await {
+                                        tracing::warn!(
+                                            node = %self.my_name,
+                                            error = %err,
+                                            "stale_beat_sdown_sweep failed"
+                                        );
+                                    }
+
                                     if let Err(err) = self.revive_scan().await {
                                         tracing::warn!(
                                             node = %self.my_name,
@@ -788,6 +800,77 @@ impl LeaderTick {
                 Ok(TickOutcome::NoOp)
             }
         }
+    }
+
+    /// Flip `online` computers whose beats have stopped to `sdown`, so
+    /// [`revive_scan`] (which only looks at down statuses) can see them.
+    ///
+    /// Why this exists: the pulse materializer only flips `computers.status`
+    /// when a beat ARRIVES (or a graceful-shutdown plan fires). An unexpected
+    /// power loss produces NO beat, so nothing ever moved the row off
+    /// `online` — the node sat with a hours-stale `last_seen_at`, invisible
+    /// to revive. The exact scenario revive exists for (silent death) was the
+    /// one scenario that never triggered it (2026-08-06 site power loss:
+    /// duncan/sophie stayed `online` in the DB and never got a Wake-on-LAN).
+    ///
+    /// The 90s threshold matches the stale-heartbeat window used by the
+    /// discovery loop in `src/main.rs`; the deferred-task scheduler's online
+    /// window is 60s, so a node is sdown before the scheduler would have
+    /// dispatched to it anyway. Called only when we are the current leader.
+    pub async fn stale_beat_sdown_sweep(&self) -> Result<(), LeaderError> {
+        let mut tx = self.pg.begin().await?;
+
+        // Atomic flip + RETURNING so the downtime-event insert below only
+        // fires for rows this sweep actually moved — a beat that arrives
+        // concurrently and re-flips the row (materializer CAS) must not
+        // produce a phantom downtime event. The reverse path (sdown →
+        // online on the next beat) already works via the materializer's
+        // transition plan, which also closes the open event with
+        // resolved_by='pulse_return'.
+        let flipped: Vec<Uuid> = sqlx::query(
+            "UPDATE computers SET \
+                status = 'sdown', \
+                status_changed_at = NOW(), \
+                offline_since = COALESCE(offline_since, NOW()) \
+             WHERE status = 'online' \
+               AND last_seen_at IS NOT NULL \
+               AND last_seen_at < NOW() - INTERVAL '90 seconds' \
+             RETURNING id",
+        )
+        .fetch_all(&mut *tx)
+        .await?
+        .into_iter()
+        .map(|row| row.get("id"))
+        .collect();
+
+        // Open a downtime event per flipped node. Distinct cause from the
+        // materializer's 'graceful_shutdown' so silent deaths stay
+        // attributable. NOT EXISTS guards against double-opening if a
+        // previous leader crashed between the flip and the event insert.
+        for computer_id in &flipped {
+            sqlx::query(
+                "INSERT INTO computer_downtime_events (computer_id, offline_at, cause) \
+                 SELECT $1, NOW(), 'missed_beats' \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM computer_downtime_events \
+                     WHERE computer_id = $1 AND online_at IS NULL)",
+            )
+            .bind(computer_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        if !flipped.is_empty() {
+            tracing::warn!(
+                node = %self.my_name,
+                flipped = flipped.len(),
+                "stale-beat sweep: flipped silent-death computer(s) online → sdown"
+            );
+        }
+
+        Ok(())
     }
 
     /// Scan for computers stuck in an objectively-down state that were alive

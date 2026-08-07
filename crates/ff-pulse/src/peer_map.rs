@@ -171,6 +171,7 @@ mod tests {
             paired_with: None,
             link_speed_gbps: None,
             medium: None,
+            mac: None,
         }];
         b
     }
