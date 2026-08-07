@@ -92,6 +92,8 @@ pub async fn run_converge() -> Vec<ConvergeResult> {
         results.push(converge_cloud_cli(bin, url, shell).await);
     }
     results.extend(converge_desktop_apps().await);
+    results.extend(converge_boot_recovery().await);
+    results.extend(converge_power_recovery().await);
     results
 }
 
@@ -313,6 +315,395 @@ async fn converge_desktop_apps() -> Vec<ConvergeResult> {
     out
 }
 
+// ─── boot recovery (power-loss auto-start) ─────────────────────────────────
+
+/// Gateway + MCP listener ports, matching local_healer.rs / the bootstrap
+/// template. Probed over loopback TCP — a completed handshake is enough.
+const GATEWAY_PORT: u16 = 51002;
+const MCP_LISTENER_PORT: u16 = 50001;
+const PORT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Verify (and cheaply re-arm) the per-OS auto-start enrollment for
+/// forgefleetd + the MCP listener, then probe the local service ports.
+///
+/// Why this exists: after a site power loss (2026-08-06) one node recovered
+/// via launchd, one crash-looped then stabilized, and two stayed dark — and
+/// nothing in the fleet continuously verified that nodes come back on their
+/// own. `local_healer` restarts a crashed forgefleetd every 30s, but it can
+/// only run once SOMETHING started the daemon after boot; this section
+/// guards that enrollment layer (launchd plist / systemd unit + linger).
+async fn converge_boot_recovery() -> Vec<ConvergeResult> {
+    let mut out = Vec::new();
+    if cfg!(target_os = "macos") {
+        out.push(boot_launchd("boot: daemon auto-start", "com.forgefleet.forgefleetd").await);
+        out.push(
+            boot_launchd(
+                "boot: mcp listener auto-start",
+                "com.forgefleet.forgefleet-mcp",
+            )
+            .await,
+        );
+    } else if cfg!(target_os = "linux") {
+        out.push(boot_systemd("boot: daemon auto-start", "forgefleetd.service").await);
+        out.push(boot_systemd("boot: mcp listener auto-start", "forgefleet-mcp.service").await);
+        out.push(boot_linger().await);
+    } else {
+        out.push(ConvergeResult::new(
+            "boot: auto-start",
+            ConvergeStatus::Skipped,
+            "Windows auto-start is handled by the bootstrap template",
+        ));
+    }
+    out.push(boot_service_probes().await);
+    out
+}
+
+/// macOS: the LaunchAgent plist must exist (bootstrap template renders it)
+/// and the label must be loaded in the gui domain. A loaded-but-dead label
+/// is local_healer's job; a missing plist needs the bootstrap service step.
+///
+/// Note: LaunchAgents fire at LOGIN, not at power-on — headless Macs also
+/// need Automatic login enabled (System Settings → Users & Groups) for true
+/// power-loss recovery. That is an operator machine setting; we can't flip
+/// it without root + a GUI session, so it lives in the checklist notes.
+async fn boot_launchd(item: &str, label: &str) -> ConvergeResult {
+    let plist = home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"));
+    if !plist.is_file() {
+        return ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!(
+                "{} missing — rerun the bootstrap launchd step",
+                plist.display()
+            ),
+        );
+    }
+    let uid = match current_uid_string().await {
+        Ok(u) => u,
+        Err(e) => return ConvergeResult::new(item, ConvergeStatus::Failed, e),
+    };
+    let domain = format!("gui/{uid}/{label}");
+    if run_quiet(Path::new("/bin/launchctl"), &["print", &domain])
+        .await
+        .unwrap_or(false)
+    {
+        return ConvergeResult::new(item, ConvergeStatus::Ok, format!("{label} loaded"));
+    }
+    // Plist present but not loaded (e.g. launchd lost it across an OS
+    // update) — re-arm by bootstrapping into the gui domain.
+    match run_quiet(
+        Path::new("/bin/launchctl"),
+        &[
+            "bootstrap",
+            &format!("gui/{uid}"),
+            &plist.display().to_string(),
+        ],
+    )
+    .await
+    {
+        Ok(true) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Installed,
+            format!("{label} re-bootstrapped"),
+        ),
+        Ok(false) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!("launchctl bootstrap {label} failed"),
+        ),
+        Err(e) => ConvergeResult::new(item, ConvergeStatus::Failed, e),
+    }
+}
+
+/// Linux: the user unit must be enabled so the user manager starts it at
+/// login — and with linger (below) that means at boot. `systemctl --user
+/// enable` is user-level, no root needed. XDG_RUNTIME_DIR is set explicitly
+/// because `ff converge` can run from a bare SSH shell outside the user
+/// manager's environment.
+async fn boot_systemd(item: &str, unit: &str) -> ConvergeResult {
+    let sysctl = "export XDG_RUNTIME_DIR=/run/user/$(id -u); \
+                  export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus; \
+                  systemctl --user";
+    // Unit file must exist before we can enable it.
+    let has_unit = run_shell("bash", &format!("{sysctl} cat {unit} >/dev/null 2>&1"))
+        .await
+        .unwrap_or(false);
+    if !has_unit {
+        return ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!("{unit} not installed — rerun the bootstrap service step"),
+        );
+    }
+    let enabled = run_shell(
+        "bash",
+        &format!("{sysctl} is-enabled {unit} >/dev/null 2>&1"),
+    )
+    .await
+    .unwrap_or(false);
+    if enabled {
+        return ConvergeResult::new(item, ConvergeStatus::Ok, format!("{unit} enabled"));
+    }
+    match run_shell("bash", &format!("{sysctl} enable {unit} >/dev/null 2>&1")).await {
+        Ok(true) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Installed,
+            format!("{unit} re-enabled"),
+        ),
+        Ok(false) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!("systemctl --user enable {unit} failed"),
+        ),
+        Err(e) => ConvergeResult::new(item, ConvergeStatus::Failed, e),
+    }
+}
+
+/// Linux linger: without it the user manager only runs while someone is
+/// logged in, so a headless node stays dark after a power loss until a
+/// human logs in. enable-linger needs root — fleet nodes are expected to
+/// have passwordless sudo (the verify battery checks it); if not, report
+/// the exact manual command.
+async fn boot_linger() -> ConvergeResult {
+    let item = "boot: linger (start at boot without login)";
+    let user = std::env::var("USER").unwrap_or_else(|_| whoami_fallback());
+    let state = run_shell_output(
+        "bash",
+        &format!("loginctl show-user {user} -p Linger --value 2>/dev/null"),
+    )
+    .await;
+    match state.as_deref() {
+        Ok("yes") => ConvergeResult::new(
+            item,
+            ConvergeStatus::Ok,
+            format!("linger enabled for {user}"),
+        ),
+        _ => match run_shell("bash", &format!("sudo -n loginctl enable-linger {user}")).await {
+            Ok(true) => ConvergeResult::new(
+                item,
+                ConvergeStatus::Installed,
+                format!("linger enabled for {user}"),
+            ),
+            _ => ConvergeResult::new(
+                item,
+                ConvergeStatus::Failed,
+                format!("run: sudo loginctl enable-linger {user}"),
+            ),
+        },
+    }
+}
+
+/// Loopback TCP probes for the gateway + MCP listener. Report-only:
+/// restarting a dead forgefleetd is local_healer's 30s job; converge just
+/// surfaces the state in the daily table.
+async fn boot_service_probes() -> ConvergeResult {
+    let item = "boot: local services";
+    let gw = probe_tcp(GATEWAY_PORT).await;
+    let mcp = probe_tcp(MCP_LISTENER_PORT).await;
+    match (gw, mcp) {
+        (true, true) => ConvergeResult::new(
+            item,
+            ConvergeStatus::Ok,
+            format!("gateway :{GATEWAY_PORT} + mcp :{MCP_LISTENER_PORT} listening"),
+        ),
+        _ => ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            format!(
+                "gateway :{GATEWAY_PORT} {}, mcp :{MCP_LISTENER_PORT} {}",
+                if gw { "ok" } else { "NOT listening" },
+                if mcp { "ok" } else { "NOT listening" },
+            ),
+        ),
+    }
+}
+
+async fn probe_tcp(port: u16) -> bool {
+    matches!(
+        tokio::time::timeout(
+            PORT_PROBE_TIMEOUT,
+            tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")),
+        )
+        .await,
+        Ok(Ok(_))
+    )
+}
+
+async fn current_uid_string() -> Result<String, String> {
+    let out = tokio::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .await
+        .map_err(|e| format!("spawn id -u: {e}"))?;
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn whoami_fallback() -> String {
+    std::process::Command::new("whoami")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+// ─── power recovery (wake-on-lan) ──────────────────────────────────────
+
+/// Systemd oneshot unit that re-applies `ethtool -s <iface> wol g` at
+/// boot — ethtool's setting does not persist across reboots on its own.
+/// Written by the bootstrap template's WoL step; converge re-creates it
+/// when missing.
+const WOL_UNIT: &str = "/etc/systemd/system/forgefleet-wol.service";
+
+/// Wake-on-LAN is the fleet's remote fallback for nodes too dead for the
+/// boot-recovery layer to matter: the leader's revive_scan sends magic
+/// packets (revive::send_wol → computers.mac_addresses) when SSH is
+/// unreachable. Site power loss 2026-08-06: duncan + sophie stayed dark
+/// because WoL was never enabled at the OS level. The BIOS half
+/// ("Restore on AC Power Loss → Power On", Wake on LAN/PCIe) can't be
+/// flipped from the OS — one-time physical step per machine, tracked in
+/// the checklist's power-recovery item.
+async fn converge_power_recovery() -> Vec<ConvergeResult> {
+    if cfg!(target_os = "linux") {
+        vec![power_wol_linux().await]
+    } else if cfg!(target_os = "macos") {
+        vec![power_wol_macos().await]
+    } else {
+        vec![ConvergeResult::new(
+            "power: wake-on-lan",
+            ConvergeStatus::Skipped,
+            "Windows WoL is a NIC-driver setting, handled by the bootstrap template",
+        )]
+    }
+}
+
+/// Linux: the default-route ethernet iface must report `Wake-on: g`, and
+/// forgefleet-wol.service must exist + be enabled so the setting survives
+/// reboots. Fixes go through passwordless sudo (the verify battery checks
+/// it); on failure report the exact manual command.
+async fn power_wol_linux() -> ConvergeResult {
+    let item = "power: wake-on-lan";
+    let iface = run_shell_output(
+        "bash",
+        "ip route show default 2>/dev/null | awk '{print $5}' | head -1",
+    )
+    .await
+    .unwrap_or_default();
+    if iface.is_empty() {
+        return ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            "no default-route interface found",
+        );
+    }
+    // WoL over wifi is unreliable — only ethernet ifaces qualify.
+    if Path::new(&format!("/sys/class/net/{iface}/wireless")).exists() {
+        return ConvergeResult::new(
+            item,
+            ConvergeStatus::Skipped,
+            format!("default route is wifi ({iface}) — WoL over wifi is unreliable"),
+        );
+    }
+    let Some(ethtool) = resolve_on_path("ethtool") else {
+        return ConvergeResult::new(
+            item,
+            ConvergeStatus::Failed,
+            "ethtool missing — run: sudo apt-get install -y ethtool",
+        );
+    };
+    let wol_on = run_shell_output("bash", &format!("ethtool {iface} 2>/dev/null"))
+        .await
+        .map(|o| o.lines().any(|l| l.trim() == "Wake-on: g"))
+        .unwrap_or(false);
+    let mut changed = false;
+    if !wol_on {
+        match run_shell("bash", &format!("sudo -n ethtool -s {iface} wol g")).await {
+            Ok(true) => changed = true,
+            _ => {
+                return ConvergeResult::new(
+                    item,
+                    ConvergeStatus::Failed,
+                    format!("run: sudo ethtool -s {iface} wol g"),
+                );
+            }
+        }
+    }
+    let unit_enabled = Path::new(WOL_UNIT).is_file()
+        && run_shell(
+            "bash",
+            "systemctl is-enabled forgefleet-wol.service >/dev/null 2>&1",
+        )
+        .await
+        .unwrap_or(false);
+    if !unit_enabled {
+        // (Re)write the oneshot unit and enable it. The unit body has no
+        // single quotes, so printf '%s' quoting is safe.
+        let unit_body = format!(
+            "[Unit]\nDescription=Enable Wake-on-LAN on {iface}\nAfter=network-pre.target\n\n\
+             [Service]\nType=oneshot\nExecStart={} -s {iface} wol g\n\n\
+             [Install]\nWantedBy=multi-user.target\n",
+            ethtool.display()
+        );
+        let install = format!(
+            "printf '%s' '{unit_body}' | sudo -n tee {WOL_UNIT} >/dev/null \
+             && sudo -n systemctl daemon-reload \
+             && sudo -n systemctl enable forgefleet-wol.service >/dev/null 2>&1"
+        );
+        match run_shell("bash", &install).await {
+            Ok(true) => changed = true,
+            _ => {
+                return ConvergeResult::new(
+                    item,
+                    ConvergeStatus::Failed,
+                    "rerun the bootstrap wol step (writes + enables forgefleet-wol.service)",
+                );
+            }
+        }
+    }
+    if changed {
+        ConvergeResult::new(
+            item,
+            ConvergeStatus::Installed,
+            format!("{iface} wol g armed + forgefleet-wol.service enabled"),
+        )
+    } else {
+        ConvergeResult::new(
+            item,
+            ConvergeStatus::Ok,
+            format!("{iface} Wake-on: g + forgefleet-wol.service enabled"),
+        )
+    }
+}
+
+/// macOS: `womp 1` (wake on magic packet) in power management settings.
+/// Persists on its own — no launchd unit needed.
+async fn power_wol_macos() -> ConvergeResult {
+    let item = "power: wake-on-lan";
+    let on = run_shell_output("bash", "pmset -g 2>/dev/null")
+        .await
+        .map(|o| {
+            o.lines().any(|l| {
+                let cols: Vec<&str> = l.split_whitespace().collect();
+                cols == ["womp", "1"]
+            })
+        })
+        .unwrap_or(false);
+    if on {
+        return ConvergeResult::new(
+            item,
+            ConvergeStatus::Ok,
+            "wake on magic packet enabled (womp 1)",
+        );
+    }
+    match run_shell("bash", "sudo -n pmset -a womp 1").await {
+        Ok(true) => ConvergeResult::new(item, ConvergeStatus::Installed, "pmset -a womp 1 applied"),
+        _ => ConvergeResult::new(item, ConvergeStatus::Failed, "run: sudo pmset -a womp 1"),
+    }
+}
+
 // ─── helpers ───────────────────────────────────────────────────────────────
 
 fn home_dir() -> PathBuf {
@@ -361,6 +752,24 @@ async fn run_shell(shell: &str, cmd: &str) -> Result<bool, String> {
         .status();
     match tokio::time::timeout(SUBPROCESS_TIMEOUT, fut).await {
         Ok(Ok(status)) => Ok(status.success()),
+        Ok(Err(e)) => Err(format!("spawn {shell}: {e}")),
+        Err(_) => Err("shell command timed out".to_string()),
+    }
+}
+
+/// Run a shell command and return trimmed stdout on exit 0.
+async fn run_shell_output(shell: &str, cmd: &str) -> Result<String, String> {
+    let fut = tokio::process::Command::new(shell)
+        .arg("-c")
+        .arg(cmd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match tokio::time::timeout(SUBPROCESS_TIMEOUT, fut).await {
+        Ok(Ok(out)) if out.status.success() => {
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        }
+        Ok(Ok(out)) => Err(format!("{shell} exited {}", out.status)),
         Ok(Err(e)) => Err(format!("spawn {shell}: {e}")),
         Err(_) => Err("shell command timed out".to_string()),
     }

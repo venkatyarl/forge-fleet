@@ -1029,6 +1029,61 @@ else
   fi
 fi
 
+# ─── 13. Wake-on-LAN (power-loss remote recovery) ────────────────────────
+# Site power loss 2026-08-06: duncan + sophie stayed dark because BIOS
+# "Restore on AC Power Loss" defaults to Power Off and WoL was never
+# enabled at the OS level, so the leader's revive_scan magic packets
+# (revive::send_wol → computers.mac_addresses) had nothing to wake. This
+# step is deliberately SOFT: a NIC without WoL support (or a wifi-only
+# node) must not kill bootstrap. The BIOS half (AC-restore → Power On,
+# Wake on LAN/PCIe) can't be flipped from the OS — one-time physical step
+# per machine, documented in the checklist's power-recovery item.
+report "wol" running
+if [ "$OS_ID" = "macos" ]; then
+  # Wake on magic packet; persists in power management settings, no
+  # launchd unit needed.
+  if pmset -g 2>/dev/null | grep -q 'womp 1'; then
+    report "wol" ok "wake on magic packet already enabled (womp 1)"
+  elif as_root pmset -a womp 1 && pmset -g 2>/dev/null | grep -q 'womp 1'; then
+    report "wol" ok "wake on magic packet enabled (pmset -a womp 1)"
+  else
+    report "wol" warn "failed to enable wake on magic packet — run manually: sudo pmset -a womp 1"
+  fi
+else
+  # Primary ethernet iface = the one holding the default route. WoL over
+  # wifi is unreliable — skip wireless ifaces.
+  WOL_IFACE="$(ip route show default 2>/dev/null | awk '{print $5}' | head -1)"
+  if [ -z "$WOL_IFACE" ]; then
+    report "wol" warn "no default-route interface found — skipping WoL setup"
+  elif [ -d "/sys/class/net/$WOL_IFACE/wireless" ]; then
+    report "wol" warn "default route is wifi ($WOL_IFACE) — WoL over wifi is unreliable; skipping"
+  else
+    command -v ethtool >/dev/null 2>&1 \
+      || as_root apt-get install -y ethtool >/dev/null 2>&1 \
+      || true
+    ETHTOOL_BIN="$(command -v ethtool || true)"
+    if [ -z "$ETHTOOL_BIN" ]; then
+      report "wol" warn "ethtool missing and apt install failed — install ethtool, then: sudo ethtool -s $WOL_IFACE wol g"
+    elif ! ethtool "$WOL_IFACE" 2>/dev/null | grep -q 'Supports Wake-on:.*g'; then
+      report "wol" warn "$WOL_IFACE does not support WoL magic packet — skipping (NIC/BIOS limitation)"
+    else
+      as_root ethtool -s "$WOL_IFACE" wol g || true
+      # ethtool's wol setting does NOT persist across reboots — re-apply
+      # at boot with a oneshot unit.
+      printf '[Unit]\nDescription=Enable Wake-on-LAN on %s\nAfter=network-pre.target\n\n[Service]\nType=oneshot\nExecStart=%s -s %s wol g\n\n[Install]\nWantedBy=multi-user.target\n' \
+        "$WOL_IFACE" "$ETHTOOL_BIN" "$WOL_IFACE" \
+        | as_root tee /etc/systemd/system/forgefleet-wol.service >/dev/null
+      as_root systemctl daemon-reload || true
+      as_root systemctl enable forgefleet-wol.service >/dev/null 2>&1 || true
+      if ethtool "$WOL_IFACE" 2>/dev/null | grep -q 'Wake-on: g$'; then
+        report "wol" ok "$WOL_IFACE wake-on magic packet enabled; forgefleet-wol.service re-applies at boot"
+      else
+        report "wol" warn "$WOL_IFACE refused 'wol g' — NIC may not support WoL; check BIOS Wake on LAN/PCIe"
+      fi
+    fi
+  fi
+fi
+
 # ─── GitHub SSH identity (V89) ───────────────────────────────────────────
 # Pull the canonical github.com SSH aliases + keypairs from Postgres so
 # this new computer can `git push` to GitHub from day one. The DB owns the
