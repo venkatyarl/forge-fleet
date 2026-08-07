@@ -1,7 +1,7 @@
 {
   "$schema": "onboarding-checklist/v1",
   "description": "Canonical software inventory for fleet computer onboarding. Source of truth for what every node should have, where it lives per-OS, how to verify it, and how it updates. Keep this current when vendors rename/move things (they do).",
-  "updated_at": "2026-08-06",
+  "updated_at": "2026-08-07",
   "items": [
     {
       "name": "claude-code",
@@ -189,6 +189,23 @@
       },
       "update": "ff converge re-verifies + re-arms daily (boot recovery section); runtime crashes are covered by local_healer's 30s tick",
       "notes": "Added 2026-08-06 after a site power loss: vinny recovered via launchd, james crash-looped then stabilized, duncan+sophie stayed dark (needed physical check). local_healer restarts a crashed daemon but only runs once something started it after boot — this item guards THAT enrollment layer."
+    },
+    {
+      "name": "power-recovery",
+      "title": "Power-loss auto power-on (BIOS AC-restore + Wake-on-LAN)",
+      "category": "fleet",
+      "check": "linux: ethtool $(ip route show default | awk '{print $5}' | head -1) | grep 'Wake-on: g' (+ this node's MAC present in computers.mac_addresses); macos: pmset -g | grep 'womp 1'",
+      "install": {
+        "linux": "bootstrap template WoL step: apt-get install -y ethtool && ethtool -s <iface> wol g, persisted across reboots by /etc/systemd/system/forgefleet-wol.service (oneshot, multi-user.target)",
+        "macos": "sudo pmset -a womp 1",
+        "windows": "NIC driver properties → Power Management → 'Wake on Magic Packet' (+ powercfg /waketimers as needed)"
+      },
+      "locations": {
+        "linux": ["/etc/systemd/system/forgefleet-wol.service"],
+        "macos": ["pmset power management settings (womp)"]
+      },
+      "update": "ff converge re-verifies WoL daily (power section); BIOS AC-restore verified once at onboarding",
+      "notes": "REQUIRES a one-time PHYSICAL BIOS step per machine — it cannot be flipped from the OS: set 'Restore on AC Power Loss → Power On' (GMKtec: Advanced → ACPI Settings; most AMI/Award BIOSes similar) and enable 'Wake on LAN / Wake on PCIe'. WoL is the fleet's remote fallback: the leader's revive_scan sends magic packets (revive::send_wol) to computers.mac_addresses when SSH is unreachable. Added 2026-08-07 after the 2026-08-06 site power loss left duncan + sophie dark (BIOS defaulted to Power Off, WoL never enabled at the OS level)."
     },
     {
       "name": "web-forge-fleet",
