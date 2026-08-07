@@ -329,6 +329,20 @@ async fn execute(
     }
 }
 
+/// True when `hostname` (this machine) is the fleet node `target`. Compares
+/// the short hostname (first DNS label), case-insensitively, so "duncan"
+/// matches "duncan" and "duncan.lan" — but NOT "duncan2": the old unanchored
+/// `starts_with` prefix match could mis-attribute a node-targeted task to a
+/// same-prefix host and execute it on the WRONG machine (issue #1611). An
+/// empty hostname or target never matches: when the target is set and we
+/// can't confirm we are it, the caller must take the SSH path (which fails
+/// loudly for a dark node) instead of silently running locally.
+pub fn hostname_matches_node(hostname: &str, target: &str) -> bool {
+    let h = hostname.split('.').next().unwrap_or("");
+    let t = target.split('.').next().unwrap_or("");
+    !h.is_empty() && !t.is_empty() && h.eq_ignore_ascii_case(t)
+}
+
 /// Run a shell command locally or via SSH to a remote node.
 async fn execute_shell(
     target_node: Option<&str>,
@@ -348,8 +362,17 @@ async fn execute_shell(
 
     let local = match target_node {
         None => true,
-        Some(n) if this_hostname.starts_with(&n.to_lowercase()) => true,
-        Some(_) => false,
+        Some(n) => hostname_matches_node(&this_hostname, n),
+    };
+
+    // Host attribution (issue #1611): every shell result records where the
+    // command actually ran (`executed_on`) and where it was MEANT to run
+    // (`target_node`), so a completed task can never silently carry another
+    // machine's output.
+    let mut executed_on = if this_hostname.is_empty() {
+        "unknown".to_string()
+    } else {
+        this_hostname.clone()
     };
 
     // Every shell command runs through a wrapper that prepends `~/.local/bin`
@@ -374,6 +397,8 @@ async fn execute_shell(
                 Some(format!("defer_worker: node '{node_name}' not in fleet")),
             );
         };
+        // The command runs ON the target host over SSH — attribute it there.
+        executed_on = node.name.clone();
         let dest = format!("{}@{}", node.ssh_user, node.ip);
         (
             "ssh",
@@ -493,6 +518,8 @@ async fn execute_shell(
         "exit_code": exit_code,
         "stdout": stdout.chars().take(8192).collect::<String>(),
         "stderr": stderr.chars().take(8192).collect::<String>(),
+        "executed_on": executed_on,
+        "target_node": target_node,
     });
 
     if status.success() {
@@ -605,6 +632,49 @@ mod tests {
                 .unwrap_or("")
                 .contains("hello")
         );
+        // Host attribution (issue #1611): untargeted local run records this
+        // host and a null target.
+        assert!(
+            r.get("executed_on")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty()),
+            "result must carry executed_on attribution: {r}"
+        );
+        assert!(
+            r.get("target_node").is_some_and(|v| v.is_null()),
+            "untargeted run must record target_node: null: {r}"
+        );
+    }
+
+    #[test]
+    fn hostname_matching_is_label_exact_not_prefix() {
+        assert!(hostname_matches_node("duncan", "duncan"));
+        assert!(hostname_matches_node("Duncan", "duncan"));
+        assert!(hostname_matches_node("duncan.lan", "duncan"));
+        assert!(hostname_matches_node("duncan", "duncan.lan"));
+        // The old `starts_with` match accepted these — wrong-host execution.
+        assert!(!hostname_matches_node("duncan2", "duncan"));
+        assert!(!hostname_matches_node("duncan", "dun"));
+        assert!(!hostname_matches_node("", "duncan"));
+        assert!(!hostname_matches_node("sophie", "duncan"));
+    }
+
+    #[tokio::test]
+    async fn shell_targeted_unknown_node_fails_never_runs_locally() {
+        // Hard guard (issue #1611): a task targeted at a node that is NOT
+        // this host must never execute locally. With no fleet row to SSH to,
+        // it fails with a routing error and produces no result.
+        let (ok, result, err) = execute_shell(
+            Some("definitely-not-this-host-zz"),
+            "echo should-not-run",
+            &[],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert!(!ok, "targeted task on wrong host must fail");
+        assert!(result.is_none(), "no output may be produced locally");
+        let msg = err.unwrap();
+        assert!(msg.contains("not in fleet"), "unexpected error: {msg}");
     }
 
     #[tokio::test]

@@ -365,6 +365,19 @@ impl TaskRunner {
                SELECT id FROM fleet_tasks t
                 WHERE t.status = 'pending'
                   AND t.task_type = 'shell'
+                  -- Deferred tasks (task_class = 'deferred') are NOT this
+                  -- runner's work: they carry their target in
+                  -- payload->>'preferred_node' (not preferred_computer_id)
+                  -- and must flow through the deferred pipeline
+                  -- (pg_scheduler_pass → pg_claim_deferred → defer_worker),
+                  -- which routes to the target host via SSH. Before this
+                  -- guard, this claim stole node-targeted deferred shell
+                  -- tasks straight out of 'pending' and ran them LOCALLY
+                  -- with no host check (issue #1611: a task for a dark node
+                  -- 'completed' with another machine's output, and
+                  -- payload.claimed_by was never set because
+                  -- pg_claim_deferred was bypassed).
+                  AND t.task_class IS DISTINCT FROM 'deferred'
                   AND (t.preferred_computer_id IS NULL
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
@@ -532,19 +545,12 @@ impl TaskRunner {
         };
 
         let task_id: uuid::Uuid = row.get("id");
+        // Deferred tasks once reached this runner via the unfiltered claim
+        // and needed their real payload unwrapped from under a
+        // `deferred_payload` key (V153-158 queue consolidation). The claim
+        // query now excludes `task_class = 'deferred'` (issue #1611), so
+        // every payload here has `command` at the top level.
         let payload: Value = row.get("payload");
-        // Deferred tasks (`pg_enqueue_deferred`) fold into `fleet_tasks` with the
-        // caller's REAL payload nested under a `deferred_payload` key (V153-158
-        // queue consolidation). Unwrap it so the shell fields (command / shell /
-        // max_duration_secs) are read from the original payload — otherwise every
-        // cross-node deferred shell task (notably `ff model download --node`)
-        // fails "task payload missing required field: command". Non-deferred
-        // fleet_tasks (command at the top level) pass straight through.
-        let payload: Value = payload
-            .get("deferred_payload")
-            .filter(|v| v.is_object())
-            .cloned()
-            .unwrap_or(payload);
         let summary: String = row.get("summary");
         let task_type: String = row.get("task_type");
         let timeout_secs: Option<i32> = row.get("timeout_secs");
@@ -620,7 +626,11 @@ impl TaskRunner {
         // `cancelled`, and a subsequent late-completing worker won't
         // overwrite that.
         match outcome {
-            Ok(result) => {
+            Ok(mut result) => {
+                // Host attribution (issue #1611): every shell/review result
+                // records which node actually executed it, so a completed
+                // task can always be traced back to its executor.
+                result["executed_on"] = json!(self.my_name);
                 let exit = result.get("exit").and_then(Value::as_i64).unwrap_or(-1);
                 if exit == 0 {
                     let update = sqlx::query(
@@ -704,6 +714,9 @@ impl TaskRunner {
                SELECT id FROM fleet_tasks t
                 WHERE t.status = 'pending'
                   AND t.task_type = 'code_review'
+                  -- Same exclusion as the shell claim above: deferred rows
+                  -- belong to the deferred pipeline (issue #1611).
+                  AND t.task_class IS DISTINCT FROM 'deferred'
                   AND (t.preferred_computer_id IS NULL
                        OR t.preferred_computer_id = $1)
                   AND t.requires_capability <@ to_jsonb($2::text[])
@@ -2774,6 +2787,33 @@ mod claim_query_tests {
         .fetch_all(&pool)
         .await
         .expect("restart executor-guard clause must parse + type-check");
+    }
+
+    /// DB-backed validation that the deferred-exclusion clause (issue #1611)
+    /// parses and type-checks against the real `fleet_tasks` schema — the
+    /// claim query is runtime-checked `sqlx::query`, so a malformed clause
+    /// wouldn't surface at compile time. Ignored so CI skips it; run on a
+    /// host with the fleet pool:
+    ///
+    ///   cargo test -p ff-agent --lib -- --ignored explain_deferred_exclusion_guard
+    #[tokio::test]
+    #[ignore]
+    async fn explain_deferred_exclusion_guard() {
+        let pool = crate::fleet_info::get_fleet_pool()
+            .await
+            .expect("fleet pool");
+        sqlx::query(
+            r#"
+            EXPLAIN
+            SELECT id FROM fleet_tasks t
+             WHERE t.status = 'pending'
+               AND t.task_type = 'shell'
+               AND t.task_class IS DISTINCT FROM 'deferred'
+            "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("deferred-exclusion clause must parse + type-check");
     }
 }
 
