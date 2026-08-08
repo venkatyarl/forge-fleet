@@ -6,7 +6,7 @@ StartLimitBurst=100
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/forgefleetd mcp --listen 0.0.0.0:50001
+ExecStart=%h/.local/bin/forgefleetd mcp --listen 127.0.0.1:50001
 Environment=PATH=%h/.cargo/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 Restart=always
 RestartSec=2
