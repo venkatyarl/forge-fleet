@@ -2,29 +2,25 @@
 //!
 //! A small, byte-capped, agent-self-editable text surface with fixed blocks
 //! and layered scope. When a write pushes a scope over its byte cap, the
-//! lowest-priority block is summarized (consolidate-and-forget) and its full
-//! pre-summary content is pushed down into Brain as a candidate so nothing is
-//! truly lost. Sits *beside* `session_brain`, *above* Brain/Cortex/Vault.
+//! complete scope is archived verbatim and replaced by a verified pointer.
+//! Sits *beside* `session_brain`, *above* Brain/Cortex/Vault.
 //!
 //! ff-db owns the transactional SQL primitives (`pg_memory_*`); this module
-//! owns the string-edit ops (`add`/`replace`/`remove`) and the
-//! consolidate-and-forget driver (which calls a summarizer LLM).
+//! owns the string-edit ops (`add`/`replace`/`remove`) and fail-closed repair.
 //!
 //! Design: `plans/agent-working-memory.md` (LLM council 2026-06-19).
 
 use anyhow::{Context, Result, bail};
 use ff_db::queries::{MEMORY_BLOCKS, MemoryBlock};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
 const DEFAULT_USER: &str = "venkat";
 
-/// Eviction priority: `scratch` first, `decisions` last (only ever summarized).
-const EVICTION_ORDER: [&str; 5] = ["scratch", "findings", "state", "task", "decisions"];
-
-/// Max consolidate-and-forget passes before falling back to a hard trim.
-const MAX_CONSOLIDATE_PASSES: usize = 5;
+const ARCHIVE_VERSION: &str = "memory-integrity-v1";
+const ARCHIVE_REASON: &str = "oversized-scope-repair";
+const POINTER_PREFIX: &str = "[forgefleet-memory-archive:";
 
 /// Result of a memory write, mirrored back to the caller / tool response.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -165,8 +161,7 @@ pub async fn memory_set_cap(
         .context("set memory cap")
 }
 
-/// Write a block's full new content, then enforce the scope's byte cap by
-/// consolidating if needed. Shared tail of every edit op.
+/// Write a block's full new content, then enforce the scope's byte cap.
 async fn write_block(
     pool: &PgPool,
     scope_type: &str,
@@ -197,92 +192,157 @@ async fn write_block(
     })
 }
 
-/// Consolidate-and-forget: while the scope is over `cap`, pick the
-/// lowest-priority non-empty block, summarize it (preserving decisions /
-/// paths / commands / IDs / failures), push the full pre-summary content into
-/// Brain, record an eviction row, and replace the block with the summary.
-/// Falls back to a hard trim if the summarizer is unavailable.
-/// `pub(crate)` for the dreamer's cap re-enforcement sweep.
+/// Compatibility entry point for the dreamer's cap re-enforcement sweep.
 pub(crate) async fn consolidate_and_forget(
     pool: &PgPool,
     scope_type: &str,
     scope_key: &str,
     cap: i32,
 ) -> Result<bool> {
-    let mut did_anything = false;
+    repair_oversized_scope(pool, scope_type, scope_key, cap).await
+}
 
-    for _ in 0..MAX_CONSOLIDATE_PASSES {
-        let blocks = ff_db::queries::pg_memory_get_all(pool, scope_type, scope_key).await?;
-        let total: i64 = blocks.iter().map(|b| b.bytes as i64).sum();
-        if total <= cap as i64 {
-            return Ok(did_anything);
-        }
-
-        // Pick the highest-priority-to-evict block that actually has content.
-        let target = EVICTION_ORDER.iter().find_map(|name| {
-            blocks
-                .iter()
-                .find(|b| &b.block == name && !b.content.is_empty())
-        });
-        let Some(target) = target else {
-            break; // nothing left to evict
-        };
-
-        let summary = match summarize_block(pool, &target.block, &target.content).await {
-            Ok(s) if !s.trim().is_empty() => s.trim().to_string(),
-            Ok(_) | Err(_) => {
-                // Summarizer unavailable/empty → hard-trim backstop this pass.
-                hard_trim(pool, scope_type, scope_key, target).await?;
-                did_anything = true;
-                continue;
-            }
-        };
-
-        // Push full pre-summary content down to Brain (best-effort).
-        let prev_hash = hex_sha256(&target.content);
-        let brain_ref =
-            push_to_brain(pool, scope_type, scope_key, &target.block, &target.content).await;
-
-        ff_db::queries::pg_memory_record_eviction(
-            pool,
-            scope_type,
-            scope_key,
-            &target.block,
-            &prev_hash,
-            target.bytes,
-            &summary,
-            "fleet-summarizer",
-            brain_ref.as_deref(),
-        )
+/// Fail-closed repair for an oversized scope. The complete, deterministically
+/// serialized scope is archived and read-back verified in the same transaction
+/// before any working-memory row is changed.
+pub(crate) async fn repair_oversized_scope(
+    pool: &PgPool,
+    scope_type: &str,
+    scope_key: &str,
+    cap: i32,
+) -> Result<bool> {
+    let mut tx = pool.begin().await.context("begin oversized-scope repair")?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("agent-memory:{scope_type}:{scope_key}"))
+        .execute(&mut *tx)
         .await
-        .context("record memory eviction")?;
+        .context("lock memory scope")?;
+    let rows = sqlx::query(
+        "SELECT block, content FROM agent_memory
+          WHERE scope_type=$1 AND scope_key=$2 ORDER BY block FOR UPDATE",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_all(&mut *tx)
+    .await
+    .context("read locked memory scope")?;
+    let total: usize = rows
+        .iter()
+        .map(|r| r.get::<String, _>("content").len())
+        .sum();
+    if total <= cap.max(0) as usize {
+        tx.commit().await?;
+        return Ok(false);
+    }
+    if rows.len() == 1
+        && rows[0]
+            .get::<String, _>("content")
+            .starts_with(POINTER_PREFIX)
+    {
+        bail!("archived pointer exceeds configured cap; refusing to re-archive it");
+    }
 
-        ff_db::queries::pg_memory_set_block(pool, scope_type, scope_key, &target.block, &summary)
+    let blocks: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "block": r.get::<String, _>("block"),
+                "content": r.get::<String, _>("content")
+            })
+        })
+        .collect();
+    let archive = serde_json::to_string(&serde_json::json!({
+        "version": ARCHIVE_VERSION,
+        "reason": ARCHIVE_REASON,
+        "scope_type": scope_type,
+        "scope_key": scope_key,
+        "blocks": blocks
+    }))?;
+    let hash = hex_sha256(&archive);
+    let user_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO brain_users(name, display_name) VALUES ($1, 'Venkat')
+         ON CONFLICT(name) DO UPDATE SET display_name=COALESCE(brain_users.display_name, EXCLUDED.display_name)
+         RETURNING id",
+    )
+    .bind(DEFAULT_USER)
+    .fetch_one(&mut *tx)
+    .await
+    .context("resolve archive owner")?;
+    let archive_id: uuid::Uuid = sqlx::query_scalar(
+        "INSERT INTO brain_knowledge_candidates
+           (user_id, action, kind, title, body, tags, project, confidence)
+         VALUES ($1, 'create', $2, $3, $4, $5, $6, 1.0) RETURNING id",
+    )
+    .bind(user_id)
+    .bind("working-memory-scope-archive")
+    .bind(format!("memory archive: {scope_type}:{scope_key}"))
+    .bind(&archive)
+    .bind(vec![
+        "working-memory".to_string(),
+        ARCHIVE_VERSION.to_string(),
+    ])
+    .bind(scope_key)
+    .fetch_one(&mut *tx)
+    .await
+    .context("archive complete memory scope")?;
+    let restored: String =
+        sqlx::query_scalar("SELECT body FROM brain_knowledge_candidates WHERE id=$1 FOR SHARE")
+            .bind(archive_id)
+            .fetch_one(&mut *tx)
             .await
-            .context("replace block with summary")?;
-        did_anything = true;
-        info!(
-            scope_type, scope_key, block = %target.block,
-            prev_bytes = target.bytes, brain = brain_ref.is_some(),
-            "scratchpad: consolidated block"
-        );
+            .context("read back memory archive")?;
+    if restored.as_bytes().len() != archive.as_bytes().len() || hex_sha256(&restored) != hash {
+        bail!("memory archive verification failed");
     }
-
-    // Final backstop: if still over cap, hard-trim scratch then findings.
-    let blocks = ff_db::queries::pg_memory_get_all(pool, scope_type, scope_key).await?;
-    let total: i64 = blocks.iter().map(|b| b.bytes as i64).sum();
-    if total > cap as i64 {
-        for name in ["scratch", "findings"] {
-            if let Some(b) = blocks
-                .iter()
-                .find(|b| b.block == name && !b.content.is_empty())
-            {
-                hard_trim(pool, scope_type, scope_key, b).await?;
-                did_anything = true;
-            }
-        }
+    let locator = archive_id.to_string();
+    let pointer = format!(
+        "{POINTER_PREFIX}{ARCHIVE_VERSION}] locator=brain-candidate:{locator} sha256={hash} bytes={} reason={ARCHIVE_REASON}",
+        archive.len()
+    );
+    if pointer.len() > cap.max(0) as usize {
+        bail!("memory cap {cap} is too small for recoverable archive pointer");
     }
-    Ok(did_anything)
+    sqlx::query(
+        "INSERT INTO agent_memory_evictions
+          (scope_type, scope_key, block, prev_hash, prev_bytes, summary, summarizer, brain_ref)
+         VALUES ($1,$2,'__scope__',$3,$4,$5,$6,$7)",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(&hash)
+    .bind(i32::try_from(archive.len()).context("archive exceeds audit byte range")?)
+    .bind(&pointer)
+    .bind(format!("{ARCHIVE_REASON}:{ARCHIVE_VERSION}"))
+    .bind(&locator)
+    .execute(&mut *tx)
+    .await
+    .context("record immutable memory eviction evidence")?;
+    sqlx::query("DELETE FROM agent_memory WHERE scope_type=$1 AND scope_key=$2")
+        .bind(scope_type)
+        .bind(scope_key)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "INSERT INTO agent_memory(scope_type,scope_key,block,content,bytes,updated_at)
+         VALUES($1,$2,'state',$3,octet_length($3),NOW())",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(&pointer)
+    .execute(&mut *tx)
+    .await?;
+    let post: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(bytes),0)::bigint FROM agent_memory WHERE scope_type=$1 AND scope_key=$2",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if post > cap as i64 {
+        bail!("oversized-scope repair postcondition failed: {post} > {cap}");
+    }
+    tx.commit().await.context("commit verified memory repair")?;
+    Ok(true)
 }
 
 /// Archive a dead `session`-scope scratchpad: push every non-empty block's
@@ -323,69 +383,6 @@ pub(crate) async fn archive_session_scope(pool: &PgPool, scope_key: &str) -> Res
         archived, "scratchpad: archived dead session scope to Brain"
     );
     Ok(archived)
-}
-
-/// Hard-trim a block to its newest half (keeps the most recent lines). Never
-/// called on `decisions` by the priority order above.
-async fn hard_trim(
-    pool: &PgPool,
-    scope_type: &str,
-    scope_key: &str,
-    block: &MemoryBlock,
-) -> Result<()> {
-    let lines: Vec<&str> = block.content.lines().collect();
-    let keep_from = lines.len() / 2;
-    let trimmed: String = lines[keep_from..].join("\n");
-    warn!(
-        scope_type, scope_key, block = %block.block,
-        "scratchpad: summarizer unavailable — hard-trimmed block to newest half"
-    );
-    ff_db::queries::pg_memory_set_block(pool, scope_type, scope_key, &block.block, &trimmed)
-        .await
-        .context("hard-trim block")
-}
-
-/// Summarize a block via a cheap fleet model, preserving the durable facts.
-async fn summarize_block(pool: &PgPool, block: &str, content: &str) -> Result<String> {
-    let (endpoint, model) = resolve_summarizer(pool).await?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
-        .build()
-        .context("build summarizer http client")?;
-    let prompt = format!(
-        "You are compacting an AI agent's working-memory block named '{block}'. \
-         Rewrite it to roughly HALF its length. PRESERVE every decision, \
-         constraint, file path, command, identifier (PR/issue/UUID/port), and \
-         recorded failure — drop only transient narration. Output ONLY the \
-         compacted text, no preamble.\n\n---\n{content}"
-    );
-    let target_tokens = (content.len() / 4).clamp(128, 2048) as u32;
-    crate::research::openai_single_completion(&endpoint, &model, &prompt, target_tokens, &client)
-        .await
-        .context("summarizer completion")
-}
-
-/// Pick a healthy, least-loaded fleet endpoint+model for the summarizer.
-/// Summarization needs no tool-calling, so any healthy chat deployment works.
-async fn resolve_summarizer(pool: &PgPool) -> Result<(String, String)> {
-    let filter = ff_db::RouteFilter {
-        workload: None,
-        require_tool_calling: false,
-        min_ctx: None,
-        exclude_hosts: vec![],
-        max_health_age_sec: Some(ff_db::queries::DISPATCH_HEALTH_MAX_AGE_SEC),
-        prefer_least_loaded: true,
-        limit: 8,
-    };
-    let candidates = ff_db::pg_route_deployments(pool, &filter)
-        .await
-        .context("route a summarizer endpoint")?;
-    let c = candidates
-        .into_iter()
-        .next()
-        .context("no healthy LLM deployment available for summarization")?;
-    let model = c.catalog_id.or(c.catalog_name).unwrap_or_default();
-    Ok((c.endpoint, model))
 }
 
 /// Push evicted full content into Brain as a candidate. Best-effort: returns
@@ -459,4 +456,138 @@ pub async fn render_snapshot(pool: &PgPool, scope_type: &str, scope_key: &str) -
         out.push_str(&format!("### {}\n{}\n", b.block, b.content));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn test_pool() -> Option<PgPool> {
+        let url = std::env::var("FORGEFLEET_POSTGRES_URL")
+            .or_else(|_| std::env::var("FORGEFLEET_DATABASE_URL"))
+            .ok()?;
+        PgPool::connect(&url).await.ok()
+    }
+
+    #[tokio::test]
+    async fn oversized_scope_is_recoverable_utf8_and_repeat_is_noop() -> Result<()> {
+        let Some(pool) = test_pool().await else {
+            return Ok(());
+        };
+        let key = format!("memory-integrity-test-{}", uuid::Uuid::new_v4());
+        let original = "🧠é".repeat(25_000);
+        ff_db::queries::pg_memory_set_block(&pool, "project", &key, "state", &original).await?;
+
+        assert!(repair_oversized_scope(&pool, "project", &key, 6144).await?);
+        let pointer = ff_db::queries::pg_memory_get_block(&pool, "project", &key, "state").await?;
+        assert!(pointer.starts_with(POINTER_PREFIX));
+        assert!(pointer.len() <= 6144);
+        assert!(!repair_oversized_scope(&pool, "project", &key, 6144).await?);
+
+        let locator = pointer
+            .split("locator=brain-candidate:")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .context("pointer locator")?;
+        let body: String =
+            sqlx::query_scalar("SELECT body FROM brain_knowledge_candidates WHERE id::text=$1")
+                .bind(locator)
+                .fetch_one(&pool)
+                .await?;
+        let archived: serde_json::Value = serde_json::from_str(&body)?;
+        assert_eq!(archived["blocks"][0]["content"], original);
+        assert!(pointer.contains(&format!("sha256={}", hex_sha256(&body))));
+
+        sqlx::query("DELETE FROM agent_memory WHERE scope_type='project' AND scope_key=$1")
+            .bind(&key)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "DELETE FROM agent_memory_evictions WHERE scope_type='project' AND scope_key=$1",
+        )
+        .bind(&key)
+        .execute(&pool)
+        .await?;
+        sqlx::query("DELETE FROM brain_knowledge_candidates WHERE id::text=$1")
+            .bind(locator)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn too_small_cap_rolls_back_without_archive_or_mutation() -> Result<()> {
+        let Some(pool) = test_pool().await else {
+            return Ok(());
+        };
+        let key = format!("memory-integrity-rollback-{}", uuid::Uuid::new_v4());
+        let original = "state".repeat(20_000);
+        ff_db::queries::pg_memory_set_block(&pool, "project", &key, "state", &original).await?;
+        assert!(
+            repair_oversized_scope(&pool, "project", &key, 1)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            ff_db::queries::pg_memory_get_block(&pool, "project", &key, "state").await?,
+            original
+        );
+        let evidence: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_memory_evictions WHERE scope_type='project' AND scope_key=$1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(evidence, 0);
+        sqlx::query("DELETE FROM agent_memory WHERE scope_type='project' AND scope_key=$1")
+            .bind(&key)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_repairs_create_one_archive_pointer() -> Result<()> {
+        let Some(pool) = test_pool().await else {
+            return Ok(());
+        };
+        let key = format!("memory-integrity-concurrency-{}", uuid::Uuid::new_v4());
+        ff_db::queries::pg_memory_set_block(&pool, "project", &key, "state", &"x".repeat(100_000))
+            .await?;
+        let (a, b) = tokio::join!(
+            repair_oversized_scope(&pool, "project", &key, 6144),
+            repair_oversized_scope(&pool, "project", &key, 6144)
+        );
+        assert_ne!(a?, b?);
+        let evidence: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM agent_memory_evictions WHERE scope_type='project' AND scope_key=$1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(evidence, 1);
+        let locator: Option<String> = sqlx::query_scalar(
+            "SELECT brain_ref FROM agent_memory_evictions WHERE scope_type='project' AND scope_key=$1",
+        )
+        .bind(&key)
+        .fetch_one(&pool)
+        .await?;
+        sqlx::query("DELETE FROM agent_memory WHERE scope_type='project' AND scope_key=$1")
+            .bind(&key)
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "DELETE FROM agent_memory_evictions WHERE scope_type='project' AND scope_key=$1",
+        )
+        .bind(&key)
+        .execute(&pool)
+        .await?;
+        if let Some(locator) = locator {
+            sqlx::query("DELETE FROM brain_knowledge_candidates WHERE id::text=$1")
+                .bind(locator)
+                .execute(&pool)
+                .await?;
+        }
+        Ok(())
+    }
 }
