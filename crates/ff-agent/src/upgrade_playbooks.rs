@@ -167,10 +167,11 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // [[macos-launchd-kickstart]] pkill alone doesn't work because
         // launchd respawns from cached state.
         //
-        // Linux: prefer systemd --user (forgefleetd.service if present),
-        // fall back to pkill + nohup + disown. The fallback is the only
-        // safe path for hosts whose bootstrap never installed a systemd
-        // unit ([[bootstrap-missing-systemd]]).
+        // Linux: both long-lived services execute this shared binary. Restart
+        // the dedicated MCP unit first and prove its HTTP initialize path is
+        // ready before detaching the worker-daemon restart. Never use a broad
+        // process pattern here: it can also match MCP stdio clients, the
+        // persistent MCP service, or this upgrade's invoking shell.
         //
         // SELF-KILL FIX (2026-06-14): the restart MUST be detached. The
         // deferred worker runs this playbook as a child of the very
@@ -186,9 +187,8 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
         // `setsid` session (escapes the worker's process-group reap — see the
         // task_runner.rs:process_group(0) comment), background+disown it so
         // the orchestrator returns and the worker records SUCCESS first, then
-        // restart via `systemctl --no-block` (or a detached pkill+nohup
-        // respawn). The leading 2s sleep guarantees the success write lands
-        // before the daemon is bounced.
+        // restart via exact systemd user units. The leading 2s sleep guarantees
+        // the success write lands before the worker daemon is bounced.
         ("forgefleetd_git" | "forgefleetd", "macos") => Some(format!(
             ". \"$HOME/.cargo/env\" 2>/dev/null || true; \
              {sync} && \
@@ -196,10 +196,7 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              cargo build --bin forgefleetd --release && {install} && \
              USER_ID=$(stat -f %u \"$HOME\" 2>/dev/null || id -u); \
              launchctl kickstart -k \"gui/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null \
-               || (pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
-                   nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                   </dev/null >/tmp/forgefleetd.log 2>&1 & disown)",
+               || launchctl kickstart -k \"user/${{USER_ID}}/com.forgefleet.forgefleetd\" 2>/dev/null",
             sync = GIT_SYNC_FORGE_FLEET,
             web_build = WEB_BUILD_STEP,
             install = atomic_install_cmd("forgefleetd", "$HOME/.local/bin/forgefleetd", true),
@@ -210,12 +207,20 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              {web_build} && \
              cargo build --bin forgefleetd --release && {install} && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             systemctl --user reset-failed forgefleet-mcp.service 2>/dev/null; \
+             systemctl --user restart forgefleet-mcp.service || {{ echo \"upgrade: failed to restart forgefleet-mcp.service\" >&2; exit 1; }}; \
+             MCP_READY=0; \
+             for ATTEMPT in $(seq 1 30); do \
+               if curl --fail --silent --show-error --max-time 1 \
+                 -H 'Content-Type: application/json' \
+                 --data '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"forgefleet-upgrade\",\"version\":\"1\"}}}}}}' \
+                 http://127.0.0.1:50001/mcp | grep -q '\"result\"'; then MCP_READY=1; break; fi; \
+               sleep 1; \
+             done; \
+             [ \"$MCP_READY\" -eq 1 ] || {{ echo \"upgrade: forgefleet-mcp.service failed initialize readiness\" >&2; exit 1; }}; \
              setsid bash -c 'sleep 2; \
                systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
-               systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
-                 || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
-                      nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                      </dev/null >/tmp/forgefleetd.log 2>&1 & disown )' \
+               systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1' \
                </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
              disown; \
              echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
@@ -234,12 +239,20 @@ fn playbook_exact(tool: &str, os_family: &str) -> Option<String> {
              {web_build} && \
              cargo build --bin forgefleetd --release -j 2 && {install} && \
              export XDG_RUNTIME_DIR=\"${{XDG_RUNTIME_DIR:-/run/user/$(id -u)}}\"; \
+             systemctl --user reset-failed forgefleet-mcp.service 2>/dev/null; \
+             systemctl --user restart forgefleet-mcp.service || {{ echo \"upgrade: failed to restart forgefleet-mcp.service\" >&2; exit 1; }}; \
+             MCP_READY=0; \
+             for ATTEMPT in $(seq 1 30); do \
+               if curl --fail --silent --show-error --max-time 1 \
+                 -H 'Content-Type: application/json' \
+                 --data '{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{{}},\"clientInfo\":{{\"name\":\"forgefleet-upgrade\",\"version\":\"1\"}}}}}}' \
+                 http://127.0.0.1:50001/mcp | grep -q '\"result\"'; then MCP_READY=1; break; fi; \
+               sleep 1; \
+             done; \
+             [ \"$MCP_READY\" -eq 1 ] || {{ echo \"upgrade: forgefleet-mcp.service failed initialize readiness\" >&2; exit 1; }}; \
              setsid bash -c 'sleep 2; \
                systemctl --user reset-failed forgefleetd.service 2>/dev/null; \
-               systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1 \
-                 || ( pkill -TERM -f \"$HOME/.local/bin/forgefleetd\" 2>/dev/null; sleep 1; \
-                      nohup \"$HOME/.local/bin/forgefleetd\" --worker-name $(hostname -s) start \
-                      </dev/null >/tmp/forgefleetd.log 2>&1 & disown )' \
+               systemctl --user restart --no-block forgefleetd.service </dev/null >/dev/null 2>&1' \
                </dev/null >/tmp/forgefleetd-restart.log 2>&1 & \
              disown; \
              echo \"build+install OK; restart dispatched detached (setsid + --no-block; survives worker self-kill)\"",
@@ -399,9 +412,45 @@ mod tests {
                 "fam={fam}: restart must be --no-block"
             );
             assert!(
-                !p.contains("pkill -f 'forgefleetd --worker-name'"),
-                "fam={fam}: foreground daemon-pkill self-kills the worker"
+                p.contains("systemctl --user restart forgefleet-mcp.service"),
+                "fam={fam}: shared binary upgrade must restart the exact MCP unit"
             );
+            assert!(
+                p.contains("for ATTEMPT in $(seq 1 30)")
+                    && p.contains("--max-time 1")
+                    && p.contains("\"method\":\"initialize\"")
+                    && p.contains("http://127.0.0.1:50001/mcp")
+                    && p.contains("failed initialize readiness"),
+                "fam={fam}: MCP initialize readiness must be bounded and required"
+            );
+            let mcp_restart = p
+                .find("systemctl --user restart forgefleet-mcp.service")
+                .unwrap();
+            let readiness = p.find("for ATTEMPT in $(seq 1 30)").unwrap();
+            let daemon_restart = p
+                .find("systemctl --user restart --no-block forgefleetd.service")
+                .unwrap();
+            assert!(
+                mcp_restart < readiness && readiness < daemon_restart,
+                "fam={fam}: exact MCP restart/readiness must precede detached daemon restart"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_upgrades_never_use_broad_process_kills() {
+        // `forgefleetd` is also the MCP executable. A pattern/name kill can
+        // terminate `mcp --stdio`, forgefleet-mcp.service, or an invoking
+        // worker shell whose command contains the pattern.
+        for fam in ["macos", "linux", "linux-dgx"] {
+            let p = playbook_for("forgefleetd_git", fam)
+                .unwrap_or_else(|| panic!("no playbook for {fam}"));
+            for broad_kill in ["pkill", "killall", "pgrep", "forgefleetd mcp --stdio"] {
+                assert!(
+                    !p.contains(broad_kill),
+                    "fam={fam}: broad process matcher `{broad_kill}` can kill MCP transports"
+                );
+            }
         }
     }
 
